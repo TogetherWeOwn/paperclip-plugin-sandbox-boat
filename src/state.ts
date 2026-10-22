@@ -1,0 +1,138 @@
+// Plugin state: one JSON document per company (scope "company"), holding the
+// card -> boat sandbox mapping and the per-run usage ledger. Writes are
+// serialized in-process; the worker is the only writer.
+import type { BoatSize } from "./config.js";
+
+export type VmKeyKind = "executionWorkspace" | "issue" | "run";
+export type VmStatus = "starting" | "running" | "stopping" | "stopped" | "deleted";
+export type StartKind = "create" | "create_from_snapshot" | "resume" | "reuse_running";
+
+export interface UsageReading {
+  seconds: number;
+  dollars: number;
+  source: "boat" | "estimate";
+  at: string;
+}
+
+export interface RunSession {
+  runId: string;
+  agentId: string | null;
+  startKind: StartKind;
+  size: BoatSize;
+  startedAt: string;
+  endedAt: string | null;
+  usage: UsageReading | null;
+}
+
+export interface VmRecord {
+  key: string;
+  keyKind: VmKeyKind;
+  sandboxId: string;
+  name: string;
+  companyId: string;
+  environmentId: string;
+  issueId: string | null;
+  executionWorkspaceId: string | null;
+  size: BoatSize;
+  status: VmStatus;
+  activeRunIds: string[];
+  createdAt: string;
+  lastStartedAt: string;
+  lastStoppedAt: string | null;
+  lastActivityAt: string;
+  archiveAfter: string | null;
+  hardDeadline: string | null;
+  starts: number;
+  lifetimeUsage: UsageReading | null;
+  sessions: RunSession[];
+  deletedAt: string | null;
+}
+
+export interface StateDoc {
+  version: 1;
+  vms: Record<string, VmRecord>;
+}
+
+export interface StateClientLike {
+  get(input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string }): Promise<unknown>;
+  set(
+    input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string },
+    value: unknown,
+  ): Promise<void>;
+}
+
+const NAMESPACE = "boat-sandbox";
+const VMS_KEY = "vms";
+const COMPANIES_KEY = "companies";
+const MAX_SESSIONS_PER_VM = 100;
+const TOMBSTONE_KEEP_MS = 30 * 24 * 3600 * 1000;
+
+function emptyDoc(): StateDoc {
+  return { version: 1, vms: {} };
+}
+
+function normalizeDoc(value: unknown): StateDoc {
+  if (!value || typeof value !== "object") return emptyDoc();
+  const doc = value as Partial<StateDoc>;
+  if (doc.version !== 1 || !doc.vms || typeof doc.vms !== "object") return emptyDoc();
+  return { version: 1, vms: { ...doc.vms } };
+}
+
+export class VmStateStore {
+  private chain: Promise<unknown> = Promise.resolve();
+
+  constructor(private readonly state: StateClientLike) {}
+
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(fn, fn);
+    this.chain = next.catch(() => undefined);
+    return next;
+  }
+
+  async read(companyId: string): Promise<StateDoc> {
+    return normalizeDoc(await this.state.get({ scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: VMS_KEY }));
+  }
+
+  /** Read-modify-write, serialized with every other write in this worker. */
+  async update<T>(companyId: string, fn: (doc: StateDoc) => T | Promise<T>): Promise<T> {
+    return this.serialize(async () => {
+      const doc = await this.read(companyId);
+      const result = await fn(doc);
+      prune(doc, Date.now());
+      await this.state.set({ scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: VMS_KEY }, doc);
+      return result;
+    });
+  }
+
+  async rememberCompany(companyId: string): Promise<void> {
+    return this.serialize(async () => {
+      const raw = await this.state.get({ scopeKind: "instance", namespace: NAMESPACE, stateKey: COMPANIES_KEY });
+      const list = Array.isArray(raw) ? raw.filter((entry): entry is string => typeof entry === "string") : [];
+      if (list.includes(companyId)) return;
+      await this.state.set({ scopeKind: "instance", namespace: NAMESPACE, stateKey: COMPANIES_KEY }, [...list, companyId]);
+    });
+  }
+
+  async companies(): Promise<string[]> {
+    const raw = await this.state.get({ scopeKind: "instance", namespace: NAMESPACE, stateKey: COMPANIES_KEY });
+    return Array.isArray(raw) ? raw.filter((entry): entry is string => typeof entry === "string") : [];
+  }
+}
+
+export function findBySandboxId(doc: StateDoc, sandboxId: string): VmRecord | null {
+  for (const record of Object.values(doc.vms)) {
+    if (record.sandboxId === sandboxId) return record;
+  }
+  return null;
+}
+
+function prune(doc: StateDoc, now: number): void {
+  for (const [key, record] of Object.entries(doc.vms)) {
+    if (record.sessions.length > MAX_SESSIONS_PER_VM) {
+      record.sessions = record.sessions.slice(-MAX_SESSIONS_PER_VM);
+    }
+    if (record.status === "deleted" && record.deletedAt && now - Date.parse(record.deletedAt) > TOMBSTONE_KEEP_MS) {
+      delete doc.vms[key];
+    }
+  }
+}

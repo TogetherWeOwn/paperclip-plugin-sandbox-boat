@@ -1,0 +1,137 @@
+import { definePlugin } from "@paperclipai/plugin-sdk";
+import type {
+  PluginApiRequestInput,
+  PluginApiResponse,
+  PluginContext,
+  PluginEnvironmentValidateConfigParams,
+  PluginEnvironmentValidationResult,
+} from "@paperclipai/plugin-sdk";
+import { parseDriverConfig, validateDriverConfig } from "./config.js";
+import { SWEEP_JOB_KEY } from "./manifest.js";
+import { BoatVmManager } from "./vm-manager.js";
+import type { ManagerDeps } from "./vm-manager.js";
+
+let manager: BoatVmManager | null = null;
+let managerOverrides: Partial<ManagerDeps> = {};
+
+/** Test hook: inject a fake clock, sleep or SSH manager before setup(). */
+export function setManagerOverridesForTests(overrides: Partial<ManagerDeps>): void {
+  managerOverrides = overrides;
+  manager = null;
+}
+
+export function currentManager(): BoatVmManager {
+  if (!manager) throw new Error("boat sandbox provider is not set up yet.");
+  return manager;
+}
+
+function requireManager(): BoatVmManager {
+  return currentManager();
+}
+
+const plugin = definePlugin({
+  async setup(ctx: PluginContext) {
+    manager = new BoatVmManager({
+      state: ctx.state,
+      logger: ctx.logger,
+      issues: {
+        get: async (issueId, companyId) => {
+          const issue = await ctx.issues.get(issueId, companyId);
+          return issue ? { status: issue.status } : null;
+        },
+      },
+      ...managerOverrides,
+    });
+    ctx.jobs.register(SWEEP_JOB_KEY, async () => {
+      const report = await requireManager().sweep("schedule");
+      if (report.stopped.length || report.deleted.length || report.errors.length) {
+        ctx.logger.info("boat: idle sweep finished", { ...report });
+      }
+    });
+    ctx.logger.info("boat sandbox provider plugin ready");
+  },
+
+  async onHealth() {
+    return {
+      status: "ok",
+      message: "boat sandbox provider plugin healthy",
+      details: manager ? manager.health() : {},
+    };
+  },
+
+  async onShutdown() {
+    await manager?.shutdown();
+  },
+
+  async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {
+    const boat = requireManager();
+    if (input.routeKey === "usage") {
+      const refreshRaw = input.query.refresh;
+      const refresh = (Array.isArray(refreshRaw) ? refreshRaw[0] : refreshRaw) !== "0";
+      return { status: 200, body: await boat.usageSummary(input.companyId, { refresh }) };
+    }
+    if (input.routeKey === "sweep") {
+      return { status: 200, body: await boat.sweep("api", { force: true }) };
+    }
+    return { status: 404, body: { error: `unknown route ${input.routeKey}` } };
+  },
+
+  async onEnvironmentValidateConfig(params: PluginEnvironmentValidateConfigParams): Promise<PluginEnvironmentValidationResult> {
+    const config = parseDriverConfig(params.config);
+    const { errors, warnings } = validateDriverConfig(config, params.config);
+    if (errors.length > 0) return { ok: false, errors, warnings };
+    const normalizedConfig: Record<string, unknown> = { ...config };
+    // Never echo secrets back as normalized config values.
+    if (normalizedConfig.apiKey == null) delete normalizedConfig.apiKey;
+    if (normalizedConfig.costApiKey == null) delete normalizedConfig.costApiKey;
+    return { ok: true, warnings, normalizedConfig };
+  },
+
+  async onEnvironmentProbe(params) {
+    return await requireManager().probe(params);
+  },
+
+  async onEnvironmentAcquireLease(params) {
+    const lease = await requireManager().acquire(params);
+    requireManager().sweepSoon("acquire");
+    return lease;
+  },
+
+  async onEnvironmentResumeLease(params) {
+    return await requireManager().resumeLease(params);
+  },
+
+  async onEnvironmentReleaseLease(params) {
+    const receipt = await requireManager().release(params, "release");
+    requireManager().sweepSoon("release");
+    return receipt;
+  },
+
+  async onEnvironmentStopLease(params) {
+    const receipt = await requireManager().release(params, "stop");
+    if (!receipt) throw new Error("boat stop was not confirmed.");
+    return receipt;
+  },
+
+  async onEnvironmentDestroyLease(params) {
+    return await requireManager().destroy(params);
+  },
+
+  async onEnvironmentRealizeWorkspace(params) {
+    return await requireManager().realizeWorkspace(params);
+  },
+
+  async onEnvironmentExecute(params) {
+    return await requireManager().execute(params);
+  },
+
+  async onEnvironmentCaptureTemplate(params) {
+    return await requireManager().captureTemplate(params);
+  },
+
+  async onEnvironmentDeleteTemplate(params) {
+    return await requireManager().deleteTemplate(params);
+  },
+});
+
+export default plugin;

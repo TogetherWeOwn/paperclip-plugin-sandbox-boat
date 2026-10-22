@@ -1,0 +1,56 @@
+{
+  "name": "@togetherweown/paperclip-plugin-sandbox-boat",
+  "version": "0.1.0",
+  "description": "boat.dev sandbox provider for Paperclip: one VM per card, started only while a run needs it and stopped on release, with a budget guard and per-run cost accounting. Built on the official @boatdev/sdk.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "sandbox",
+    "boat.dev"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@boatdev/sdk": "1.10.0"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1012.0",
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
