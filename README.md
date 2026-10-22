@@ -11,6 +11,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 | AcquireLease | The card already has a VM: resume it if it is stopped, or share it if it is running. Otherwise create a VM, from `templateSnapshot` when that is set. Every start passes the budget guard first and uses fail-fast. |
 | Execute | SSH as boat's non-root `user`, with the host key pinned from `POST /sandboxes/{id}/sshkey`. The run env goes over stdin into a 0600 file in a fresh 0700 directory under `/tmp`, never in argv. The command script sources the file and removes it before the command starts. A reverse tunnel makes `127.0.0.1:8317` inside the VM reach the model proxy. |
 | ReleaseLease | Stop the VM at once, which stops billing. A VM keyed to a single run has nothing worth keeping, so it is deleted instead. |
+| (reuse) | The driver declares `sandboxCapabilities.reusableLeases`. With `reuseLease: true` and `runnerLifecycleMode: "per_turn"` on the environment, Paperclip stops the card's VM after each run and resumes it for the card's next run, so the checkout and build output stay on its disk. Without reuse, Paperclip destroys the VM after every run (DestroyLease) and the next run starts a fresh one from `templateSnapshot`. Never set `runnerLifecycleMode: "warm"`: it keeps the VM running between runs. |
 | StopLease | Stop the VM, keep its disk, and confirm the stop or throw. |
 | DestroyLease | Delete the VM and forget the card mapping. |
 | ResumeLease | Resume the lease's VM, or report the lease expired. |

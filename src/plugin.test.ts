@@ -84,6 +84,11 @@ async function release(lease: { providerLeaseId: string | null; metadata?: Recor
 }
 
 describe("manifest", () => {
+  it("declares reusable leases, so Paperclip can stop a card's VM between runs and resume it", () => {
+    const driver = manifest.environmentDrivers?.[0] as { sandboxCapabilities?: { reusableLeases?: boolean } };
+    expect(driver.sandboxCapabilities?.reusableLeases).toBe(true);
+  });
+
   it("declares a sandbox_provider driver, the sweep job and the usage route", () => {
     expect(manifest.environmentDrivers?.[0]).toMatchObject({
       driverKey: "boat",
@@ -563,6 +568,26 @@ describe("ResumeLease and RealizeWorkspace", () => {
     expect(resumed.providerLeaseId).toBe(lease.providerLeaseId);
     expect(resumed.metadata).toMatchObject({ resumedLease: true, remoteCwd: "/home/user/paperclip-workspace" });
     expect(fake.callsOf("resume")).toHaveLength(1);
+  });
+
+  it("records a run window for a resumed lease, and release still stops the VM", async () => {
+    const lease = await acquire("run-1");
+    await release(lease, { resourceDisposition: "stop_and_retain" });
+    expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("archived");
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({
+      ...base(),
+      issueId: ISSUE,
+      providerLeaseId: lease.providerLeaseId!,
+      leaseMetadata: lease.metadata,
+    } as never);
+    expect(resumed.providerLeaseId).toBe(lease.providerLeaseId);
+    expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("ready");
+    clock.t += 5 * 60 * 1000;
+    await release({ providerLeaseId: resumed.providerLeaseId, metadata: resumed.metadata }, { resourceDisposition: "stop_and_retain" });
+    expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("archived");
+    const summary = await currentManager().usageSummary(COMPANY, { refresh: false });
+    const runs = summary.vms[0].runs as Array<{ runId: string; endedAt: string | null }>;
+    expect(runs.some((run) => run.runId.startsWith("resumed-lease:") && run.endedAt)).toBe(true);
   });
 
   it("realizes the workspace directory on the VM", async () => {

@@ -804,8 +804,29 @@ export class BoatVmManager {
       return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
     }
     this.sandboxCompany.set(sandbox.id, params.companyId);
+    const wasUp = UP_STATES.has(sandbox.state);
     const session = await this.liveSession(config, params.companyId, sandbox.id);
     const remote = await this.prepareRemote(config, session);
+    // Paperclip resumes a reusable lease without naming the new run, so record
+    // the run window under a synthetic id: it gives per-run cost accounting.
+    // It is not added to activeRunIds, so release still stops the VM.
+    await this.store
+      .update(params.companyId, (doc) => {
+        const record = findBySandboxId(doc, sandbox.id);
+        if (!record) return;
+        const now = this.nowIso();
+        record.lastActivityAt = now;
+        record.sessions.push({
+          runId: `resumed-lease:${now}`,
+          agentId: null,
+          startKind: wasUp ? "reuse_running" : "resume",
+          size: record.size,
+          startedAt: now,
+          endedAt: null,
+          usage: null,
+        });
+      })
+      .catch((error) => this.logger.warn("boat: could not record the resumed run window", { sandboxId: sandbox.id, error: errorText(error) }));
     return {
       providerLeaseId: sandbox.id,
       metadata: {

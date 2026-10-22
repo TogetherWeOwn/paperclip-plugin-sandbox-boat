@@ -62,6 +62,11 @@ const manifest: PaperclipPluginManifestV1 = {
       description:
         "boat.dev VMs over the official SDK and pinned-host-key SSH. One VM per card, stopped on release so it bills only while a run uses it. Budget guard, fail-fast starts, reverse tunnel to the model proxy.",
       defaultAcquireTimeoutMs: 600_000,
+      // Per-card reuse: with `reuseLease: true` and `runnerLifecycleMode: "per_turn"`
+      // on the environment, Paperclip stops the VM after each run (release with
+      // stop_and_retain) and resumes the same VM for the card's next run
+      // (ResumeLease). Never use "warm": it keeps the VM running between runs.
+      sandboxCapabilities: { reusableLeases: true },
       supportsTemplateCapture: true,
       templateRefKind: "snapshot",
       templateConfigBinding: { field: "templateSnapshot" },
