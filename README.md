@@ -9,7 +9,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 | Paperclip hook | boat action |
 | - | - |
 | AcquireLease | The card already has a VM: resume it if it is stopped, or share it if it is running. Otherwise create a VM, from `templateSnapshot` when that is set. Every start passes the budget guard first and uses fail-fast. |
-| Execute | SSH as boat's non-root `user`, with the host key pinned from `POST /sandboxes/{id}/sshkey`. The run env goes in a 0600 file over stdin, never in argv. A reverse tunnel makes `127.0.0.1:8317` inside the VM reach the model proxy. |
+| Execute | SSH as boat's non-root `user`, with the host key pinned from `POST /sandboxes/{id}/sshkey`. The run env goes over stdin into a 0600 file in a fresh 0700 directory under `/tmp`, never in argv. The command script sources the file and removes it before the command starts. A reverse tunnel makes `127.0.0.1:8317` inside the VM reach the model proxy. |
 | ReleaseLease | Stop the VM at once, which stops billing. A VM keyed to a single run has nothing worth keeping, so it is deleted instead. |
 | StopLease | Stop the VM, keep its disk, and confirm the stop or throw. |
 | DestroyLease | Delete the VM and forget the card mapping. |
@@ -52,6 +52,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 
 * VMs are created with `noEnv: true` and `monitoring: false`. Use a boat environment marked *safe for third parties*.
 * The VM gets nothing of the account. The run env is the only input.
+* The staged env file never sits in the workspace (the git checkout), so `git add -A` cannot commit it. It sits under `/tmp`, which boat snapshots do not save ([What a snapshot saves](https://docs.boat.dev/snapshots/whats-saved)), and it is gone before the command starts. If ssh drops before the script runs, the plugin removes it itself.
 * An ephemeral ed25519 key is made per worker process with `ssh-keygen`. It is never stored.
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
 * The tunnel binds to `127.0.0.1` inside the VM only. Nothing is published.

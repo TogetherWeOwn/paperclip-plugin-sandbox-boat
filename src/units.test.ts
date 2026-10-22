@@ -1,8 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { checkBudget, readBudget } from "./budget.js";
 import { parseDriverConfig } from "./config.js";
 import { describeBoatError } from "./errors.js";
-import { buildLoginShellScript, buildRemoteEnvFileContents } from "./shell.js";
+import {
+  REMOTE_ENV_STAGING_ROOT,
+  buildLoginShellScript,
+  buildRemoteEnvFileContents,
+  newRemoteEnvStage,
+  stageRemoteEnvCommand,
+} from "./shell.js";
+import type { RemoteEnvStage } from "./shell.js";
 import { endpointFromSshKeyResponse } from "./ssh.js";
 import { resolveVmKey, sandboxNameFor, sanitizeSnapshotName } from "./vm-manager.js";
 import { responseError, trialLimits } from "./test-support/fake-boat.js";
@@ -107,11 +118,74 @@ describe("shell", () => {
     expect(buildRemoteEnvFileContents([["A", "it's"]])).toBe("export A='it'\"'\"'s';\n");
   });
 
-  it("sources then removes the env file around the payload", () => {
-    const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnvPath: "/w/.e.sh" });
-    expect(script).toContain("cd '/w'");
-    expect(script).toContain("if [ -f '/w/.e.sh' ]; then . '/w/.e.sh'; fi");
-    expect(script).toContain("'node' 'x.js'; rc=$?; rm -f '/w/.e.sh'; exit $rc");
+  it("stages each command's env in a fresh directory under /tmp, never in the workspace", () => {
+    const a = newRemoteEnvStage();
+    const b = newRemoteEnvStage();
+    expect(REMOTE_ENV_STAGING_ROOT).toBe("/tmp");
+    expect(a.dir).toMatch(/^\/tmp\/paperclip-boat-env-[0-9a-f]{32}$/);
+    expect(a.path).toBe(`${a.dir}/env.sh`);
+    expect(b.dir).not.toBe(a.dir);
+  });
+
+  it("sources the env file, removes it, then runs the payload, with a trailing remove as a fallback", () => {
+    const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
+    const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
+    expect(script).toContain(
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+    );
+    expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
     expect(script).not.toContain("exec 'node'");
+  });
+
+  describe("in a real shell", () => {
+    let root: string;
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    // The same two steps the plugin runs over ssh, against a local sh.
+    function stageAndRun(stage: RemoteEnvStage, cwd: string, payload: string) {
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
+      execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t 'x'"]]), env });
+      const mode = statSync(stage.dir).mode & 0o777;
+      const fileMode = statSync(stage.path).mode & 0o777;
+      const script = buildLoginShellScript({ command: "sh", args: ["-c", payload, "payload", stage.path], cwd, remoteEnv: stage });
+      return { mode, fileMode, run: spawnSync("sh", ["-c", script], { env, encoding: "utf8" }) };
+    }
+
+    it("the payload gets the env but the file is already gone when it starts", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const cwd = path.join(root, "workspace");
+      execFileSync("mkdir", [cwd]);
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      const { mode, fileMode, run } = stageAndRun(
+        stage,
+        cwd,
+        'printf "secret=%s\\n" "$PCB_SECRET"; if [ -e "$1" ]; then echo file=present; else echo file=gone; fi; printf "cwd=%s\\n" "$PWD"; exit 7',
+      );
+      expect(mode).toBe(0o700);
+      expect(fileMode).toBe(0o600);
+      expect(run.stdout).toBe(`secret=s3cr3t 'x'\nfile=gone\ncwd=${cwd}\n`);
+      expect(run.status).toBe(7);
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    it("the fallback removes the file when the script stops before the payload", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      const { run } = stageAndRun(stage, path.join(root, "no-such-dir"), "echo ran");
+      expect(run.stdout).not.toContain("ran");
+      expect(run.status).not.toBe(0);
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    it("staging refuses a directory that already exists", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const dir = path.join(root, "stage");
+      execFileSync("mkdir", [dir]);
+      const result = spawnSync("sh", ["-c", stageRemoteEnvCommand({ dir, path: path.join(dir, "env.sh") })], { input: "export A=1;\n" });
+      expect(result.status).not.toBe(0);
+      expect(existsSync(path.join(dir, "env.sh"))).toBe(false);
+    });
   });
 });

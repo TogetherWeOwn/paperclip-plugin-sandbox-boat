@@ -41,9 +41,12 @@ import {
   buildLoginShellScript,
   buildRemoteEnvFileContents,
   filterStringEnvEntries,
-  remoteEnvFileName,
+  newRemoteEnvStage,
+  removeRemoteEnvCommand,
   shellQuote,
+  stageRemoteEnvCommand,
 } from "./shell.js";
+import type { RemoteEnvStage } from "./shell.js";
 import { SshManager, endpointFromSshKeyResponse, runProcess } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
 import { VmStateStore, findBySandboxId } from "./state.js";
@@ -1110,27 +1113,28 @@ export class BoatVmManager {
       await this.maybeExtend(config, sandboxId);
 
       // Env values never ride argv: they go over the ssh stdin pipe into a
-      // 0600 file that the command script sources and removes (exe-dev rule).
-      let remoteEnvPath: string | null = null;
+      // 0600 file (exe-dev rule). The file sits in a fresh 0700 directory
+      // under /tmp, outside the git checkout and outside every boat snapshot,
+      // and the command script removes it before the payload starts (shell.ts).
+      let remoteEnv: RemoteEnvStage | null = null;
       if (envEntries.length > 0) {
-        const stagingDir = (cwd ?? "/home/user").replace(/\/+$/, "") || "/";
-        remoteEnvPath = `${stagingDir}/${remoteEnvFileName()}`;
-        let staged = await this.ssh.run(
-          session,
-          `mkdir -p ${shellQuote(stagingDir)} && umask 077 && cat > ${shellQuote(remoteEnvPath)} && chmod 600 ${shellQuote(remoteEnvPath)}`,
-          { stdin: buildRemoteEnvFileContents(envEntries), timeoutMs },
-        );
+        remoteEnv = newRemoteEnvStage();
+        let staged = await this.ssh.run(session, stageRemoteEnvCommand(remoteEnv), {
+          stdin: buildRemoteEnvFileContents(envEntries),
+          timeoutMs,
+        });
         if (staged.exitCode === 255 && (await this.sessionLost(config, sandboxId))) {
           // The VM was stopped under us (auto-stop or sweep). Nothing ran yet,
-          // so resume and stage again once.
+          // so resume and stage again once, in a new directory.
           session = await this.liveSession(config, params.companyId, sandboxId);
-          staged = await this.ssh.run(
-            session,
-            `mkdir -p ${shellQuote(stagingDir)} && umask 077 && cat > ${shellQuote(remoteEnvPath)} && chmod 600 ${shellQuote(remoteEnvPath)}`,
-            { stdin: buildRemoteEnvFileContents(envEntries), timeoutMs },
-          );
+          remoteEnv = newRemoteEnvStage();
+          staged = await this.ssh.run(session, stageRemoteEnvCommand(remoteEnv), {
+            stdin: buildRemoteEnvFileContents(envEntries),
+            timeoutMs,
+          });
         }
         if (staged.timedOut || staged.exitCode !== 0) {
+          await this.removeStagedEnv(session, remoteEnv);
           return {
             exitCode: 1,
             signal: null,
@@ -1142,11 +1146,17 @@ export class BoatVmManager {
         }
       }
 
-      const script = buildLoginShellScript({ command: params.command, args: params.args ?? [], cwd, remoteEnvPath });
+      const script = buildLoginShellScript({ command: params.command, args: params.args ?? [], cwd, remoteEnv });
       const result = await this.ssh.run(session, `sh -c ${shellQuote(script)}`, { stdin: params.stdin, timeoutMs });
       let stderr = result.stderr;
-      if (result.exitCode === 255 && (await this.sessionLost(config, sandboxId))) {
-        stderr = `${stderr}\nboat: VM ${sandboxId} was stopped while the command ran (auto-stop deadline or idle sweep). The next command resumes it.`.trim();
+      if (result.exitCode === 255) {
+        if (await this.sessionLost(config, sandboxId)) {
+          // A stopped VM loses /tmp, so the env file is gone with it.
+          stderr = `${stderr}\nboat: VM ${sandboxId} was stopped while the command ran (auto-stop deadline or idle sweep). The next command resumes it.`.trim();
+        } else if (remoteEnv) {
+          // ssh may have failed before the script could remove the file.
+          await this.removeStagedEnv(session, remoteEnv);
+        }
       }
       return {
         exitCode: result.exitCode,
@@ -1159,6 +1169,11 @@ export class BoatVmManager {
     } finally {
       await this.endActivity(params.companyId, sandboxId);
     }
+  }
+
+  /** Best effort: remove a staged env file that the command script may not have reached. */
+  private async removeStagedEnv(session: SshSession, stage: RemoteEnvStage): Promise<void> {
+    await this.ssh.run(session, removeRemoteEnvCommand(stage), { timeoutMs: 15_000 }).catch(() => undefined);
   }
 
   /** After an SSH failure: is the VM no longer running? If so, drop the dead session. */

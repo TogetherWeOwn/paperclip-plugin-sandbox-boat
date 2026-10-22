@@ -57,17 +57,24 @@ try {
   sandboxId = lease1.providerLeaseId;
   console.log(JSON.stringify(lease1.metadata));
 
-  step("execute: identity, env file, argv check, tunnel, marker file");
+  step("execute: identity, env, argv check, env file gone, tunnel, marker file");
   const sentinel = `sentinel-${stamp}`;
-  await exec(
+  const run1 = await exec(
     lease1,
     'echo "user=$(id -un) uid=$(id -u)"; echo "env_ok=${SMOKE_SENTINEL:+yes}"; ' +
       // The sentinel value must not appear in any process argv (grep reads it from a file).
-      'printenv SMOKE_SENTINEL > /tmp/.smoke-s; echo "in_argv=$(ps -eo args | grep -c -F -f /tmp/.smoke-s)"; rm -f /tmp/.smoke-s; ' +
+      'printenv SMOKE_SENTINEL > /tmp/.smoke-s; echo "in_argv=$(ps -eo args | grep -c -F -f /tmp/.smoke-s)"; ' +
+      // The staged env file must already be gone when the command runs: not in /tmp, and never in the
+      // workspace or anywhere under /home (boat snapshots save /home/user, not /tmp).
+      'echo "env_files=$(timeout 60 grep -rlF -f /tmp/.smoke-s /tmp "$HOME" 2>/dev/null | grep -v -c "^/tmp/.smoke-s$")"; rm -f /tmp/.smoke-s; ' +
+      'echo "env_dirs=$(ls -d /tmp/paperclip-boat-env-* 2>/dev/null | wc -l)"; ' +
       'echo "tunnel_http=$(curl -s -o /dev/null -m 5 -w %{http_code} http://127.0.0.1:8317/ || echo fail)"; ' +
-      'echo warm > "$HOME/paperclip-workspace/.smoke-marker"; ls -a "$HOME/paperclip-workspace" | grep -c paperclip-boat-env || true',
+      'echo warm > "$HOME/paperclip-workspace/.smoke-marker"',
     { SMOKE_SENTINEL: sentinel },
   );
+  for (const expected of ["env_ok=yes", "in_argv=0", "env_files=0", "env_dirs=0"]) {
+    if (!run1.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
+  }
 
   step("release run 1 (stop)");
   console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease1.metadata }, "release")));

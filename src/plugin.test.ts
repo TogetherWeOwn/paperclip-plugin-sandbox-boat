@@ -359,8 +359,15 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
   });
 });
 
+/** The script inside `sh -c '<script>'`, undoing shellQuote. */
+function unquoteShDashC(remoteCommand: string): string {
+  const quoted = remoteCommand.replace(/^sh -c /, "");
+  expect(quoted.startsWith("'") && quoted.endsWith("'")).toBe(true);
+  return quoted.slice(1, -1).replaceAll(`'"'"'`, "'");
+}
+
 describe("Execute", () => {
-  it("stages env in a 0600 file over stdin, never in argv, and removes it after the command", async () => {
+  it("stages env in a 0600 file under /tmp over stdin, never in argv, and removes it before the command starts", async () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     const result = await plugin.definition.onEnvironmentExecute!({
@@ -376,14 +383,76 @@ describe("Execute", () => {
     for (const call of ssh.spawned) {
       expect(call.args.join(" ")).not.toContain(SECRET);
     }
-    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && cat >"));
+
+    // Staged over stdin into a fresh 0700 directory under /tmp, which no boat snapshot saves.
+    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
     expect(staging?.stdin).toContain(`export ANTHROPIC_API_KEY='${SECRET}';`);
-    const run = calls.find((call) => call.args.at(-1)!.includes("claude"));
-    const script = run!.args.at(-1)!;
-    expect(script).toMatch(/\/home\/user\/paperclip-workspace\/\.paperclip-boat-env-[0-9a-f]{32}\.sh/);
-    expect(staging!.args.at(-1)).toContain(script.match(/\.paperclip-boat-env-[0-9a-f]{32}\.sh/)![0]);
-    expect(script).toMatch(/rc=\$\?; rm -f/);
+    const stagingCommand = staging!.args.at(-1)!;
+    const dirMatch = stagingCommand.match(/mkdir -m 700 '(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/);
+    expect(dirMatch).not.toBeNull();
+    const envDir = dirMatch![1];
+    const envFile = `${envDir}/env.sh`;
+    expect(stagingCommand).toBe(`umask 077 && mkdir -m 700 '${envDir}' && cat > '${envFile}' && chmod 600 '${envFile}'`);
+
+    // Never inside the workspace (the git checkout, saved in every boat snapshot).
+    const cwd = "/home/user/paperclip-workspace";
+    expect(envFile.startsWith(`${cwd}/`)).toBe(false);
+    expect(envFile.startsWith("/home/")).toBe(false);
+
+    // The script sources the file, removes it, and only then runs the payload.
+    const run = calls.find((call) => call.args.at(-1)!.startsWith("sh -c ") && call.args.at(-1)!.includes("claude"));
+    const script = unquoteShDashC(run!.args.at(-1)!);
+    expect(script).not.toContain(".paperclip-boat-env-");
+    const cdAt = script.indexOf(`cd '${cwd}'`);
+    const sourceAt = script.indexOf(`. '${envFile}'`);
+    const firstRemoveAt = script.indexOf(`rm -f '${envFile}'`);
+    const payloadAt = script.indexOf("'claude' '-p' 'hello'");
+    const fallbackRemoveAt = script.indexOf(`rm -f '${envFile}'`, payloadAt);
+    expect(cdAt).toBeGreaterThan(-1);
+    expect(sourceAt).toBeGreaterThan(cdAt);
+    expect(firstRemoveAt).toBeGreaterThan(sourceAt);
+    expect(payloadAt).toBeGreaterThan(firstRemoveAt);
+    expect(fallbackRemoveAt).toBeGreaterThan(payloadAt);
+    expect(script).toContain(`rmdir '${envDir}'`);
     expect(run!.args).toEqual(expect.arrayContaining(["ControlMaster=no", "StrictHostKeyChecking=yes"]));
+  });
+
+  it("uses a new staging directory for every command", async () => {
+    const lease = await acquire("run-1");
+    const dirs: string[] = [];
+    ssh.handler = (remoteCommand) => {
+      const match = remoteCommand.match(/mkdir -m 700 '([^']+)'/);
+      if (match) dirs.push(match[1]);
+      return undefined;
+    };
+    for (let i = 0; i < 2; i += 1) {
+      await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: "1" } } as never);
+    }
+    expect(dirs).toHaveLength(2);
+    expect(dirs[0]).not.toBe(dirs[1]);
+  });
+
+  it("removes the staged env file itself when ssh fails before the script could, and the VM is still up", async () => {
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    ssh.handler = (remoteCommand) => (remoteCommand.startsWith("sh -c ") ? { code: 255, stderr: "Connection reset" } : undefined);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: SECRET } } as never);
+    expect(result.exitCode).toBe(255);
+    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    const envDir = commands.find((command) => command.includes("mkdir -m 700"))!.match(/'(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/)![1];
+    expect(commands.at(-1)).toBe(`rm -f '${envDir}/env.sh'; rmdir '${envDir}' 2>/dev/null`);
+  });
+
+  it("removes the staged env file when staging fails part way", async () => {
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("mkdir -m 700") ? { code: 1, stderr: "No space left on device" } : undefined);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: SECRET } } as never);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/could not stage the run environment/);
+    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    expect(commands.some((command) => command.startsWith("sh -c "))).toBe(false);
+    expect(commands.at(-1)).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
   });
 
   it("extends the auto-stop deadline while a command runs once less than half of it is left", async () => {

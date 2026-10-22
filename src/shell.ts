@@ -1,8 +1,17 @@
 // Shell helpers carried over from the exe-dev provider (Paperclip
-// packages/plugins/sandbox-providers/exe-dev). The env-file staging rules are
-// the same: env values never ride argv; they travel over the encrypted ssh
-// stdin pipe into a remote 0600 file that the payload script sources and then
-// removes in the same shell invocation.
+// packages/plugins/sandbox-providers/exe-dev). The env-file pattern is the
+// same: env values never ride argv; they travel over the encrypted ssh stdin
+// pipe into a remote 0600 file that the command script sources.
+//
+// Where the file lives and when it goes differs from exe-dev, on purpose:
+//   - It sits in a fresh 0700 directory under /tmp, never in the workspace.
+//     The workspace is the git checkout, so a file there can be committed by
+//     `git add -A`. boat snapshots save /home/user (every minute, on stop and
+//     in named snapshots) but do not save /tmp
+//     (docs.boat.dev/snapshots/whats-saved).
+//   - It is removed right after it is sourced, before the payload starts, so
+//     the payload never sees it on disk. A trailing remove after the payload
+//     stays as a fallback for a script that did not get that far.
 import { randomUUID } from "node:crypto";
 
 export function shellQuote(value: string): string {
@@ -29,23 +38,57 @@ export function buildRemoteEnvFileContents(entries: Array<[string, string]>): st
   return entries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join("\n") + "\n";
 }
 
-export function remoteEnvFileName(): string {
-  return `.paperclip-boat-env-${randomUUID().replace(/-/g, "")}.sh`;
+/** boat does not save /tmp in any snapshot (docs.boat.dev/snapshots/whats-saved). */
+export const REMOTE_ENV_STAGING_ROOT = "/tmp";
+
+/** Where one command's env file is staged on the VM. */
+export interface RemoteEnvStage {
+  /** A fresh directory, mode 0700, made for this one command. */
+  dir: string;
+  /** The 0600 env file inside `dir`. */
+  path: string;
 }
 
-// Sources the staged env file, then runs the payload with a chained `rm -f`
-// so the secret-bearing file is removed on success and on failure. The payload
-// must not end in a terminal `exec`, which would skip the chained `rm`.
-export function envSourcingScriptLines(remotePath: string, payloadScript: string): string[] {
-  const quoted = shellQuote(remotePath);
-  return [`if [ -f ${quoted} ]; then . ${quoted}; fi`, `${payloadScript}; rc=$?; rm -f ${quoted}; exit $rc`];
+export function newRemoteEnvStage(): RemoteEnvStage {
+  const dir = `${REMOTE_ENV_STAGING_ROOT}/paperclip-boat-env-${randomUUID().replace(/-/g, "")}`;
+  return { dir, path: `${dir}/env.sh` };
+}
+
+/**
+ * The remote command that writes stdin into the env file. `mkdir` without -p
+ * fails when the path exists, so the file only ever lands in a directory that
+ * this command made itself.
+ */
+export function stageRemoteEnvCommand(stage: RemoteEnvStage): string {
+  const dir = shellQuote(stage.dir);
+  const file = shellQuote(stage.path);
+  return `umask 077 && mkdir -m 700 ${dir} && cat > ${file} && chmod 600 ${file}`;
+}
+
+/** Removes the env file and its directory. Safe to run when they are gone. */
+export function removeRemoteEnvCommand(stage: RemoteEnvStage): string {
+  return `rm -f ${shellQuote(stage.path)}; rmdir ${shellQuote(stage.dir)} 2>/dev/null`;
+}
+
+// Sources the staged env file, removes it at once, and only then runs the
+// payload. The trailing remove is a fallback for a script that stopped before
+// the first one (a failed `cd` or a failed source). The payload must not end in
+// a terminal `exec`, which would skip the trailing remove.
+export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
+  const file = shellQuote(stage.path);
+  const remove = removeRemoteEnvCommand(stage);
+  return [
+    `if [ -f ${file} ]; then . ${file}; fi`,
+    `{ ${remove} || true; }`,
+    `${payloadScript}; rc=$?; ${remove}; exit $rc`,
+  ];
 }
 
 export function buildLoginShellScript(input: {
   command: string;
   args: string[];
   cwd?: string;
-  remoteEnvPath?: string | null;
+  remoteEnv?: RemoteEnvStage | null;
 }): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   // Source the usual login profiles so the command sees the interactive PATH.
@@ -56,8 +99,8 @@ export function buildLoginShellScript(input: {
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
   ];
   if (input.cwd) lines.push(`cd ${shellQuote(input.cwd)}`);
-  if (input.remoteEnvPath != null) {
-    lines.push(...envSourcingScriptLines(input.remoteEnvPath, commandParts));
+  if (input.remoteEnv != null) {
+    lines.push(...envSourcingScriptLines(input.remoteEnv, commandParts));
   } else {
     lines.push(`exec ${commandParts}`);
   }
