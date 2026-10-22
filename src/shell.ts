@@ -183,13 +183,15 @@ export function newRuntimeTmpDir(): string {
  *   - A link to an existing runtime directory of ours (the exact
  *     `/tmp/paperclip-boat-runtime-<32 hex>` shape, a real directory owned by
  *     this user) is kept, so a second run on a running VM does not lose the
- *     first run's files.
+ *     first run's files. A resume within boat's 10-minute machine keep after a
+ *     stop gets the same machine back, /tmp included, and keeps it too.
  *   - Anything else is replaced by a link to `fresh`, made with `mkdir -m 700`
- *     (it fails when the path exists): a link that dangles because a stop
- *     emptied /tmp, a link elsewhere, a file, or a real directory (from before
- *     this version, or made by something else). A real directory's entries move
- *     into `fresh` first, so they leave the saved disk and a run that uses
- *     them still finds them through the link.
+ *     (it fails when the path exists): a link that dangles because the VM came
+ *     back on a new machine (restored from a snapshot, which has no /tmp), a
+ *     link elsewhere, a file, or a real directory (from before this version,
+ *     or made by something else). A real directory's entries move into `fresh`
+ *     first, so they leave the saved disk and a run that uses them still finds
+ *     them through the link.
  * Prints `paperclip-boat-runtime linked|kept <target>` and exits 0 only when
  * the link resolves to that target.
  */

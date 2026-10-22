@@ -752,13 +752,13 @@ describe("shell", () => {
         expect(readFileSync(path.join(runtime, "bridge-queue"), "utf8")).toBe("x");
       });
 
-      it("replaces a link that dangles after a stop emptied /tmp, and any link, file or target that is not a runtime directory of ours", () => {
+      it("replaces a link that dangles on a new machine (a snapshot restore has no /tmp), and any link, file or target that is not a runtime directory of ours", () => {
         root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
         const ws = path.join(root, "ws");
         const runtime = path.join(ws, ".paperclip-runtime");
         const first = fresh();
         link(ws, first);
-        rmSync(first, { recursive: true }); // a boat stop: /tmp is not saved
+        rmSync(first, { recursive: true }); // a resume on a new machine: snapshots do not save /tmp
         const second = fresh();
         expect(result(link(ws, second))).toEqual(["linked", second]);
         const elsewhere = path.join(root, "elsewhere");

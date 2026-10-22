@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Live smoke test against the real boat API, through the plugin's own code
-// (dist/vm-manager.js + the official @boatdev/sdk). Costs 2 starts and a few
+// (dist/vm-manager.js + the official @boatdev/sdk). Costs 1-3 starts and a few
 // minutes of a `small` VM (about $0.001). Leaves nothing behind: the VM is
 // deleted at the end, also on failure.
 //
@@ -9,12 +9,20 @@
 // in neither the command's env, ~/.bashrc, /etc/environment, nor the startup
 // environ of its parent or any readable ancestor; the workspace's
 // .paperclip-runtime is a symlink into /tmp, so a stand-in for Paperclip's run
-// MCP config written through it never reaches /home and is gone after a stop
-// and resume; and a payload killed by SIGTERM exits 143, not ssh's 255.
+// MCP config written through it never reaches /home, is in no snapshot of the
+// VM (per-minute or stop; read with GET /snapshots/{id}/tree), and is gone
+// after a stop and resume; and a payload killed by SIGTERM exits 143, not 255.
+//
+// A resume within 10 minutes of a stop gets the same machine back, /tmp
+// included (docs.boat.dev/snapshots/stop), so the runtime link is kept. With
+// SMOKE_NEW_MACHINE=1 the smoke also waits out those 10 unbilled minutes and
+// resumes once more: that restores the snapshot on a new machine, whose /tmp is
+// empty, and the plugin must make a fresh runtime directory (one more start).
 //
 // Usage (key from stdin or BOAT_API_KEY; never put it in argv):
 //   read -rs BOAT_API_KEY; export BOAT_API_KEY; node scripts/live-smoke.mjs
-// Options (env): SMOKE_TUNNEL_HOST (default 127.0.0.1), SMOKE_TUNNEL_PORT (8317), SMOKE_SIZE (small)
+// Options (env): SMOKE_TUNNEL_HOST (default 127.0.0.1), SMOKE_TUNNEL_PORT (8317), SMOKE_SIZE (small), SMOKE_NEW_MACHINE (unset)
+import { createSdkBoatApi } from "../dist/boat-client.js";
 import { DEFAULT_ENV_ALLOWLIST } from "../dist/env-policy.js";
 import { BoatVmManager } from "../dist/vm-manager.js";
 
@@ -58,6 +66,38 @@ async function exec(lease, script, env = {}) {
   const result = await manager.execute({ ...base, lease, command: "sh", args: ["-c", script], env, timeoutMs: 120_000 });
   console.log(`exit=${result.exitCode} stdout=${JSON.stringify(result.stdout.trim())} stderr=${JSON.stringify(result.stderr.trim().slice(0, 300))}`);
   return result;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sdk = createSdkBoatApi({ apiKey: process.env.BOAT_API_KEY, apiBase: process.env.BOAT_API_BASE ?? "https://boat.dev/api/v1" });
+
+/** Every snapshot boat holds for the VM, with what its file tree says about the runtime directory. */
+async function snapshotTrees(id) {
+  const list = await sdk.listSandboxSnapshots({ sandboxId: id, limit: 50 });
+  const out = [];
+  for (const snapshot of list.snapshots ?? []) {
+    if (snapshot.status !== "ready" && snapshot.status !== "completed") {
+      out.push({ id: snapshot.id, kind: snapshot.kind ?? null, status: snapshot.status, tree: "not ready" });
+      continue;
+    }
+    const tree = await sdk.getSnapshotTree({ snapshotId: snapshot.id });
+    const entries = tree.entries ?? [];
+    // Tree paths are relative to the snapshot root, /home/user for the home folder ("paperclip-workspace/...").
+    const link = entries.find((entry) => /(^|\/)paperclip-workspace\/\.paperclip-runtime$/.test(entry.path));
+    out.push({
+      id: snapshot.id,
+      kind: snapshot.kind ?? null,
+      createdAt: snapshot.createdAt,
+      treeAvailable: tree.treeAvailable,
+      truncated: tree.truncated,
+      entries: entries.length,
+      tmpRuntimeEntries: entries.filter((entry) => entry.path.includes("paperclip-boat-runtime-")).length,
+      mcpConfigEntries: entries.filter((entry) => /\.paperclip-runtime\/[^/]+\/mcp-config/.test(entry.path)).length,
+      runtimeLinkKind: link?.kind ?? null,
+      marker: entries.some((entry) => entry.path.endsWith("paperclip-workspace/.smoke-marker")),
+    });
+  }
+  return out;
 }
 
 try {
@@ -128,28 +168,73 @@ try {
   const killed = await exec(lease1, "kill -TERM $$");
   if (killed.exitCode !== 143) throw new Error(`smoke check failed: expected exit 143 for SIGTERM, got ${killed.exitCode}`);
 
+  // boat takes its per-minute snapshots on its own schedule (one run got the first after 46 s, another
+  // none in 81 s), so wait until one exists while the stand-in is in place, up to 4 minutes.
+  step("wait until boat has taken a snapshot of the running VM with the stand-in in place (up to 240 s)");
+  let runningSnapshots = 0;
+  for (let waited = 0; waited <= 240_000 && runningSnapshots === 0; waited += 10_000) {
+    if (waited > 0) await sleep(10_000);
+    const list = await sdk.listSandboxSnapshots({ sandboxId, limit: 50 });
+    runningSnapshots = (list.snapshots ?? []).filter((snapshot) => snapshot.status === "completed").length;
+  }
+  console.log(`running_snapshots=${runningSnapshots}`);
+  if (runningSnapshots === 0) console.log("warning: boat took no snapshot of the running VM within 240 s; only the stop snapshot is checked below");
+
   step("release run 1 (stop)");
   console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease1.metadata }, "release")));
 
-  step("acquire run 2 (resume the same card VM)");
+  step("snapshots: none holds the /tmp runtime directory or an MCP config (GET /snapshots/{id}/tree)");
+  const trees = await snapshotTrees(sandboxId);
+  console.log(JSON.stringify(trees));
+  const read = trees.filter((tree) => typeof tree.entries === "number");
+  if (read.length < Math.min(2, runningSnapshots + 1)) throw new Error(`smoke check failed: expected ${runningSnapshots > 0 ? "a running and a stop snapshot" : "the stop snapshot"}, read ${read.length}`);
+  if (read.some((tree) => tree.tmpRuntimeEntries > 0 || tree.mcpConfigEntries > 0)) throw new Error("smoke check failed: a snapshot holds the runtime directory");
+  if (!read.some((tree) => tree.marker)) throw new Error("smoke check failed: no snapshot tree shows the workspace marker (tree not covering /home?)");
+  // The snapshots hold the link itself, never what it points at.
+  if (!read.some((tree) => tree.runtimeLinkKind === "symlink") || read.some((tree) => tree.runtimeLinkKind != null && tree.runtimeLinkKind !== "symlink")) {
+    throw new Error("smoke check failed: expected .paperclip-runtime as a symlink in the snapshot trees");
+  }
+
+  // Within 10 minutes of the stop boat gives the same machine back, /tmp included: the link is kept, and
+  // the scrub before the stop already removed the stand-in MCP config. On a new machine /tmp is empty.
+  const checkRuntimeAfterResume = async (lease, label) => {
+    const run = await exec(
+      lease,
+      'cat "$HOME/paperclip-workspace/.smoke-marker"; rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; ' +
+        'echo "mcp_config=$([ -e "$rt/mcp-config" ] && echo present || echo gone) upload_tar=$([ -e "$rt/mcp-config-upload.tar" ] && echo present || echo gone)"; ' +
+        'echo "skills=$([ -e "$rt/skills/smoke.md" ] && echo present || echo gone)"; ' +
+        'echo "runtime_link_now=$(readlink "$HOME/paperclip-workspace/.paperclip-runtime")"',
+    );
+    for (const expected of ["warm", "mcp_config=gone upload_tar=gone", `runtime_link_now=${lease.metadata?.runtimeDir}`]) {
+      if (!run.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed (${label}): expected ${expected}`);
+    }
+    return run.stdout.split("\n").find((line) => line.startsWith("skills=")) ?? "";
+  };
+
+  step("acquire run 2 (resume the same card VM within 10 minutes: the same machine)");
   const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null });
   console.log(JSON.stringify(lease2.metadata));
   if (lease2.providerLeaseId !== sandboxId) throw new Error("expected the same VM on resume");
-  if (lease2.metadata?.runtimeDir === lease1.metadata?.runtimeDir) throw new Error("expected a fresh runtime directory after the resume");
-  const run2 = await exec(
-    lease2,
-    'cat "$HOME/paperclip-workspace/.smoke-marker"; rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; ' +
-      'echo "mcp_config=$([ -e "$rt/mcp-config" ] && echo present || echo gone) upload_tar=$([ -e "$rt/mcp-config-upload.tar" ] && echo present || echo gone) skills=$([ -e "$rt/skills/smoke.md" ] && echo present || echo gone)"; ' +
-      'echo "runtime_link_now=$(readlink "$HOME/paperclip-workspace/.paperclip-runtime")"',
-  );
-  // The whole runtime directory lived in /tmp, which the stop snapshot does not save; the rest of the disk is kept.
-  // Paperclip syncs the runtime assets again for every run.
-  for (const expected of ["warm", "mcp_config=gone upload_tar=gone skills=gone", `runtime_link_now=${lease2.metadata?.runtimeDir}`]) {
-    if (!run2.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
-  }
+  const sameMachine = lease2.metadata?.runtimeDir === lease1.metadata?.runtimeDir;
+  const skills2 = await checkRuntimeAfterResume(lease2, "run 2");
+  console.log(`runtime_dir_after_quick_resume=${sameMachine ? "kept (same machine)" : "fresh (new machine)"} ${skills2}`);
+  if (sameMachine && skills2 !== "skills=present") throw new Error("smoke check failed: a kept runtime directory lost its files");
 
   step("release run 2 (stop)");
   console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease2.metadata }, "release")));
+
+  if (process.env.SMOKE_NEW_MACHINE === "1") {
+    step("wait 11 minutes (boat keeps the stopped machine 10 minutes, unbilled), then resume on a new machine");
+    await sleep(11 * 60_000);
+    const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+    console.log(JSON.stringify(lease3.metadata));
+    if (lease3.metadata?.runtimeDir === lease2.metadata?.runtimeDir) throw new Error("smoke check failed: expected a fresh runtime directory on a new machine");
+    const skills3 = await checkRuntimeAfterResume(lease3, "run 3");
+    if (skills3 !== "skills=gone") throw new Error("smoke check failed: the new machine's /tmp still had the old runtime files");
+    console.log("runtime_dir_after_new_machine_resume=fresh skills=gone");
+    step("release run 3 (stop)");
+    console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease3.metadata }, "release")));
+  }
 
   step("usage summary");
   const summary = await manager.usageSummary("smoke-company", { refresh: true });

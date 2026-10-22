@@ -1100,7 +1100,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(commands.findIndex((command) => command.includes('"$d" "$s"'))).toBeLessThan(commands.findIndex((command) => command.includes("paperclip-boat-runtime")));
     expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
     await release(first);
-    // The resumed VM's /tmp is empty: a new directory.
+    // A resumed VM can be on a new machine with an empty /tmp; the plugin always asks for a link (the VM keeps a valid one).
     const second = await acquire("run-2");
     expect(second.metadata).toMatchObject({ startKind: "resume" });
     expect(second.metadata?.runtimeDir).toBe(links().at(-1)!.runtimeDir);
@@ -1120,7 +1120,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
     await currentManager().shutdown();
-    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop emptied /tmp
+    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop; the resume may land on a new machine with an empty /tmp
     const before = ssh.execs().length;
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
     expect(result.exitCode).toBe(0);

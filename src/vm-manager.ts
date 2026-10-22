@@ -650,9 +650,11 @@ export class BoatVmManager {
 
   /**
    * After a resume for a command (auto-stop or the sweep stopped the VM
-   * mid-lease), /tmp is empty and the links dangle; relink every known root,
-   * so Paperclip's next sync into `.paperclip-runtime` (the sync-back at the
-   * run's end) lands in /tmp again. Best effort: logs a warning.
+   * mid-lease): on a new machine /tmp is empty and the links dangle (on the
+   * same machine, back within boat's 10-minute keep, they are kept). Relink
+   * every known root, so Paperclip's next sync into `.paperclip-runtime` (the
+   * sync-back at the run's end) lands in /tmp again. Best effort: logs a
+   * warning.
    */
   private async relinkRuntimeDirs(config: BoatDriverConfig, companyId: string, sandboxId: string, session: SshSession): Promise<void> {
     const record = await this.store
@@ -1073,7 +1075,7 @@ export class BoatVmManager {
     const session = await this.liveSession(config, params.companyId, sandbox.id);
     const remote = await this.prepareRemote(config, session);
     const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
-    // Before Paperclip syncs this run's runtime assets: a resume emptied /tmp, so the old link dangles.
+    // Before Paperclip syncs this run's runtime assets: a resume on a new machine has an empty /tmp, so the old link dangles.
     const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
     // Paperclip resumes a reusable lease without naming the new run, so record
     // the run window under a synthetic id: it gives per-run cost accounting.
