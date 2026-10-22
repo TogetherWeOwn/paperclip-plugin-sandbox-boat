@@ -34,7 +34,7 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { PRICE_PER_HOUR, parseDriverConfig, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
-import { carriesInlineEnvEnvelope, effectiveEnvAllowlist, filterRunEnv } from "./env-policy.js";
+import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
@@ -1152,17 +1152,20 @@ export class BoatVmManager {
     }
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
-    if (carriesInlineEnvEnvelope(params.command, params.args ?? [])) {
-      // The env inside the envelope would bypass the allowlist below.
-      this.logger.warn("boat: refused a command that carries an inline env envelope (ACP process session)", { sandboxId });
+    if (isAcpProcessSessionCommand(params.command, params.args ?? [], params.env)) {
+      // The ACP launcher starts the agent from an envelope (inline, or uploaded
+      // as command.b64 in chunks) that holds the unfiltered launch env, so the
+      // allowlist below would never see it. Refuse every step of it. The
+      // command itself is not logged: its arguments can be envelope chunks.
+      this.logger.warn("boat: refused a Paperclip ACP process-session command", { sandboxId });
       return {
         exitCode: 1,
         signal: null,
         timedOut: false,
         stdout: "",
         stderr:
-          "boat: refused a command that carries PAPERCLIP_PROCESS_SESSION_COMMAND_B64 in its arguments: that envelope holds an environment this provider cannot filter. Use the cli engine on boat environments.",
-        metadata: { provider: "boat", sandboxId, error: "BOAT_ENV_ENVELOPE_REFUSED" },
+          "boat: refused a Paperclip ACP process-session command. That launcher starts the agent from an envelope (PAPERCLIP_PROCESS_SESSION_COMMAND_B64, or a command.b64 file it uploads under process-sessions/) that holds the run's whole environment, which this provider cannot filter. Set the agent's engine to cli on boat environments.",
+        metadata: { provider: "boat", sandboxId, error: "BOAT_ACP_PROCESS_SESSION_REFUSED" },
       };
     }
     // Default-deny env (env-policy.ts): only allowlisted names reach the VM.

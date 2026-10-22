@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkBudget, readBudget } from "./budget.js";
 import { parseDriverConfig } from "./config.js";
-import { DEFAULT_ENV_ALLOWLIST, carriesInlineEnvEnvelope, filterRunEnv, parseEnvAllowlist } from "./env-policy.js";
+import { DEFAULT_ENV_ALLOWLIST, filterRunEnv, isAcpProcessSessionCommand, parseEnvAllowlist } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
   REMOTE_ENV_STAGING_ROOT,
@@ -18,6 +18,7 @@ import {
 import type { RemoteEnvStage } from "./shell.js";
 import { endpointFromSshKeyResponse } from "./ssh.js";
 import { resolveVmKey, sandboxNameFor, sanitizeSnapshotName } from "./vm-manager.js";
+import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
 import { responseError, trialLimits } from "./test-support/fake-boat.js";
 
 describe("readBudget", () => {
@@ -156,9 +157,49 @@ describe("env policy", () => {
     expect(parseEnvAllowlist(undefined)).toBeNull();
   });
 
-  it("spots Paperclip's inline ACP env envelope", () => {
-    expect(carriesInlineEnvEnvelope("sh", ["-c", "PAPERCLIP_PROCESS_SESSION_COMMAND_B64='x' nohup node w.js"])).toBe(true);
-    expect(carriesInlineEnvEnvelope("claude", ["-p", "hello"])).toBe(false);
+  it("spots Paperclip's inline ACP env envelope, in the launch command or the launch env", () => {
+    expect(isAcpProcessSessionCommand("sh", ["-c", "PAPERCLIP_PROCESS_SESSION_COMMAND_B64='x' nohup node w.js"])).toBe(true);
+    expect(isAcpProcessSessionCommand("sh", ["-c", "node w.js"], { PAPERCLIP_PROCESS_SESSION_COMMAND_B64: "eyJ9" })).toBe(true);
+    expect(isAcpProcessSessionCommand("claude", ["-p", "hello"])).toBe(false);
+  });
+
+  it("spots every step of an ACP launch whose envelope is uploaded as command.b64 (above 64 KiB)", () => {
+    const calls = largeEnvelopeAcpLaunch();
+    const chunkAppend = calls.find((call) => call.label === "writeTextFile chunk append")!;
+    // The exact shape Paperclip's writeTextFile sends: the old check missed it.
+    expect(chunkAppend.args[1]).toMatch(
+      /^printf '%s' '[A-Za-z0-9+\/=]+' >> '\/home\/user\/paperclip-workspace\/\.paperclip-runtime\/claude\/process-sessions\/[0-9a-f-]+\/command\.b64\.[0-9a-f-]+\.paperclip-upload\.b64'$/,
+    );
+    expect(chunkAppend.args[1]).not.toContain("PAPERCLIP_PROCESS_SESSION_COMMAND_B64=");
+    const mkdir = calls.find((call) => call.label === "session dir mkdir")!;
+    expect(mkdir.args[1]).toMatch(/^umask 077 && mkdir -m 700 '\/home\/user\/paperclip-workspace\/\.paperclip-runtime\/claude\/process-sessions\/[0-9a-f-]+'$/);
+    for (const call of calls) {
+      expect({ label: call.label, refused: isAcpProcessSessionCommand(call.command, call.args, call.env) }).toEqual({
+        label: call.label,
+        refused: true,
+      });
+    }
+    // The first step already fails, before any envelope byte is uploaded.
+    expect(calls[0].label).toBe("wrapper script sync");
+  });
+
+  it("spots the ACP steps under a custom runtime root, including the bare process-sessions directory", () => {
+    const calls = largeEnvelopeAcpLaunch({ runtimeRootDir: "/home/user/.paperclip-managed/claude" });
+    for (const call of calls) expect(isAcpProcessSessionCommand(call.command, call.args, call.env)).toBe(true);
+    expect(isAcpProcessSessionCommand("sh", ["-c", "mkdir -p '/home/user/.paperclip-managed/claude/process-sessions'"])).toBe(true);
+    expect(isAcpProcessSessionCommand("sh", ["-c", "mkdir -p /srv/process-sessions && true"])).toBe(true);
+    expect(isAcpProcessSessionCommand("sh", ["-c", "cat command.b64"])).toBe(true);
+  });
+
+  it("leaves a cli-engine run alone", () => {
+    for (const call of cliEngineCalls()) {
+      expect({ label: call.label, refused: isAcpProcessSessionCommand(call.command, call.args, call.env) }).toEqual({
+        label: call.label,
+        refused: false,
+      });
+    }
+    // Names that merely share a prefix or suffix are not the ACP paths.
+    expect(isAcpProcessSessionCommand("ls", ["/home/user/process-sessions-archive", "notcommand.b64x"])).toBe(false);
   });
 });
 

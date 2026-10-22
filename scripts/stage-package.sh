@@ -85,6 +85,12 @@ if [ ! -f "$pkg/dist/env-policy.js" ] || ! grep -qF 'filterRunEnv(params.env' "$
   echo "stage-package: dist has no run env allowlist; refusing (every env key would reach the VM)." >&2
   exit 1
 fi
+# Execute must refuse every ACP process-session step, including the command.b64
+# upload of a large envelope (the old inline-only check missed it).
+if ! grep -qF 'isAcpProcessSessionCommand(params.command' "$pkg/dist/vm-manager.js" || ! grep -qF 'process-sessions' "$pkg/dist/env-policy.js"; then
+  echo "stage-package: dist does not refuse Paperclip's ACP process-session commands; refusing (its envelope carries the unfiltered env)." >&2
+  exit 1
+fi
 
 # Copy next to the destination first (the work dir may be on another
 # filesystem), then rename in one step, so a failed copy never leaves a

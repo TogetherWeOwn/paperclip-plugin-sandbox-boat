@@ -79,15 +79,15 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   // Paperclip's sandbox callback bridge. In a sandbox run PAPERCLIP_API_KEY is
   // the bridge token, a random per-run value that only the bridge inside this
   // VM accepts. Before the bridge starts it holds the run JWT instead, which
-  // the JWT rule drops. PAPERCLIP_PROCESS_SESSION_COMMAND_B64 is not here: it
-  // packs a whole child env that this filter cannot see into.
+  // the JWT rule drops. The ACP process-session variables
+  // (PAPERCLIP_PROCESS_SESSION_COMMAND_B64, PAPERCLIP_PROCESS_SESSION_DIR) are
+  // not here: that launcher is refused (isAcpProcessSessionCommand below).
   "PAPERCLIP_API_URL",
   "PAPERCLIP_API_KEY",
   "PAPERCLIP_API_BRIDGE_MODE",
   "PAPERCLIP_BRIDGE_TOKEN",
   "PAPERCLIP_BRIDGE_*",
   "PAPERCLIP_SANDBOX_EXEC_CHANNEL",
-  "PAPERCLIP_PROCESS_SESSION_DIR",
   // Shell basics.
   "PATH",
   "HOME",
@@ -270,11 +270,33 @@ export const ESSENTIAL_RUN_ENV = [
   "PAPERCLIP_BRIDGE_TOKEN",
 ] as const;
 
+// Paperclip's ACP process-session launcher (adapter-utils execution-target.ts,
+// tog.22) starts the agent from a base64 envelope of its command and its whole
+// launch env, project secrets included, that this filter never sees:
+//   - up to 64 KiB, inline: `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=...` in the
+//     launch command (legacy) or in the launch env (streamed);
+//   - above 64 KiB, as a file: `<root>/process-sessions/<uuid>/command.b64`,
+//     uploaded through Execute as `printf '%s' <base64 chunk> >> ...` commands,
+//     then launched with only `PAPERCLIP_PROCESS_SESSION_DIR=...`.
+// Every ACP step names that directory, from the first one (the wrapper script
+// sync into `<root>/process-sessions`) to the launch, so refusing them all
+// makes ACP fail before any envelope reaches the VM.
+const ACP_PROCESS_SESSION_TEXT_RE =
+  /\/process-sessions(?![A-Za-z0-9_.-])|(?<![A-Za-z0-9_.-])command\.b64|PAPERCLIP_PROCESS_SESSION_(?:COMMAND_B64|DIR)=/;
+const ACP_PROCESS_SESSION_ENV_NAMES = ["PAPERCLIP_PROCESS_SESSION_COMMAND_B64", "PAPERCLIP_PROCESS_SESSION_DIR"] as const;
+
 /**
- * Paperclip's ACP process-session launcher can put a base64 envelope of the
- * child's whole env (`PAPERCLIP_PROCESS_SESSION_COMMAND_B64=...`) into the
- * command itself, where this filter cannot see it. Such a command is refused.
+ * Is this an Execute call from Paperclip's ACP process-session launcher? True
+ * when the command or an argument names the process-session directory or its
+ * `command.b64` envelope file, carries the inline envelope or the session-dir
+ * assignment, or when the env holds either launcher variable. Such a call is
+ * refused: the agent it starts would get an environment this filter cannot see.
  */
-export function carriesInlineEnvEnvelope(command: string, args: readonly string[]): boolean {
-  return [command, ...args].some((part) => part.includes("PAPERCLIP_PROCESS_SESSION_COMMAND_B64="));
+export function isAcpProcessSessionCommand(
+  command: string,
+  args: readonly string[],
+  env?: Record<string, unknown> | undefined,
+): boolean {
+  if ([command, ...args].some((part) => ACP_PROCESS_SESSION_TEXT_RE.test(part))) return true;
+  return env != null && ACP_PROCESS_SESSION_ENV_NAMES.some((name) => Object.hasOwn(env, name));
 }

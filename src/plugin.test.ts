@@ -11,6 +11,7 @@ vi.mock("node:child_process", async () => {
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import manifest, { DRIVER_KEY, SWEEP_JOB_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
+import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
 import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext, inHostInvocation } from "./test-support/harness.js";
 import type { BoatApiLike } from "./boat-client.js";
@@ -748,8 +749,49 @@ describe("run env allowlist (incident TOG-37420)", () => {
       command: "sh",
       args: ["-c", "PAPERCLIP_PROCESS_SESSION_COMMAND_B64='eyJlbnYiOnt9fQ==' nohup node wrapper.js &"],
     } as never);
-    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_ENVELOPE_REFUSED" } });
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ACP_PROCESS_SESSION_REFUSED" } });
     expect(ssh.spawned.slice(before)).toHaveLength(0);
+  });
+
+  it("refuses the ACP command.b64 upload of a large envelope: the exact mkdir and chunk-append commands never reach the VM", async () => {
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    const sessionDir = "/home/user/paperclip-workspace/.paperclip-runtime/claude/process-sessions/0b0f6c2e-3f2a-4f4e-9a51-6d1f4b1c2a77";
+    const chunk = Buffer.from(JSON.stringify({ env: { PROD_DATABASE_PASSWORD: "not-a-real-value" } })).toString("base64");
+    const shapes = [
+      `umask 077 && mkdir -m 700 '${sessionDir}'`,
+      `printf '%s' '${chunk}' >> '${sessionDir}/command.b64.5d7c1e0a-8b44-4f0e-b3a2-9c6e2f1d4b10.paperclip-upload.b64'`,
+    ];
+    for (const script of shapes) {
+      const result = await plugin.definition.onEnvironmentExecute!({
+        ...base(),
+        lease,
+        command: "sh",
+        args: ["-c", script],
+        env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+      } as never);
+      expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ACP_PROCESS_SESSION_REFUSED" } });
+      expect(result.stderr).toMatch(/engine to cli/);
+    }
+    // Every other step of the launch, from the first (wrapper-script sync) to
+    // the streamed launch that names the session dir only in its env.
+    for (const call of largeEnvelopeAcpLaunch()) {
+      const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, ...call } as never);
+      expect({ label: call.label, error: result.metadata?.error }).toEqual({ label: call.label, error: "BOAT_ACP_PROCESS_SESSION_REFUSED" });
+    }
+    expect(ssh.spawned.slice(before)).toHaveLength(0);
+    // The refusal log never carries the command: its arguments can be envelope chunks.
+    const refusals = harness.logs.filter((entry) => entry.message.includes("ACP process-session"));
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(JSON.stringify(refusals)).not.toContain(chunk);
+  });
+
+  it("still runs the commands of a cli-engine run", async () => {
+    const lease = await acquire("run-1");
+    for (const call of cliEngineCalls()) {
+      const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, ...call } as never);
+      expect({ label: call.label, error: result.metadata?.error }).toEqual({ label: call.label, error: undefined });
+    }
   });
 
   it("validates envAllowlist entries, warns when a list cannot run Claude, and keeps an unset list unset", async () => {
