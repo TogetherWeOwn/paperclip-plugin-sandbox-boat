@@ -430,7 +430,7 @@ describe("Execute", () => {
       lease,
       command: "claude",
       args: ["-p", "hello"],
-      env: { ANTHROPIC_API_KEY: SECRET, ANTHROPIC_BASE_URL: "http://127.0.0.1:8317" },
+      env: { ANTHROPIC_AUTH_TOKEN: SECRET, ANTHROPIC_BASE_URL: "http://127.0.0.1:8317" },
       timeoutMs: 60_000,
     } as never);
     expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "ok\n" });
@@ -441,7 +441,7 @@ describe("Execute", () => {
 
     // Staged over stdin into a fresh 0700 directory under /tmp, which no boat snapshot saves.
     const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
-    expect(staging?.stdin).toContain(`export ANTHROPIC_API_KEY='${SECRET}';`);
+    expect(staging?.stdin).toContain(`export ANTHROPIC_AUTH_TOKEN='${SECRET}';`);
     const stagingCommand = staging!.args.at(-1)!;
     const dirMatch = stagingCommand.match(/mkdir -m 700 '(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/);
     expect(dirMatch).not.toBeNull();
@@ -481,7 +481,7 @@ describe("Execute", () => {
       return undefined;
     };
     for (let i = 0; i < 2; i += 1) {
-      await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: "1" } } as never);
+      await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { PAPERCLIP_RUN_ID: "1" } } as never);
     }
     expect(dirs).toHaveLength(2);
     expect(dirs[0]).not.toBe(dirs[1]);
@@ -491,7 +491,7 @@ describe("Execute", () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     ssh.handler = (remoteCommand) => (remoteCommand.startsWith("sh -c ") ? { code: 255, stderr: "Connection reset" } : undefined);
-    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: SECRET } } as never);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(255);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
     const envDir = commands.find((command) => command.includes("mkdir -m 700"))!.match(/'(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/)![1];
@@ -502,7 +502,7 @@ describe("Execute", () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     ssh.handler = (remoteCommand) => (remoteCommand.includes("mkdir -m 700") ? { code: 1, stderr: "No space left on device" } : undefined);
-    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { A: SECRET } } as never);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
@@ -556,6 +556,217 @@ describe("Execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/budget guard \(maxStartsPerDay\)/);
     expect(fake.callsOf("resume")).toHaveLength(0);
+  });
+});
+
+// Incident TOG-37420 (run eca3f106, 2026-10-22): Paperclip merged the TWO Bot
+// Next project env, with PlanetScale prod secrets, into a boat run, and the
+// plugin sent every string entry to the VM. These values stand in for the real
+// ones; the names are the shapes that reach a provider.
+const PROJECT_SECRETS: Record<string, string> = {
+  PLANETSCALE_PROD_URL: "mysql://two_prod:pscale_pw_PROD_SECRET_1@aws.connect.psdb.cloud/two?sslaccept=strict",
+  PLANETSCALE_SERVICE_TOKEN: "pscale_tkn_PROD_SECRET_2",
+  PLANETSCALE_SERVICE_TOKEN_ID: "PROD_SECRET_3",
+  PLANETSCALE_ORG: "togetherweown-PROD_SECRET_4",
+  DATABASE_URL: "postgres://two_app:PROD_SECRET_5@prod-db.example.net:5432/two",
+  DISCORD_BOT_TOKEN: "PROD_SECRET_6",
+  CLOUDFLARE_API_TOKEN: "PROD_SECRET_7",
+  GITHUB_TOKEN: "ghs_PROD_SECRET_8",
+  GH_TOKEN: "ghs_PROD_SECRET_9",
+};
+// The Paperclip server's own process env, which reaches the command-resolution
+// probe ({ ...process.env, ...env } in the claude-local adapter).
+const SERVER_SECRETS: Record<string, string> = {
+  BETTER_AUTH_SECRET: "HOST_SECRET_1",
+  PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "HOST_SECRET_2",
+  PAPERCLIP_GITHUB_SHADOW_PROXY_TOKEN: "HOST_SECRET_3",
+  ANTHROPIC_API_KEY: "sk-HOST_SECRET_4",
+  CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat-HOST_SECRET_5",
+};
+const BRIDGE_TOKEN = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
+const RUN_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCIsInJ1biI6InJ1bi0xIn0.c2lnbmF0dXJlLVJVTl9KV1Q";
+const ALLOWED_RUN_ENV: Record<string, string> = {
+  ANTHROPIC_BASE_URL: "http://127.0.0.1:8317",
+  ANTHROPIC_AUTH_TOKEN: SECRET,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: "muse-spark-1.3-contributor",
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS: "200000",
+  PAPERCLIP_RUN_ID: "run-1",
+  PAPERCLIP_API_URL: "http://127.0.0.1:41234",
+  PAPERCLIP_API_KEY: BRIDGE_TOKEN,
+  PAPERCLIP_BRIDGE_TOKEN: BRIDGE_TOKEN,
+  PAPERCLIP_BRIDGE_QUEUE_DIR: "/home/user/paperclip-workspace/.paperclip-runtime/claude/paperclip-bridge/queue",
+  PAPERCLIP_WORKSPACE_REPO_URL: "https://github.com/TogetherWeOwn/two-bot-next",
+  HOME: "/home/user",
+  LANG: "C.UTF-8",
+};
+
+describe("run env allowlist (incident TOG-37420)", () => {
+  async function runWithEnv(env: Record<string, string>, config: Record<string, unknown> = {}) {
+    const lease = await acquire("run-1", {}, config);
+    const before = ssh.spawned.length;
+    const result = await plugin.definition.onEnvironmentExecute!({
+      ...base(config),
+      lease,
+      command: "claude",
+      args: ["-p", "hello"],
+      env,
+    } as never);
+    const calls = ssh.spawned.slice(before);
+    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
+    const run = calls.find((call) => call.args.at(-1)!.startsWith("sh -c ") && call.args.at(-1)!.includes("'claude'"));
+    return { result, staged: staging?.stdin ?? "", script: run ? unquoteShDashC(run.args.at(-1)!) : "" };
+  }
+
+  it("delivers none of the project's or the server's secrets to the VM, in the staged env file or in argv", async () => {
+    const { result, staged, script } = await runWithEnv({ ...PROJECT_SECRETS, ...SERVER_SECRETS, ...ALLOWED_RUN_ENV });
+    expect(result.exitCode).toBe(0);
+    const argv = ssh.spawned.map((call) => call.args.join(" ")).join("\n");
+    const logs = JSON.stringify(harness.logs);
+    for (const [name, value] of Object.entries({ ...PROJECT_SECRETS, ...SERVER_SECRETS })) {
+      expect(staged).not.toContain(`${name}=`);
+      expect(staged).not.toContain(value);
+      expect(argv).not.toContain(value);
+      expect(script).not.toContain(value);
+      expect(logs).not.toContain(value);
+    }
+    // The staged file holds exactly the allowlisted keys, nothing else.
+    const exported = [...staged.matchAll(/^export ([A-Za-z_][A-Za-z0-9_]*)=/gm)].map((match) => match[1]).sort();
+    expect(exported).toEqual(Object.keys(ALLOWED_RUN_ENV).sort());
+    expect(staged).toContain(`export ANTHROPIC_AUTH_TOKEN='${SECRET}';`);
+    expect(staged).toContain(`export PAPERCLIP_API_KEY='${BRIDGE_TOKEN}';`);
+    expect(staged).toContain("export CLAUDE_CODE_MAX_CONTEXT_TOKENS='200000';");
+    // Allowed values never ride argv either.
+    expect(argv).not.toContain(SECRET);
+    expect(argv).not.toContain(BRIDGE_TOKEN);
+  });
+
+  it("logs the dropped keys by name and reason only, once per distinct set per run", async () => {
+    const lease = await acquire("run-1");
+    const env = { ...PROJECT_SECRETS, ...SERVER_SECRETS, ...ALLOWED_RUN_ENV };
+    for (let i = 0; i < 3; i += 1) {
+      await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env } as never);
+    }
+    const drops = harness.logs.filter((entry) => entry.message.includes("run env key(s) not allowed into the VM"));
+    expect(drops).toHaveLength(1);
+    expect(drops[0].level).toBe("warn");
+    const dropped = drops[0].meta?.dropped as Record<string, string[]>;
+    // Default deny: none of these is on the allowlist. CLAUDE_CODE_OAUTH_TOKEN
+    // matches the CLAUDE_CODE_* prefix, but a prefix never delivers a secret name.
+    const notListed = Object.keys({ ...PROJECT_SECRETS, ...SERVER_SECRETS }).filter((name) => name !== "CLAUDE_CODE_OAUTH_TOKEN");
+    expect(dropped).toEqual({ not_allowlisted: [...notListed].sort(), secret_name_needs_exact_entry: ["CLAUDE_CODE_OAUTH_TOKEN"] });
+  });
+
+  it("sends PAPERCLIP_API_KEY only as the per-run bridge token, never as the host-verifiable run JWT", async () => {
+    const { staged } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_API_KEY: RUN_JWT });
+    expect(staged).not.toContain("PAPERCLIP_API_KEY");
+    expect(staged).not.toContain(RUN_JWT);
+    expect(staged).toContain(`export PAPERCLIP_BRIDGE_TOKEN='${BRIDGE_TOKEN}';`);
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect((drop?.meta?.dropped as Record<string, string[]>).jwt).toEqual(["PAPERCLIP_API_KEY"]);
+  });
+
+  it("clears ASCII_TOKEN and BOAT_ID in the payload shell, after every source and before the payload", async () => {
+    const { script } = await runWithEnv(ALLOWED_RUN_ENV);
+    const bashrcAt = script.indexOf('. "$HOME/.bashrc"');
+    const sourceAt = script.indexOf("; then . '/tmp/paperclip-boat-env-");
+    const unsetAt = script.indexOf("unset ASCII_TOKEN BOAT_ID");
+    const payloadAt = script.indexOf("'claude' '-p' 'hello'");
+    expect(bashrcAt).toBeGreaterThan(-1);
+    expect(sourceAt).toBeGreaterThan(bashrcAt);
+    expect(unsetAt).toBeGreaterThan(sourceAt);
+    expect(payloadAt).toBeGreaterThan(unsetAt);
+    // With no env to stage, the same unset still comes before the payload.
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "claude", args: ["-v"] } as never);
+    const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("'claude'"))!.args.at(-1)!);
+    expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && exec 'claude' '-v'$/);
+  });
+
+  it("removes boat's ASCII_TOKEN line from ~/.bashrc when it sets up a VM and after resuming one for a command", async () => {
+    const lease = await acquire("run-1");
+    const setup = ssh.execs().find((call) => call.args.at(-1)!.includes('"$d" "$s"'));
+    expect(setup!.args.at(-1)).toContain("ASCII_TOKEN=/d");
+    await currentManager().shutdown();
+    fake.boxes.get(lease.providerLeaseId!)!.state = "archived";
+    const before = ssh.spawned.length;
+    await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
+    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    const scrubAt = commands.findIndex((command) => command.includes("ASCII_TOKEN=/d"));
+    const payloadAt = commands.findIndex((command) => command.includes("'true'"));
+    expect(scrubAt).toBeGreaterThan(-1);
+    expect(payloadAt).toBeGreaterThan(scrubAt);
+  });
+
+  it("a configured envAllowlist replaces the default: prefixes never deliver secrets, exact names do, database URLs only when VM-local", async () => {
+    const config = {
+      envAllowlist: [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CARGO_*",
+        "RUSTUP_HOME",
+        "TWO_TEST_DATABASE_URL",
+        "PROD_DATABASE_URL",
+        "PLANETSCALE_*",
+        "GITHUB_TOKEN",
+      ],
+    };
+    const { staged } = await runWithEnv(
+      {
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:8317",
+        ANTHROPIC_AUTH_TOKEN: SECRET,
+        CARGO_HOME: "/usr/local/cargo",
+        CARGO_REGISTRY_TOKEN: "PROD_SECRET_10",
+        RUSTUP_HOME: "/usr/local/rustup",
+        TWO_TEST_DATABASE_URL: "postgres://postgres:local_pw@agent-testdb:5432/two_bot_test_local",
+        PROD_DATABASE_URL: "postgres://two:PROD_SECRET_11@db.prod.example.com:5432/two",
+        PLANETSCALE_PROD_URL: PROJECT_SECRETS.PLANETSCALE_PROD_URL,
+        GITHUB_TOKEN: PROJECT_SECRETS.GITHUB_TOKEN,
+        PAPERCLIP_RUN_ID: "run-1",
+      },
+      config,
+    );
+    const exported = [...staged.matchAll(/^export ([A-Za-z_][A-Za-z0-9_]*)=/gm)].map((match) => match[1]).sort();
+    expect(exported).toEqual(["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CARGO_HOME", "RUSTUP_HOME", "TWO_TEST_DATABASE_URL"]);
+    expect(staged).not.toContain("PROD_SECRET_");
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect(drop?.meta?.dropped).toEqual({
+      // Provider families never reach a VM, even when the allowlist names them.
+      denied_family: ["GITHUB_TOKEN", "PLANETSCALE_PROD_URL"],
+      remote_database_or_credential_url: ["PROD_DATABASE_URL"],
+      secret_name_needs_exact_entry: ["CARGO_REGISTRY_TOKEN"],
+      not_allowlisted: ["PAPERCLIP_RUN_ID"],
+    });
+  });
+
+  it("refuses a command that carries an inline env envelope instead of sending env it cannot filter", async () => {
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    const result = await plugin.definition.onEnvironmentExecute!({
+      ...base(),
+      lease,
+      command: "sh",
+      args: ["-c", "PAPERCLIP_PROCESS_SESSION_COMMAND_B64='eyJlbnYiOnt9fQ==' nohup node wrapper.js &"],
+    } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_ENVELOPE_REFUSED" } });
+    expect(ssh.spawned.slice(before)).toHaveLength(0);
+  });
+
+  it("validates envAllowlist entries, warns when a list cannot run Claude, and keeps an unset list unset", async () => {
+    const bad = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig, envAllowlist: ["OK", "BAD-NAME", "*"] } });
+    expect(bad.ok).toBe(false);
+    expect(bad.errors?.join("\n")).toMatch(/envAllowlist entries must be an exact NAME or a NAME_\* prefix: BAD-NAME, \*/);
+    const thin = await plugin.definition.onEnvironmentValidateConfig!({
+      driverKey: DRIVER_KEY,
+      config: { ...baseConfig, envAllowlist: "ANTHROPIC_BASE_URL, ANTHROPIC_*, GITHUB_TOKEN" },
+    });
+    expect(thin.ok).toBe(true);
+    expect(thin.normalizedConfig).toMatchObject({ envAllowlist: ["ANTHROPIC_BASE_URL", "ANTHROPIC_*", "GITHUB_TOKEN"] });
+    expect(thin.warnings?.join("\n")).toMatch(/does not deliver ANTHROPIC_AUTH_TOKEN, PAPERCLIP_API_URL, PAPERCLIP_API_KEY, PAPERCLIP_BRIDGE_TOKEN/);
+    expect(thin.warnings?.join("\n")).toMatch(/never sends to a VM \(provider credentials\): GITHUB_TOKEN/);
+    const unset = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig } });
+    expect(unset.normalizedConfig).not.toHaveProperty("envAllowlist");
+    expect(unset.warnings?.join("\n") ?? "").not.toMatch(/envAllowlist/);
   });
 });
 

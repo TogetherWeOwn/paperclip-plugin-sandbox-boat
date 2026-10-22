@@ -7,6 +7,7 @@
 // Usage (key from stdin or BOAT_API_KEY; never put it in argv):
 //   read -rs BOAT_API_KEY; export BOAT_API_KEY; node scripts/live-smoke.mjs
 // Options (env): SMOKE_TUNNEL_HOST (default 127.0.0.1), SMOKE_TUNNEL_PORT (8317), SMOKE_SIZE (small)
+import { DEFAULT_ENV_ALLOWLIST } from "../dist/env-policy.js";
 import { BoatVmManager } from "../dist/vm-manager.js";
 
 if (!process.env.BOAT_API_KEY) {
@@ -33,6 +34,8 @@ const config = {
   tunnelTargetHost: process.env.SMOKE_TUNNEL_HOST ?? "127.0.0.1",
   tunnelTargetPort: Number(process.env.SMOKE_TUNNEL_PORT ?? 8317),
   autoStopMinutes: 30,
+  // The built-in run env allowlist plus the smoke sentinel.
+  envAllowlist: [...DEFAULT_ENV_ALLOWLIST, "SMOKE_SENTINEL"],
 };
 const base = { driverKey: "boat", companyId: "smoke-company", environmentId: "smoke-env", config };
 const workspace = `smoke-ws-${stamp}`;
@@ -68,11 +71,15 @@ try {
       // workspace or anywhere under /home (boat snapshots save /home/user, not /tmp).
       'echo "env_files=$(timeout 60 grep -rlF -f /tmp/.smoke-s /tmp "$HOME" 2>/dev/null | grep -v -c "^/tmp/.smoke-s$")"; rm -f /tmp/.smoke-s; ' +
       'echo "env_dirs=$(ls -d /tmp/paperclip-boat-env-* 2>/dev/null | wc -l)"; ' +
+      // Default-deny env and boat's own credentials. ${VAR+set} never prints a value.
+      'echo "denied_env=${PLANETSCALE_SMOKE_URL+set}${SMOKE_DENIED+set}"; ' +
+      'echo "ascii_token=${ASCII_TOKEN+set} boat_id=${BOAT_ID+set}"; ' +
+      'echo "bashrc_ascii_token=$(grep -c "^[[:space:]]*export[[:space:]][[:space:]]*ASCII_TOKEN=" "$HOME/.bashrc" 2>/dev/null)"; ' +
       'echo "tunnel_http=$(curl -s -o /dev/null -m 5 -w %{http_code} http://127.0.0.1:8317/ || echo fail)"; ' +
       'echo warm > "$HOME/paperclip-workspace/.smoke-marker"',
-    { SMOKE_SENTINEL: sentinel },
+    { SMOKE_SENTINEL: sentinel, SMOKE_DENIED: "not-allowlisted", PLANETSCALE_SMOKE_URL: "mysql://u:p@example.invalid/db" },
   );
-  for (const expected of ["env_ok=yes", "in_argv=0", "env_files=0", "env_dirs=0"]) {
+  for (const expected of ["env_ok=yes", "in_argv=0", "env_files=0", "env_dirs=0", "denied_env=", "ascii_token= boat_id=", "bashrc_ascii_token=0"]) {
     if (!run1.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
   }
 

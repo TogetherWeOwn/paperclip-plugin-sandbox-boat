@@ -22,10 +22,6 @@ export function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-export function filterStringEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
-  return Object.entries(env ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string");
-}
-
 export function assertValidEnvKeys(entries: Array<[string, string]>): void {
   for (const [key] of entries) {
     if (!isValidShellEnvKey(key)) {
@@ -70,16 +66,40 @@ export function removeRemoteEnvCommand(stage: RemoteEnvStage): string {
   return `rm -f ${shellQuote(stage.path)}; rmdir ${shellQuote(stage.dir)} 2>/dev/null`;
 }
 
-// Sources the staged env file, removes it at once, and only then runs the
-// payload. The trailing remove is a fallback for a script that stopped before
-// the first one (a failed `cd` or a failed source). The payload must not end in
-// a terminal `exec`, which would skip the trailing remove.
+/**
+ * boat puts these in every VM, even with noEnv and "safe for third parties"
+ * (docs.boat.dev/security#boat-credentials-inside-a-sandbox). ASCII_TOKEN can
+ * publish any port of the VM on a public URL; nothing here needs it. boat sets
+ * it in the exec env and in an `export ASCII_TOKEN=...` line near the top of
+ * ~/.bashrc, above the interactive guard, so every shell that reads ~/.bashrc
+ * gets it again.
+ */
+export const BOAT_VM_CREDENTIAL_VARS = ["ASCII_TOKEN", "BOAT_ID"] as const;
+
+/** Clears the boat VM credentials from the payload's environment. */
+export const UNSET_BOAT_VM_CREDENTIALS = `unset ${BOAT_VM_CREDENTIAL_VARS.join(" ")}`;
+
+const ASCII_TOKEN_EXPORT_LINE = "^[[:space:]]*export[[:space:]][[:space:]]*ASCII_TOKEN=";
+
+/**
+ * Deletes boat's `export ASCII_TOKEN=...` line from ~/.bashrc, so a shell the
+ * agent starts (Claude Code's Bash tool sources the user's shell rc file) does not export the
+ * token again. Never fails: it is a best-effort step in VM setup.
+ */
+export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && grep -q '${ASCII_TOKEN_EXPORT_LINE}' "$f"; then sed -i '/${ASCII_TOKEN_EXPORT_LINE}/d' "$f"; fi; } 2>/dev/null || true`;
+
+// Sources the staged env file, removes it at once, clears the boat VM
+// credentials, and only then runs the payload. The trailing remove is a
+// fallback for a script that stopped before the first one (a failed `cd` or a
+// failed source). The payload must not end in a terminal `exec`, which would
+// skip the trailing remove.
 export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
   const file = shellQuote(stage.path);
   const remove = removeRemoteEnvCommand(stage);
   return [
     `if [ -f ${file} ]; then . ${file}; fi`,
     `{ ${remove} || true; }`,
+    UNSET_BOAT_VM_CREDENTIALS,
     `${payloadScript}; rc=$?; ${remove}; exit $rc`,
   ];
 }
@@ -102,7 +122,7 @@ export function buildLoginShellScript(input: {
   if (input.remoteEnv != null) {
     lines.push(...envSourcingScriptLines(input.remoteEnv, commandParts));
   } else {
-    lines.push(`exec ${commandParts}`);
+    lines.push(UNSET_BOAT_VM_CREDENTIALS, `exec ${commandParts}`);
   }
   return lines.join(" && ");
 }

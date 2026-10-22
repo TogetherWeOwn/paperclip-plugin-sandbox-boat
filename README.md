@@ -9,7 +9,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 | Paperclip hook | boat action |
 | - | - |
 | AcquireLease | The card already has a VM: resume it if it is stopped, or share it if it is running. Otherwise create a VM, from `templateSnapshot` when that is set. Every start passes the budget guard first and uses fail-fast. |
-| Execute | SSH as boat's non-root `user`, with the host key pinned from `POST /sandboxes/{id}/sshkey`. The run env goes over stdin into a 0600 file in a fresh 0700 directory under `/tmp`, never in argv. The command script sources the file and removes it before the command starts. A reverse tunnel makes `127.0.0.1:8317` inside the VM reach the model proxy. |
+| Execute | SSH as boat's non-root `user`, with the host key pinned from `POST /sandboxes/{id}/sshkey`. Only the run env keys the [env allowlist](#run-env-allowlist) names reach the VM; the rest is dropped and logged by name. The kept env goes over stdin into a 0600 file in a fresh 0700 directory under `/tmp`, never in argv. The command script sources the file, removes it, clears boat's `ASCII_TOKEN` and `BOAT_ID`, and only then starts the command. A reverse tunnel makes `127.0.0.1:8317` inside the VM reach the model proxy. |
 | ReleaseLease | Stop the VM at once, which stops billing. A VM keyed to a single run has nothing worth keeping, so it is deleted instead. |
 | (reuse) | The driver declares `sandboxCapabilities.reusableLeases`. With `reuseLease: true` and `runnerLifecycleMode: "per_turn"` on the environment, Paperclip stops the card's VM after each run and resumes it for the card's next run, so the checkout and build output stay on its disk. Without reuse, Paperclip destroys the VM after every run (DestroyLease) and the next run starts a fresh one from `templateSnapshot`. Never set `runnerLifecycleMode: "warm"`: it keeps the VM running between runs. |
 | StopLease | Stop the VM, keep its disk, and confirm the stop or throw. |
@@ -53,7 +53,8 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 ### Security
 
 * VMs are created with `noEnv: true` and `monitoring: false`. Use a boat environment marked *safe for third parties*.
-* The VM gets nothing of the account except boat's own `BOAT_ID` and `ASCII_TOKEN` (see [boat account settings](#boat-account-settings)). The run env is the only other input.
+* **Default-deny run env.** Paperclip passes a sandbox provider the whole run env, with every secret resolved, and filters nothing for sandboxes. The plugin sends the VM only what the [env allowlist](#run-env-allowlist) names and drops the rest.
+* The VM gets nothing of the account except boat's own `BOAT_ID` and `ASCII_TOKEN` (see [boat account settings](#boat-account-settings)). The plugin removes both from every command's environment and deletes the `export ASCII_TOKEN=...` line from `~/.bashrc`, so the agent cannot casually publish a port on a public URL. The allowlisted run env is the only other input.
 * The staged env file never sits in the workspace (the git checkout), so `git add -A` cannot commit it. It sits under `/tmp`, which boat snapshots do not save ([What a snapshot saves](https://docs.boat.dev/snapshots/whats-saved)), and it is gone before the command starts. If ssh drops before the script runs, the plugin removes it itself.
 * An ephemeral ed25519 key is made per worker process with `ssh-keygen`. It is never stored.
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
@@ -78,12 +79,54 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `tunnelRemotePort` | 8317 | |
 | `tunnelTargetHost` | `127.0.0.1` | **Inside the Paperclip container, set this to `cliproxy`**: the container's 127.0.0.1 is not the CLIProxy. |
 | `tunnelTargetPort` | 8317 | |
+| `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](#run-env-allowlist). A list you set replaces the built-in one. |
 | `noEnv` | true | |
 | `boatEnvironment` | account default | |
 | `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | |
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
+
+## Run env allowlist
+
+### Why
+
+On 2026-10-22 the first pilot run on a boat VM (TOG-37420) received the TWO Bot Next project env, including four PlanetScale production secret references, which Paperclip resolves to their values before a run starts. Paperclip merges project, routine and environment env into every run and filters nothing for a sandbox, and plugin versions before 0.2.0 sent every string entry to the VM. The claude-local adapter also passes `{ ...process.env, ...env }` (the Paperclip server's own environment) to the command-resolution probe it runs in the sandbox. Since 0.2.0 nothing reaches a VM unless an allowlist names it.
+
+### Rules
+
+For each `NAME=value` that Paperclip passes to Execute:
+
+1. The name must match the allowlist: an exact `NAME`, or a `NAME_*` prefix. Anything else is dropped.
+2. These are never sent, even when the allowlist names them exactly:
+   * names starting with `PLANETSCALE_`, `CLOUDFLARE_`, `CF_`, `DISCORD_`, `GH_`, `GITHUB_`, `BOAT_` or `ASCII_`;
+   * a JWT, for example Paperclip's run token (`PAPERCLIP_API_KEY` before the sandbox bridge starts);
+   * a database URL, or any URL with a password, that points off the VM. A URL on the VM itself (loopback, or a one-label host such as a container on the VM) is allowed only by an exact entry. A `..._DATABASE_URL` or `..._DB_URL` name (also `_URI`, `_DSN`) counts as a database URL whatever its value.
+3. A name with `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PRIVATE_KEY`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `CREDENTIAL` or `COOKIE` in it is sent only when the allowlist names it exactly, never through a prefix. A `..._TOKENS` name with a whole-number value is a token budget, not a credential.
+
+Dropped keys are logged once per run as a warning, by name and reason (`not_allowlisted`, `denied_family`, `jwt`, `remote_database_or_credential_url`, `secret_name_needs_exact_entry`, `invalid_name`). Values are never logged.
+
+The plugin also refuses a command whose arguments carry `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=`: Paperclip's ACP process-session launcher packs the child's whole env into it, where no filter can see it. Use the `cli` engine on boat environments.
+
+### The built-in list
+
+It covers a Claude Code run through the model-proxy tunnel and Paperclip's sandbox callback bridge. Each `PAPERCLIP_*` name was checked in Paperclip's claude-local adapter and adapter-utils: ids, modes and paths, plus the bridge's per-run credentials.
+
+| Group | Names |
+| - | - |
+| Model proxy | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the environment's dedicated model-proxy key), `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*` |
+| Claude Code | `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`, `API_TIMEOUT_MS`, `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `MCP_TOOL_TIMEOUT`, `DISABLE_AUTOUPDATER`, `DISABLE_ERROR_REPORTING`, `DISABLE_TELEMETRY`, `DISABLE_NON_ESSENTIAL_MODEL_CALLS`, `IS_SANDBOX` |
+| Paperclip run context | `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_RUN_ID`, `PAPERCLIP_TASK_ID`, `PAPERCLIP_ISSUE_WORK_MODE`, `PAPERCLIP_WAKE_REASON`, `PAPERCLIP_WAKE_COMMENT_ID`, `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, `PAPERCLIP_LINKED_ISSUE_IDS`, `PAPERCLIP_WORKSPACE_CWD`, `PAPERCLIP_WORKSPACE_SOURCE`, `PAPERCLIP_WORKSPACE_STRATEGY`, `PAPERCLIP_WORKSPACE_ID`, `PAPERCLIP_WORKSPACE_REPO_URL`, `PAPERCLIP_WORKSPACE_REPO_REF`, `PAPERCLIP_WORKSPACE_BRANCH`, `PAPERCLIP_WORKSPACE_WORKTREE_PATH`, `PAPERCLIP_WORKSPACES_JSON`, `AGENT_HOME` |
+| Paperclip sandbox bridge | `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, `PAPERCLIP_API_BRIDGE_MODE`, `PAPERCLIP_BRIDGE_TOKEN`, `PAPERCLIP_BRIDGE_*`, `PAPERCLIP_SANDBOX_EXEC_CHANNEL`, `PAPERCLIP_PROCESS_SESSION_DIR` |
+| Shell | `PATH`, `HOME`, `TERM`, `LANG`, `LC_*`, `TZ` |
+
+In a sandbox run, `PAPERCLIP_API_KEY` and `PAPERCLIP_BRIDGE_TOKEN` hold the bridge token: a random per-run value that only the bridge inside this VM accepts, and the host forwards each bridged call with the real run token. When `PAPERCLIP_API_KEY` holds the run JWT itself (the commands Paperclip runs before the bridge starts), the JWT rule drops it.
+
+Not on the list, on purpose: `ANTHROPIC_API_KEY` and any other model key (the Paperclip server's own key reaches the probe otherwise), `PAPERCLIP_RUNTIME_SERVICES_JSON` and its siblings (host services a VM cannot reach), `PAPERCLIP_PROCESS_SESSION_COMMAND_B64`, git and GitHub credentials (Paperclip restores the workspace and its git history to the host after each run).
+
+### Adding names
+
+A list you set replaces the built-in one, so start from the table above and add what the work needs. Validation fails on an entry that is not `NAME` or `NAME_*`, and warns when the list no longer delivers `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY` or `PAPERCLIP_BRIDGE_TOKEN`, or names a family that is never sent. For a Rust card with a test database in a container on the VM, add for example `CARGO_*`, `RUSTUP_HOME` and `TWO_TEST_DATABASE_URL` (an exact entry, and its URL must point at the VM).
 
 ## Install on a Paperclip host
 
@@ -107,13 +150,14 @@ It refuses:
 
 * a commit that is not on `origin/main`;
 * a commit older than `0721a3a`. Before it, the run env file sat in the workspace, so `git add -A` or a boat snapshot could pick up the tokens in it;
+* a build without the run env allowlist (0.2.0). Before it, every env key Paperclip passed, project secrets included, reached the VM;
 * a destination that already exists.
 
 Then install it as an instance admin. `packageName` is the path as the server sees it:
 
 ```sh
 curl -X POST "$PAPERCLIP/api/plugins/install" -H 'content-type: application/json' \
-  -d '{"packageName":"/paperclip/plugin-packages-root/sandbox-boat-0.1.0-<sha>","isLocalPath":true}'
+  -d '{"packageName":"/paperclip/plugin-packages-root/sandbox-boat-0.2.0-<sha>","isLocalPath":true}'
 ```
 
 The capabilities are:
@@ -150,11 +194,16 @@ These are the settings the plugin expects, with the docs (docs.boat.dev) that ba
 * **Auto-refill OFF.** It needs a paid plan and does not work during the trial. With it off, spend stops at the balance ([docs](https://docs.boat.dev/billing#control-your-spend)).
 * **Keys:** a scoped `ci` key for the plugin and a `read-only` key for cost reads. Never use an admin key in the plugin.
 
-Even with safe for third parties on, every VM gets `BOAT_ID` and `ASCII_TOKEN`. `ASCII_TOKEN` can publish a port of that one VM on a public URL and nothing else ([docs](https://docs.boat.dev/security#boat-credentials-inside-a-sandbox)).
+Even with safe for third parties on, every VM gets `BOAT_ID` and `ASCII_TOKEN`. `ASCII_TOKEN` can publish a port of that one VM on a public URL and nothing else ([docs](https://docs.boat.dev/security#boat-credentials-inside-a-sandbox)). boat sets it in the exec environment and in an `export ASCII_TOKEN=...` line near the top of `~/.bashrc`, above the interactive guard, so any shell that reads `~/.bashrc` exports it. The plugin:
+
+* unsets `ASCII_TOKEN` and `BOAT_ID` in every command script, after the profiles and the env file are sourced and before the command starts;
+* deletes the `export ASCII_TOKEN=` line from `~/.bashrc` when it sets up a VM (acquire, resumed lease) and when it resumes one for a command, so a shell the agent starts (Claude Code's Bash tool sources the user's shell rc file) does not get it back.
+
+This stops casual use, not a determined agent: `user` has passwordless `sudo` and is root in its VM. boat documents no switch to leave the token out: it stays even with safe for third parties.
 
 ## Live smoke test
 
-`scripts/live-smoke.mjs` runs the plugin's own code against the real API. It does create, SSH, env, tunnel, stop, resume, stop and delete. It costs about $0.001.
+`scripts/live-smoke.mjs` runs the plugin's own code against the real API. It does create, SSH, env (an allowlisted key arrives, denied keys and `ASCII_TOKEN` do not), tunnel, stop, resume, stop and delete. It costs about $0.001.
 
 ```sh
 npm run build

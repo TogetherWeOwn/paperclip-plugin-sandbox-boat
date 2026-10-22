@@ -1,13 +1,15 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkBudget, readBudget } from "./budget.js";
 import { parseDriverConfig } from "./config.js";
+import { DEFAULT_ENV_ALLOWLIST, carriesInlineEnvEnvelope, filterRunEnv, parseEnvAllowlist } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
   REMOTE_ENV_STAGING_ROOT,
+  SCRUB_BASHRC_ASCII_TOKEN,
   buildLoginShellScript,
   buildRemoteEnvFileContents,
   newRemoteEnvStage,
@@ -65,6 +67,98 @@ describe("config", () => {
       apiBase: "https://boat.dev/api/v1",
       templateSnapshot: null,
     });
+  });
+});
+
+describe("env policy", () => {
+  const decide = (name: string, value: string, allowlist: readonly string[] = DEFAULT_ENV_ALLOWLIST) => {
+    const result = filterRunEnv({ [name]: value }, allowlist);
+    return result.kept.length === 1 ? "kept" : result.dropped[0].reason;
+  };
+
+  it("drops every name the allowlist does not list (default deny)", () => {
+    expect(decide("PLANETSCALE_PROD_URL", "mysql://u:p@aws.connect.psdb.cloud/db")).toBe("not_allowlisted");
+    expect(decide("SERVICE_TOKEN", "x")).toBe("not_allowlisted");
+    expect(decide("BETTER_AUTH_SECRET", "x")).toBe("not_allowlisted");
+    expect(decide("ANTHROPIC_API_KEY", "sk-x")).toBe("not_allowlisted");
+    expect(decide("OPENAI_API_KEY", "sk-x")).toBe("not_allowlisted");
+    expect(decide("PAPERCLIP_PROCESS_SESSION_COMMAND_B64", "eyJ9")).toBe("not_allowlisted");
+    expect(decide("PAPERCLIP_RUNTIME_SERVICES_JSON", "[]")).toBe("not_allowlisted");
+    expect(decide("SSH_AUTH_SOCK", "/tmp/agent")).toBe("not_allowlisted");
+  });
+
+  it("keeps what a Claude run needs through the model-proxy tunnel and the Paperclip bridge", () => {
+    for (const [name, value] of [
+      ["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"],
+      ["ANTHROPIC_AUTH_TOKEN", "sk-pilot-proxy-key"],
+      ["ANTHROPIC_DEFAULT_SONNET_MODEL", "muse-spark"],
+      ["CLAUDE_CODE_SUBAGENT_MODEL", "muse-spark"],
+      ["CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000"],
+      ["MAX_THINKING_TOKENS", "8000"],
+      ["PAPERCLIP_API_KEY", "Zm9vYmFyYmF6cXV4"],
+      ["PAPERCLIP_BRIDGE_TOKEN", "Zm9vYmFyYmF6cXV4"],
+      ["PAPERCLIP_BRIDGE_PORT", "41234"],
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"repoUrl":"https://github.com/o/r"}]'],
+      ["LC_ALL", "C.UTF-8"],
+      ["PATH", "/usr/local/bin:/usr/bin:/bin"],
+    ] as const) {
+      expect([name, decide(name, value)]).toEqual([name, "kept"]);
+    }
+  });
+
+  it("a NAME_* prefix never delivers a secret-looking name; an exact entry does", () => {
+    expect(decide("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")).toBe("secret_name_needs_exact_entry");
+    expect(decide("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "not-a-number")).toBe("secret_name_needs_exact_entry");
+    for (const name of ["CARGO_REGISTRY_TOKEN", "CARGO_SECRET", "CARGO_PASSWORD", "CARGO_API_KEY", "CARGO_PRIVATE_KEY", "CARGO_CREDENTIALS"]) {
+      expect([name, decide(name, "x", ["CARGO_*"])]).toEqual([name, "secret_name_needs_exact_entry"]);
+      expect([name, decide(name, "x", [name])]).toEqual([name, "kept"]);
+    }
+  });
+
+  it("never delivers provider credential families, JWTs, or database URLs that leave the VM, even when listed exactly", () => {
+    for (const name of ["PLANETSCALE_PROD_URL", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "DISCORD_BOT_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "BOAT_API_KEY", "ASCII_TOKEN", "planetscale_org"]) {
+      expect([name, decide(name, "x", [name])]).toEqual([name, "denied_family"]);
+    }
+    expect(decide("PAPERCLIP_API_KEY", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln")).toBe("jwt");
+    expect(decide("ANTHROPIC_AUTH_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln")).toBe("jwt");
+    expect(decide("DATABASE_URL", "postgres://u:p@prod.example.net/db", ["DATABASE_URL"])).toBe("remote_database_or_credential_url");
+    expect(decide("DATABASE_URL", "https://aws.connect.psdb.cloud", ["DATABASE_URL"])).toBe("remote_database_or_credential_url");
+    expect(decide("DATABASE_URL", "host=prod password=x", ["DATABASE_URL"])).toBe("remote_database_or_credential_url");
+    expect(decide("REDIS_CONN", "rediss://default:pw@10.0.0.5:6379", ["REDIS_CONN"])).toBe("remote_database_or_credential_url");
+    expect(decide("SERVICE_JSON", '{"url":"mysql://u:p@db.example.com/x"}', ["SERVICE_JSON"])).toBe("remote_database_or_credential_url");
+    // A URL with a password that leaves the VM, under an innocent name.
+    expect(decide("PAPERCLIP_WORKSPACE_REPO_URL", "https://x-access-token:ghs_x@github.com/o/r")).toBe("remote_database_or_credential_url");
+  });
+
+  it("a database URL that stays on the VM needs an exact entry", () => {
+    const local = "postgres://postgres:pw@agent-testdb:5432/two_bot_test_local";
+    expect(decide("TWO_TEST_DATABASE_URL", local, ["TWO_*"])).toBe("secret_name_needs_exact_entry");
+    expect(decide("TWO_TEST_DATABASE_URL", local, ["TWO_TEST_DATABASE_URL"])).toBe("kept");
+    expect(decide("TEST_DATABASE_URL", "postgres://p:p@127.0.0.1:5432/t", ["TEST_DATABASE_URL"])).toBe("kept");
+    expect(decide("TEST_DATABASE_URL", "postgres://p:p@[::1]:5432/t", ["TEST_DATABASE_URL"])).toBe("kept");
+    expect(decide("TEST_DATABASE_URL", "postgres://p:p@192.168.1.4:5432/t", ["TEST_DATABASE_URL"])).toBe("remote_database_or_credential_url");
+  });
+
+  it("reports dropped names only, and an invalid name without echoing it", () => {
+    const result = filterRunEnv({ "BAD NAME": "v", GOOD: 1 as unknown as string, PLANETSCALE_X: "s3cr3t" }, DEFAULT_ENV_ALLOWLIST);
+    expect(result.kept).toEqual([]);
+    expect(result.dropped).toEqual([
+      { name: "(invalid name)", reason: "invalid_name" },
+      { name: "PLANETSCALE_X", reason: "not_allowlisted" },
+    ]);
+    expect(JSON.stringify(result.dropped)).not.toContain("s3cr3t");
+  });
+
+  it("reads envAllowlist from a list or a comma or newline separated string", () => {
+    expect(parseEnvAllowlist(["A", " B ", "", "A"])).toEqual(["A", "B"]);
+    expect(parseEnvAllowlist("A, B\nC_*")).toEqual(["A", "B", "C_*"]);
+    expect(parseEnvAllowlist("")).toBeNull();
+    expect(parseEnvAllowlist(undefined)).toBeNull();
+  });
+
+  it("spots Paperclip's inline ACP env envelope", () => {
+    expect(carriesInlineEnvEnvelope("sh", ["-c", "PAPERCLIP_PROCESS_SESSION_COMMAND_B64='x' nohup node w.js"])).toBe(true);
+    expect(carriesInlineEnvEnvelope("claude", ["-p", "hello"])).toBe(false);
   });
 });
 
@@ -131,7 +225,7 @@ describe("shell", () => {
     const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
     const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
     expect(script).toContain(
-      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
     );
     expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
     expect(script).not.toContain("exec 'node'");
@@ -177,6 +271,41 @@ describe("shell", () => {
       expect(run.stdout).not.toContain("ran");
       expect(run.status).not.toBe(0);
       expect(existsSync(dir)).toBe(false);
+    });
+
+    it("the payload runs without ASCII_TOKEN and BOAT_ID, even though ~/.bashrc exports the token", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      // boat's own ~/.bashrc block, above the interactive guard.
+      writeFileSync(
+        path.join(root, ".bashrc"),
+        '# ASCII TOKEN START\nexport ASCII_TOKEN="bashrc-token-value"\nexport ASCII_API_URL="https://boat.dev"\n# ASCII TOKEN END\ncase $- in *i*) ;; *) return;; esac\n',
+      );
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, ASCII_TOKEN: "exec-env-token", BOAT_ID: "bx_test" };
+      const payload = 'printf "ascii=%s boat=%s url=%s\\n" "${ASCII_TOKEN-unset}" "${BOAT_ID-unset}" "${ASCII_API_URL-unset}"';
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PAPERCLIP_RUN_ID", "r1"]]), env });
+      for (const remoteEnv of [stage, null]) {
+        const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv });
+        const run = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
+        expect(run.stdout).toBe("ascii=unset boat=unset url=https://boat.dev\n");
+        expect(run.status).toBe(0);
+      }
+    });
+
+    it("the setup step deletes boat's export ASCII_TOKEN line from ~/.bashrc and nothing else", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const bashrc = path.join(root, ".bashrc");
+      const rest = '# ASCII TOKEN START\nexport ASCII_API_URL="https://boat.dev"\n# ASCII TOKEN END\nalias ll="ls -l"\n';
+      writeFileSync(bashrc, '# ASCII TOKEN START\n  export ASCII_TOKEN="value"\nexport ASCII_API_URL="https://boat.dev"\n# ASCII TOKEN END\nalias ll="ls -l"\n');
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
+      for (let i = 0; i < 2; i += 1) {
+        const run = spawnSync("sh", ["-c", SCRUB_BASHRC_ASCII_TOKEN], { env, encoding: "utf8" });
+        expect(run.status).toBe(0);
+        expect(readFileSync(bashrc, "utf8")).toBe(rest);
+      }
+      rmSync(bashrc);
+      expect(spawnSync("sh", ["-c", SCRUB_BASHRC_ASCII_TOKEN], { env }).status).toBe(0);
     });
 
     it("staging refuses a directory that already exists", () => {

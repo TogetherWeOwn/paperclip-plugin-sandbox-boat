@@ -86,6 +86,8 @@ const plugin = definePlugin({
     // Never echo secrets back as normalized config values.
     if (normalizedConfig.apiKey == null) delete normalizedConfig.apiKey;
     if (normalizedConfig.costApiKey == null) delete normalizedConfig.costApiKey;
+    // Unset means the built-in allowlist; keep it unset so it follows the plugin.
+    if (normalizedConfig.envAllowlist == null) delete normalizedConfig.envAllowlist;
     return { ok: true, warnings, normalizedConfig };
   },
 

@@ -34,13 +34,15 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { PRICE_PER_HOUR, parseDriverConfig, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
+import { carriesInlineEnvEnvelope, effectiveEnvAllowlist, filterRunEnv } from "./env-policy.js";
+import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
+  SCRUB_BASHRC_ASCII_TOKEN,
   assertValidEnvKeys,
   buildLoginShellScript,
   buildRemoteEnvFileContents,
-  filterStringEnvEntries,
   newRemoteEnvStage,
   removeRemoteEnvCommand,
   shellQuote,
@@ -166,6 +168,8 @@ export class BoatVmManager {
   private readonly hardDeadlines = new Map<string, number>();
   private readonly sandboxCompany = new Map<string, string>();
   private readonly configs = new Map<string, CachedConfig>();
+  /** Per VM, the sets of dropped env names already logged, so a run's many commands log each set once. */
+  private readonly envDropsLogged = new Map<string, Set<string>>();
   private lastSweepAt = 0;
   private sweeping: Promise<SweepReport> | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
@@ -459,7 +463,8 @@ export class BoatVmManager {
     session: SshSession,
   ): Promise<{ remoteCwd: string; shellCommand: "bash" | "sh" }> {
     const dirExpr = config.remoteWorkspaceDir ? shellQuote(config.remoteWorkspaceDir) : '"$HOME/paperclip-workspace"';
-    const script = `d=${dirExpr}; mkdir -p "$d" && if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; printf '%s\\n%s\\n' "$d" "$s"`;
+    // Also removes boat's ASCII_TOKEN line from ~/.bashrc (shell.ts), so no shell the agent starts exports it.
+    const script = `${SCRUB_BASHRC_ASCII_TOKEN}; d=${dirExpr}; mkdir -p "$d" && if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; printf '%s\\n%s\\n' "$d" "$s"`;
     const deadline = this.now() + config.timeoutMs;
     let last = "";
     for (let attempt = 0; ; attempt += 1) {
@@ -885,7 +890,11 @@ export class BoatVmManager {
       }
       const ready = toView(await waitReady(api, sandboxId, { timeoutMs: config.timeoutMs }));
       if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
-      return await this.openSsh(api, config, sandboxId);
+      const session = await this.openSsh(api, config, sandboxId);
+      // This path (a resume for a command, or a new worker) skips acquire's setup step, and a resume
+      // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
+      await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+      return session;
     });
   }
 
@@ -1008,6 +1017,7 @@ export class BoatVmManager {
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
+      this.envDropsLogged.delete(sandboxId);
 
       if (snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain") {
         // A run-keyed VM can never be reused, so there is nothing to keep: delete it.
@@ -1095,6 +1105,7 @@ export class BoatVmManager {
     this.deadlines.delete(sandboxId);
     this.hardDeadlines.delete(sandboxId);
     this.lastActivity.delete(sandboxId);
+    this.envDropsLogged.delete(sandboxId);
   }
 
   async destroy(params: PluginEnvironmentDestroyLeaseParams): Promise<PluginEnvironmentTerminationReceipt | undefined> {
@@ -1107,6 +1118,7 @@ export class BoatVmManager {
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
+      this.envDropsLogged.delete(sandboxId);
       await this.recordStopUsage(config, params.companyId, sandboxId, null).catch(() => undefined);
       await this.deleteSandbox(api, sandboxId);
       await this.markDeleted(params.companyId, sandboxId);
@@ -1140,8 +1152,23 @@ export class BoatVmManager {
     }
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
-    const envEntries = filterStringEnvEntries(params.env);
+    if (carriesInlineEnvEnvelope(params.command, params.args ?? [])) {
+      // The env inside the envelope would bypass the allowlist below.
+      this.logger.warn("boat: refused a command that carries an inline env envelope (ACP process session)", { sandboxId });
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr:
+          "boat: refused a command that carries PAPERCLIP_PROCESS_SESSION_COMMAND_B64 in its arguments: that envelope holds an environment this provider cannot filter. Use the cli engine on boat environments.",
+        metadata: { provider: "boat", sandboxId, error: "BOAT_ENV_ENVELOPE_REFUSED" },
+      };
+    }
+    // Default-deny env (env-policy.ts): only allowlisted names reach the VM.
+    const { kept: envEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
     assertValidEnvKeys(envEntries);
+    if (dropped.length > 0) this.logEnvDrops(sandboxId, dropped);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
     const cwd = params.cwd ?? str(params.lease.metadata?.remoteCwd) ?? undefined;
 
@@ -1239,6 +1266,28 @@ export class BoatVmManager {
     } finally {
       await this.endActivity(params.companyId, sandboxId);
     }
+  }
+
+  /** Logs dropped env names (never values), once per distinct set per VM. */
+  private logEnvDrops(sandboxId: string, dropped: EnvDrop[]): void {
+    const signature = dropped
+      .map((entry) => `${entry.name}:${entry.reason}`)
+      .sort()
+      .join(",");
+    let seen = this.envDropsLogged.get(sandboxId);
+    if (!seen) {
+      seen = new Set();
+      this.envDropsLogged.set(sandboxId, seen);
+    }
+    if (seen.has(signature)) return;
+    seen.add(signature);
+    const byReason: Record<string, string[]> = {};
+    for (const entry of dropped) (byReason[entry.reason] ??= []).push(entry.name);
+    for (const names of Object.values(byReason)) names.sort();
+    this.logger.warn(`boat: dropped ${dropped.length} run env key(s) not allowed into the VM (names only)`, {
+      sandboxId,
+      dropped: byReason,
+    });
   }
 
   /** Best effort: remove a staged env file that the command script may not have reached. */

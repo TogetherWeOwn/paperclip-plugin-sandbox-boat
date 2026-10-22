@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.2.0";
 export const DRIVER_KEY = "boat";
 export const SWEEP_JOB_KEY = "boat-idle-sweep";
 
@@ -169,6 +169,12 @@ const manifest: PaperclipPluginManifestV1 = {
             default: 8317,
             description: "Port of the model proxy, as seen from the plugin worker.",
             ...advanced("Model proxy tunnel"),
+          },
+          envAllowlist: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Run env names that may reach the VM: exact names (ANTHROPIC_AUTH_TOKEN) and NAME_* prefixes (CARGO_*). Everything else Paperclip passes (project and routine env, its own process env) is dropped and logged by name. Secret-looking names (TOKEN, SECRET, PASSWORD, API_KEY...) need an exact entry; PLANETSCALE_, CLOUDFLARE_, CF_, DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_ names, JWTs and database URLs that leave the VM are never sent. Blank: the built-in list, which covers a Claude Code run through the model-proxy tunnel and Paperclip's sandbox bridge (see the README). A list you set replaces the built-in one.",
           },
           noEnv: {
             type: "boolean",

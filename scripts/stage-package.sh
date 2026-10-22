@@ -14,6 +14,8 @@
 #   - a commit older than the env-file fix (0721a3a): before it, the run env
 #     file sat in the workspace, where `git add -A` and boat snapshots could
 #     pick up the tokens in it;
+#   - a build without the run env allowlist (0.2.0): before it, every env key
+#     Paperclip passed, project secrets included, reached the VM;
 #   - a destination that already exists.
 set -eu
 
@@ -76,6 +78,11 @@ echo "$sha" > "$pkg/.source-commit"
 # The env file must never be named inside the workspace again.
 if grep -rqF '.paperclip-boat-env-' "$pkg/dist"; then
   echo "stage-package: dist still stages the env file in the workspace; refusing." >&2
+  exit 1
+fi
+# Execute must filter the run env through the allowlist (src/env-policy.ts).
+if [ ! -f "$pkg/dist/env-policy.js" ] || ! grep -qF 'filterRunEnv(params.env' "$pkg/dist/vm-manager.js"; then
+  echo "stage-package: dist has no run env allowlist; refusing (every env key would reach the VM)." >&2
   exit 1
 fi
 
