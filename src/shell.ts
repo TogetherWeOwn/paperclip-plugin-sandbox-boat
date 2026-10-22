@@ -167,6 +167,13 @@ export const RUNTIME_SECRET_SCRUB_RESULT_RE = /^paperclip-boat-scrub found=(\d+)
  * then looks again and exits 0 only when none is left, printing
  * `paperclip-boat-scrub found=<n> left=<m>`. It removes nothing else: the
  * checkout, skills, config and the bridge stay.
+ *
+ * A file name may hold a newline (repo content, or an agent steered by a
+ * prompt), so no path is ever read back as text to pick what to delete: `each`
+ * hands every match to its command as one argument, from the glob loop or from
+ * `find -exec ... {} +`. The counts read NUL-terminated paths (a path cannot
+ * hold a NUL), deduplicated with `sort -zu` because the default workspace is
+ * both a root and under $HOME; that output only ever goes to `wc`.
  */
 export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
   const absolute = [...new Set(roots.map((root) => root.trim().replace(/\/+$/, "")).filter((root) => root.startsWith("/") && root.length > 1))];
@@ -175,19 +182,24 @@ export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
   const findPaths = RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `-path ${shellQuote(`*/.paperclip-runtime/*/${glob}`)}`).join(" -o ");
   const find =
     `find "$HOME" -maxdepth ${RUNTIME_SECRET_FIND_MAX_DEPTH} \\( -name node_modules -o -name .git -o -name target \\) -prune` +
-    ` -o \\( ${findPaths} \\) -print -prune 2>/dev/null`;
+    ` -o \\( ${findPaths} \\) -prune -exec "$@" {} + 2>/dev/null`;
   return [
-    "list() {",
+    // each <command...>: runs `<command...> <path>` for every match, the path as one argument.
+    "each() {",
     `  for r in ${rootWords}; do`,
     `    for p in ${globs}; do`,
-    `      if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\\n' "$p"; fi`,
+    `      if [ -e "$p" ] || [ -L "$p" ]; then "$@" "$p"; fi`,
     "    done",
     "  done",
     `  if [ -n "\${HOME:-}" ] && [ -d "$HOME" ]; then ${find}; fi`,
     "}",
-    "found=$(list | sort -u | wc -l | tr -d ' ')",
-    `list | sort -u | while IFS= read -r p; do rm -rf -- "$p"; done`,
-    "left=$(list | sort -u | wc -l | tr -d ' ')",
+    "count() { each printf '%s\\0' | sort -zu | tr -cd '\\000' | wc -c | tr -d ' '; }",
+    // A sort or tr that drops NUL-terminated input would count 0 and pass; check the pipeline first.
+    "probe=$(printf 'x\\0x\\0y\\0' | sort -zu | tr -cd '\\000' | wc -c | tr -d ' ')",
+    "found=$(count)",
+    "each rm -rf --",
+    "left=$(count)",
+    `if [ "$probe" != 2 ]; then echo "paperclip-boat-scrub: this VM's sort/tr cannot count NUL-terminated paths; nothing verified" >&2; exit 2; fi`,
     'echo "paperclip-boat-scrub found=$found left=$left"',
     '[ "$left" = 0 ]',
   ].join("\n");

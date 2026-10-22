@@ -538,6 +538,50 @@ describe("shell", () => {
       expect(second.status).toBe(0);
     });
 
+    // A name may hold a newline (repo content, or an agent steered by a
+    // prompt). Split at its newlines, each name below spells a real path next
+    // to it: an absolute sibling, or a relative one that resolves against the
+    // ssh cwd ($HOME under sshd). The scrub must delete only the matched
+    // mcp-config itself.
+    it.each(["sh", "bash"])("the scrub (%s) deletes only the matched paths when names hold newlines, never what those names spell line by line", (shell) => {
+      const tree = runtimeTree();
+      const victims: Record<string, string> = {
+        "home/paperclip-workspace/src/main.rs": "fn main() {}",
+        "home/.cargo/bin/cargo": "cargo",
+        "home/.rustup/settings.toml": "toolchain",
+        "srv/w o'rk/.paperclip-runtime/skills/paperclip/SKILL.md": "skill",
+      };
+      const decoys = [
+        // Found by the $HOME search; the lines are "<home>/paperclip-workspace/src" and "/.paperclip-runtime/a/mcp-config".
+        "home/paperclip-workspace/src\n/.paperclip-runtime/a/mcp-config",
+        // Found by the $HOME search; the line ".cargo" is $HOME/.cargo from the ssh cwd.
+        "home/paperclip-workspace/x\n.cargo\n/.paperclip-runtime/a/mcp-config",
+        // Found by the workspace-root glob; the lines are "<root>/.paperclip-runtime/skills" and ".rustup".
+        "srv/w o'rk/.paperclip-runtime/skills\n.rustup\n/mcp-config",
+      ];
+      for (const [file, body] of Object.entries(victims)) {
+        mkdirSync(path.dirname(tree.at(file)), { recursive: true });
+        writeFileSync(tree.at(file), body);
+      }
+      for (const dir of decoys) {
+        mkdirSync(tree.at(dir), { recursive: true });
+        writeFileSync(path.join(tree.at(dir), "mcp-config.json"), tree.jwt);
+      }
+      const script = scrubRuntimeSecretsScript([tree.at("srv/w o'rk")]);
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home };
+      const run = spawnSync(shell, ["-c", script], { cwd: tree.home, env, encoding: "utf8" });
+      for (const [file, body] of Object.entries(victims)) {
+        expect([file, existsSync(tree.at(file)) && readFileSync(tree.at(file), "utf8")]).toEqual([file, body]);
+      }
+      for (const dir of decoys) {
+        expect([dir, existsSync(tree.at(dir)), existsSync(path.dirname(tree.at(dir)))]).toEqual([dir, false, true]);
+      }
+      // Five from the base tree, three decoys; each counted once.
+      expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=8 left=0");
+      expect(run.status).toBe(0);
+      expect(spawnSync("grep", ["-rlF", tree.jwt, root], { encoding: "utf8" }).stdout).toBe("");
+    });
+
     it.skipIf(process.getuid?.() === 0)("the scrub fails (non-zero, left>0) when a run MCP config cannot be removed", () => {
       const tree = runtimeTree();
       const locked = tree.at("home/paperclip-workspace/.paperclip-runtime/claude/mcp-config");
@@ -550,6 +594,21 @@ describe("shell", () => {
       } finally {
         chmodSync(locked, 0o755);
       }
+    });
+
+    it("the scrub still deletes but reports no result (exit 2) when the VM's sort cannot count NUL-terminated paths", () => {
+      const tree = runtimeTree();
+      // A sort without -z: the count pipeline would read 0 and pass as clean.
+      const shims = tree.at("shims");
+      mkdirSync(shims);
+      writeFileSync(path.join(shims, "sort"), "#!/bin/sh\necho \"sort: invalid option -- 'z'\" >&2\nexit 2\n", { mode: 0o755 });
+      const env = { PATH: `${shims}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: tree.home };
+      const run = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([])], { env, encoding: "utf8" });
+      expect(run.status).toBe(2);
+      expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(run.stdout)).toBeNull();
+      expect(run.stderr).toContain("cannot count NUL-terminated paths");
+      expect(existsSync(tree.at("home/paperclip-workspace/.paperclip-runtime/claude/mcp-config"))).toBe(false);
+      expect(existsSync(tree.at("home/paperclip-workspace/.paperclip-runtime/claude/skills/paperclip/SKILL.md"))).toBe(true);
     });
 
     it("staging refuses a directory that already exists", () => {
