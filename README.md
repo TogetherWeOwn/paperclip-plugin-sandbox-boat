@@ -51,7 +51,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 ### Security
 
 * VMs are created with `noEnv: true` and `monitoring: false`. Use a boat environment marked *safe for third parties*.
-* The VM gets nothing of the account. The run env is the only input.
+* The VM gets nothing of the account except boat's own `BOAT_ID` and `ASCII_TOKEN` (see [boat account settings](#boat-account-settings)). The run env is the only other input.
 * The staged env file never sits in the workspace (the git checkout), so `git add -A` cannot commit it. It sits under `/tmp`, which boat snapshots do not save ([What a snapshot saves](https://docs.boat.dev/snapshots/whats-saved)), and it is gone before the command starts. If ssh drops before the script runs, the plugin removes it itself.
 * An ephemeral ed25519 key is made per worker process with `ssh-keygen`. It is never stored.
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
@@ -87,16 +87,25 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 
 The worker must resolve `@paperclipai/plugin-sdk` from the host's own SDK. That is what the bundled providers do.
 
+Stage the package with `scripts/stage-package.sh`. It builds from one pushed commit, never from the working tree:
+
 ```sh
 git clone https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat && cd paperclip-plugin-sandbox-boat
-npm ci && npm run check            # typecheck + tests + build
-DEST=<plugin packages root>/sandbox-boat-0.1.0-$(git rev-parse --short HEAD)
-mkdir -p "$DEST/node_modules/@boatdev" "$DEST/node_modules/@paperclipai"
-cp -r dist package.json README.md LICENSE "$DEST/"
-cp -r node_modules/@boatdev/sdk "$DEST/node_modules/@boatdev/"
-# Inside the Paperclip container the host SDK lives at /app/packages/plugins/sdk:
-ln -s /app/packages/plugins/sdk "$DEST/node_modules/@paperclipai/plugin-sdk"
+git fetch origin
+scripts/stage-package.sh <commit> <plugin packages root>   # prints <root>/sandbox-boat-<version>-<short sha>
 ```
+
+The script:
+
+* exports the commit with `git archive`, then runs `npm ci` and `npm run check` (typecheck, tests, build) on that copy;
+* copies `dist`, `package.json`, `README.md`, `LICENSE` and `@boatdev/sdk` into the package, links `node_modules/@paperclipai/plugin-sdk` to `/app/packages/plugins/sdk` (the SDK path inside the Paperclip container; a third argument changes it), and writes the full sha to `.source-commit`;
+* makes the package read-only, and uses `sudo` only for the final move when the root is not writable.
+
+It refuses:
+
+* a commit that is not on `origin/main`;
+* a commit older than `0721a3a`. Before it, the run env file sat in the workspace, so `git add -A` or a boat snapshot could pick up the tokens in it;
+* a destination that already exists.
 
 Then install it as an instance admin. `packageName` is the path as the server sees it:
 
@@ -119,15 +128,18 @@ To undo, uninstall the plugin from the Plugins page and delete any `paperclip-*`
 
 ## boat account settings
 
-These settings match the docs (docs.boat.dev). They are checked on our account.
+These are the settings the plugin expects, with the docs (docs.boat.dev) that back them. Check yours with `boat env info <env>`, `boat data-retention status` and `boat limits`. The AI-proxy and auto-refill switches need an admin key or the dashboard to read.
 
-* **Environment `base`: safe for third parties ON.** The effective `passGithub`, `passSecrets`, `passSandboxCredentials` and `passAgentsCredentials` are all false ([docs](https://docs.boat.dev/environments/access)).
+* **Sign in with Google or email, not GitHub.** Then boat has no GitHub token of yours to pass into a VM ([docs](https://docs.boat.dev/environments/access#what-a-normal-sandbox-receives)).
+* **Environment: safe for third parties ON.** The raw toggles still read `true`; the `effective` `passGithub`, `passSecrets`, `passSandboxCredentials` and `passAgentsCredentials` must all be false ([docs](https://docs.boat.dev/environments/access)). Keep `proxyAiCredentials` off.
 * **AI credentials proxy OFF.** It costs $1 a day, and on the trial one day uses the whole 25 h allowance ([docs](https://docs.boat.dev/free-trial)).
 * **Zero data retention OFF.** It deletes a VM's data at every stop, so resume would never work ([docs](https://docs.boat.dev/data-retention/zero-data-retention)).
 * **Snapshots off: OFF.** With it on, a stop erases the VM ([docs](https://docs.boat.dev/data-retention/snapshots-and-monitoring-off)).
-* **Monitoring off: ON for the account.** boat keeps no command output or process list. The plugin sends `monitoring: false` anyway. With monitoring on, boat would refuse that value with `409 monitoring_off_for_account`. The cost of this setting is that boat sends no out-of-disk emails for these VMs.
-* **Auto-refill OFF** (the trial cannot use it). Spend then stops at the balance ([docs](https://docs.boat.dev/billing#control-your-spend)).
+* **Monitoring off: per VM.** The plugin creates every VM with `monitoring: false`, so boat keeps no command output, process list or CPU/RAM samples for it. That works whether the account-wide *Monitoring off* switch is on or off: with the switch on, boat refuses only `monitoring: true` (`409 monitoring_off_for_account`). Turning the switch on as well also covers VMs made by hand, for example `boat new` without `--no-monitoring`. Either way, these VMs get no disk-full alerts ([docs](https://docs.boat.dev/data-retention/snapshots-and-monitoring-off#monitoring-off)).
+* **Auto-refill OFF.** It needs a paid plan and does not work during the trial. With it off, spend stops at the balance ([docs](https://docs.boat.dev/billing#control-your-spend)).
 * **Keys:** a scoped `ci` key for the plugin and a `read-only` key for cost reads. Never use an admin key in the plugin.
+
+Even with safe for third parties on, every VM gets `BOAT_ID` and `ASCII_TOKEN`. `ASCII_TOKEN` can publish a port of that one VM on a public URL and nothing else ([docs](https://docs.boat.dev/security#boat-credentials-inside-a-sandbox)).
 
 ## Live smoke test
 
