@@ -108,6 +108,14 @@ describe("manifest", () => {
 });
 
 describe("ValidateConfig", () => {
+  it("keeps Paperclip's reuseLease flag in the normalized config, so per-card reuse is not dropped on save", async () => {
+    const result = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig, reuseLease: true } });
+    expect(result.ok).toBe(true);
+    expect(result.normalizedConfig).toMatchObject({ reuseLease: true });
+    const off = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig } });
+    expect(off.normalizedConfig).toMatchObject({ reuseLease: false });
+  });
+
   it("normalizes defaults that match the boat trial", async () => {
     const result = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { apiKey: "boat_x" } });
     expect(result.ok).toBe(true);

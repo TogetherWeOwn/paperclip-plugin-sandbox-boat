@@ -43,6 +43,12 @@ export interface BoatDriverConfig {
   sshConnectTimeoutSec: number;
   remoteWorkspaceDir: string | null;
   allowPaidNamedSnapshots: boolean;
+  /**
+   * Paperclip's own envelope flag (not a boat setting). The host passes it to
+   * the plugin and keeps only what the plugin returns as normalized config, so
+   * it must survive normalization or per-card lease reuse silently turns off.
+   */
+  reuseLease: boolean;
 }
 
 export const CONFIG_DEFAULTS = {
@@ -67,6 +73,7 @@ export const CONFIG_DEFAULTS = {
   tunnelTargetPort: 8317,
   sshConnectTimeoutSec: 15,
   allowPaidNamedSnapshots: false,
+  reuseLease: false,
 };
 
 function str(value: unknown): string | null {
@@ -131,6 +138,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     sshConnectTimeoutSec: Math.trunc(num(raw.sshConnectTimeoutSec, CONFIG_DEFAULTS.sshConnectTimeoutSec)),
     remoteWorkspaceDir: str(raw.remoteWorkspaceDir),
     allowPaidNamedSnapshots: bool(raw.allowPaidNamedSnapshots, CONFIG_DEFAULTS.allowPaidNamedSnapshots),
+    reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),
   };
 }
 
