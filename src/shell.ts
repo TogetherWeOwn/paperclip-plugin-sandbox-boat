@@ -10,8 +10,12 @@
 //     in named snapshots) but do not save /tmp
 //     (docs.boat.dev/snapshots/whats-saved).
 //   - It is removed right after it is sourced, before the payload starts, so
-//     the payload never sees it on disk. A trailing remove after the payload
-//     stays as a fallback for a script that did not get that far.
+//     the payload never sees it on disk. A trailing remove stays as a fallback
+//     for a script that did not get that far.
+//   - The payload is exec'd: it replaces the shell that sourced the file, so
+//     no parent shell stays alive with boat's ASCII_TOKEN in its startup
+//     environment (/proc/<pid>/environ keeps a process's startup env even
+//     after `unset`).
 import { randomUUID } from "node:crypto";
 
 export function shellQuote(value: string): string {
@@ -89,10 +93,13 @@ const ASCII_TOKEN_EXPORT_LINE = "^[[:space:]]*export[[:space:]][[:space:]]*ASCII
 export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && grep -q '${ASCII_TOKEN_EXPORT_LINE}' "$f"; then sed -i '/${ASCII_TOKEN_EXPORT_LINE}/d' "$f"; fi; } 2>/dev/null || true`;
 
 // Sources the staged env file, removes it at once, clears the boat VM
-// credentials, and only then runs the payload. The trailing remove is a
+// credentials, and only then execs the payload in place of this shell. The
+// shell was started with boat's ASCII_TOKEN and BOAT_ID in its environment;
+// `unset` hides them from children but not from /proc/<pid>/environ, so this
+// shell must not stay alive as the payload's parent. The trailing remove is a
 // fallback for a script that stopped before the first one (a failed `cd` or a
-// failed source). The payload must not end in a terminal `exec`, which would
-// skip the trailing remove.
+// failed source); after a successful exec nothing of this shell is left to run
+// it, and the file is already gone.
 export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
   const file = shellQuote(stage.path);
   const remove = removeRemoteEnvCommand(stage);
@@ -100,7 +107,7 @@ export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: str
     `if [ -f ${file} ]; then . ${file}; fi`,
     `{ ${remove} || true; }`,
     UNSET_BOAT_VM_CREDENTIALS,
-    `${payloadScript}; rc=$?; ${remove}; exit $rc`,
+    `exec ${payloadScript}; rc=$?; ${remove}; exit $rc`,
   ];
 }
 
@@ -125,4 +132,63 @@ export function buildLoginShellScript(input: {
     lines.push(UNSET_BOAT_VM_CREDENTIALS, `exec ${commandParts}`);
   }
   return lines.join(" && ");
+}
+
+// ---------------------------------------------------------------------------
+// Run secrets Paperclip itself writes into the VM, outside the run env.
+//
+// claude_local writes the run's MCP config, `{"mcpServers":{...,"headers":
+// {"Authorization":"Bearer <token>"}}}`, where the "Paperclip projects" server
+// carries the run JWT (valid 48 h, accepted by the publicly exposed Paperclip
+// API). Paperclip syncs it into the VM as the `mcp-config` runtime asset:
+// `<remoteCwd>/.paperclip-runtime/<adapter>/mcp-config/mcp-config.json`
+// (tog.22: server heartbeat.ts ~25853, claude-local claude-config.ts ~175,
+// execute.ts ~658-713; adapter-utils sandbox-managed-runtime.ts ~1531 and
+// ~1690). The asset is uploaded as `<adapter dir>/mcp-config-upload.tar`
+// (plus `.paperclip-upload*` temp files) and extracted. That is under
+// /home/user, which every boat snapshot saves, and Paperclip never removes it.
+// The plugin cannot filter it (it is a file, not env), so it deletes it before
+// every stop, delete and template capture it makes.
+
+/** Runtime asset names, under `<root>/.paperclip-runtime/<adapter>/`, that hold run credentials. */
+export const RUNTIME_SECRET_ASSET_GLOBS = ["mcp-config", "mcp-config-upload.tar*"] as const;
+
+/** How deep the catch-all search under $HOME goes (`$HOME/<ws>/.paperclip-runtime/<adapter>/mcp-config` is depth 4). */
+export const RUNTIME_SECRET_FIND_MAX_DEPTH = 6;
+
+/** The line the scrub prints last: how many paths it found and how many are left. */
+export const RUNTIME_SECRET_SCRUB_RESULT_RE = /^paperclip-boat-scrub found=(\d+) left=(\d+)$/m;
+
+/**
+ * A script that deletes every `.paperclip-runtime/<adapter>/mcp-config` (and
+ * its upload tarball) under each workspace root, under the default
+ * `$HOME/paperclip-workspace`, and anywhere under $HOME up to
+ * RUNTIME_SECRET_FIND_MAX_DEPTH (skipping node_modules, .git and target). It
+ * then looks again and exits 0 only when none is left, printing
+ * `paperclip-boat-scrub found=<n> left=<m>`. It removes nothing else: the
+ * checkout, skills, config and the bridge stay.
+ */
+export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
+  const absolute = [...new Set(roots.map((root) => root.trim().replace(/\/+$/, "")).filter((root) => root.startsWith("/") && root.length > 1))];
+  const rootWords = [...absolute.map(shellQuote), '"$HOME/paperclip-workspace"'].join(" ");
+  const globs = RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `"$r"/.paperclip-runtime/*/${glob}`).join(" ");
+  const findPaths = RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `-path ${shellQuote(`*/.paperclip-runtime/*/${glob}`)}`).join(" -o ");
+  const find =
+    `find "$HOME" -maxdepth ${RUNTIME_SECRET_FIND_MAX_DEPTH} \\( -name node_modules -o -name .git -o -name target \\) -prune` +
+    ` -o \\( ${findPaths} \\) -print -prune 2>/dev/null`;
+  return [
+    "list() {",
+    `  for r in ${rootWords}; do`,
+    `    for p in ${globs}; do`,
+    `      if [ -e "$p" ] || [ -L "$p" ]; then printf '%s\\n' "$p"; fi`,
+    "    done",
+    "  done",
+    `  if [ -n "\${HOME:-}" ] && [ -d "$HOME" ]; then ${find}; fi`,
+    "}",
+    "found=$(list | sort -u | wc -l | tr -d ' ')",
+    `list | sort -u | while IFS= read -r p; do rm -rf -- "$p"; done`,
+    "left=$(list | sort -u | wc -l | tr -d ' ')",
+    'echo "paperclip-boat-scrub found=$found left=$left"',
+    '[ "$left" = 0 ]',
+  ].join("\n");
 }

@@ -53,8 +53,8 @@ export interface BoatDriverConfig {
   reuseLease: boolean;
   /**
    * Run env names that may reach the VM: exact names and `NAME_*` prefixes.
-   * Null: the built-in DEFAULT_ENV_ALLOWLIST (env-policy.ts). Everything else
-   * the host passes is dropped.
+   * Null: the built-in DEFAULT_ENV_ALLOWLIST (env-policy.ts). An empty list:
+   * nothing reaches the VM. Everything else the host passes is dropped.
    */
   envAllowlist: string[] | null;
 }
@@ -227,7 +227,11 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
       "noEnv is off: if the boat environment is not marked safe for third parties, sandboxes receive the account's GitHub token, secrets and model logins.",
     );
   }
-  if (config.envAllowlist) {
+  if (config.envAllowlist && config.envAllowlist.length === 0) {
+    warnings.push(
+      `envAllowlist is empty: no run env reaches the VM (deny-all), so a Claude run gets none of ${ESSENTIAL_RUN_ENV.join(", ")} and cannot reach the model proxy or Paperclip's sandbox bridge. Remove envAllowlist to use the built-in list.`,
+    );
+  } else if (config.envAllowlist) {
     const invalid = invalidAllowlistEntries(config.envAllowlist);
     if (invalid.length > 0) {
       errors.push(`envAllowlist entries must be an exact NAME or a NAME_* prefix: ${invalid.slice(0, 5).join(", ")}.`);

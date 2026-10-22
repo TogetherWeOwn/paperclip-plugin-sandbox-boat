@@ -16,6 +16,8 @@
 #     pick up the tokens in it;
 #   - a build without the run env allowlist (0.2.0): before it, every env key
 #     Paperclip passed, project secrets included, reached the VM;
+#   - a build that does not delete Paperclip's run MCP config (run JWT) before
+#     it stops, deletes or snapshots a VM;
 #   - a destination that already exists.
 set -eu
 
@@ -89,6 +91,13 @@ fi
 # upload of a large envelope (the old inline-only check missed it).
 if ! grep -qF 'isAcpProcessSessionCommand(params.command' "$pkg/dist/vm-manager.js" || ! grep -qF 'process-sessions' "$pkg/dist/env-policy.js"; then
   echo "stage-package: dist does not refuse Paperclip's ACP process-session commands; refusing (its envelope carries the unfiltered env)." >&2
+  exit 1
+fi
+
+# Release, stop, destroy, the sweep and template capture must delete Paperclip's
+# run MCP config (it holds the run JWT) before boat saves the VM disk.
+if ! grep -qF 'scrubRuntimeSecretsScript(' "$pkg/dist/vm-manager.js" || ! grep -qF 'mcp-config' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not remove Paperclip's run MCP config before stops; refusing (the run JWT would stay in boat snapshots)." >&2
   exit 1
 fi
 

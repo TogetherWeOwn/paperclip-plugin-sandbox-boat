@@ -1,18 +1,28 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkBudget, readBudget } from "./budget.js";
-import { parseDriverConfig } from "./config.js";
-import { DEFAULT_ENV_ALLOWLIST, filterRunEnv, isAcpProcessSessionCommand, parseEnvAllowlist } from "./env-policy.js";
+import { parseDriverConfig, validateDriverConfig } from "./config.js";
+import {
+  DEFAULT_ENV_ALLOWLIST,
+  containsJwt,
+  effectiveEnvAllowlist,
+  filterRunEnv,
+  isAcpProcessSessionCommand,
+  parseEnvAllowlist,
+} from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
   REMOTE_ENV_STAGING_ROOT,
+  RUNTIME_SECRET_SCRUB_RESULT_RE,
   SCRUB_BASHRC_ASCII_TOKEN,
   buildLoginShellScript,
   buildRemoteEnvFileContents,
   newRemoteEnvStage,
+  scrubRuntimeSecretsScript,
+  shellQuote,
   stageRemoteEnvCommand,
 } from "./shell.js";
 import type { RemoteEnvStage } from "./shell.js";
@@ -116,6 +126,71 @@ describe("env policy", () => {
     }
   });
 
+  it("treats ..._KEY, SIGNING, HMAC, SALT, _AUTH and _PAT names as secrets: a prefix never delivers them, an exact entry does", () => {
+    // Both match a built-in prefix (PAPERCLIP_BRIDGE_*, LC_*), and must still be dropped.
+    expect(decide("PAPERCLIP_BRIDGE_SIGNING_KEY", "k3y")).toBe("secret_name_needs_exact_entry");
+    expect(decide("LC_SESSION_KEY", "k3y")).toBe("secret_name_needs_exact_entry");
+    expect(decide("PAPERCLIP_BRIDGE_SIGNING_KEY", "k3y", ["PAPERCLIP_BRIDGE_SIGNING_KEY"])).toBe("kept");
+    expect(decide("LC_SESSION_KEY", "k3y", ["LC_SESSION_KEY"])).toBe("kept");
+    for (const name of ["CARGO_KEY", "CARGO_SIGNING_CERT", "CARGO_WEBHOOK_HMAC", "CARGO_SALT", "CARGO_HASH_SALT_V2", "CARGO_AUTH", "CARGO_PAT", "cargo_key"]) {
+      expect([name, decide(name, "x", ["CARGO_*", "cargo_*"])]).toEqual([name, "secret_name_needs_exact_entry"]);
+      expect([name, decide(name, "x", [name])]).toEqual([name, "kept"]);
+    }
+    expect(decide("KEY", "x", ["KEY"])).toBe("kept");
+    expect(decide("KEY", "x", ["K*"].map((entry) => entry.replace("*", "_*")))).toBe("not_allowlisted");
+    // Look-alikes that are not secret names still pass through a prefix.
+    for (const name of ["CARGO_MONKEY", "CARGO_KEYBOARD", "CARGO_AUTHOR", "CARGO_PATH", "CARGO_AUTH_SOCK"]) {
+      expect([name, decide(name, "x", ["CARGO_*"])]).toEqual([name, "kept"]);
+    }
+    // The built-in list still delivers everything a Claude run needs.
+    expect(decide("PAPERCLIP_BRIDGE_PORT", "41234")).toBe("kept");
+    expect(decide("LC_ALL", "C.UTF-8")).toBe("kept");
+  });
+
+  it("an empty envAllowlist delivers nothing; unset means the built-in list", () => {
+    expect(parseEnvAllowlist([])).toEqual([]);
+    expect(parseEnvAllowlist(["", "  "])).toEqual([]);
+    expect(parseEnvAllowlist("")).toBeNull();
+    expect(parseEnvAllowlist(" , ")).toBeNull();
+    expect(effectiveEnvAllowlist([])).toEqual([]);
+    expect(effectiveEnvAllowlist(null)).toBe(DEFAULT_ENV_ALLOWLIST);
+    const config = parseDriverConfig({ apiKey: "k", envAllowlist: [] });
+    expect(config.envAllowlist).toEqual([]);
+    const result = filterRunEnv({ PATH: "/usr/bin", ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", PAPERCLIP_RUN_ID: "r1" }, effectiveEnvAllowlist(config.envAllowlist));
+    expect(result.kept).toEqual([]);
+    expect(result.dropped.map((entry) => entry.reason)).toEqual(["not_allowlisted", "not_allowlisted", "not_allowlisted"]);
+    const { errors, warnings } = validateDriverConfig(config, { apiKey: "k", envAllowlist: [] });
+    expect(errors).toEqual([]);
+    expect(warnings.join("\n")).toMatch(/envAllowlist is empty: no run env reaches the VM \(deny-all\)/);
+    expect(warnings.join("\n")).not.toMatch(/does not deliver/);
+  });
+
+  it("drops a value with a JWT anywhere in it: behind Bearer, inside JSON or a header, with spaces around", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
+    for (const value of [
+      jwt,
+      `Bearer ${jwt}`,
+      `bearer ${jwt}`,
+      `  ${jwt}\n`,
+      `Authorization: Bearer ${jwt}`,
+      JSON.stringify([{ repoUrl: "https://github.com/o/r", token: jwt }]),
+      JSON.stringify({ headers: { Authorization: `Bearer ${jwt}` } }),
+      `${jwt}.extra-part`,
+      // A JWE (5 parts) also starts with a JSON header and a dot.
+      "eyJhbGciOiJSU0EtT0FFUCJ9.eyJ6aXAiOiJERUYifQ.a.b.c",
+    ]) {
+      expect([value, decide("PAPERCLIP_WORKSPACES_JSON", value)]).toEqual([value, "jwt"]);
+      expect(containsJwt(value)).toBe(true);
+    }
+    // A whole-value JWT whose payload is not `{"...` (anchored form), with or without Bearer.
+    expect(decide("PAPERCLIP_API_KEY", "eyJhbGciOiJIUzI1NiJ9.e30.c2ln")).toBe("jwt");
+    expect(decide("PAPERCLIP_API_KEY", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln")).toBe("jwt");
+    // base64 JSON without the dotted JWT shape is not a JWT.
+    for (const value of ["eyJvayI6dHJ1ZX0=", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo", "eyJhIjoxfQ.notjson", "v1.eyJhIjoxfQ"]) {
+      expect([value, containsJwt(value)]).toEqual([value, false]);
+    }
+  });
+
   it("never delivers provider credential families, JWTs, or database URLs that leave the VM, even when listed exactly", () => {
     for (const name of ["PLANETSCALE_PROD_URL", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "DISCORD_BOT_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "BOAT_API_KEY", "ASCII_TOKEN", "planetscale_org"]) {
       expect([name, decide(name, "x", [name])]).toEqual([name, "denied_family"]);
@@ -189,6 +264,28 @@ describe("env policy", () => {
     expect(isAcpProcessSessionCommand("sh", ["-c", "mkdir -p '/home/user/.paperclip-managed/claude/process-sessions'"])).toBe(true);
     expect(isAcpProcessSessionCommand("sh", ["-c", "mkdir -p /srv/process-sessions && true"])).toBe(true);
     expect(isAcpProcessSessionCommand("sh", ["-c", "cat command.b64"])).toBe(true);
+  });
+
+  it("spots a relative process-sessions directory too (after a cd into the runtime root)", () => {
+    for (const script of [
+      "process-sessions",
+      "mkdir -p process-sessions/0b0f6c2e",
+      "cd '/home/user/paperclip-workspace/.paperclip-runtime/claude' && mkdir -p process-sessions",
+      "cd x && ls 'process-sessions'",
+      'test -d "process-sessions/abc"',
+      "remote_dir=process-sessions",
+      "cd x;process-sessions/run.sh",
+      "true&&process-sessions/run.sh",
+      "echo x >process-sessions/a",
+      "(cd process-sessions/a)",
+    ]) {
+      expect([script, isAcpProcessSessionCommand("sh", ["-c", script])]).toEqual([script, true]);
+    }
+    expect(isAcpProcessSessionCommand("process-sessions/launch", [])).toBe(true);
+    expect(isAcpProcessSessionCommand("ls", ["process-sessions"])).toBe(true);
+    for (const script of ["ls process-sessions-archive", "ls myprocess-sessions", "echo process-sessionsX", "grep process-sessions.bak x"]) {
+      expect([script, isAcpProcessSessionCommand("sh", ["-c", script])]).toEqual([script, false]);
+    }
   });
 
   it("leaves a cli-engine run alone", () => {
@@ -266,10 +363,11 @@ describe("shell", () => {
     const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
     const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
     expect(script).toContain(
-      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && exec 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
     );
     expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
-    expect(script).not.toContain("exec 'node'");
+    // The payload replaces the shell that sourced the env: no parent shell is left.
+    expect(script).toContain("&& exec 'node' 'x.js';");
   });
 
   describe("in a real shell", () => {
@@ -347,6 +445,111 @@ describe("shell", () => {
       }
       rmSync(bashrc);
       expect(spawnSync("sh", ["-c", SCRUB_BASHRC_ASCII_TOKEN], { env }).status).toBe(0);
+    });
+
+    it.skipIf(!existsSync("/proc/self/environ"))(
+      "no parent shell of the payload keeps ASCII_TOKEN or BOAT_ID in /proc/<pid>/environ, and the payload's own env has neither",
+      () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+        expect(process.env.ASCII_TOKEN).toBeUndefined();
+        const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, ASCII_TOKEN: "exec-env-token", BOAT_ID: "bx_test" };
+        const environHits = (pid: string) => `tr '\\000' '\\n' < /proc/${pid}/environ | grep -c -E '^(ASCII_TOKEN|BOAT_ID)='`;
+        const payload = `printf 'parent=%s self=%s secret=%s\\n' "$(${environHits("$PPID")})" "$(${environHits("$$")})" "$PCB_SECRET"`;
+        const dir = path.join(root, "stage");
+        const stage = { dir, path: path.join(dir, "env.sh") };
+        execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
+        const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv: stage });
+        const run = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
+        expect(run.stdout).toBe("parent=0 self=0 secret=s3cr3t\n");
+        expect(run.status).toBe(0);
+        expect(existsSync(dir)).toBe(false);
+        // Control: a wrapper shell that only unsets and stays alive still shows the token to its child.
+        const control = spawnSync("sh", ["-c", `unset ASCII_TOKEN BOAT_ID; sh -c ${shellQuote(payload)}; true`], { env: { ...env, PCB_SECRET: "x" }, encoding: "utf8" });
+        expect(control.stdout).toBe("parent=2 self=0 secret=x\n");
+        // sshd runs the remote command as `$SHELL -c '<command>'`; the plugin's
+        // command is `exec sh -c '<script>'`, so that login shell is gone too.
+        execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
+        const viaLogin = spawnSync("bash", ["-c", `exec sh -c ${shellQuote(script)}`], { env, encoding: "utf8" });
+        expect(viaLogin.stdout).toBe("parent=0 self=0 secret=s3cr3t\n");
+        // Control: a login shell that stays alive (no `exec`) is the payload's parent and still holds the token.
+        const loginControl = spawnSync("bash", ["-c", `sh -c ${shellQuote(script)}; true`], { env, encoding: "utf8" });
+        expect(loginControl.stdout).toBe("parent=2 self=0 secret=\n");
+      },
+    );
+
+    // Paperclip's runtime asset layout on the VM (adapter-utils sandbox-managed-runtime.ts, tog.22).
+    function runtimeTree() {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-scrub-"));
+      const home = path.join(root, "home");
+      const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJydW4iOiJyMSJ9.c2ln";
+      const files: Record<string, string> = {
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config/mcp-config.json": JSON.stringify({
+          mcpServers: { "Paperclip projects": { type: "http", url: "https://pc.example/api/mcp/project-tools", headers: { Authorization: `Bearer ${jwt}` } } },
+        }),
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config-upload.tar": jwt,
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config-upload.tar.5d7c1e0a.paperclip-upload.b64": jwt,
+        "home/other/proj/.paperclip-runtime/claude/mcp-config/mcp-config.json": jwt,
+        "srv/w o'rk/.paperclip-runtime/codex/mcp-config/mcp-config.json": jwt,
+        // Kept: everything else under the runtime root, and look-alikes outside it.
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/paperclip/SKILL.md": "skill",
+        "home/paperclip-workspace/.paperclip-runtime/claude/config/settings.json": "{}",
+        "home/paperclip-workspace/.paperclip-runtime/claude/paperclip-bridge/queue/requests/r1.json": "{}",
+        "home/paperclip-workspace/src/mcp-config/keep.json": "{}",
+        "home/paperclip-workspace/README.md": "readme",
+      };
+      for (const [file, body] of Object.entries(files)) {
+        mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        writeFileSync(path.join(root, file), body);
+      }
+      return { home, jwt, at: (file: string) => path.join(root, file) };
+    }
+
+    it("the scrub removes every run MCP config and its upload under the roots and $HOME, and nothing else", () => {
+      const tree = runtimeTree();
+      const script = scrubRuntimeSecretsScript([tree.at("srv/w o'rk") + "/", "relative/ignored"]);
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home };
+      const first = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
+      expect(first.stdout.trim()).toBe("paperclip-boat-scrub found=5 left=0");
+      expect(first.status).toBe(0);
+      expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(first.stdout)?.slice(1)).toEqual(["5", "0"]);
+      for (const gone of [
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config",
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config-upload.tar",
+        "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config-upload.tar.5d7c1e0a.paperclip-upload.b64",
+        "home/other/proj/.paperclip-runtime/claude/mcp-config",
+        "srv/w o'rk/.paperclip-runtime/codex/mcp-config",
+      ]) {
+        expect([gone, existsSync(tree.at(gone))]).toEqual([gone, false]);
+      }
+      for (const kept of [
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/paperclip/SKILL.md",
+        "home/paperclip-workspace/.paperclip-runtime/claude/config/settings.json",
+        "home/paperclip-workspace/.paperclip-runtime/claude/paperclip-bridge/queue/requests/r1.json",
+        "home/paperclip-workspace/src/mcp-config/keep.json",
+        "home/paperclip-workspace/README.md",
+      ]) {
+        expect([kept, existsSync(tree.at(kept))]).toEqual([kept, true]);
+      }
+      const grep = spawnSync("grep", ["-rlF", tree.jwt, root], { encoding: "utf8" });
+      expect(grep.stdout).toBe("");
+      // Idempotent: a second run finds nothing and succeeds.
+      const second = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
+      expect(second.stdout.trim()).toBe("paperclip-boat-scrub found=0 left=0");
+      expect(second.status).toBe(0);
+    });
+
+    it.skipIf(process.getuid?.() === 0)("the scrub fails (non-zero, left>0) when a run MCP config cannot be removed", () => {
+      const tree = runtimeTree();
+      const locked = tree.at("home/paperclip-workspace/.paperclip-runtime/claude/mcp-config");
+      chmodSync(locked, 0o555);
+      try {
+        const run = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home }, encoding: "utf8" });
+        expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=4 left=1");
+        expect(run.status).not.toBe(0);
+        expect(existsSync(path.join(locked, "mcp-config.json"))).toBe(true);
+      } finally {
+        chmodSync(locked, 0o755);
+      }
     });
 
     it("staging refuses a directory that already exists", () => {

@@ -73,6 +73,14 @@ function optionValue(args: string[], name: string): string | null {
 export class FakeSsh {
   readonly spawned: SpawnRecord[] = [];
   masterFailures = 0;
+  /**
+   * Per sandbox (HostKeyAlias), how many run-secret paths (Paperclip's
+   * `.paperclip-runtime/<adapter>/mcp-config`) the fake VM disk holds. The
+   * plugin's scrub command removes them and reports the count.
+   */
+  readonly runtimeSecrets = new Map<string, number>();
+  /** Shared with FakeBoat.timeline: `ssh:scrub:<sandboxId>` for each scrub, in call order. */
+  timeline: string[] | null = null;
   /** Return a reply for a remote command, or undefined for the default. */
   handler: ((remoteCommand: string, stdin: string) => ExecReply | undefined) | null = null;
 
@@ -102,9 +110,11 @@ export class FakeSsh {
       return child; // stays alive until killed
     }
     const remoteCommand = args[args.length - 1];
+    const sandboxId = optionValue(args, "HostKeyAlias") ?? "";
+    if (remoteCommand.includes("paperclip-boat-scrub")) this.timeline?.push(`ssh:scrub:${sandboxId}`);
     const respond = () => {
       record.stdin = child.stdinText;
-      const reply = this.handler?.(remoteCommand, child.stdinText) ?? this.defaultReply(remoteCommand);
+      const reply = this.handler?.(remoteCommand, child.stdinText) ?? this.defaultReply(remoteCommand, sandboxId);
       child.finish(reply.code, reply.stdout ?? "", reply.stderr ?? "");
     };
     const stdio = options?.stdio ?? [];
@@ -113,9 +123,14 @@ export class FakeSsh {
     return child;
   };
 
-  private defaultReply(remoteCommand: string): ExecReply {
+  private defaultReply(remoteCommand: string, sandboxId: string): ExecReply {
     if (remoteCommand.includes('"$d" "$s"')) {
       return { code: 0, stdout: "/home/user/paperclip-workspace\nbash\n" };
+    }
+    if (remoteCommand.includes("paperclip-boat-scrub")) {
+      const found = this.runtimeSecrets.get(sandboxId) ?? 0;
+      this.runtimeSecrets.set(sandboxId, 0);
+      return { code: 0, stdout: `paperclip-boat-scrub found=${found} left=0\n` };
     }
     return { code: 0, stdout: "ok\n" };
   }
@@ -130,6 +145,13 @@ export class FakeSsh {
 
   execs(): SpawnRecord[] {
     return this.spawned.filter((entry) => entry.command === "ssh" && !entry.args.includes("-N") && !entry.args.includes("-V"));
+  }
+
+  /** The scrub commands sent to one sandbox. */
+  scrubs(sandboxId?: string): SpawnRecord[] {
+    return this.execs().filter(
+      (entry) => entry.args.at(-1)!.includes("paperclip-boat-scrub") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
+    );
   }
 }
 

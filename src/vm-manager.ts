@@ -39,12 +39,14 @@ import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
+  RUNTIME_SECRET_SCRUB_RESULT_RE,
   SCRUB_BASHRC_ASCII_TOKEN,
   assertValidEnvKeys,
   buildLoginShellScript,
   buildRemoteEnvFileContents,
   newRemoteEnvStage,
   removeRemoteEnvCommand,
+  scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
 } from "./shell.js";
@@ -52,7 +54,7 @@ import type { RemoteEnvStage } from "./shell.js";
 import { SshManager, endpointFromSshKeyResponse, runProcess } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
 import { runOutsideInvocation } from "./proactive.js";
-import { VmStateStore, findBySandboxId } from "./state.js";
+import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -62,6 +64,17 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
 const STOP_POLL_INTERVAL_MS = 2000;
 const DONE_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// States in which boat accepts SSH (POST /sshkey answers machine_not_running otherwise).
+const SSH_STATES = new Set(["ready", "idle", "running"]);
+const SCRUB_TIMEOUT_MS = 60_000;
+
+/** What the run-secret scrub before a stop, delete or capture found. */
+export interface RuntimeScrubOutcome {
+  /** clean: nothing to remove; scrubbed: removed and verified; vm_not_running: nothing to reach; failed: could not verify. */
+  status: "clean" | "scrubbed" | "vm_not_running" | "failed";
+  removed: number;
+  detail?: string;
+}
 
 export interface ManagerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
@@ -170,6 +183,8 @@ export class BoatVmManager {
   private readonly configs = new Map<string, CachedConfig>();
   /** Per VM, the sets of dropped env names already logged, so a run's many commands log each set once. */
   private readonly envDropsLogged = new Map<string, Set<string>>();
+  /** Per VM, workspace roots already written to its state record (saves a state write per realize). */
+  private readonly knownRoots = new Map<string, Set<string>>();
   private lastSweepAt = 0;
   private sweeping: Promise<SweepReport> | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
@@ -483,6 +498,113 @@ export class BoatVmManager {
     throw new BoatProviderError("BOAT_SSH_FAILED", `SSH to boat VM ${session.sandboxId} failed: ${last.slice(0, 500) || "unknown error"}`);
   }
 
+  // ------------------------------------------------- run secrets on the VM
+
+  /** Remember a workspace root of a VM in its state record, so a later scrub (also the sweep's, in another worker) looks there. */
+  private async rememberRemoteRoot(companyId: string, sandboxId: string, root: string | null): Promise<void> {
+    if (!root) return;
+    const known = this.knownRoots.get(sandboxId) ?? new Set<string>();
+    if (known.has(root)) return;
+    await this.store
+      .update(companyId, (doc) => {
+        const record = findBySandboxId(doc, sandboxId);
+        if (record) record.remoteRoots = mergeRemoteRoot(record.remoteRoots, root);
+      })
+      .then(() => {
+        known.add(root);
+        this.knownRoots.set(sandboxId, known);
+      })
+      .catch((error) => this.logger.warn("boat: could not record the VM workspace root", { sandboxId, error: errorText(error) }));
+  }
+
+  /** Every workspace root Paperclip may have put `.paperclip-runtime/` under on this VM. */
+  private runtimeRoots(
+    config: BoatDriverConfig,
+    sandboxId: string,
+    leaseMetadata: Record<string, unknown> | null | undefined,
+    record: VmRecord | null,
+  ): string[] {
+    return [
+      ...(record?.remoteRoots ?? []),
+      str(leaseMetadata?.remoteCwd),
+      config.remoteWorkspaceDir,
+      ...(this.knownRoots.get(sandboxId) ?? []),
+    ].filter((root): root is string => typeof root === "string" && root.length > 0);
+  }
+
+  /**
+   * Delete the run credentials Paperclip writes into the VM as files: the
+   * `mcp-config` runtime asset under `<root>/.paperclip-runtime/<adapter>/`,
+   * whose MCP headers carry the run JWT (shell.ts, scrubRuntimeSecretsScript).
+   * boat saves /home/user in every stop snapshot and named snapshot, so this
+   * runs before every stop, delete and capture the plugin makes. It uses the
+   * VM's SSH session, or opens one when the VM runs and this worker has none
+   * (`connect`). Never throws.
+   */
+  private async scrubRuntimeSecrets(input: {
+    api: BoatApiLike;
+    config: BoatDriverConfig;
+    sandboxId: string;
+    roots: readonly string[];
+    before: "stop" | "delete" | "template capture";
+    connect: boolean;
+    session?: SshSession | null;
+  }): Promise<RuntimeScrubOutcome> {
+    const { sandboxId } = input;
+    let session = input.session ?? this.ssh.getSession(sandboxId);
+    if (!session) {
+      if (!input.connect) return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: "no SSH session" });
+      const sandbox = await this.getSandbox(input.api, sandboxId).catch(() => undefined);
+      if (sandbox === null || (sandbox && !SSH_STATES.has(sandbox.state))) {
+        return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: sandbox ? `state ${sandbox.state}` : "VM gone" });
+      }
+      try {
+        session = await this.openSsh(input.api, input.config, sandboxId);
+      } catch (error) {
+        return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+      }
+    }
+    let result: Awaited<ReturnType<SshManager["run"]>>;
+    try {
+      result = await this.ssh.run(session, `sh -c ${shellQuote(scrubRuntimeSecretsScript(input.roots))}`, { timeoutMs: SCRUB_TIMEOUT_MS });
+    } catch (error) {
+      return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+    }
+    const counts = RUNTIME_SECRET_SCRUB_RESULT_RE.exec(result.stdout);
+    if (!result.timedOut && result.exitCode === 0 && counts && counts[2] === "0") {
+      const removed = Number(counts[1]);
+      return this.reportScrub(input, { status: removed > 0 ? "scrubbed" : "clean", removed });
+    }
+    if (result.exitCode === 255) {
+      const sandbox = await this.getSandbox(input.api, sandboxId).catch(() => undefined);
+      if (sandbox === null || (sandbox && !UP_STATES.has(sandbox.state))) {
+        return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: sandbox ? `state ${sandbox.state}` : "VM gone" });
+      }
+    }
+    const detail = result.timedOut
+      ? `timed out after ${SCRUB_TIMEOUT_MS / 1000} s`
+      : `exit ${result.exitCode}${counts ? `, ${counts[2]} left` : ""}: ${(result.stderr || "").trim().slice(0, 300)}`;
+    return this.reportScrub(input, { status: "failed", removed: counts ? Number(counts[1]) : 0, detail });
+  }
+
+  private reportScrub(input: { sandboxId: string; before: string }, outcome: RuntimeScrubOutcome): RuntimeScrubOutcome {
+    const meta = { sandboxId: input.sandboxId, before: input.before, removed: outcome.removed, ...(outcome.detail ? { detail: outcome.detail } : {}) };
+    if (outcome.status === "scrubbed") {
+      this.logger.info(`boat: removed Paperclip's run MCP config (it holds the run JWT) from the VM before the ${input.before}`, meta);
+    } else if (outcome.status === "failed") {
+      this.logger.error(
+        `boat: could not remove Paperclip's run MCP config (it holds the run JWT, valid up to 48 h) from the VM before the ${input.before}; the VM disk may keep it`,
+        meta,
+      );
+    } else if (outcome.status === "vm_not_running" && input.before !== "delete") {
+      this.logger.warn(
+        `boat: could not reach the VM to remove Paperclip's run MCP config before the ${input.before}; if boat stopped it (auto-stop), its disk may keep the run JWT until a later release removes it`,
+        meta,
+      );
+    }
+    return outcome;
+  }
+
   // ---------------------------------------------------------- deadline/extend
 
   private noteDeadline(sandboxId: string, archiveAfter: string | null): void {
@@ -675,8 +797,10 @@ export class BoatVmManager {
           if (record) {
             record.status = "running";
             record.archiveAfter = ready?.archiveAfter ?? record.archiveAfter;
+            record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remote.remoteCwd);
           }
         });
+        this.knownRoots.set(sandboxId, new Set([...(this.knownRoots.get(sandboxId) ?? []), remote.remoteCwd]));
         const lease: PluginEnvironmentLease = {
           providerLeaseId: sandboxId,
           metadata: {
@@ -711,7 +835,16 @@ export class BoatVmManager {
             .catch(() => undefined);
         }
         if (startedNew && sandboxId) {
-          // Never leave a VM billing after a failed start.
+          // Never leave a VM billing after a failed start. A resumed disk can
+          // still hold an earlier run's MCP config, so scrub first when SSH works.
+          await this.scrubRuntimeSecrets({
+            api,
+            config,
+            sandboxId,
+            roots: this.runtimeRoots(config, sandboxId, null, null),
+            before: "stop",
+            connect: false,
+          });
           await this.ssh.closeSession(sandboxId).catch(() => undefined);
           await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
           await this.store
@@ -821,6 +954,7 @@ export class BoatVmManager {
         if (!record) return;
         const now = this.nowIso();
         record.lastActivityAt = now;
+        record.remoteRoots = mergeRemoteRoot(record.remoteRoots, str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd);
         record.sessions.push({
           runId: `resumed-lease:${now}`,
           agentId: null,
@@ -1005,7 +1139,7 @@ export class BoatVmManager {
         if (!record) return null;
         if (runId) record.activeRunIds = record.activeRunIds.filter((id) => id !== runId);
         else if (mode === "stop" || params.cancelActiveWork) record.activeRunIds = [];
-        return { keyKind: record.keyKind, othersActive: record.activeRunIds.length, size: record.size };
+        return { keyKind: record.keyKind, othersActive: record.activeRunIds.length, size: record.size, record: structuredClone(record) };
       });
       const forced = mode === "stop" || params.cancelActiveWork === true || params.resourceDisposition === "stop_and_retain";
       if (snapshot && snapshot.othersActive > 0 && !forced) {
@@ -1014,12 +1148,24 @@ export class BoatVmManager {
         return undefined;
       }
 
+      // Before the stop (or delete): the stop snapshot must not keep the run JWT
+      // that Paperclip left in the VM as the run's MCP config. A failed scrub
+      // does not keep the VM running: that would bill and keep the token live.
+      const deleting = snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain";
+      await this.scrubRuntimeSecrets({
+        api,
+        config,
+        sandboxId,
+        roots: this.runtimeRoots(config, sandboxId, params.leaseMetadata, snapshot?.record ?? null),
+        before: deleting ? "delete" : "stop",
+        connect: true,
+      });
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
       this.envDropsLogged.delete(sandboxId);
 
-      if (snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain") {
+      if (deleting) {
         // A run-keyed VM can never be reused, so there is nothing to keep: delete it.
         await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch(() => undefined);
         await this.deleteSandbox(api, sandboxId);
@@ -1106,6 +1252,7 @@ export class BoatVmManager {
     this.hardDeadlines.delete(sandboxId);
     this.lastActivity.delete(sandboxId);
     this.envDropsLogged.delete(sandboxId);
+    this.knownRoots.delete(sandboxId);
   }
 
   async destroy(params: PluginEnvironmentDestroyLeaseParams): Promise<PluginEnvironmentTerminationReceipt | undefined> {
@@ -1115,6 +1262,20 @@ export class BoatVmManager {
     this.rememberConfig(params.companyId, params.environmentId, config);
     const api = this.opsApi(config);
     return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+      // The delete removes the disk, but a delete that fails leaves the VM as it
+      // is, so remove the run JWT first, the same as before a stop.
+      const record = await this.store
+        .read(params.companyId)
+        .then((doc) => findBySandboxId(doc, sandboxId))
+        .catch(() => null);
+      await this.scrubRuntimeSecrets({
+        api,
+        config,
+        sandboxId,
+        roots: this.runtimeRoots(config, sandboxId, params.leaseMetadata, record),
+        before: "delete",
+        connect: true,
+      });
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
@@ -1141,6 +1302,8 @@ export class BoatVmManager {
           `could not create the workspace ${remoteCwd} on boat VM ${sandboxId}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`,
         );
       }
+      // Paperclip puts its runtime assets (the run MCP config among them) under this root.
+      await this.rememberRemoteRoot(params.companyId, sandboxId, remoteCwd);
     }
     return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd } };
   }
@@ -1247,7 +1410,11 @@ export class BoatVmManager {
       }
 
       const script = buildLoginShellScript({ command: params.command, args: params.args ?? [], cwd, remoteEnv });
-      const result = await this.ssh.run(session, `sh -c ${shellQuote(script)}`, { stdin: params.stdin, timeoutMs });
+      // sshd runs this through the user's login shell (`$SHELL -c '<this>'`).
+      // `exec` makes that shell replace itself, and the script execs the
+      // payload, so the payload's parent is sshd: no shell started with boat's
+      // ASCII_TOKEN in its environment stays alive above the agent.
+      const result = await this.ssh.run(session, `exec sh -c ${shellQuote(script)}`, { stdin: params.stdin, timeoutMs });
       let stderr = result.stderr;
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
@@ -1371,6 +1538,16 @@ export class BoatVmManager {
     if (!params.providerLeaseId) throw new BoatProviderError("BOAT_NO_LEASE", "cannot capture a boat template without a sandbox lease.");
     const sandboxId = params.providerLeaseId;
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
+    // Under the card lock, so no acquire or release of the card runs between the scrub and the save.
+    return await this.withCardLock(params.companyId, sandboxId, null, () => this.captureTemplateLocked(params, sandboxId, config));
+  }
+
+  private async captureTemplateLocked(
+    params: PluginEnvironmentCaptureTemplateParams,
+    sandboxId: string,
+    config: BoatDriverConfig,
+  ): Promise<PluginEnvironmentCaptureTemplateResult> {
     const api = this.opsApi(config);
     const name = sanitizeSnapshotName(params.templateLabel, `${config.namePrefix}-tpl-${params.environmentId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase()}-${this.now().toString(36)}`);
     const list = (await api.listNamedSnapshots()) as {
@@ -1384,6 +1561,39 @@ export class BoatVmManager {
       throw new BoatProviderError(
         "BOAT_NAMED_SNAPSHOT_NOT_FREE",
         `all ${free} free boat named snapshots are used; one more costs $1.70 a month. Delete an old template, or set allowPaidNamedSnapshots.`,
+      );
+    }
+    // A named snapshot outlives every run and seeds new VMs, so it must never
+    // hold the run JWT in Paperclip's MCP config: remove it first, and refuse
+    // the capture when that cannot be verified. A stopped VM is resumed for it
+    // (budget-guarded, as for a command): its disk may come from an auto-stop
+    // that nobody scrubbed.
+    let session: SshSession;
+    try {
+      session = await this.liveSession(config, params.companyId, sandboxId);
+    } catch (error) {
+      throw new BoatProviderError(
+        "BOAT_RUNTIME_SCRUB_FAILED",
+        `could not reach boat VM ${sandboxId} to remove Paperclip's run MCP config (run JWT) before the template capture, so nothing was captured: ${errorText(error)}`,
+      );
+    }
+    const record = await this.store
+      .read(params.companyId)
+      .then((doc) => findBySandboxId(doc, sandboxId))
+      .catch(() => null);
+    const scrub = await this.scrubRuntimeSecrets({
+      api,
+      config,
+      sandboxId,
+      roots: this.runtimeRoots(config, sandboxId, null, record),
+      before: "template capture",
+      connect: false,
+      session,
+    });
+    if (scrub.status !== "clean" && scrub.status !== "scrubbed") {
+      throw new BoatProviderError(
+        "BOAT_RUNTIME_SCRUB_FAILED",
+        `could not verify that Paperclip's run MCP config (run JWT) is gone from boat VM ${sandboxId}, so no template was captured (${scrub.status}${scrub.detail ? `: ${scrub.detail}` : ""}).`,
       );
     }
     await api.saveNamedSnapshot({ sandboxId, name });
@@ -1543,6 +1753,15 @@ export class BoatVmManager {
                 if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return false;
                 if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return false;
               }
+              // Same as release: the stop snapshot must not keep the run JWT.
+              await this.scrubRuntimeSecrets({
+                api,
+                config,
+                sandboxId: sandbox.id,
+                roots: this.runtimeRoots(config, sandbox.id, null, record),
+                before: "stop",
+                connect: true,
+              });
               await this.ssh.closeSession(sandbox.id);
               this.clearExtendTimer(sandbox.id);
               const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);

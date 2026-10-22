@@ -10,8 +10,9 @@
 //   2. Never delivered, even when the allowlist names it exactly:
 //      - names in the provider families PLANETSCALE_, CLOUDFLARE_, CF_,
 //        DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_;
-//      - a JWT (a host-verifiable bearer credential, such as Paperclip's run
-//        token);
+//      - a value with a JWT in it anywhere (a host-verifiable bearer
+//        credential, such as Paperclip's run token), also behind "Bearer " or
+//        inside JSON;
 //      - a database URL or a URL with a password, unless every such URL in the
 //        value points at the VM itself (loopback, or a one-label host name such
 //        as a container on the VM). A `..._DATABASE_URL` or `..._DB_URL` name
@@ -19,10 +20,13 @@
 //        needs a VM-local URL in it.
 //   3. Delivered only when the allowlist names it exactly, never through a
 //      prefix: a name with TOKEN, SECRET, PASSWORD, PASSWD, PASSPHRASE,
-//      PRIVATE_KEY, API_KEY, APIKEY, ACCESS_KEY, CREDENTIAL or COOKIE in it, and
-//      a VM-local database URL or URL with a password. A `..._TOKENS` name with
-//      a whole-number value is a token budget (CLAUDE_CODE_MAX_OUTPUT_TOKENS),
-//      not a credential.
+//      PRIVATE_KEY, API_KEY, APIKEY, ACCESS_KEY, CREDENTIAL, COOKIE, SIGNING,
+//      HMAC or SALT in it, or ending in KEY (_KEY, or the whole name), _AUTH or
+//      _PAT, and a VM-local database URL or URL with a password. A `..._TOKENS`
+//      name with a whole-number value is a token budget
+//      (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
+//
+// An empty allowlist (`envAllowlist: []`) delivers nothing.
 
 /**
  * What a Claude Code run needs to work through Paperclip's sandbox bridge and
@@ -100,10 +104,15 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
 /** Never delivered, not even when the allowlist names them exactly. */
 const DENIED_NAME_PREFIXES = ["PLANETSCALE_", "CLOUDFLARE_", "CF_", "DISCORD_", "GH_", "GITHUB_", "BOAT_", "ASCII_"] as const;
 
-const SECRET_NAME_RE = /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PRIVATE_?KEY|API_?KEY|ACCESS_?KEY|CREDENTIAL|COOKIE/i;
+const SECRET_NAME_RE =
+  /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PRIVATE_?KEY|API_?KEY|ACCESS_?KEY|CREDENTIAL|COOKIE|(?:^|_)KEY$|SIGNING|HMAC|SALT|_AUTH$|_PAT$/i;
 const TOKEN_BUDGET_NAME_RE = /TOKENS$/i;
 const WHOLE_NUMBER_RE = /^\d+$/;
-const JWT_RE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+// A JWT anywhere in the value: a JSON header and a JSON payload (both base64url
+// of `{"`), as in "Bearer eyJ...", a JSON blob or an MCP header. The anchored
+// form also catches a whole-value JWT whose payload does not start with `{"`.
+const JWT_IN_TEXT_RE = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./;
+const JWT_WHOLE_VALUE_RE = /^(?:[Bb]earer\s+)?eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 const DATABASE_SCHEME_RE =
   /^(?:postgres(?:ql)?|mysql2?|mariadb|mongodb(?:\+srv)?|rediss?|libsql|sqlserver|mssql|cockroachdb|clickhouse|amqps?|prisma(?:\+postgres)?)(?:\+[a-z0-9]+)?:$/i;
 const DATABASE_NAME_RE = /(?:^|_)(?:DATABASE|DB)(?:_|$)/i;
@@ -136,7 +145,12 @@ interface CompiledAllowlist {
   prefixes: string[];
 }
 
-/** Read `envAllowlist` from config: a list, or one string split on commas, spaces or newlines. Null when unset. */
+/**
+ * Read `envAllowlist` from config: a list, or one string split on commas,
+ * spaces or newlines. Null when unset (the built-in list applies). A list, even
+ * an empty one, is used as it is: `[]` delivers nothing. A blank string counts
+ * as unset, because a form field that was left empty sends one.
+ */
 export function parseEnvAllowlist(raw: unknown): string[] | null {
   let items: unknown[];
   if (Array.isArray(raw)) items = raw;
@@ -146,7 +160,8 @@ export function parseEnvAllowlist(raw: unknown): string[] | null {
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
-  return entries.length > 0 ? [...new Set(entries)] : null;
+  if (entries.length === 0 && !Array.isArray(raw)) return null;
+  return [...new Set(entries)];
 }
 
 /** Entries must be an exact `NAME` or a `NAME_*` prefix. */
@@ -207,6 +222,11 @@ function scanUrls(value: string): UrlScan {
   return scan;
 }
 
+/** Does the value carry a JWT anywhere (bare, behind "Bearer ", or inside JSON or a header)? */
+export function containsJwt(value: string): boolean {
+  return JWT_IN_TEXT_RE.test(value) || JWT_WHOLE_VALUE_RE.test(value.trim());
+}
+
 /** A provider-credential family (PLANETSCALE_, GITHUB_, ...) that never reaches a VM. */
 export function isDeniedEnvFamily(name: string): boolean {
   const upper = name.toUpperCase();
@@ -219,7 +239,7 @@ function decide(name: string, value: string, allow: CompiledAllowlist): EnvDropR
   const exact = allow.exact.has(name);
   if (!exact && !allow.prefixes.some((prefix) => name.startsWith(prefix))) return "not_allowlisted";
   if (isDeniedEnvFamily(name)) return "denied_family";
-  if (JWT_RE.test(value.trim())) return "jwt";
+  if (containsJwt(value)) return "jwt";
 
   const urls = scanUrls(value);
   if (urls.remote > 0) return "remote_database_or_credential_url";
@@ -251,7 +271,7 @@ export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist
   return { kept, dropped };
 }
 
-/** The allowlist a config resolves to: its own list, else the default. */
+/** The allowlist a config resolves to: its own list (an empty one delivers nothing), else the default. */
 export function effectiveEnvAllowlist(configured: readonly string[] | null): readonly string[] {
   return configured ?? DEFAULT_ENV_ALLOWLIST;
 }
@@ -280,9 +300,13 @@ export const ESSENTIAL_RUN_ENV = [
 //     then launched with only `PAPERCLIP_PROCESS_SESSION_DIR=...`.
 // Every ACP step names that directory, from the first one (the wrapper script
 // sync into `<root>/process-sessions`) to the launch, so refusing them all
-// makes ACP fail before any envelope reaches the VM.
+// makes ACP fail before any envelope reaches the VM. The directory is matched
+// as a path segment, absolute (`.../process-sessions`) or relative
+// (`process-sessions/...` after a `cd` into the runtime root): at the start,
+// or after a space, a quote, `=` or a shell operator, and followed by `/`, a
+// quote, a space, a shell operator or the end.
 const ACP_PROCESS_SESSION_TEXT_RE =
-  /\/process-sessions(?![A-Za-z0-9_.-])|(?<![A-Za-z0-9_.-])command\.b64|PAPERCLIP_PROCESS_SESSION_(?:COMMAND_B64|DIR)=/;
+  /\/process-sessions(?![A-Za-z0-9_.-])|(?:^|[\s'"=;&|()<>:`])process-sessions(?:\/|['"\s;&|()<>:`]|$)|(?<![A-Za-z0-9_.-])command\.b64|PAPERCLIP_PROCESS_SESSION_(?:COMMAND_B64|DIR)=/;
 const ACP_PROCESS_SESSION_ENV_NAMES = ["PAPERCLIP_PROCESS_SESSION_COMMAND_B64", "PAPERCLIP_PROCESS_SESSION_DIR"] as const;
 
 /**

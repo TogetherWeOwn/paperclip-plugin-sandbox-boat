@@ -46,6 +46,24 @@ export interface VmRecord {
   lifetimeUsage: UsageReading | null;
   sessions: RunSession[];
   deletedAt: string | null;
+  /**
+   * Workspace roots the plugin set up or realized on this VM (absolute VM
+   * paths). Paperclip puts its runtime assets, the run MCP config with the run
+   * JWT among them, under `<root>/.paperclip-runtime/`, so the scrub before a
+   * stop looks there. Absent on records written before 0.2.0.
+   */
+  remoteRoots?: string[];
+}
+
+const MAX_REMOTE_ROOTS = 8;
+
+/** Add an absolute VM path to a record's roots (newest last, at most 8). */
+export function mergeRemoteRoot(roots: readonly string[] | undefined, root: string | null | undefined): string[] {
+  const list = [...(roots ?? [])];
+  const value = root?.trim().replace(/\/+$/, "") ?? "";
+  if (!value.startsWith("/") || value.length < 2) return list;
+  const next = [...list.filter((entry) => entry !== value), value];
+  return next.slice(-MAX_REMOTE_ROOTS);
 }
 
 export interface StateDoc {

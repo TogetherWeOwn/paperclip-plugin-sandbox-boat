@@ -74,6 +74,8 @@ export class FakeBoat {
   stopMode: "immediate" | "never" = "immediate";
   namedSnapshotPolls = 1;
   namedAllowance = { free: 10, used: 0 };
+  /** Shared with FakeSsh.timeline: each API method, in call order. */
+  timeline: string[] | null = null;
   private counter = 0;
 
   constructor(private readonly clock: { now: () => number }) {}
@@ -84,6 +86,7 @@ export class FakeBoat {
 
   private record(method: string, args: Record<string, unknown>): void {
     this.calls.push({ method, args: JSON.parse(JSON.stringify(args ?? {})) });
+    this.timeline?.push(method);
     const queue = this.failures.get(method);
     if (queue && queue.length > 0) {
       const next = queue.shift()!;

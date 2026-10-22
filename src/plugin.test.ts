@@ -415,9 +415,9 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
   });
 });
 
-/** The script inside `sh -c '<script>'`, undoing shellQuote. */
+/** The script inside `[exec ]sh -c '<script>'`, undoing shellQuote. */
 function unquoteShDashC(remoteCommand: string): string {
-  const quoted = remoteCommand.replace(/^sh -c /, "");
+  const quoted = remoteCommand.replace(/^(?:exec )?sh -c /, "");
   expect(quoted.startsWith("'") && quoted.endsWith("'")).toBe(true);
   return quoted.slice(1, -1).replaceAll(`'"'"'`, "'");
 }
@@ -456,7 +456,7 @@ describe("Execute", () => {
     expect(envFile.startsWith("/home/")).toBe(false);
 
     // The script sources the file, removes it, and only then runs the payload.
-    const run = calls.find((call) => call.args.at(-1)!.startsWith("sh -c ") && call.args.at(-1)!.includes("claude"));
+    const run = calls.find((call) => call.args.at(-1)!.startsWith("exec sh -c ") && call.args.at(-1)!.includes("claude"));
     const script = unquoteShDashC(run!.args.at(-1)!);
     expect(script).not.toContain(".paperclip-boat-env-");
     const cdAt = script.indexOf(`cd '${cwd}'`);
@@ -469,6 +469,9 @@ describe("Execute", () => {
     expect(firstRemoveAt).toBeGreaterThan(sourceAt);
     expect(payloadAt).toBeGreaterThan(firstRemoveAt);
     expect(fallbackRemoveAt).toBeGreaterThan(payloadAt);
+    // The login shell and the shell that sourced the env both exec: no parent shell keeps ASCII_TOKEN in its environ.
+    expect(run!.args.at(-1)!.startsWith("exec sh -c '")).toBe(true);
+    expect(script).toContain("&& exec 'claude' '-p' 'hello';");
     expect(script).toContain(`rmdir '${envDir}'`);
     expect(run!.args).toEqual(expect.arrayContaining(["ControlMaster=no", "StrictHostKeyChecking=yes"]));
   });
@@ -491,7 +494,7 @@ describe("Execute", () => {
   it("removes the staged env file itself when ssh fails before the script could, and the VM is still up", async () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
-    ssh.handler = (remoteCommand) => (remoteCommand.startsWith("sh -c ") ? { code: 255, stderr: "Connection reset" } : undefined);
+    ssh.handler = (remoteCommand) => (remoteCommand.startsWith("exec sh -c ") ? { code: 255, stderr: "Connection reset" } : undefined);
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(255);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
@@ -507,7 +510,7 @@ describe("Execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
-    expect(commands.some((command) => command.startsWith("sh -c "))).toBe(false);
+    expect(commands.some((command) => command.startsWith("exec sh -c "))).toBe(false);
     expect(commands.at(-1)).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
   });
 
@@ -614,7 +617,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
     } as never);
     const calls = ssh.spawned.slice(before);
     const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
-    const run = calls.find((call) => call.args.at(-1)!.startsWith("sh -c ") && call.args.at(-1)!.includes("'claude'"));
+    const run = calls.find((call) => call.args.at(-1)!.startsWith("exec sh -c ") && call.args.at(-1)!.includes("'claude'"));
     return { result, staged: staging?.stdin ?? "", script: run ? unquoteShDashC(run.args.at(-1)!) : "" };
   }
 
@@ -794,6 +797,50 @@ describe("run env allowlist (incident TOG-37420)", () => {
     }
   });
 
+  it("an empty envAllowlist sends the VM nothing, and validation keeps it and warns", async () => {
+    const { result, staged } = await runWithEnv({ ...ALLOWED_RUN_ENV, ...PROJECT_SECRETS }, { envAllowlist: [] });
+    expect(result.exitCode).toBe(0);
+    expect(staged).toBe("");
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect(Object.keys(drop?.meta?.dropped as Record<string, string[]>)).toEqual(["not_allowlisted"]);
+    expect((drop?.meta?.dropped as Record<string, string[]>).not_allowlisted).toEqual(Object.keys({ ...ALLOWED_RUN_ENV, ...PROJECT_SECRETS }).sort());
+    const validated = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig, envAllowlist: [] } });
+    expect(validated.ok).toBe(true);
+    expect(validated.normalizedConfig).toMatchObject({ envAllowlist: [] });
+    expect(validated.warnings?.join("\n")).toMatch(/envAllowlist is empty: no run env reaches the VM \(deny-all\)/);
+  });
+
+  it("drops PAPERCLIP_BRIDGE_SIGNING_KEY and LC_SESSION_KEY though the built-in prefixes match them, and any value holding the run JWT", async () => {
+    const { staged } = await runWithEnv({
+      ...ALLOWED_RUN_ENV,
+      PAPERCLIP_BRIDGE_SIGNING_KEY: "HOST_SECRET_6",
+      LC_SESSION_KEY: "HOST_SECRET_7",
+      PAPERCLIP_WORKSPACES_JSON: JSON.stringify([{ repoUrl: "https://github.com/o/r", auth: `Bearer ${RUN_JWT}` }]),
+      PAPERCLIP_API_KEY: `Bearer ${RUN_JWT}`,
+    });
+    expect(staged).not.toContain("HOST_SECRET_");
+    expect(staged).not.toContain(RUN_JWT);
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect(drop?.meta?.dropped).toEqual({
+      secret_name_needs_exact_entry: ["LC_SESSION_KEY", "PAPERCLIP_BRIDGE_SIGNING_KEY"],
+      jwt: ["PAPERCLIP_API_KEY", "PAPERCLIP_WORKSPACES_JSON"],
+    });
+  });
+
+  it("refuses an ACP step that names a relative process-sessions directory", async () => {
+    const lease = await acquire("run-1");
+    const before = ssh.spawned.length;
+    const result = await plugin.definition.onEnvironmentExecute!({
+      ...base(),
+      lease,
+      command: "sh",
+      args: ["-c", "cd '/home/user/paperclip-workspace/.paperclip-runtime/claude' && mkdir -p process-sessions/0b0f6c2e"],
+      env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+    } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ACP_PROCESS_SESSION_REFUSED" } });
+    expect(ssh.spawned.slice(before)).toHaveLength(0);
+  });
+
   it("validates envAllowlist entries, warns when a list cannot run Claude, and keeps an unset list unset", async () => {
     const bad = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig, envAllowlist: ["OK", "BAD-NAME", "*"] } });
     expect(bad.ok).toBe(false);
@@ -809,6 +856,203 @@ describe("run env allowlist (incident TOG-37420)", () => {
     const unset = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: DRIVER_KEY, config: { ...baseConfig } });
     expect(unset.normalizedConfig).not.toHaveProperty("envAllowlist");
     expect(unset.warnings?.join("\n") ?? "").not.toMatch(/envAllowlist/);
+  });
+});
+
+describe("run JWT in Paperclip's MCP config on the VM disk", () => {
+  let timeline: string[];
+  beforeEach(() => {
+    timeline = [];
+    fake.timeline = timeline;
+    ssh.timeline = timeline;
+  });
+
+  /** The script of the last scrub sent to a sandbox. */
+  function lastScrubScript(sandboxId: string): string {
+    const scrubs = ssh.scrubs(sandboxId);
+    expect(scrubs.length).toBeGreaterThan(0);
+    return unquoteShDashC(scrubs.at(-1)!.args.at(-1)!);
+  }
+
+  /** Paperclip synced the run's mcp-config asset into the VM. */
+  function paperclipSyncedMcpConfig(sandboxId: string) {
+    ssh.runtimeSecrets.set(sandboxId, 1);
+  }
+
+  const scrubbedBefore = (sandboxId: string, method: string) => {
+    const scrubAt = timeline.indexOf(`ssh:scrub:${sandboxId}`);
+    const methodAt = timeline.indexOf(method);
+    return { scrubAt: scrubAt > -1, methodAt: methodAt > -1, scrubFirst: scrubAt > -1 && scrubAt < methodAt };
+  };
+
+  it("release removes it from the VM before the stop, so the stop snapshot never holds it", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    timeline.length = 0;
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expect(scrubbedBefore(sandboxId, "stop")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+    expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
+    const script = lastScrubScript(sandboxId);
+    expect(script).toContain("'/home/user/paperclip-workspace'");
+    expect(script).toContain('"$r"/.paperclip-runtime/*/mcp-config');
+    expect(script).toContain("-path '*/.paperclip-runtime/*/mcp-config-upload.tar*'");
+    const removed = harness.logs.find((entry) => entry.message.includes("removed Paperclip's run MCP config"));
+    expect(removed).toMatchObject({ level: "info", meta: { sandboxId, before: "stop", removed: 1 } });
+    // The SSH session is closed only after the scrub.
+    expect(ssh.masters()[0].child.killed).toBe(true);
+  });
+
+  it("StopLease removes it before the stop too", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    timeline.length = 0;
+    await plugin.definition.onEnvironmentStopLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata, resourceDisposition: "stop_and_retain" } as never);
+    expect(scrubbedBefore(sandboxId, "stop")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+  });
+
+  it("a per-run VM is scrubbed before its delete on release", async () => {
+    const lease = await acquire("run-1", { executionWorkspaceId: null, issueId: null });
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    timeline.length = 0;
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "destroyed" });
+    expect(scrubbedBefore(sandboxId, "deleteSandbox")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+  });
+
+  it("destroy scrubs before the delete", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    timeline.length = 0;
+    await plugin.definition.onEnvironmentDestroyLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    expect(scrubbedBefore(sandboxId, "deleteSandbox")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+    expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
+  });
+
+  it("leaves a VM that stays up for another run on the card alone, and scrubs at the last release", async () => {
+    const first = await acquire("run-1");
+    const second = await acquire("run-2");
+    const sandboxId = first.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    await release(first);
+    expect(ssh.scrubs(sandboxId)).toHaveLength(0);
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    timeline.length = 0;
+    await release(second);
+    expect(scrubbedBefore(sandboxId, "stop")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+  });
+
+  it("a worker with no SSH session to the running VM opens one to scrub before it stops the VM", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    await currentManager().shutdown(); // a restarted worker: no session
+    paperclipSyncedMcpConfig(sandboxId);
+    const sshKeysBefore = fake.callsOf("sshKey").length;
+    timeline.length = 0;
+    await release(lease);
+    expect(fake.callsOf("sshKey").length).toBe(sshKeysBefore + 1);
+    expect(scrubbedBefore(sandboxId, "stop")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+    expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
+  });
+
+  it("still stops the VM when the scrub fails, and logs an error (a running VM would bill and keep the token live)", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n", stderr: "rm: Permission denied" } : undefined);
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    const failed = harness.logs.find((entry) => entry.message.includes("could not remove Paperclip's run MCP config"));
+    expect(failed).toMatchObject({ level: "error", meta: { sandboxId, before: "stop" } });
+    expect(String(failed?.meta?.detail)).toContain("1 left");
+  });
+
+  it("warns, without starting anything, when the VM was already stopped by someone else", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    await currentManager().shutdown();
+    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop
+    await release(lease);
+    expect(ssh.scrubs(sandboxId)).toHaveLength(0);
+    expect(fake.callsOf("resume")).toHaveLength(0);
+    expect(harness.logs.some((entry) => entry.level === "warn" && entry.message.includes("could not reach the VM to remove Paperclip's run MCP config"))).toBe(true);
+  });
+
+  it("captureTemplate scrubs before the named snapshot, and refuses to capture when the scrub cannot be verified", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    timeline.length = 0;
+    await plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never);
+    expect(scrubbedBefore(sandboxId, "saveNamedSnapshot")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n" } : undefined);
+    await expect(
+      plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm-2" } as never),
+    ).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
+    // A reply without the scrub's result line is not a verified scrub either.
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 0, stdout: "ok\n" } : undefined);
+    await expect(
+      plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm-3" } as never),
+    ).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
+    expect(fake.callsOf("saveNamedSnapshot").map((call) => call.args.name)).toEqual(["warm"]);
+  });
+
+  it("captureTemplate of a VM that boat stopped resumes it (budget-guarded) and scrubs before the snapshot", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    await currentManager().shutdown();
+    fake.boxes.get(sandboxId)!.state = "archived";
+    paperclipSyncedMcpConfig(sandboxId); // left on the disk by the auto-stop
+    timeline.length = 0;
+    await plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never);
+    expect(timeline.indexOf("limits")).toBeLessThan(timeline.indexOf("resume"));
+    expect(scrubbedBefore(sandboxId, "saveNamedSnapshot")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+    expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
+  });
+
+  it("the sweep scrubs every VM it stops: a held-but-idle lease, one with no SSH session in this worker, and an orphan", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    paperclipSyncedMcpConfig(sandboxId);
+    await currentManager().shutdown(); // no session: the sweep must open one
+    fake.addSandbox({ id: "bx_orphan", name: "paperclip-0123456789abcdef", state: "ready", updatedAt: new Date(clock.t - 60 * 60 * 1000) });
+    ssh.runtimeSecrets.set("bx_orphan", 1);
+    clock.t += 61 * 60 * 1000;
+    timeline.length = 0;
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report.stopped.sort()).toEqual([sandboxId, "bx_orphan"].sort());
+    for (const id of [sandboxId, "bx_orphan"]) {
+      const scrubAt = timeline.indexOf(`ssh:scrub:${id}`);
+      const stopAt = timeline.findIndex((entry, index) => entry === "stop" && index > scrubAt);
+      expect({ id, scrubAt: scrubAt > -1, stopAfter: stopAt > scrubAt }).toEqual({ id, scrubAt: true, stopAfter: true });
+      expect(ssh.runtimeSecrets.get(id)).toBe(0);
+    }
+    expect(lastScrubScript(sandboxId)).toContain("'/home/user/paperclip-workspace'");
+  });
+
+  it("scrubs every workspace root the plugin knows of: the realized one (kept in state for a new worker) and remoteWorkspaceDir", async () => {
+    const lease = await acquire("run-1", {}, { remoteWorkspaceDir: "/home/user/custom-ws" });
+    const sandboxId = lease.providerLeaseId!;
+    const leaseWithoutCwd = { providerLeaseId: sandboxId, metadata: { ...lease.metadata, remoteCwd: undefined } };
+    await plugin.definition.onEnvironmentRealizeWorkspace!({
+      ...base({ remoteWorkspaceDir: "/home/user/custom-ws" }),
+      lease: leaseWithoutCwd,
+      workspace: { localPath: "/tmp/x", remotePath: "/home/user/ws-other" },
+    } as never);
+    // A new worker (state kept, memory lost) releases the lease.
+    await plugin.definition.onShutdown?.();
+    await plugin.definition.setup(harness.ctx as never);
+    await plugin.definition.onEnvironmentReleaseLease!({
+      ...base({ remoteWorkspaceDir: "/home/user/custom-ws" }),
+      issueId: ISSUE,
+      providerLeaseId: sandboxId,
+      leaseMetadata: leaseWithoutCwd.metadata,
+    } as never);
+    const script = lastScrubScript(sandboxId);
+    for (const root of ["'/home/user/paperclip-workspace'", "'/home/user/ws-other'", "'/home/user/custom-ws'", '"$HOME/paperclip-workspace"']) {
+      expect([root, script.includes(root)]).toEqual([root, true]);
+    }
   });
 });
 
