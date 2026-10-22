@@ -80,6 +80,14 @@ export interface RuntimeScrubOutcome {
   detail?: string;
 }
 
+/** Why a VM whose scrub failed is stopped with its disk kept instead of deleted (VmManager.logKeptDisk). */
+type KeptDiskReason = "stop_lease" | "stop_and_retain" | "held_lease";
+
+/** A run still holds the VM: an active run, or the open run window of a resumed lease (which never joins activeRunIds). */
+function runHoldsVm(record: VmRecord | null | undefined): boolean {
+  return !!record && (record.activeRunIds.length > 0 || record.sessions.some((entry) => !entry.endedAt));
+}
+
 export interface ManagerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
   warn(message: string, meta?: Record<string, unknown>): void;
@@ -678,7 +686,8 @@ export class BoatVmManager {
    * deleted instead: boat erases its disk and its snapshots, and the card's
    * next run starts a fresh VM (from templateSnapshot when set), which costs one
    * start. Returns false when the delete fails; the caller then stops the VM,
-   * because a running VM bills and keeps the token live.
+   * because a running VM bills and keeps the token live. Never called where
+   * the disk must be kept (logKeptDisk).
    */
   private async deleteInsteadOfStop(input: {
     api: BoatApiLike;
@@ -705,6 +714,32 @@ export class BoatVmManager {
       this.logger.warn("boat: could not forget the deleted VM in plugin state", { sandboxId: input.sandboxId, error: errorText(error) }),
     );
     return true;
+  }
+
+  /**
+   * The scrub failed, but the VM's disk holds work that Paperclip still needs,
+   * so the VM is stopped and its disk kept (never deleted):
+   * * `stop_lease` / `stop_and_retain`: Paperclip asked to keep the disk. It does
+   *   that to keep a run's unexported work (a failed run, a failed native
+   *   finalize), and its export-resume recovery needs a `stopped` receipt. The
+   *   SDK forbids a delete as the fallback of a stop-and-retain. The scrub is
+   *   most likely to fail exactly then: a wedged or out-of-memory VM.
+   * * `held_lease`: a run still holds the VM (an active run, or the open run
+   *   window of a resumed lease), so its work is not synced back yet.
+   * A VM set up by this version keeps the MCP config under /tmp, which boat
+   * never snapshots, so the stop snapshot does not get it; a VM set up before
+   * the link may keep the run JWT there. The owner accepted that residual risk.
+   */
+  private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep"; keep: KeptDiskReason; reason: string }): void {
+    const why = {
+      stop_lease: "Paperclip's StopLease must keep the disk",
+      stop_and_retain: "Paperclip asked to keep the disk (stop_and_retain)",
+      held_lease: "a run still holds the VM",
+    }[input.keep];
+    this.logger.error(
+      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. With .paperclip-runtime linked into /tmp the file is not on the saved disk; a VM set up before the link may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
+      { sandboxId: input.sandboxId, trigger: input.trigger, keep: input.keep, reason: input.reason },
+    );
   }
 
   // ---------------------------------------------------------- deadline/extend
@@ -1286,8 +1321,18 @@ export class BoatVmManager {
       // Before the stop (or delete): the stop snapshot must not keep the run JWT
       // that Paperclip left in the VM as the run's MCP config. A failed scrub
       // does not keep the VM running (that would bill and keep the token
-      // live), and does not stop it either: the VM is deleted instead.
+      // live), and does not stop it either: the VM is deleted instead. Except
+      // where the disk must be kept (logKeptDisk): StopLease, stop_and_retain,
+      // and a forced stop of a VM that another run on the card still holds.
       const deleting = snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain";
+      const keep: KeptDiskReason | null =
+        mode === "stop"
+          ? "stop_lease"
+          : params.resourceDisposition === "stop_and_retain"
+            ? "stop_and_retain"
+            : (snapshot?.othersActive ?? 0) > 0
+              ? "held_lease"
+              : null;
       const scrub = await this.scrubRuntimeSecrets({
         api,
         config,
@@ -1301,20 +1346,14 @@ export class BoatVmManager {
       this.inflight.delete(sandboxId);
       this.envDropsLogged.delete(sandboxId);
 
-      if (
-        !deleting &&
-        scrub.status === "failed" &&
-        (await this.deleteInsteadOfStop({
-          api,
-          config,
-          companyId: params.companyId,
-          sandboxId,
-          runId,
-          trigger: mode === "stop" ? "stop lease" : "release",
-          reason: `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`,
-        }))
-      ) {
-        return { providerLeaseId: sandboxId, state: "destroyed" };
+      if (!deleting && scrub.status === "failed") {
+        const trigger = mode === "stop" ? "stop lease" : "release";
+        const reason = `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`;
+        if (keep) {
+          this.logKeptDisk({ sandboxId, trigger, keep, reason });
+        } else if (await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId, runId, trigger, reason })) {
+          return { providerLeaseId: sandboxId, state: "destroyed" };
+        }
       }
 
       if (deleting) {
@@ -1895,14 +1934,18 @@ export class BoatVmManager {
             // Stop under the card lock, so a run that is acquiring this VM right now
             // finishes first; then re-check, because that run may have taken it.
             const outcome = await this.withCardLock(companyId, sandbox.id, record ? { vmKey: record.key } : null, async () => {
+              let held = false;
               if (record) {
                 const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
                 const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
                 if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return null;
                 if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return null;
+                held = runHoldsVm(fresh ?? record);
               }
               // Same as release: the stop snapshot must not keep the run JWT,
-              // so a VM whose scrub fails is deleted instead of stopped.
+              // so a VM whose scrub fails is deleted instead of stopped. Except
+              // a VM that a run still holds (a stale lease, or a resumed lease):
+              // its work is not synced back yet, so it is stopped, disk kept.
               const scrub = await this.scrubRuntimeSecrets({
                 api,
                 config,
@@ -1913,19 +1956,13 @@ export class BoatVmManager {
               });
               await this.ssh.closeSession(sandbox.id);
               this.clearExtendTimer(sandbox.id);
-              if (
-                scrub.status === "failed" &&
-                (await this.deleteInsteadOfStop({
-                  api,
-                  config,
-                  companyId,
-                  sandboxId: sandbox.id,
-                  runId: null,
-                  trigger: "sweep",
-                  reason: `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`,
-                }))
-              ) {
-                return "deleted" as const;
+              if (scrub.status === "failed") {
+                const reason = `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`;
+                if (held) {
+                  this.logKeptDisk({ sandboxId: sandbox.id, trigger: "sweep", keep: "held_lease", reason });
+                } else if (await this.deleteInsteadOfStop({ api, config, companyId, sandboxId: sandbox.id, runId: null, trigger: "sweep", reason })) {
+                  return "deleted" as const;
+                }
               }
               const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
               if (record) {

@@ -1039,7 +1039,19 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(next.metadata).toMatchObject({ startKind: "create" });
   });
 
-  it("StopLease deletes the VM too when the scrub fails, and its receipt says destroyed", async () => {
+  /** The VM was stopped with its disk kept after a failed scrub, and an error said why. */
+  const expectKeptDisk = (sandboxId: string, trigger: string, keep: string) => {
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+    expect(fake.callsOf("deleteSandbox").filter((call) => call.args.sandboxId === sandboxId)).toHaveLength(0);
+    const kept = harness.logs.filter((entry) => entry.message.includes("stopping the VM and keeping its disk although") && entry.meta?.sandboxId === sandboxId);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ level: "error", meta: { sandboxId, trigger, keep } });
+    expect(String(kept[0].meta?.reason)).toContain("1 left");
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it") && entry.meta?.sandboxId === sandboxId)).toBe(false);
+  };
+
+  it("StopLease and a stop_and_retain release stop the VM and keep its disk when the scrub fails: Paperclip keeps a run's unexported work there", async () => {
+    // StopLease, as export-resume recovery sends it: it needs a `stopped` receipt and must never fall through to a delete.
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
     failScrub();
@@ -1047,12 +1059,36 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
       ...base(),
       providerLeaseId: sandboxId,
       leaseMetadata: lease.metadata,
+      cancelActiveWork: true,
       resourceDisposition: "stop_and_retain",
     } as never);
-    expect(receipt).toEqual({ providerLeaseId: sandboxId, state: "destroyed" });
-    expect(fake.callsOf("stop")).toHaveLength(0);
-    expect(fake.boxes.has(sandboxId)).toBe(false);
-    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (stop lease)"))).toBe(true);
+    expect(receipt).toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expectKeptDisk(sandboxId, "stop lease", "stop_lease");
+
+    // A failed run's release (heartbeat sends stop_and_retain), on another card.
+    const other = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
+    await expect(release(other, { resourceDisposition: "stop_and_retain" })).resolves.toEqual({ providerLeaseId: other.providerLeaseId, state: "stopped" });
+    expectKeptDisk(other.providerLeaseId!, "release", "stop_and_retain");
+
+    // A per-run VM is deleted on an ordinary release, but stop_and_retain keeps it too.
+    const perRun = await acquire("run-3", { executionWorkspaceId: null, issueId: null });
+    expect(perRun.metadata).toMatchObject({ vmKeyKind: "run" });
+    await expect(release(perRun, { resourceDisposition: "stop_and_retain" })).resolves.toEqual({ providerLeaseId: perRun.providerLeaseId, state: "stopped" });
+    expectKeptDisk(perRun.providerLeaseId!, "release", "stop_and_retain");
+
+    // The kept disk resumes for the export, with its work in place.
+    ssh.handler = null;
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    expect(resumed.providerLeaseId).toBe(sandboxId);
+  });
+
+  it("a forced release of a VM that another run on the card still holds keeps its disk when the scrub fails", async () => {
+    const first = await acquire("run-1");
+    await acquire("run-2");
+    const sandboxId = first.providerLeaseId!;
+    failScrub();
+    await expect(release(first, { cancelActiveWork: true })).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expectKeptDisk(sandboxId, "release", "held_lease");
   });
 
   it("a scrub that cannot reach a running VM over SSH counts as failed: the VM is deleted, not stopped", async () => {
@@ -1074,18 +1110,56 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(harness.logs.find((entry) => entry.message.includes("could not delete the VM whose disk may keep the run JWT; stopping it instead"))?.level).toBe("error");
   });
 
-  it("the sweep deletes, instead of stopping, an idle VM whose scrub fails", async () => {
+  /** Paperclip ended every lease on the card without a confirmed stop (for example the host crashed in release). */
+  async function forgetLeasesInState() {
+    const doc = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
+      vms: Record<string, { activeRunIds: string[]; sessions: Array<{ endedAt: string | null }> }>;
+    };
+    for (const record of Object.values(doc.vms)) {
+      record.activeRunIds = [];
+      for (const entry of record.sessions) entry.endedAt ??= new Date(clock.t).toISOString();
+    }
+    await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, namespace: "boat-sandbox", stateKey: "vms" }, doc);
+  }
+
+  it("the sweep deletes, instead of stopping, an idle VM that no run holds (or an orphan) when its scrub fails", async () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
+    await forgetLeasesInState();
+    fake.addSandbox({ id: "bx_orphan", name: "paperclip-0123456789abcdef", state: "ready", updatedAt: new Date(clock.t) });
     failScrub();
-    clock.t += 61 * 60 * 1000;
+    clock.t += 16 * 60 * 1000;
     const report = await currentManager().sweep("test", { force: true });
-    expect(report.deleted).toEqual([sandboxId]);
+    expect(report.deleted.sort()).toEqual([sandboxId, "bx_orphan"].sort());
     expect(report.stopped).toEqual([]);
     expect(fake.callsOf("stop")).toHaveLength(0);
     expect(fake.boxes.has(sandboxId)).toBe(false);
     expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (sweep)"))).toBe(true);
     expect(harness.logs.some((entry) => entry.message.includes("sweep deleted an idle VM instead of stopping it (runtime_scrub_failed)"))).toBe(true);
+    expect(harness.logs.some((entry) => entry.message.includes("keeping its disk"))).toBe(false);
+  });
+
+  it("the sweep stops, and keeps the disk of, a VM that a run still holds when its scrub fails: a stale lease or a resumed lease", async () => {
+    // A held lease idle beyond staleLeaseMinutes (a wedged run): its work is not synced back yet.
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    failScrub();
+    clock.t += 61 * 60 * 1000;
+    let report = await currentManager().sweep("test", { force: true });
+    expect(report).toMatchObject({ stopped: [sandboxId], deleted: [] });
+    expectKeptDisk(sandboxId, "sweep", "held_lease");
+
+    // A resumed lease never joins activeRunIds; its open run window counts as held.
+    ssh.handler = null;
+    const other = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
+    await release(other, { resourceDisposition: "stop_and_retain" });
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: other.providerLeaseId, leaseMetadata: other.metadata } as never);
+    expect(fake.boxes.get(resumed.providerLeaseId!)?.state).toBe("ready");
+    failScrub();
+    clock.t += 16 * 60 * 1000;
+    report = await currentManager().sweep("test", { force: true });
+    expect(report).toMatchObject({ stopped: [other.providerLeaseId], deleted: [] });
+    expectKeptDisk(other.providerLeaseId!, "sweep", "held_lease");
   });
 
   it("links .paperclip-runtime into a fresh /tmp directory before each lease goes to Paperclip: acquire, resume, resumed lease and realize", async () => {
