@@ -196,6 +196,32 @@ export class BoatVmManager {
     }
   }
 
+  // Lock order: the card lock first, then `sandbox:<id>`. Acquire, release,
+  // destroy and the sweep's stop all hold the card lock, so a new run on a card
+  // never reads the VM as running while the previous run's release stops it.
+  private cardLockKey(companyId: string, vmKey: string): string {
+    return `card:${companyId}:${vmKey}`;
+  }
+
+  /** The card key of a sandbox: from the lease metadata, else from plugin state. */
+  private async vmKeyFor(companyId: string, sandboxId: string, leaseMetadata?: Record<string, unknown> | null): Promise<string | null> {
+    const fromLease = str(leaseMetadata?.vmKey);
+    if (fromLease) return fromLease;
+    const doc = await this.store.read(companyId).catch(() => null);
+    const record = doc ? findBySandboxId(doc, sandboxId) : null;
+    return record ? record.key.split("~")[0] : null;
+  }
+
+  private async withCardLock<T>(
+    companyId: string,
+    sandboxId: string,
+    leaseMetadata: Record<string, unknown> | null | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const vmKey = await this.vmKeyFor(companyId, sandboxId, leaseMetadata);
+    return vmKey ? await this.withLock(this.cardLockKey(companyId, vmKey), fn) : await fn();
+  }
+
   private opsApi(config: BoatDriverConfig): BoatApiLike {
     return boatApi({ apiKey: resolveApiKey(config), apiBase: config.apiBase });
   }
@@ -533,11 +559,16 @@ export class BoatVmManager {
     const api = this.opsApi(config);
     await this.store.rememberCompany(params.companyId);
 
-    return await this.withLock(`${params.companyId}:${key}`, async () => {
+    return await this.withLock(this.cardLockKey(params.companyId, key), async () => {
       const doc = await this.store.read(params.companyId);
       const existing = doc.vms[key] && doc.vms[key].status !== "deleted" ? doc.vms[key] : null;
       let sandbox = existing ? await this.getSandbox(api, existing.sandboxId) : null;
       if (!sandbox && kind !== "run") sandbox = await this.findSandboxByName(api, name);
+      if (sandbox?.state === "archiving") {
+        // A stop (auto-stop, the sweep, or a stop from another worker) is still
+        // saving the disk. boat refuses a resume until it ends, so wait for it.
+        sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
+      }
       if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
 
       const context = { vmKey: key, runId: params.runId, issueId: params.issueId ?? null };
@@ -836,6 +867,23 @@ export class BoatVmManager {
     });
   }
 
+  /** Poll a stopping VM until boat reports it stopped. Throws when the stop does not end in time. */
+  private async waitUntilStopped(api: BoatApiLike, sandbox: SandboxView, timeoutMs: number): Promise<SandboxView | null> {
+    const deadline = this.now() + timeoutMs;
+    let current: SandboxView | null = sandbox;
+    while (current && current.state === "archiving") {
+      if (this.now() >= deadline) {
+        throw new BoatProviderError(
+          "BOAT_STOP_PENDING",
+          `boat VM ${sandbox.id} is still stopping after ${Math.round(timeoutMs / 1000)} s; the run cannot resume it yet.`,
+        );
+      }
+      await this.sleep(STOP_POLL_INTERVAL_MS);
+      current = await this.getSandbox(api, sandbox.id);
+    }
+    return current;
+  }
+
   /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
   private async stopAndConfirm(api: BoatApiLike, sandboxId: string, timeoutMs: number): Promise<boolean> {
     try {
@@ -920,7 +968,7 @@ export class BoatVmManager {
     const runId = str(params.leaseMetadata?.runId);
     const api = this.opsApi(config);
 
-    return await this.withLock(`sandbox:${sandboxId}`, async () => {
+    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       const snapshot = await this.store.update(params.companyId, (doc) => {
         const record = findBySandboxId(doc, sandboxId);
         if (!record) return null;
@@ -975,7 +1023,7 @@ export class BoatVmManager {
       }
       this.logger.warn("boat: stop requested but not yet confirmed; the sweep will check it", { sandboxId });
       return undefined;
-    });
+    }));
   }
 
   private async recordRunEnd(config: BoatDriverConfig, companyId: string, sandboxId: string, runId: string): Promise<void> {
@@ -1033,7 +1081,7 @@ export class BoatVmManager {
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
     const api = this.opsApi(config);
-    return await this.withLock(`sandbox:${sandboxId}`, async () => {
+    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
@@ -1042,7 +1090,7 @@ export class BoatVmManager {
       await this.markDeleted(params.companyId, sandboxId);
       this.logger.info("boat: deleted VM (destroy lease) and forgot its card mapping", { sandboxId });
       return { providerLeaseId: sandboxId, state: "destroyed" };
-    });
+    }));
   }
 
   async realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
@@ -1394,26 +1442,31 @@ export class BoatVmManager {
             const hasActive = (record?.activeRunIds.length ?? 0) > 0;
             const shouldStop = hasActive ? idleMinutes > config.staleLeaseMinutes : idleMinutes > config.idleStopMinutes;
             if (!shouldStop) continue;
-            // Re-check right before stopping: a run may have taken the VM since the sweep began.
-            if (record) {
-              const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
-              const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
-              if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) continue;
-              if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) continue;
-            }
-            await this.ssh.closeSession(sandbox.id);
-            this.clearExtendTimer(sandbox.id);
-            const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
-            if (record) {
-              await this.store.update(companyId, (doc) => {
-                const current = findBySandboxId(doc, sandbox.id);
-                if (!current) return;
-                current.status = confirmed ? "stopped" : "stopping";
-                current.lastStoppedAt = this.nowIso();
-                current.activeRunIds = [];
-              });
-              await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
-            }
+            // Stop under the card lock, so a run that is acquiring this VM right now
+            // finishes first; then re-check, because that run may have taken it.
+            const stopped = await this.withCardLock(companyId, sandbox.id, record ? { vmKey: record.key } : null, async () => {
+              if (record) {
+                const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
+                const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
+                if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return false;
+                if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return false;
+              }
+              await this.ssh.closeSession(sandbox.id);
+              this.clearExtendTimer(sandbox.id);
+              const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
+              if (record) {
+                await this.store.update(companyId, (doc) => {
+                  const current = findBySandboxId(doc, sandbox.id);
+                  if (!current) return;
+                  current.status = confirmed ? "stopped" : "stopping";
+                  current.lastStoppedAt = this.nowIso();
+                  current.activeRunIds = [];
+                });
+                await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+              }
+              return true;
+            });
+            if (!stopped) continue;
             report.stopped.push(sandbox.id);
             this.logger.info(`boat: sweep stopped an idle VM after ${Math.round(idleMinutes)} min`, {
               sandboxId: sandbox.id,

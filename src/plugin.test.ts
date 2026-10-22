@@ -227,6 +227,45 @@ describe("AcquireLease", () => {
     expect(fake.callsOf("stop")).toHaveLength(1);
   });
 
+  it("a new run on the card waits for the previous run's release, then resumes the stopped VM", async () => {
+    const first = await acquire("run-1");
+    const releasing = release(first);
+    const acquiring = acquire("run-2");
+    await expect(releasing).resolves.toEqual({ providerLeaseId: first.providerLeaseId, state: "stopped" });
+    const second = await acquiring;
+    expect(second.providerLeaseId).toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+    expect(fake.boxes.get(first.providerLeaseId!)?.state).toBe("ready");
+    const order = fake.calls.filter((call) => call.method === "stop" || call.method === "resume").map((call) => call.method);
+    expect(order).toEqual(["stop", "resume"]);
+  });
+
+  it("waits for a stop that boat is still saving, then resumes", async () => {
+    const first = await acquire("run-1");
+    fake.stopMode = "never";
+    await expect(release(first)).resolves.toBeUndefined();
+    const box = fake.boxes.get(first.providerLeaseId!)!;
+    expect(box.state).toBe("archiving");
+    // boat finishes the save while the next run waits.
+    fake.failNext("get", () => null);
+    fake.failNext("get", () => {
+      box.state = "archived";
+      return null;
+    });
+    const second = await acquire("run-2");
+    expect(second.providerLeaseId).toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+  });
+
+  it("refuses to resume a VM whose stop does not end in time, without starting anything", async () => {
+    const first = await acquire("run-1");
+    fake.stopMode = "never";
+    await release(first);
+    await expect(acquire("run-2")).rejects.toMatchObject({ code: "BOAT_STOP_PENDING" });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+    expect(fake.callsOf("create")).toHaveLength(1);
+  });
+
   it("bounds the VM to a caller deadline and returns the provider expiry", async () => {
     const deadline = new Date(clock.t + 30 * 60 * 1000).toISOString();
     const lease = await acquire("run-1", { requestedExpiresAt: deadline });
@@ -325,7 +364,8 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
     const lease = await acquire("run-1");
     fake.stopMode = "never";
     await expect(release(lease)).resolves.toBeUndefined();
-    const second = await acquire("run-2");
+    // Another card: this one's VM is still stopping, which a new run waits for.
+    const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
     await expect(
       plugin.definition.onEnvironmentStopLease!({
         ...base(),
