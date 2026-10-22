@@ -39,12 +39,16 @@ import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
+  RUNTIME_LINK_RESULT_RE,
   RUNTIME_SECRET_SCRUB_RESULT_RE,
   SCRUB_BASHRC_ASCII_TOKEN,
   assertValidEnvKeys,
   buildLoginShellScript,
+  buildRemoteCommand,
   buildRemoteEnvFileContents,
+  linkRuntimeDirScript,
   newRemoteEnvStage,
+  newRuntimeTmpDir,
   removeRemoteEnvCommand,
   scrubRuntimeSecretsScript,
   shellQuote,
@@ -605,6 +609,102 @@ export class BoatVmManager {
     return outcome;
   }
 
+  /**
+   * Make `<root>/.paperclip-runtime` a symlink into a fresh 0700 directory
+   * under /tmp, or keep a valid one (shell.ts, linkRuntimeDirScript). boat
+   * never saves /tmp, so the run MCP config with the run JWT, and the other
+   * files Paperclip syncs there for each run, stay out of the per-minute and
+   * stop snapshots. Runs before Paperclip syncs anything: at acquire, at a
+   * resumed lease and at realize. Returns the /tmp directory; throws
+   * BOAT_RUNTIME_DIR_FAILED.
+   */
+  private async linkRuntimeDir(session: SshSession, root: string): Promise<string> {
+    const fresh = newRuntimeTmpDir();
+    // onVm: the script ran on the VM and failed there (not ssh's 255 or a timeout), so the disk is in a state it cannot fix.
+    const fail = (detail: string, onVm: boolean) =>
+      new BoatProviderError(
+        "BOAT_RUNTIME_DIR_FAILED",
+        `could not create ${root} with its .paperclip-runtime linked into /tmp on boat VM ${session.sandboxId}, so Paperclip's run MCP config (run JWT) would land on the saved disk: ${detail}`,
+        { onVm },
+      );
+    let result: Awaited<ReturnType<SshManager["run"]>>;
+    try {
+      result = await this.ssh.run(session, `sh -c ${shellQuote(linkRuntimeDirScript(root, fresh))}`, { timeoutMs: 60_000 });
+    } catch (error) {
+      throw fail(errorText(error).slice(0, 300), false);
+    }
+    const line = RUNTIME_LINK_RESULT_RE.exec(result.stdout);
+    if (result.timedOut || result.exitCode !== 0 || !line || (line[1] === "linked" && line[2] !== fresh)) {
+      const onVm = !result.timedOut && result.exitCode != null && result.exitCode !== 255;
+      throw fail(result.timedOut ? "timed out" : `exit ${result.exitCode}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`, onVm);
+    }
+    if (line[1] === "linked") {
+      this.logger.info("boat: linked Paperclip's runtime directory on the VM into /tmp, which boat never snapshots", {
+        sandboxId: session.sandboxId,
+        root,
+        runtimeDir: line[2],
+      });
+    }
+    return line[2];
+  }
+
+  /**
+   * After a resume for a command (auto-stop or the sweep stopped the VM
+   * mid-lease), /tmp is empty and the links dangle; relink every known root,
+   * so Paperclip's next sync into `.paperclip-runtime` (the sync-back at the
+   * run's end) lands in /tmp again. Best effort: logs a warning.
+   */
+  private async relinkRuntimeDirs(config: BoatDriverConfig, companyId: string, sandboxId: string, session: SshSession): Promise<void> {
+    const record = await this.store
+      .read(companyId)
+      .then((doc) => findBySandboxId(doc, sandboxId))
+      .catch(() => null);
+    const roots = new Set(this.runtimeRoots(config, sandboxId, null, record).map((root) => root.trim().replace(/\/+$/, "")));
+    for (const root of roots) {
+      if (!root.startsWith("/") || root.length < 2) continue;
+      try {
+        await this.linkRuntimeDir(session, root);
+      } catch (error) {
+        this.logger.warn("boat: could not relink Paperclip's runtime directory into /tmp after a resume", { sandboxId, root, error: errorText(error) });
+      }
+    }
+  }
+
+  /**
+   * A scrub that failed means the VM disk may still hold the run JWT, and a
+   * stop would save it in the stop snapshot (kept 14 days). So the VM is
+   * deleted instead: boat erases its disk and its snapshots, and the card's
+   * next run starts a fresh VM (from templateSnapshot when set), which costs one
+   * start. Returns false when the delete fails; the caller then stops the VM,
+   * because a running VM bills and keeps the token live.
+   */
+  private async deleteInsteadOfStop(input: {
+    api: BoatApiLike;
+    config: BoatDriverConfig;
+    companyId: string;
+    sandboxId: string;
+    runId: string | null;
+    trigger: "release" | "stop lease" | "sweep" | "failed start";
+    reason: string;
+  }): Promise<boolean> {
+    const meta = { sandboxId: input.sandboxId, trigger: input.trigger, reason: input.reason };
+    this.logger.warn(
+      `boat: deleting the VM instead of stopping it (${input.trigger}): ${input.reason}; a stop would keep its disk, run JWT included, in boat's stop snapshot for 14 days. The card's next run starts a fresh VM.`,
+      meta,
+    );
+    await this.recordStopUsage(input.config, input.companyId, input.sandboxId, input.runId).catch(() => undefined);
+    try {
+      await this.deleteSandbox(input.api, input.sandboxId);
+    } catch (error) {
+      this.logger.error("boat: could not delete the VM whose disk may keep the run JWT; stopping it instead", { ...meta, error: errorText(error) });
+      return false;
+    }
+    await this.markDeleted(input.companyId, input.sandboxId).catch((error) =>
+      this.logger.warn("boat: could not forget the deleted VM in plugin state", { sandboxId: input.sandboxId, error: errorText(error) }),
+    );
+    return true;
+  }
+
   // ---------------------------------------------------------- deadline/extend
 
   private noteDeadline(sandboxId: string, archiveAfter: string | null): void {
@@ -791,6 +891,8 @@ export class BoatVmManager {
         if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
         const session = this.ssh.getSession(sandboxId) ?? (await this.openSsh(api, config, sandboxId));
         const remote = await this.prepareRemote(config, session);
+        // Before the lease goes back to Paperclip, which then syncs the run's runtime assets (the MCP config with the run JWT among them).
+        const runtimeDir = await this.linkRuntimeDir(session, remote.remoteCwd);
         if (startKind! === "reuse_running") await this.maybeExtend(config, sandboxId);
         await this.store.update(params.companyId, (state) => {
           const record = state.vms[key];
@@ -813,6 +915,7 @@ export class BoatVmManager {
             runId: params.runId,
             startKind: startKind!,
             remoteCwd: remote.remoteCwd,
+            runtimeDir,
             shellCommand: remote.shellCommand,
             tunnel: session.tunnel,
           },
@@ -823,39 +926,63 @@ export class BoatVmManager {
         }
         return lease;
       } catch (error) {
+        // The VM's record as stored, for the workspace roots earlier runs (and other workers) recorded on it.
+        let stored: VmRecord | null = null;
         if (sandboxId) {
-          await this.store
+          stored = await this.store
             .update(params.companyId, (state) => {
               const record = state.vms[key];
-              if (!record) return;
-              record.activeRunIds = record.activeRunIds.filter((id) => id !== params.runId);
-              const open = record.sessions.find((entry) => entry.runId === params.runId && !entry.endedAt);
-              if (open) open.endedAt = this.nowIso();
+              if (record) {
+                record.activeRunIds = record.activeRunIds.filter((id) => id !== params.runId);
+                const open = record.sessions.find((entry) => entry.runId === params.runId && !entry.endedAt);
+                if (open) open.endedAt = this.nowIso();
+              }
+              const own = findBySandboxId(state, sandboxId);
+              return own ? structuredClone(own) : null;
             })
-            .catch(() => undefined);
+            .catch(() => null);
         }
         if (startedNew && sandboxId) {
           // Never leave a VM billing after a failed start. A resumed disk can
-          // still hold an earlier run's MCP config, so scrub first when SSH works.
-          await this.scrubRuntimeSecrets({
+          // still hold an earlier run's MCP config, so scrub first when SSH
+          // works, in every root the VM's record knows of.
+          const scrub = await this.scrubRuntimeSecrets({
             api,
             config,
             sandboxId,
-            roots: this.runtimeRoots(config, sandboxId, null, null),
+            roots: this.runtimeRoots(config, sandboxId, null, stored),
             before: "stop",
             connect: false,
           });
           await this.ssh.closeSession(sandboxId).catch(() => undefined);
-          await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
-          await this.store
-            .update(params.companyId, (state) => {
-              const record = state.vms[key];
-              if (record && record.sandboxId === sandboxId) {
-                record.status = "stopped";
-                record.lastStoppedAt = this.nowIso();
-              }
-            })
-            .catch(() => undefined);
+          // A link that failed on the VM fails again at every resume of this disk; a fresh VM does not.
+          const linkFailed = error instanceof BoatProviderError && error.code === "BOAT_RUNTIME_DIR_FAILED" && error.details.onVm === true;
+          const deleted =
+            (scrub.status === "failed" || linkFailed) &&
+            (await this.deleteInsteadOfStop({
+              api,
+              config,
+              companyId: params.companyId,
+              sandboxId,
+              runId: params.runId,
+              trigger: "failed start",
+              reason:
+                scrub.status === "failed"
+                  ? `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`
+                  : "its .paperclip-runtime could not be linked into /tmp",
+            }));
+          if (!deleted) {
+            await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
+            await this.store
+              .update(params.companyId, (state) => {
+                const record = state.vms[key];
+                if (record && record.sandboxId === sandboxId) {
+                  record.status = "stopped";
+                  record.lastStoppedAt = this.nowIso();
+                }
+              })
+              .catch(() => undefined);
+          }
         }
         throw error;
       }
@@ -945,6 +1072,9 @@ export class BoatVmManager {
     const wasUp = UP_STATES.has(sandbox.state);
     const session = await this.liveSession(config, params.companyId, sandbox.id);
     const remote = await this.prepareRemote(config, session);
+    const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
+    // Before Paperclip syncs this run's runtime assets: a resume emptied /tmp, so the old link dangles.
+    const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
     // Paperclip resumes a reusable lease without naming the new run, so record
     // the run window under a synthetic id: it gives per-run cost accounting.
     // It is not added to activeRunIds, so release still stops the VM.
@@ -954,7 +1084,7 @@ export class BoatVmManager {
         if (!record) return;
         const now = this.nowIso();
         record.lastActivityAt = now;
-        record.remoteRoots = mergeRemoteRoot(record.remoteRoots, str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd);
+        record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remoteCwd);
         record.sessions.push({
           runId: `resumed-lease:${now}`,
           agentId: null,
@@ -972,7 +1102,8 @@ export class BoatVmManager {
         ...(params.leaseMetadata ?? {}),
         provider: "boat",
         sandboxId: sandbox.id,
-        remoteCwd: str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd,
+        remoteCwd,
+        runtimeDir,
         shellCommand: remote.shellCommand,
         tunnel: session.tunnel,
         resumedLease: true,
@@ -992,7 +1123,8 @@ export class BoatVmManager {
       if (!sandbox || sandbox.dataExpiredAt || sandbox.state === "cancelled") {
         throw new BoatProviderError("BOAT_VM_GONE", `boat VM ${sandboxId} no longer exists; the run must acquire a new lease.`);
       }
-      if (!UP_STATES.has(sandbox.state)) {
+      const resumed = !UP_STATES.has(sandbox.state);
+      if (resumed) {
         await this.guardBudget(config, { sandboxId, reason: "resume_for_execute" });
         const response = await this.startCall(
           "resume",
@@ -1028,6 +1160,7 @@ export class BoatVmManager {
       // This path (a resume for a command, or a new worker) skips acquire's setup step, and a resume
       // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
       await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+      if (resumed) await this.relinkRuntimeDirs(config, companyId, sandboxId, session);
       return session;
     });
   }
@@ -1150,9 +1283,10 @@ export class BoatVmManager {
 
       // Before the stop (or delete): the stop snapshot must not keep the run JWT
       // that Paperclip left in the VM as the run's MCP config. A failed scrub
-      // does not keep the VM running: that would bill and keep the token live.
+      // does not keep the VM running (that would bill and keep the token
+      // live), and does not stop it either: the VM is deleted instead.
       const deleting = snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain";
-      await this.scrubRuntimeSecrets({
+      const scrub = await this.scrubRuntimeSecrets({
         api,
         config,
         sandboxId,
@@ -1164,6 +1298,22 @@ export class BoatVmManager {
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
       this.envDropsLogged.delete(sandboxId);
+
+      if (
+        !deleting &&
+        scrub.status === "failed" &&
+        (await this.deleteInsteadOfStop({
+          api,
+          config,
+          companyId: params.companyId,
+          sandboxId,
+          runId,
+          trigger: mode === "stop" ? "stop lease" : "release",
+          reason: `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`,
+        }))
+      ) {
+        return { providerLeaseId: sandboxId, state: "destroyed" };
+      }
 
       if (deleting) {
         // A run-keyed VM can never be reused, so there is nothing to keep: delete it.
@@ -1295,15 +1445,11 @@ export class BoatVmManager {
     const sandboxId = params.lease.providerLeaseId;
     if (sandboxId) {
       const session = await this.liveSession(config, params.companyId, sandboxId);
-      const result = await this.ssh.run(session, `sh -c ${shellQuote(`mkdir -p ${shellQuote(remoteCwd)}`)}`, { timeoutMs: 60_000 });
-      if (result.timedOut || result.exitCode !== 0) {
-        throw new BoatProviderError(
-          "BOAT_SSH_FAILED",
-          `could not create the workspace ${remoteCwd} on boat VM ${sandboxId}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`,
-        );
-      }
+      // mkdir -p the workspace, and link its .paperclip-runtime into /tmp (kept when acquire already did) before Paperclip syncs into it.
+      const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
       // Paperclip puts its runtime assets (the run MCP config among them) under this root.
       await this.rememberRemoteRoot(params.companyId, sandboxId, remoteCwd);
+      return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd, runtimeDir } };
     }
     return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd } };
   }
@@ -1410,11 +1556,11 @@ export class BoatVmManager {
       }
 
       const script = buildLoginShellScript({ command: params.command, args: params.args ?? [], cwd, remoteEnv });
-      // sshd runs this through the user's login shell (`$SHELL -c '<this>'`).
-      // `exec` makes that shell replace itself, and the script execs the
-      // payload, so the payload's parent is sshd: no shell started with boat's
-      // ASCII_TOKEN in its environment stays alive above the agent.
-      const result = await this.ssh.run(session, `exec sh -c ${shellQuote(script)}`, { stdin: params.stdin, timeoutMs });
+      // sshd runs this through the user's login shell (`$SHELL -c '<this>'`),
+      // which execs `env -u ASCII_TOKEN -u BOAT_ID sh -c <script>`: the shell
+      // above the payload never had boat's credentials in its environment,
+      // and it exits with the payload's status (128+n for a signal, not 255).
+      const result = await this.ssh.run(session, buildRemoteCommand(script), { stdin: params.stdin, timeoutMs });
       let stderr = result.stderr;
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
@@ -1746,15 +1892,16 @@ export class BoatVmManager {
             if (!shouldStop) continue;
             // Stop under the card lock, so a run that is acquiring this VM right now
             // finishes first; then re-check, because that run may have taken it.
-            const stopped = await this.withCardLock(companyId, sandbox.id, record ? { vmKey: record.key } : null, async () => {
+            const outcome = await this.withCardLock(companyId, sandbox.id, record ? { vmKey: record.key } : null, async () => {
               if (record) {
                 const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
                 const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
-                if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return false;
-                if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return false;
+                if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return null;
+                if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return null;
               }
-              // Same as release: the stop snapshot must not keep the run JWT.
-              await this.scrubRuntimeSecrets({
+              // Same as release: the stop snapshot must not keep the run JWT,
+              // so a VM whose scrub fails is deleted instead of stopped.
+              const scrub = await this.scrubRuntimeSecrets({
                 api,
                 config,
                 sandboxId: sandbox.id,
@@ -1764,6 +1911,20 @@ export class BoatVmManager {
               });
               await this.ssh.closeSession(sandbox.id);
               this.clearExtendTimer(sandbox.id);
+              if (
+                scrub.status === "failed" &&
+                (await this.deleteInsteadOfStop({
+                  api,
+                  config,
+                  companyId,
+                  sandboxId: sandbox.id,
+                  runId: null,
+                  trigger: "sweep",
+                  reason: `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`,
+                }))
+              ) {
+                return "deleted" as const;
+              }
               const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
               if (record) {
                 await this.store.update(companyId, (doc) => {
@@ -1775,9 +1936,14 @@ export class BoatVmManager {
                 });
                 await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
               }
-              return true;
+              return "stopped" as const;
             });
-            if (!stopped) continue;
+            if (!outcome) continue;
+            if (outcome === "deleted") {
+              report.deleted.push(sandbox.id);
+              this.logger.info("boat: sweep deleted an idle VM instead of stopping it (runtime_scrub_failed)", { sandboxId: sandbox.id, orphan: !record, reason });
+              continue;
+            }
             report.stopped.push(sandbox.id);
             this.logger.info(`boat: sweep stopped an idle VM after ${Math.round(idleMinutes)} min`, {
               sandboxId: sandbox.id,

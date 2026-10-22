@@ -108,16 +108,29 @@ const SECRET_NAME_RE =
   /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PRIVATE_?KEY|API_?KEY|ACCESS_?KEY|CREDENTIAL|COOKIE|(?:^|_)KEY$|SIGNING|HMAC|SALT|_AUTH$|_PAT$/i;
 const TOKEN_BUDGET_NAME_RE = /TOKENS$/i;
 const WHOLE_NUMBER_RE = /^\d+$/;
-// A JWT anywhere in the value: a JSON header and a JSON payload (both base64url
-// of `{"`), as in "Bearer eyJ...", a JSON blob or an MCP header. The anchored
-// form also catches a whole-value JWT whose payload does not start with `{"`.
-const JWT_IN_TEXT_RE = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./;
+// Every value pattern below runs in time linear in the value: the host passes
+// values of any size, and a pattern that backtracks over a long run (an
+// unanchored `X+\.` tried from every offset of `eyJeyJeyJ...` or `aaaa...`)
+// takes seconds on a few hundred KB. A JWT anywhere in the value is found by a
+// scan (containsJwtInText); the anchored form also catches a whole-value JWT
+// whose payload does not start with `{"`. Anchored at the start, it tries one
+// offset only, and its runs are split by literal dots, so it backtracks
+// over each run at most once.
 const JWT_WHOLE_VALUE_RE = /^(?:[Bb]earer\s+)?eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 const DATABASE_SCHEME_RE =
   /^(?:postgres(?:ql)?|mysql2?|mariadb|mongodb(?:\+srv)?|rediss?|libsql|sqlserver|mssql|cockroachdb|clickhouse|amqps?|prisma(?:\+postgres)?)(?:\+[a-z0-9]+)?:$/i;
 const DATABASE_NAME_RE = /(?:^|_)(?:DATABASE|DB)(?:_|$)/i;
 const URL_NAME_RE = /(?:_URL|_URI|_DSN|^DSN)$/i;
-const URL_IN_TEXT_RE = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/g;
+// A URL in the text: `scheme://` and what follows up to a space, quote or `<>`.
+// Same matches as /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/g, but a match may
+// only start where a run of scheme characters starts (the lookbehind), so a
+// long run with no `://` after it is walked once, not once per offset. The run
+// may begin with digits or `+.-`; the URL (group 1) starts at its first letter,
+// where the old pattern started too.
+const URL_IN_TEXT_RE = /(?<![A-Za-z0-9+.-])[0-9+.-]*([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+)/g;
+// `scheme://user:password@` in a URL that `new URL` cannot parse. The user part
+// stops at the first `:`, so no split of a long `::::` run is tried twice.
+const URL_PASSWORD_FALLBACK_RE = /:\/\/[^/@\s:]*:[^/@\s]+@/;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ALLOWLIST_ENTRY_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:_\*)?$/;
 
@@ -200,20 +213,25 @@ interface UrlScan {
   totalRemote: number;
 }
 
+/** Every `scheme://...` URL in the text, in order (URL_IN_TEXT_RE). */
+export function* urlsInText(value: string): Generator<string> {
+  for (const match of value.matchAll(URL_IN_TEXT_RE)) yield match[1];
+}
+
 function scanUrls(value: string): UrlScan {
   const scan: UrlScan = { sensitive: 0, remote: 0, total: 0, totalRemote: 0 };
-  for (const match of value.matchAll(URL_IN_TEXT_RE)) {
+  for (const text of urlsInText(value)) {
     scan.total += 1;
     let url: URL | null = null;
     try {
-      url = new URL(match[0]);
+      url = new URL(text);
     } catch {
       url = null;
     }
     const local = url != null && isVmLocalHost(url.hostname);
     if (!local) scan.totalRemote += 1;
-    const database = DATABASE_SCHEME_RE.test(match[0].slice(0, match[0].indexOf(":") + 1));
-    const password = url != null ? url.password.length > 0 : /:\/\/[^/@\s]*:[^/@\s]+@/.test(match[0]);
+    const database = DATABASE_SCHEME_RE.test(text.slice(0, text.indexOf(":") + 1));
+    const password = url != null ? url.password.length > 0 : URL_PASSWORD_FALLBACK_RE.test(text);
     if (database || password) {
       scan.sensitive += 1;
       if (!local) scan.remote += 1;
@@ -222,9 +240,46 @@ function scanUrls(value: string): UrlScan {
   return scan;
 }
 
+function isBase64UrlChar(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 45 || code === 95;
+}
+
+/**
+ * Is there a JWT in the text: a JSON header and a JSON payload (both base64url
+ * of `{"`), as in "Bearer eyJ...", a JSON blob or an MCP header? The same
+ * matches as /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./, in one pass: the text
+ * is cut into maximal base64url runs, and a JWT is a run that holds `eyJ` with
+ * at least one character after it, then `.`, then a run that starts with `eyJ`
+ * and has at least one more character, then `.`.
+ */
+export function containsJwtInText(value: string): boolean {
+  const length = value.length;
+  // The run that ended at the `.` just before the current run can start a JWT.
+  let previousRunOpensJwt = false;
+  let index = 0;
+  while (index <= length) {
+    const start = index;
+    // The first `eyJ` in this run (offset from the run start), or -1.
+    let eyj = -1;
+    while (index < length && isBase64UrlChar(value.charCodeAt(index))) {
+      if (eyj < 0 && index - start >= 2 && value.charCodeAt(index) === 74 && value.charCodeAt(index - 1) === 121 && value.charCodeAt(index - 2) === 101) {
+        eyj = index - 2 - start;
+      }
+      index += 1;
+    }
+    const runLength = index - start;
+    const endsAtDot = index < length && value.charCodeAt(index) === 46;
+    if (previousRunOpensJwt && endsAtDot && eyj === 0 && runLength >= 4) return true;
+    previousRunOpensJwt = endsAtDot && eyj >= 0 && eyj + 3 < runLength;
+    // Step over the one character that ended the run (a `.` or any other).
+    index += 1;
+  }
+  return false;
+}
+
 /** Does the value carry a JWT anywhere (bare, behind "Bearer ", or inside JSON or a header)? */
 export function containsJwt(value: string): boolean {
-  return JWT_IN_TEXT_RE.test(value) || JWT_WHOLE_VALUE_RE.test(value.trim());
+  return containsJwtInText(value) || JWT_WHOLE_VALUE_RE.test(value.trim());
 }
 
 /** A provider-credential family (PLANETSCALE_, GITHUB_, ...) that never reaches a VM. */

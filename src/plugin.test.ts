@@ -289,12 +289,58 @@ describe("AcquireLease", () => {
     expect(lease.expiresAt).toBe(deadline);
   });
 
-  it("stops a VM it started when SSH setup fails, so nothing keeps billing", async () => {
+  it("deletes, not stops, a VM it started when SSH setup fails and the disk cannot be checked, so nothing keeps billing or keeps a run JWT", async () => {
     ssh.handler = () => ({ code: 1, stderr: "permission denied" });
     await expect(acquire("run-1")).rejects.toMatchObject({ code: "BOAT_SSH_FAILED" });
-    const [sandbox] = [...fake.boxes.values()];
-    expect(sandbox.state).toBe("archived");
+    expect(fake.boxes.size).toBe(0);
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    const why = harness.logs.find((entry) => entry.message.includes("deleting the VM instead of stopping it (failed start)"));
+    expect(why).toMatchObject({ level: "warn", meta: { trigger: "failed start" } });
+    expect(String(why?.meta?.reason)).toContain("could not be removed");
+  });
+
+  it("a failed start scrubs the VM in every workspace root its stored record names (a new worker knows no other), then stops it", async () => {
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    // A realized root that only plugin state remembers.
+    await plugin.definition.onEnvironmentRealizeWorkspace!({
+      ...base(),
+      lease: { providerLeaseId: sandboxId, metadata: { ...first.metadata, remoteCwd: undefined } },
+      workspace: { localPath: "/tmp/x", remotePath: "/srv/ws-other" },
+    } as never);
+    await release(first);
+    await plugin.definition.onShutdown?.();
+    await plugin.definition.setup(harness.ctx as never);
+    ssh.runtimeSecrets.set(sandboxId, 1); // an earlier run's MCP config, left on the stopped disk
+    const timeline: string[] = [];
+    fake.timeline = timeline;
+    ssh.timeline = timeline;
+    ssh.handler = (remoteCommand) => (remoteCommand.includes('"$d" "$s"') ? { code: 1, stderr: "mkdir: Permission denied" } : undefined);
+    await expect(acquire("run-2")).rejects.toMatchObject({ code: "BOAT_SSH_FAILED" });
+    expect(fake.callsOf("resume")).toHaveLength(1);
+    const scrubAt = timeline.indexOf(`ssh:scrub:${sandboxId}`);
+    expect(scrubAt).toBeGreaterThan(timeline.indexOf("resume"));
+    expect(timeline.indexOf("stop", scrubAt)).toBeGreaterThan(scrubAt);
+    expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
+    expect(unquoteShDashC(ssh.scrubs(sandboxId).at(-1)!.args.at(-1)!)).toContain("'/srv/ws-other'");
+    // The scrub verified the disk, so the card keeps its VM, stopped.
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+  });
+
+  it("deletes a VM it started when the VM refuses to link .paperclip-runtime into /tmp, but only stops it when ssh lost that command in transit", async () => {
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes("paperclip-boat-runtime") ? { code: 1, stderr: "rm: cannot remove '.paperclip-runtime/claude': Permission denied" } : undefined;
+    await expect(acquire("run-1")).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
+    // That disk would fail the same way at every resume; a fresh VM does not.
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (failed start)") && String(entry.meta?.reason).includes("linked into /tmp"))).toBe(true);
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-runtime") ? { code: 255, stderr: "Connection reset by peer" } : undefined);
+    await expect(acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" })).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
     expect(fake.callsOf("stop")).toHaveLength(1);
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
   });
 });
 
@@ -415,9 +461,12 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
   });
 });
 
-/** The script inside `[exec ]sh -c '<script>'`, undoing shellQuote. */
+/** How Execute sends a payload script: the login shell execs env, which drops boat's credentials and execs sh. */
+const PAYLOAD_PREFIX = "exec env -u ASCII_TOKEN -u BOAT_ID sh -c ";
+
+/** The script inside `sh -c '<script>'` or `exec env -u ... sh -c '<script>'`, undoing shellQuote. */
 function unquoteShDashC(remoteCommand: string): string {
-  const quoted = remoteCommand.replace(/^(?:exec )?sh -c /, "");
+  const quoted = remoteCommand.replace(/^(?:exec env -u ASCII_TOKEN -u BOAT_ID )?sh -c /, "");
   expect(quoted.startsWith("'") && quoted.endsWith("'")).toBe(true);
   return quoted.slice(1, -1).replaceAll(`'"'"'`, "'");
 }
@@ -456,7 +505,8 @@ describe("Execute", () => {
     expect(envFile.startsWith("/home/")).toBe(false);
 
     // The script sources the file, removes it, and only then runs the payload.
-    const run = calls.find((call) => call.args.at(-1)!.startsWith("exec sh -c ") && call.args.at(-1)!.includes("claude"));
+    const run = calls.find((call) => call.args.at(-1)!.startsWith(PAYLOAD_PREFIX) && call.args.at(-1)!.includes("claude"));
+    expect(run).toBeDefined();
     const script = unquoteShDashC(run!.args.at(-1)!);
     expect(script).not.toContain(".paperclip-boat-env-");
     const cdAt = script.indexOf(`cd '${cwd}'`);
@@ -469,9 +519,12 @@ describe("Execute", () => {
     expect(firstRemoveAt).toBeGreaterThan(sourceAt);
     expect(payloadAt).toBeGreaterThan(firstRemoveAt);
     expect(fallbackRemoveAt).toBeGreaterThan(payloadAt);
-    // The login shell and the shell that sourced the env both exec: no parent shell keeps ASCII_TOKEN in its environ.
-    expect(run!.args.at(-1)!.startsWith("exec sh -c '")).toBe(true);
-    expect(script).toContain("&& exec 'claude' '-p' 'hello';");
+    // The login shell execs env, which drops boat's credentials and execs the sh that runs the
+    // script: the payload's parent shell never had ASCII_TOKEN in its environ, and it waits for the
+    // payload, so the payload's exit status (128+n for a signal) reaches ssh.
+    expect(run!.args.at(-1)!.startsWith(`${PAYLOAD_PREFIX}'`)).toBe(true);
+    expect(script).toContain("&& 'claude' '-p' 'hello'; rc=$?;");
+    expect(script).not.toContain("exec 'claude'");
     expect(script).toContain(`rmdir '${envDir}'`);
     expect(run!.args).toEqual(expect.arrayContaining(["ControlMaster=no", "StrictHostKeyChecking=yes"]));
   });
@@ -494,7 +547,7 @@ describe("Execute", () => {
   it("removes the staged env file itself when ssh fails before the script could, and the VM is still up", async () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
-    ssh.handler = (remoteCommand) => (remoteCommand.startsWith("exec sh -c ") ? { code: 255, stderr: "Connection reset" } : undefined);
+    ssh.handler = (remoteCommand) => (remoteCommand.startsWith(PAYLOAD_PREFIX) ? { code: 255, stderr: "Connection reset" } : undefined);
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(255);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
@@ -510,7 +563,7 @@ describe("Execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
-    expect(commands.some((command) => command.startsWith("exec sh -c "))).toBe(false);
+    expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
     expect(commands.at(-1)).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
   });
 
@@ -617,8 +670,10 @@ describe("run env allowlist (incident TOG-37420)", () => {
     } as never);
     const calls = ssh.spawned.slice(before);
     const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
-    const run = calls.find((call) => call.args.at(-1)!.startsWith("exec sh -c ") && call.args.at(-1)!.includes("'claude'"));
-    return { result, staged: staging?.stdin ?? "", script: run ? unquoteShDashC(run.args.at(-1)!) : "" };
+    const run = calls.find((call) => call.args.at(-1)!.startsWith(PAYLOAD_PREFIX) && call.args.at(-1)!.includes("'claude'"));
+    // Every caller checks what the script and argv do not contain, so a missed payload must fail here.
+    expect(run).toBeDefined();
+    return { result, staged: staging?.stdin ?? "", script: unquoteShDashC(run!.args.at(-1)!) };
   }
 
   it("delivers none of the project's or the server's secrets to the VM, in the staged env file or in argv", async () => {
@@ -684,7 +739,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
     const before = ssh.spawned.length;
     await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "claude", args: ["-v"] } as never);
     const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("'claude'"))!.args.at(-1)!);
-    expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && exec 'claude' '-v'$/);
+    expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && 'claude' '-v'; rc=\$\?; exit \$rc$/);
   });
 
   it("removes boat's ASCII_TOKEN line from ~/.bashrc when it sets up a VM and after resuming one for a command", async () => {
@@ -957,14 +1012,133 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
   });
 
-  it("still stops the VM when the scrub fails, and logs an error (a running VM would bill and keep the token live)", async () => {
+  const failScrub = () => {
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n", stderr: "rm: Permission denied" } : undefined;
+  };
+
+  it("release deletes the VM instead of stopping it when the scrub fails, logs why, and the card's next run gets a fresh VM", async () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
-    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n", stderr: "rm: Permission denied" } : undefined);
-    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    failScrub();
+    timeline.length = 0;
+    // Not running it would bill and keep the token live; stopping it would save the token in the stop snapshot.
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "destroyed" });
+    expect(scrubbedBefore(sandboxId, "deleteSandbox")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    expect(fake.boxes.has(sandboxId)).toBe(false);
     const failed = harness.logs.find((entry) => entry.message.includes("could not remove Paperclip's run MCP config"));
     expect(failed).toMatchObject({ level: "error", meta: { sandboxId, before: "stop" } });
     expect(String(failed?.meta?.detail)).toContain("1 left");
+    const why = harness.logs.find((entry) => entry.message.includes("deleting the VM instead of stopping it (release)"));
+    expect(why).toMatchObject({ level: "warn", meta: { sandboxId, trigger: "release" } });
+    expect(String(why?.meta?.reason)).toContain("1 left");
+    ssh.handler = null;
+    const next = await acquire("run-2");
+    expect(next.providerLeaseId).not.toBe(sandboxId);
+    expect(next.metadata).toMatchObject({ startKind: "create" });
+  });
+
+  it("StopLease deletes the VM too when the scrub fails, and its receipt says destroyed", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    failScrub();
+    const receipt = await plugin.definition.onEnvironmentStopLease!({
+      ...base(),
+      providerLeaseId: sandboxId,
+      leaseMetadata: lease.metadata,
+      resourceDisposition: "stop_and_retain",
+    } as never);
+    expect(receipt).toEqual({ providerLeaseId: sandboxId, state: "destroyed" });
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    expect(fake.boxes.has(sandboxId)).toBe(false);
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (stop lease)"))).toBe(true);
+  });
+
+  it("a scrub that cannot reach a running VM over SSH counts as failed: the VM is deleted, not stopped", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 255, stderr: "kex_exchange_identification: Connection closed" } : undefined);
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "destroyed" });
+    expect(fake.callsOf("stop")).toHaveLength(0);
+  });
+
+  it("stops the VM after all when the delete that replaces the stop fails (a running VM bills and keeps the token live)", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    failScrub();
+    fake.failNext("deleteSandbox", responseError(500, { code: "http_500" }));
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+    expect(harness.logs.find((entry) => entry.message.includes("could not delete the VM whose disk may keep the run JWT; stopping it instead"))?.level).toBe("error");
+  });
+
+  it("the sweep deletes, instead of stopping, an idle VM whose scrub fails", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    failScrub();
+    clock.t += 61 * 60 * 1000;
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report.deleted).toEqual([sandboxId]);
+    expect(report.stopped).toEqual([]);
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    expect(fake.boxes.has(sandboxId)).toBe(false);
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (sweep)"))).toBe(true);
+    expect(harness.logs.some((entry) => entry.message.includes("sweep deleted an idle VM instead of stopping it (runtime_scrub_failed)"))).toBe(true);
+  });
+
+  it("links .paperclip-runtime into a fresh /tmp directory before each lease goes to Paperclip: acquire, resume, resumed lease and realize", async () => {
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    const links = () => ssh.runtimeLinks.get(sandboxId) ?? [];
+    const runtimeDir = String(first.metadata?.runtimeDir);
+    expect(runtimeDir).toMatch(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/);
+    expect(links()).toEqual([{ root: "/home/user/paperclip-workspace", runtimeDir }]);
+    // After the setup step, before acquire returns (Paperclip syncs the runtime assets after that).
+    const commands = ssh.execs().map((call) => call.args.at(-1)!);
+    expect(commands.findIndex((command) => command.includes('"$d" "$s"'))).toBeLessThan(commands.findIndex((command) => command.includes("paperclip-boat-runtime")));
+    expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
+    await release(first);
+    // The resumed VM's /tmp is empty: a new directory.
+    const second = await acquire("run-2");
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+    expect(second.metadata?.runtimeDir).toBe(links().at(-1)!.runtimeDir);
+    expect(second.metadata?.runtimeDir).not.toBe(runtimeDir);
+    await release(second, { resourceDisposition: "stop_and_retain" });
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: second.metadata } as never);
+    expect(resumed.metadata).toMatchObject({ resumedLease: true, runtimeDir: links().at(-1)!.runtimeDir });
+    const realized = await plugin.definition.onEnvironmentRealizeWorkspace!({ ...base(), lease: resumed, workspace: { localPath: "/tmp/x" } } as never);
+    expect(realized).toEqual({
+      cwd: "/home/user/paperclip-workspace",
+      metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace", runtimeDir: links().at(-1)!.runtimeDir },
+    });
+    expect(new Set(links().map((link) => link.root))).toEqual(new Set(["/home/user/paperclip-workspace"]));
+  });
+
+  it("relinks .paperclip-runtime after resuming a VM that stopped mid-lease, before the command runs", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    await currentManager().shutdown();
+    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop emptied /tmp
+    const before = ssh.execs().length;
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
+    expect(result.exitCode).toBe(0);
+    const commands = ssh.execs().slice(before).map((call) => call.args.at(-1)!);
+    const linkAt = commands.findIndex((command) => command.includes("paperclip-boat-runtime"));
+    expect(linkAt).toBeGreaterThan(-1);
+    expect(commands.findIndex((command) => command.startsWith(PAYLOAD_PREFIX))).toBeGreaterThan(linkAt);
+    expect(ssh.runtimeLinks.get(sandboxId)!.at(-1)!.root).toBe("/home/user/paperclip-workspace");
+  });
+
+  it("passes a payload's own exit status through, 128+n for a signal, without treating it as a lost VM", async () => {
+    const lease = await acquire("run-1");
+    ssh.handler = (remoteCommand) => (remoteCommand.startsWith(PAYLOAD_PREFIX) ? { code: 143, stderr: "Terminated" } : undefined);
+    const gets = fake.callsOf("get").length;
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "sleep", args: ["600"] } as never);
+    expect(result).toMatchObject({ exitCode: 143, timedOut: false });
+    expect(result.stderr).not.toMatch(/was stopped while the command ran/);
+    expect(fake.callsOf("get")).toHaveLength(gets);
   });
 
   it("warns, without starting anything, when the VM was already stopped by someone else", async () => {
@@ -1098,8 +1272,13 @@ describe("ResumeLease and RealizeWorkspace", () => {
   it("realizes the workspace directory on the VM", async () => {
     const lease = await acquire("run-1");
     const result = await plugin.definition.onEnvironmentRealizeWorkspace!({ ...base(), lease, workspace: { localPath: "/tmp/x" } } as never);
-    expect(result).toEqual({ cwd: "/home/user/paperclip-workspace", metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace" } });
-    expect(ssh.execs().at(-1)!.args.at(-1)).toContain("mkdir -p");
+    expect(result).toEqual({
+      cwd: "/home/user/paperclip-workspace",
+      metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace", runtimeDir: expect.stringMatching(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/) },
+    });
+    // One command makes the workspace and links its .paperclip-runtime into /tmp.
+    expect(ssh.execs().at(-1)!.args.at(-1)).toContain('mkdir -p "$root"');
+    expect(ssh.execs().at(-1)!.args.at(-1)).toContain("paperclip-boat-runtime");
   });
 });
 

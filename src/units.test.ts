@@ -1,5 +1,18 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,19 +21,26 @@ import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import {
   DEFAULT_ENV_ALLOWLIST,
   containsJwt,
+  containsJwtInText,
   effectiveEnvAllowlist,
   filterRunEnv,
   isAcpProcessSessionCommand,
   parseEnvAllowlist,
+  urlsInText,
 } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
   REMOTE_ENV_STAGING_ROOT,
+  RUNTIME_LINK_RESULT_RE,
   RUNTIME_SECRET_SCRUB_RESULT_RE,
+  RUNTIME_TMP_PREFIX,
   SCRUB_BASHRC_ASCII_TOKEN,
   buildLoginShellScript,
+  buildRemoteCommand,
   buildRemoteEnvFileContents,
+  linkRuntimeDirScript,
   newRemoteEnvStage,
+  newRuntimeTmpDir,
   scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
@@ -188,6 +208,51 @@ describe("env policy", () => {
     // base64 JSON without the dotted JWT shape is not a JWT.
     for (const value of ["eyJvayI6dHJ1ZX0=", "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo", "eyJhIjoxfQ.notjson", "v1.eyJhIjoxfQ"]) {
       expect([value, containsJwt(value)]).toEqual([value, false]);
+    }
+  });
+
+  // The host passes values of any size. Before, an unanchored `eyJ[...]+\.`
+  // tried from every offset of `eyJeyJeyJ...` took 12 s on 256 KB, and the URL
+  // pattern took 28 s on 256 KB of letters (measured on rbx1, Node 24).
+  it("decides a 256 KB adversarial value in under 50 ms, and still finds a JWT or a remote URL at its very end", () => {
+    const size = 256 * 1024;
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
+    const fill = (unit: string) => unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
+    const shapes: Array<[string, string, string]> = [
+      ["eyJ repeated (JWT header runs, no dot)", fill("eyJ"), "kept"],
+      ["eyJ. repeated (header then dot, no payload)", fill("eyJ."), "kept"],
+      ["one header, then a payload run with no closing dot", `eyJa.eyJ${fill("a")}`, "kept"],
+      ["letters with no ://", fill("a"), "kept"],
+      ["scheme characters, no letter", fill("1+.-"), "kept"],
+      ["one URL whose authority is all colons", `a://${fill(":")}`, "kept"],
+      ["a JWT after 256 KB of eyJ", `${fill("eyJ")} ${jwt}`, "jwt"],
+      ["a Bearer JWT after 256 KB of letters", `${fill("a")} Bearer ${jwt}`, "jwt"],
+      ["a remote database URL after 256 KB of letters", `${fill("a")} postgres://u:p@db.example.com/x`, "remote_database_or_credential_url"],
+    ];
+    filterRunEnv({ PAPERCLIP_WORKSPACES_JSON: `warm-up ${jwt} https://example.com` }, DEFAULT_ENV_ALLOWLIST);
+    for (const [label, value, expected] of shapes) {
+      let best = Number.POSITIVE_INFINITY;
+      let decision = "";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const started = performance.now();
+        decision = decide("PAPERCLIP_WORKSPACES_JSON", value);
+        best = Math.min(best, performance.now() - started);
+      }
+      expect({ label, decision, under50ms: best < 50 }).toEqual({ label, decision: expected, under50ms: true });
+    }
+  });
+
+  it("finds JWTs and URLs exactly where the old backtracking patterns did (fuzzed against them)", () => {
+    const oldJwt = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./;
+    const oldUrl = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/g;
+    let seed = 20261022;
+    const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const text = (parts: string[]) => Array.from({ length: 1 + Math.floor(next() * 16) }, () => parts[Math.floor(next() * parts.length)]).join("");
+    for (let i = 0; i < 20_000; i += 1) {
+      const a = text(["e", "y", "J", "eyJ", "eyJ", "a", "Z", "9", ".", ".", "-", "_", " ", '"', "="]);
+      expect([a, containsJwtInText(a)]).toEqual([a, oldJwt.test(a)]);
+      const b = text(["a", "Z", "1", "+", ".", "-", ":", "/", "//", "://", "://", " ", '"', "<", "@", "p"]);
+      expect([b, [...urlsInText(b)]]).toEqual([b, [...b.matchAll(oldUrl)].map((match) => match[0])]);
     }
   });
 
@@ -363,11 +428,14 @@ describe("shell", () => {
     const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
     const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
     expect(script).toContain(
-      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && exec 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
     );
     expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
-    // The payload replaces the shell that sourced the env: no parent shell is left.
-    expect(script).toContain("&& exec 'node' 'x.js';");
+    // The payload runs as a child of the script's shell, never as its last command, so no shell execs it.
+    expect(script).not.toContain("exec 'node'");
+    expect(buildLoginShellScript({ command: "node", args: ["x.js"], remoteEnv: null })).toMatch(/&& unset ASCII_TOKEN BOAT_ID && 'node' 'x\.js'; rc=\$\?; exit \$rc$/);
+    // That shell is started by env without boat's credentials.
+    expect(buildRemoteCommand("true")).toBe("exec env -u ASCII_TOKEN -u BOAT_ID sh -c 'true'");
   });
 
   describe("in a real shell", () => {
@@ -423,13 +491,41 @@ describe("shell", () => {
       const payload = 'printf "ascii=%s boat=%s url=%s\\n" "${ASCII_TOKEN-unset}" "${BOAT_ID-unset}" "${ASCII_API_URL-unset}"';
       const dir = path.join(root, "stage");
       const stage = { dir, path: path.join(dir, "env.sh") };
-      execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PAPERCLIP_RUN_ID", "r1"]]), env });
       for (const remoteEnv of [stage, null]) {
-        const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv });
-        const run = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
-        expect(run.stdout).toBe("ascii=unset boat=unset url=https://boat.dev\n");
-        expect(run.status).toBe(0);
+        // The script alone (in a shell that has the tokens), and as Execute sends it (through env -u).
+        for (const command of ["script", "remote"] as const) {
+          if (remoteEnv) execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PAPERCLIP_RUN_ID", "r1"]]), env });
+          const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv });
+          const run = spawnSync("sh", ["-c", command === "script" ? script : buildRemoteCommand(script)], { env, encoding: "utf8" });
+          expect([command, run.stdout]).toEqual([command, "ascii=unset boat=unset url=https://boat.dev\n"]);
+          expect(run.status).toBe(0);
+        }
       }
+    });
+
+    // sshd runs the remote command as `$SHELL -c '<command>'`. Over ssh, a
+    // remote process that dies of a signal is reported as a signal, and the
+    // OpenSSH client then exits 255, which the plugin reads as a lost VM.
+    it.each(["sh", "bash"])("a payload killed by a signal exits 128+n through the remote command (login shell %s), with or without staged env", (login) => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, ASCII_TOKEN: "exec-env-token", BOAT_ID: "bx_test" };
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      for (const [signal, status] of [["TERM", 143], ["KILL", 137], ["HUP", 129]] as const) {
+        for (const remoteEnv of [stage, null]) {
+          if (remoteEnv) execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s"]]), env });
+          const script = buildLoginShellScript({ command: "sh", args: ["-c", `kill -${signal} $$`], cwd: root, remoteEnv });
+          const run = spawnSync(login, ["-c", buildRemoteCommand(script)], { env, encoding: "utf8" });
+          expect({ signal, staged: remoteEnv != null, status: run.status, killedBy: run.signal }).toEqual({ signal, staged: remoteEnv != null, status, killedBy: null });
+          expect(existsSync(dir)).toBe(false);
+        }
+      }
+      // An ordinary exit status still comes through as it is.
+      const seven = spawnSync(login, ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", "exit 7"], remoteEnv: null }))], { env });
+      expect(seven.status).toBe(7);
+      // Control, the chain before: the payload replaced every shell, so the remote process itself died of the signal.
+      const before = spawnSync(login, ["-c", `exec sh -c ${shellQuote(`unset ASCII_TOKEN BOAT_ID && exec sh -c 'kill -TERM $$'`)}`], { env });
+      expect([before.status, before.signal]).toEqual([null, "SIGTERM"]);
     });
 
     it("the setup step deletes boat's export ASCII_TOKEN line from ~/.bashrc and nothing else", () => {
@@ -457,23 +553,22 @@ describe("shell", () => {
         const payload = `printf 'parent=%s self=%s secret=%s\\n' "$(${environHits("$PPID")})" "$(${environHits("$$")})" "$PCB_SECRET"`;
         const dir = path.join(root, "stage");
         const stage = { dir, path: path.join(dir, "env.sh") };
-        execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
         const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv: stage });
-        const run = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
-        expect(run.stdout).toBe("parent=0 self=0 secret=s3cr3t\n");
-        expect(run.status).toBe(0);
-        expect(existsSync(dir)).toBe(false);
-        // Control: a wrapper shell that only unsets and stays alive still shows the token to its child.
-        const control = spawnSync("sh", ["-c", `unset ASCII_TOKEN BOAT_ID; sh -c ${shellQuote(payload)}; true`], { env: { ...env, PCB_SECRET: "x" }, encoding: "utf8" });
-        expect(control.stdout).toBe("parent=2 self=0 secret=x\n");
         // sshd runs the remote command as `$SHELL -c '<command>'`; the plugin's
-        // command is `exec sh -c '<script>'`, so that login shell is gone too.
+        // command is `exec env -u ASCII_TOKEN -u BOAT_ID sh -c '<script>'`, so the
+        // login shell becomes a sh that never had the tokens, and stays the payload's parent.
+        for (const login of ["sh", "bash"]) {
+          execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
+          const viaLogin = spawnSync(login, ["-c", buildRemoteCommand(script)], { env, encoding: "utf8" });
+          expect([login, viaLogin.stdout]).toEqual([login, "parent=0 self=0 secret=s3cr3t\n"]);
+          expect(viaLogin.status).toBe(0);
+          expect(existsSync(dir)).toBe(false);
+        }
+        // Control: the same script in a shell started with the tokens: that shell is the payload's
+        // parent, and `unset` hid the tokens from the payload but not from its own environ.
         execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
-        const viaLogin = spawnSync("bash", ["-c", `exec sh -c ${shellQuote(script)}`], { env, encoding: "utf8" });
-        expect(viaLogin.stdout).toBe("parent=0 self=0 secret=s3cr3t\n");
-        // Control: a login shell that stays alive (no `exec`) is the payload's parent and still holds the token.
-        const loginControl = spawnSync("bash", ["-c", `sh -c ${shellQuote(script)}; true`], { env, encoding: "utf8" });
-        expect(loginControl.stdout).toBe("parent=2 self=0 secret=\n");
+        const direct = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
+        expect(direct.stdout).toBe("parent=2 self=0 secret=s3cr3t\n");
       },
     );
 
@@ -618,6 +713,143 @@ describe("shell", () => {
       const result = spawnSync("sh", ["-c", stageRemoteEnvCommand({ dir, path: path.join(dir, "env.sh") })], { input: "export A=1;\n" });
       expect(result.status).not.toBe(0);
       expect(existsSync(path.join(dir, "env.sh"))).toBe(false);
+    });
+
+    // <root>/.paperclip-runtime is a symlink into /tmp, which no boat snapshot saves.
+    describe("the runtime directory link", () => {
+      const made: string[] = [];
+      afterEach(() => {
+        for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+      });
+      const fresh = () => {
+        const dir = newRuntimeTmpDir();
+        made.push(dir);
+        return dir;
+      };
+      const link = (ws: string, dir: string, shell = "sh") =>
+        spawnSync(shell, ["-c", linkRuntimeDirScript(ws, dir)], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
+      const result = (run: ReturnType<typeof link>) => RUNTIME_LINK_RESULT_RE.exec(run.stdout)?.slice(1) ?? null;
+      const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJydW4iOiJyMSJ9.c2ln";
+
+      it.each(["sh", "bash"])("makes <root> and links its .paperclip-runtime to a fresh 0700 directory under /tmp, then keeps that link (%s)", (shell) => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const ws = path.join(root, "w o'rk");
+        const first = fresh();
+        const run = link(ws, first, shell);
+        expect(run.status).toBe(0);
+        expect(result(run)).toEqual(["linked", first]);
+        const runtime = path.join(ws, ".paperclip-runtime");
+        expect(lstatSync(runtime).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(runtime)).toBe(first);
+        expect(first.startsWith(RUNTIME_TMP_PREFIX)).toBe(true);
+        expect(statSync(first).mode & 0o777).toBe(0o700);
+        // A second run on the running VM keeps the link, so the first run's files stay where they are.
+        writeFileSync(path.join(runtime, "bridge-queue"), "x");
+        const second = fresh();
+        const again = link(ws, second, shell);
+        expect(result(again)).toEqual(["kept", first]);
+        expect(existsSync(second)).toBe(false);
+        expect(readFileSync(path.join(runtime, "bridge-queue"), "utf8")).toBe("x");
+      });
+
+      it("replaces a link that dangles after a stop emptied /tmp, and any link, file or target that is not a runtime directory of ours", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const ws = path.join(root, "ws");
+        const runtime = path.join(ws, ".paperclip-runtime");
+        const first = fresh();
+        link(ws, first);
+        rmSync(first, { recursive: true }); // a boat stop: /tmp is not saved
+        const second = fresh();
+        expect(result(link(ws, second))).toEqual(["linked", second]);
+        const elsewhere = path.join(root, "elsewhere");
+        mkdirSync(elsewhere);
+        writeFileSync(path.join(elsewhere, "keep"), "k");
+        const ourShapeButALink = fresh();
+        symlinkSync(elsewhere, ourShapeButALink);
+        const targets = [elsewhere, `${second}/../..${elsewhere}`, `${RUNTIME_TMP_PREFIX}notours`, ourShapeButALink, "file"];
+        for (const target of targets) {
+          rmSync(runtime, { force: true });
+          if (target === "file") writeFileSync(runtime, "not a link");
+          else symlinkSync(target, runtime);
+          const next = fresh();
+          const run = link(ws, next);
+          expect({ target, result: result(run), now: readlinkSync(runtime) }).toEqual({ target, result: ["linked", next], now: next });
+        }
+        // Only the link was replaced; its old targets are untouched.
+        expect(readFileSync(path.join(elsewhere, "keep"), "utf8")).toBe("k");
+      });
+
+      it("moves a real .paperclip-runtime directory (a VM set up before this version) into /tmp, so its run MCP config leaves the saved disk", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const ws = path.join(root, "ws");
+        const files: Record<string, string> = {
+          "claude/mcp-config/mcp-config.json": jwt,
+          "claude/skills/paperclip/SKILL.md": "skill",
+          ".hidden": "h",
+          "odd\nname/f": "n",
+        };
+        for (const [file, body] of Object.entries(files)) {
+          mkdirSync(path.dirname(path.join(ws, ".paperclip-runtime", file)), { recursive: true });
+          writeFileSync(path.join(ws, ".paperclip-runtime", file), body);
+        }
+        writeFileSync(path.join(ws, "README.md"), "readme");
+        const dir = fresh();
+        const run = link(ws, dir);
+        expect(result(run)).toEqual(["linked", dir]);
+        expect(lstatSync(path.join(ws, ".paperclip-runtime")).isSymbolicLink()).toBe(true);
+        for (const [file, body] of Object.entries(files)) {
+          expect([file, readFileSync(path.join(dir, file), "utf8")]).toEqual([file, body]);
+        }
+        expect(readFileSync(path.join(ws, "README.md"), "utf8")).toBe("readme");
+        // grep -r does not follow the link: nothing on the workspace's own disk holds the JWT.
+        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
+      });
+
+      it("Paperclip's asset extract and workspace wipe work through the link, and the scrub still removes the MCP config there", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const ws = path.join(root, "paperclip-workspace");
+        const dir = fresh();
+        expect(link(ws, dir).status).toBe(0);
+        // The asset, packed on the host.
+        const source = path.join(root, "asset-src");
+        mkdirSync(source);
+        writeFileSync(path.join(source, "mcp-config.json"), JSON.stringify({ mcpServers: { p: { headers: { Authorization: `Bearer ${jwt}` } } } }));
+        const assetDir = `${ws}/.paperclip-runtime/claude/mcp-config`;
+        const assetTar = `${ws}/.paperclip-runtime/claude/mcp-config-upload.tar`;
+        execFileSync("sh", ["-c", `mkdir -p ${shellQuote(path.dirname(assetTar))} && tar -cf ${shellQuote(assetTar)} -C ${shellQuote(source)} .`]);
+        // buildDefaultExtractRuntimeAssetCommand and the workspace wipe (adapter-utils sandbox-managed-runtime.ts, tog.22).
+        const q = shellQuote;
+        execFileSync("sh", ["-c", `rm -rf ${q(assetDir)} && mkdir -p ${q(assetDir)} && tar -xf ${q(assetTar)} -C ${q(assetDir)} && rm -f ${q(assetTar)}`]);
+        writeFileSync(path.join(ws, "old.txt"), "old");
+        execFileSync("sh", ["-c", `find ${q(ws)} -mindepth 1 -maxdepth 1 ! -name '.paperclip-runtime' ! -name '.paperclip-upload-*' -exec rm -rf -- {} +`]);
+        expect(existsSync(path.join(ws, "old.txt"))).toBe(false);
+        expect(readlinkSync(path.join(ws, ".paperclip-runtime"))).toBe(dir);
+        expect(realpathSync(assetDir)).toBe(realpathSync(path.join(dir, "claude", "mcp-config")));
+        expect(readFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
+        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
+        // The scrub before a stop is kept as defense in depth, and it reaches the file through the link.
+        const scrub = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
+        expect(scrub.stdout.trim()).toBe("paperclip-boat-scrub found=1 left=0");
+        expect(existsSync(path.join(dir, "claude", "mcp-config"))).toBe(false);
+      });
+
+      it("fails, with no result line and no link, when the fresh directory already exists", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const ws = path.join(root, "ws");
+        const dir = fresh();
+        mkdirSync(dir);
+        const run = link(ws, dir);
+        expect(run.status).not.toBe(0);
+        expect(result(run)).toBeNull();
+        expect(existsSync(path.join(ws, ".paperclip-runtime"))).toBe(false);
+      });
+
+      it("refuses to build a script for a relative root or a directory that is not a fresh runtime directory", () => {
+        expect(() => linkRuntimeDirScript("relative/ws", newRuntimeTmpDir())).toThrow(/absolute/);
+        expect(() => linkRuntimeDirScript("/w", "/tmp/elsewhere")).toThrow(/32 hex/);
+        expect(() => linkRuntimeDirScript("/w", `${RUNTIME_TMP_PREFIX}${"a".repeat(31)}`)).toThrow(/32 hex/);
+        expect(newRuntimeTmpDir()).toMatch(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/);
+      });
     });
   });
 });

@@ -7,8 +7,10 @@
 // It checks, among others: an allowlisted key arrives and denied keys do not;
 // the env file is gone before the command runs; boat's ASCII_TOKEN/BOAT_* are
 // in neither the command's env, ~/.bashrc, /etc/environment, nor the startup
-// environ of its parent or any readable ancestor; and a stand-in for
-// Paperclip's run MCP config is gone from the disk after a stop and resume.
+// environ of its parent or any readable ancestor; the workspace's
+// .paperclip-runtime is a symlink into /tmp, so a stand-in for Paperclip's run
+// MCP config written through it never reaches /home and is gone after a stop
+// and resume; and a payload killed by SIGTERM exits 143, not ssh's 255.
 //
 // Usage (key from stdin or BOAT_API_KEY; never put it in argv):
 //   read -rs BOAT_API_KEY; export BOAT_API_KEY; node scripts/live-smoke.mjs
@@ -90,11 +92,15 @@ try {
       // Every ancestor this user can read, up to pid 1.
       `p=$PPID; hits=0; seen=0; while [ "\${p:-0}" -gt 1 ]; do if [ -r /proc/$p/environ ]; then seen=$((seen+1)); if tr "\\000" "\\n" < /proc/$p/environ | grep -q -E "${BOAT_TOKEN_NAMES}"; then hits=$((hits+1)); fi; fi; p=$(sed "s/.*) //" /proc/$p/stat 2>/dev/null | cut -d" " -f2); done; echo "ancestor_environ_tokens=$hits readable_ancestors=$seen"; ` +
       `n=$(grep -c -E "^[[:space:]]*(export[[:space:]]+)?(ASCII_TOKEN|BOAT_[A-Z0-9_]+)=" /etc/environment 2>/dev/null); echo "etc_environment_tokens=\${n:-0}"; ` +
-      // Stand-in for Paperclip's mcp-config runtime asset (it holds the run JWT): release must remove it
-      // before the stop, so the resumed disk (the stop snapshot) does not have it. skills/ must survive.
+      // Acquire linked .paperclip-runtime into /tmp (never snapshotted). Evidence: where it points, and what /tmp is.
+      'l="$HOME/paperclip-workspace/.paperclip-runtime"; t=$(readlink "$l"); case "$t" in /tmp/paperclip-boat-runtime-*) [ -L "$l" ] && [ -d "$t" ] && echo "runtime_link=tmp";; *) echo "runtime_link=bad";; esac; ' +
+      'echo "tmp_fs=$(stat -f -c %T /tmp) tmp_free_kb=$(df -Pk /tmp | awk "NR==2{print \\$4}") runtime_target=$t"; ' +
+      // Stand-in for Paperclip's mcp-config runtime asset (it holds the run JWT), written the way Paperclip
+      // writes it, through the link: it must never reach /home, and the resumed disk must not have it.
       'rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; mkdir -p "$rt/mcp-config" "$rt/skills" && ' +
       'printf "{\\"mcpServers\\":{\\"smoke\\":{\\"headers\\":{\\"Authorization\\":\\"Bearer smoke-not-a-jwt\\"}}}}" > "$rt/mcp-config/mcp-config.json" && ' +
       'echo smoke > "$rt/mcp-config-upload.tar" && echo skill > "$rt/skills/smoke.md" && echo "planted_mcp_config=yes"; ' +
+      'echo "planted_on_home_disk=$(timeout 60 grep -rlF smoke-not-a-jwt "$HOME" 2>/dev/null | wc -l)"; ' +
       'echo "tunnel_http=$(curl -s -o /dev/null -m 5 -w %{http_code} http://127.0.0.1:8317/ || echo fail)"; ' +
       'echo warm > "$HOME/paperclip-workspace/.smoke-marker"',
     { SMOKE_SENTINEL: sentinel, SMOKE_DENIED: "not-allowlisted", PLANETSCALE_SMOKE_URL: "mysql://u:p@example.invalid/db" },
@@ -110,11 +116,17 @@ try {
     "bashrc_ascii_token=0",
     "ppid_environ_tokens=0",
     "etc_environment_tokens=0",
+    "runtime_link=tmp",
     "planted_mcp_config=yes",
+    "planted_on_home_disk=0",
   ]) {
     if (!lines1.includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
   }
   if (!lines1.some((line) => line.startsWith("ancestor_environ_tokens=0 "))) throw new Error("smoke check failed: expected ancestor_environ_tokens=0");
+
+  step("execute: a payload killed by SIGTERM reports 143 (ssh would say 255 if the payload replaced every shell)");
+  const killed = await exec(lease1, "kill -TERM $$");
+  if (killed.exitCode !== 143) throw new Error(`smoke check failed: expected exit 143 for SIGTERM, got ${killed.exitCode}`);
 
   step("release run 1 (stop)");
   console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease1.metadata }, "release")));
@@ -123,13 +135,16 @@ try {
   const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null });
   console.log(JSON.stringify(lease2.metadata));
   if (lease2.providerLeaseId !== sandboxId) throw new Error("expected the same VM on resume");
+  if (lease2.metadata?.runtimeDir === lease1.metadata?.runtimeDir) throw new Error("expected a fresh runtime directory after the resume");
   const run2 = await exec(
     lease2,
     'cat "$HOME/paperclip-workspace/.smoke-marker"; rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; ' +
-      'echo "mcp_config=$([ -e "$rt/mcp-config" ] && echo present || echo gone) upload_tar=$([ -e "$rt/mcp-config-upload.tar" ] && echo present || echo gone) skills=$([ -e "$rt/skills/smoke.md" ] && echo present || echo gone)"',
+      'echo "mcp_config=$([ -e "$rt/mcp-config" ] && echo present || echo gone) upload_tar=$([ -e "$rt/mcp-config-upload.tar" ] && echo present || echo gone) skills=$([ -e "$rt/skills/smoke.md" ] && echo present || echo gone)"; ' +
+      'echo "runtime_link_now=$(readlink "$HOME/paperclip-workspace/.paperclip-runtime")"',
   );
-  // The stop snapshot was taken after the scrub: the planted MCP config is gone, the rest of the disk is not.
-  for (const expected of ["warm", "mcp_config=gone upload_tar=gone skills=present"]) {
+  // The whole runtime directory lived in /tmp, which the stop snapshot does not save; the rest of the disk is kept.
+  // Paperclip syncs the runtime assets again for every run.
+  for (const expected of ["warm", "mcp_config=gone upload_tar=gone skills=gone", `runtime_link_now=${lease2.metadata?.runtimeDir}`]) {
     if (!run2.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
   }
 

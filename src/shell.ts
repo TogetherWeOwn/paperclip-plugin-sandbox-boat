@@ -12,10 +12,12 @@
 //   - It is removed right after it is sourced, before the payload starts, so
 //     the payload never sees it on disk. A trailing remove stays as a fallback
 //     for a script that did not get that far.
-//   - The payload is exec'd: it replaces the shell that sourced the file, so
-//     no parent shell stays alive with boat's ASCII_TOKEN in its startup
-//     environment (/proc/<pid>/environ keeps a process's startup env even
-//     after `unset`).
+//   - The script runs in a `sh` that `env -u` started without boat's
+//     ASCII_TOKEN and BOAT_ID (buildRemoteCommand), so the payload's parent
+//     shell never had them in its startup environment (/proc/<pid>/environ
+//     keeps a process's startup env even after `unset`). That shell stays
+//     the payload's parent and exits with its status, so a payload killed by
+//     a signal reports 128+n instead of ssh's 255.
 import { randomUUID } from "node:crypto";
 
 export function shellQuote(value: string): string {
@@ -93,13 +95,15 @@ const ASCII_TOKEN_EXPORT_LINE = "^[[:space:]]*export[[:space:]][[:space:]]*ASCII
 export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && grep -q '${ASCII_TOKEN_EXPORT_LINE}' "$f"; then sed -i '/${ASCII_TOKEN_EXPORT_LINE}/d' "$f"; fi; } 2>/dev/null || true`;
 
 // Sources the staged env file, removes it at once, clears the boat VM
-// credentials, and only then execs the payload in place of this shell. The
-// shell was started with boat's ASCII_TOKEN and BOAT_ID in its environment;
-// `unset` hides them from children but not from /proc/<pid>/environ, so this
-// shell must not stay alive as the payload's parent. The trailing remove is a
-// fallback for a script that stopped before the first one (a failed `cd` or a
-// failed source); after a successful exec nothing of this shell is left to run
-// it, and the file is already gone.
+// credentials again (a sourced profile can export ASCII_TOKEN from ~/.bashrc),
+// and only then runs the payload. The payload runs as a child, not exec'd:
+// this shell never had the credentials in its startup environment
+// (buildRemoteCommand), so it may stay alive as the payload's parent, and its
+// `exit $rc` hands sshd the payload's status, 128+n for a signal. The payload
+// is never the script's last command, so no shell turns it into an implicit
+// exec. The trailing remove is a fallback for a script that stopped before the
+// first one (a failed `cd` or a failed source); after the payload the file is
+// already gone.
 export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
   const file = shellQuote(stage.path);
   const remove = removeRemoteEnvCommand(stage);
@@ -107,8 +111,23 @@ export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: str
     `if [ -f ${file} ]; then . ${file}; fi`,
     `{ ${remove} || true; }`,
     UNSET_BOAT_VM_CREDENTIALS,
-    `exec ${payloadScript}; rc=$?; ${remove}; exit $rc`,
+    `${payloadScript}; rc=$?; ${remove}; exit $rc`,
   ];
+}
+
+/**
+ * The ssh remote command that runs a command script. sshd runs it as
+ * `$SHELL -c '<this>'`. That login shell, started with boat's ASCII_TOKEN and
+ * BOAT_ID, execs `env`, which execs `sh` with an environment that lacks both,
+ * so no process left between sshd and the payload holds them in
+ * /proc/<pid>/environ. The `sh` waits for the payload and exits with its
+ * status: a payload killed by signal n gives 128+n. (When the payload itself
+ * replaced the shell, sshd reported the signal and the ssh client exited 255,
+ * which reads as a lost VM.)
+ */
+export function buildRemoteCommand(script: string): string {
+  const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
+  return `exec env ${unset} sh -c ${shellQuote(script)}`;
 }
 
 export function buildLoginShellScript(input: {
@@ -129,9 +148,77 @@ export function buildLoginShellScript(input: {
   if (input.remoteEnv != null) {
     lines.push(...envSourcingScriptLines(input.remoteEnv, commandParts));
   } else {
-    lines.push(UNSET_BOAT_VM_CREDENTIALS, `exec ${commandParts}`);
+    lines.push(UNSET_BOAT_VM_CREDENTIALS, `${commandParts}; rc=$?; exit $rc`);
   }
   return lines.join(" && ");
+}
+
+// ---------------------------------------------------------------------------
+// Paperclip's runtime directory lives under /tmp.
+//
+// Paperclip syncs a run's runtime assets (the run MCP config with the run JWT,
+// skills, config, the bridge queue, GitHub launchers, upload tarballs) into
+// `<root>/.paperclip-runtime/<adapter>/` and re-syncs them for every run. boat
+// saves /home/user every minute while a VM runs and at every stop, and keeps
+// the older per-minute snapshots for up to about a day. /tmp is in none of
+// them (docs.boat.dev/snapshots/whats-saved). So `<root>/.paperclip-runtime`
+// is made a symlink to a fresh 0700 directory under /tmp, before Paperclip
+// syncs anything: the files reach the VM's memory or scratch disk, never a
+// snapshot. Paperclip only creates and empties paths below it (`mkdir -p`,
+// `rm -rf <asset dir>`), and its workspace wipe and restore skip the name.
+
+/** Where the runtime directories of a VM live. Fixed: the link check below accepts only this shape. */
+export const RUNTIME_TMP_PREFIX = "/tmp/paperclip-boat-runtime-";
+
+/** The line the link script prints last: whether it kept the old target or made a new one, and the target. */
+export const RUNTIME_LINK_RESULT_RE = /^paperclip-boat-runtime (linked|kept) (\/tmp\/paperclip-boat-runtime-[0-9a-f]{32})$/m;
+
+/** A fresh, unguessable runtime directory name for one VM start (one lease). */
+export function newRuntimeTmpDir(): string {
+  return `${RUNTIME_TMP_PREFIX}${randomUUID().replace(/-/g, "")}`;
+}
+
+/**
+ * A script that makes `<root>/.paperclip-runtime` a symlink into /tmp:
+ *   - A link to an existing runtime directory of ours (the exact
+ *     `/tmp/paperclip-boat-runtime-<32 hex>` shape, a real directory owned by
+ *     this user) is kept, so a second run on a running VM does not lose the
+ *     first run's files.
+ *   - Anything else is replaced by a link to `fresh`, made with `mkdir -m 700`
+ *     (it fails when the path exists): a link that dangles because a stop
+ *     emptied /tmp, a link elsewhere, a file, or a real directory (from before
+ *     this version, or made by something else). A real directory's entries move
+ *     into `fresh` first, so they leave the saved disk and a run that uses
+ *     them still finds them through the link.
+ * Prints `paperclip-boat-runtime linked|kept <target>` and exits 0 only when
+ * the link resolves to that target.
+ */
+export function linkRuntimeDirScript(root: string, fresh: string): string {
+  const cleanRoot = root.trim().replace(/\/+$/, "");
+  if (!cleanRoot.startsWith("/") || cleanRoot.length < 2) throw new Error(`runtime root must be an absolute path: ${root}`);
+  if (!fresh.startsWith(RUNTIME_TMP_PREFIX) || !/^[0-9a-f]{32}$/.test(fresh.slice(RUNTIME_TMP_PREFIX.length))) {
+    throw new Error(`runtime directory must be ${RUNTIME_TMP_PREFIX}<32 hex>: ${fresh}`);
+  }
+  // Spelled out, not [0-9a-f]: a range in a case pattern can follow the locale's collation.
+  const ours = `${RUNTIME_TMP_PREFIX}${"[0123456789abcdef]".repeat(32)}`;
+  return [
+    `root=${shellQuote(cleanRoot)}; link="$root/.paperclip-runtime"; new=${shellQuote(fresh)}`,
+    'mkdir -p "$root" || exit 1',
+    'if [ -L "$link" ]; then',
+    '  t=$(readlink "$link")',
+    `  case "$t" in ${ours}) if [ -d "$t" ] && [ ! -L "$t" ] && [ -O "$t" ]; then echo "paperclip-boat-runtime kept $t"; exit 0; fi;; esac`,
+    "fi",
+    'umask 077 && mkdir -m 700 "$new" || exit 1',
+    'if [ -d "$link" ] && [ ! -L "$link" ]; then',
+    '  find "$link" -mindepth 1 -maxdepth 1 -exec mv -f -- {} "$new"/ \\; 2>/dev/null',
+    '  rm -rf -- "$link" || exit 1',
+    'elif [ -L "$link" ] || [ -e "$link" ]; then',
+    '  rm -f -- "$link" || exit 1',
+    "fi",
+    'ln -s "$new" "$link" || exit 1',
+    '[ "$(readlink "$link")" = "$new" ] || exit 1',
+    'echo "paperclip-boat-runtime linked $new"',
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +232,13 @@ export function buildLoginShellScript(input: {
 // (tog.22: server heartbeat.ts ~25853, claude-local claude-config.ts ~175,
 // execute.ts ~658-713; adapter-utils sandbox-managed-runtime.ts ~1531 and
 // ~1690). The asset is uploaded as `<adapter dir>/mcp-config-upload.tar`
-// (plus `.paperclip-upload*` temp files) and extracted. That is under
+// (plus `.paperclip-upload*` temp files) and extracted. That path is under
 // /home/user, which every boat snapshot saves, and Paperclip never removes it.
-// The plugin cannot filter it (it is a file, not env), so it deletes it before
-// every stop, delete and template capture it makes.
+// The plugin cannot filter it (it is a file, not env). It links
+// `.paperclip-runtime` into /tmp (linkRuntimeDirScript above), so the file
+// normally never reaches the saved disk, and it still deletes it before every
+// stop, delete and template capture it makes: a VM set up before the link, or
+// a link that something replaced with a real directory, would keep it.
 
 /** Runtime asset names, under `<root>/.paperclip-runtime/<adapter>/`, that hold run credentials. */
 export const RUNTIME_SECRET_ASSET_GLOBS = ["mcp-config", "mcp-config-upload.tar*"] as const;

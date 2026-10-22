@@ -18,6 +18,8 @@
 #     Paperclip passed, project secrets included, reached the VM;
 #   - a build that does not delete Paperclip's run MCP config (run JWT) before
 #     it stops, deletes or snapshots a VM;
+#   - a build that does not link the workspace's .paperclip-runtime into /tmp
+#     (which boat never snapshots) before Paperclip syncs the run's files;
 #   - a destination that already exists.
 set -eu
 
@@ -98,6 +100,12 @@ fi
 # run MCP config (it holds the run JWT) before boat saves the VM disk.
 if ! grep -qF 'scrubRuntimeSecretsScript(' "$pkg/dist/vm-manager.js" || ! grep -qF 'mcp-config' "$pkg/dist/shell.js"; then
   echo "stage-package: dist does not remove Paperclip's run MCP config before stops; refusing (the run JWT would stay in boat snapshots)." >&2
+  exit 1
+fi
+# Acquire, resumed leases and realize must link <root>/.paperclip-runtime into
+# /tmp, which boat never snapshots, before Paperclip syncs the run's files.
+if ! grep -qF 'linkRuntimeDirScript(' "$pkg/dist/vm-manager.js" || ! grep -qF '/tmp/paperclip-boat-runtime-' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not keep Paperclip's runtime directory under /tmp; refusing (the run JWT would be in boat's per-minute snapshots)." >&2
   exit 1
 fi
 
