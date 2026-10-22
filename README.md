@@ -24,7 +24,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 * **Stop on release.** Billing stops at the stop ([docs](https://docs.boat.dev/snapshots/stop)). In our trial a resume within 10 minutes of a stop got the same machine back and did not count as a start.
 * **One lock per card.** Acquire, release, destroy and the sweep's stop take the same per-card lock, so a new run never reads the VM as running while the previous run's release stops it. A new run that finds the VM still stopping (`archiving`) waits up to `stopConfirmTimeoutMs` for the save to end, then resumes it, or fails with `BOAT_STOP_PENDING` without starting anything.
 * **Auto-stop is a deadline, not idle detection.** It counts from the start or resume ([docs](https://docs.boat.dev/long-running-tasks/auto-stop)). The plugin sets it to `autoStopMinutes` (120, the trial maximum) as a safety net. It extends the deadline only while a command is running and less than half of it is left. An idle VM is never extended.
-* **Idle sweep, every 5 minutes.** A VM with no active run is stopped after `idleStopMinutes` (15) idle. A VM whose lease is held but sent no command for `staleLeaseMinutes` (60) is stopped too. A stopped VM is deleted when its card is done or cancelled, or after `deleteAfterDays` (7) untouched. The sweep only touches sandboxes named with our prefix.
+* **Idle sweep, every 5 minutes.** It runs outside any host request (`src/proactive.ts`), because the host refuses plugin state in a scheduled job's company-less request and in a request that already ended. A VM with no active run is stopped after `idleStopMinutes` (15) idle. A VM whose lease is held but sent no command for `staleLeaseMinutes` (60) is stopped too. A stopped VM is deleted when its card is done or cancelled, or after `deleteAfterDays` (7) untouched. The sweep only touches sandboxes named with our prefix.
 * **Budget guard.** Before every create or resume, the plugin reads `GET /limits` once. It refuses the start, fast and with a clear error, when any of these is true:
   * `maxActive` (2) VMs already run;
   * `maxStartsPerDay` (70) starts happened in the last 24 hours;
@@ -123,7 +123,16 @@ The capabilities are:
 * `api.routes.register`;
 * `issues.read`, used to see whether a card is done.
 
-After the install, create a sandbox environment with provider `boat` and the config above. Run *Probe*, which starts no VM, and then point one pilot agent at it.
+After the install, save a plugin config for every company that uses the plugin. It can be empty:
+
+```sh
+curl -X POST "$PAPERCLIP/api/plugins/<pluginId>/config" -H 'content-type: application/json' \
+  -d '{"companyId":"<companyId>","configJson":{}}'
+```
+
+The host lets a plugin's background work (the idle sweep, and the sweep that starts after an acquire or release) touch only the state of companies the plugin is configured for. Without that row, the sweep logs `state <companyId>: ... company context is required` and skips the company; release still stops each VM, and boat's auto-stop stays the backstop.
+
+Then create a sandbox environment with provider `boat` and the config above. Run *Probe*, which starts no VM, and then point one pilot agent at it.
 
 To undo, uninstall the plugin from the Plugins page and delete any `paperclip-*` VMs with `boat delete <id> --yes`.
 

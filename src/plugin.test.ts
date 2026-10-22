@@ -12,7 +12,7 @@ import { setBoatApiFactoryForTests } from "./boat-client.js";
 import manifest, { DRIVER_KEY, SWEEP_JOB_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.js";
-import { FakeSsh, createFakeContext } from "./test-support/harness.js";
+import { FakeSsh, createFakeContext, inHostInvocation } from "./test-support/harness.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatProviderError } from "./errors.js";
 
@@ -38,7 +38,9 @@ let ssh: FakeSsh;
 let harness: ReturnType<typeof createFakeContext>;
 let sleeps: number[];
 
-async function setup(options: { issues?: Map<string, { status: string }> } = {}) {
+async function setup(
+  options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
+) {
   harness = createFakeContext(options);
   await plugin.definition.setup(harness.ctx as never);
 }
@@ -639,6 +641,51 @@ describe("idle sweep", () => {
   it("runs from the scheduled job", async () => {
     await acquire("run-1");
     await harness.jobs.get(SWEEP_JOB_KEY)!({ jobKey: SWEEP_JOB_KEY, runId: "j1", trigger: "schedule", scheduledAt: new Date().toISOString() });
+    expect(fake.callsOf("sandboxes").length).toBeGreaterThan(0);
+  });
+});
+
+describe("host invocation scopes (as the Paperclip host enforces them)", () => {
+  beforeEach(async () => {
+    await plugin.definition.onShutdown?.();
+    setManagerOverridesForTests({
+      now: () => clock.t,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        clock.t += ms;
+      },
+    });
+    await setup({ hostScopes: { proactiveCompanies: [COMPANY] } });
+  });
+
+  it("the scheduled sweep runs outside the job's company-less invocation and stops an idle VM", async () => {
+    // A run that never released (a crash): the VM is up and idle.
+    const lease = await inHostInvocation(COMPANY, () => acquire("run-1"));
+    await currentManager().sweepInFlight();
+    clock.t += 70 * 60 * 1000;
+    await inHostInvocation(null, () =>
+      harness.jobs.get(SWEEP_JOB_KEY)!({ jobKey: SWEEP_JOB_KEY, runId: "j1", trigger: "schedule", scheduledAt: new Date().toISOString() }),
+    );
+    expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("archived");
+    expect(harness.logs.filter((entry) => entry.level === "warn" && /sweep failed/.test(entry.message))).toEqual([]);
+  });
+
+  it("the sweep started after an acquire does not reuse the finished request", async () => {
+    await inHostInvocation(COMPANY, () => acquire("run-1"));
+    await currentManager().sweepInFlight();
+    expect(harness.logs.filter((entry) => entry.level === "warn" && /sweep failed/.test(entry.message))).toEqual([]);
+    expect(fake.callsOf("sandboxes").length).toBeGreaterThan(0);
+  });
+
+  it("skips a company the host refuses instead of failing the whole sweep", async () => {
+    await inHostInvocation(COMPANY, () => acquire("run-1"));
+    await currentManager().sweepInFlight();
+    await inHostInvocation("99999999-9999-4999-8999-999999999999", () =>
+      plugin.definition.onEnvironmentProbe!({ ...base(), companyId: "99999999-9999-4999-8999-999999999999" } as never),
+    );
+    clock.t += 2 * 60 * 1000;
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report.errors.some((line) => line.startsWith("state 99999999-"))).toBe(true);
     expect(fake.callsOf("sandboxes").length).toBeGreaterThan(0);
   });
 });

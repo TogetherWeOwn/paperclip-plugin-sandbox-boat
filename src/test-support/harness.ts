@@ -1,5 +1,7 @@
 // Test doubles: a scripted `ssh`/`ssh-keygen` (via a mocked spawn) and a
 // minimal Paperclip plugin context (state, logger, issues, jobs).
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 
@@ -137,7 +139,50 @@ export interface FakeLogEntry {
   meta?: Record<string, unknown>;
 }
 
-export function createFakeContext(options: { issues?: Map<string, { status: string }> } = {}) {
+// Emulation of the Paperclip host's invocation scopes (plugin-worker-manager +
+// host-client-factory): calls made inside a host request carry its invocation;
+// a finished invocation is refused; an invocation with no company refuses
+// company state; calls outside any invocation are "proactive" and allowed only
+// for configured companies. Instance-scoped state needs a company invocation.
+export interface FakeInvocation {
+  id: string;
+  companyId: string | null;
+  ended: boolean;
+}
+
+export const fakeInvocations = new AsyncLocalStorage<FakeInvocation>();
+
+/** Run fn the way the host runs a plugin RPC: inside an invocation that ends when fn settles. */
+export async function inHostInvocation<T>(companyId: string | null, fn: () => Promise<T>): Promise<T> {
+  const invocation: FakeInvocation = { id: randomUUID(), companyId, ended: false };
+  try {
+    return await fakeInvocations.run(invocation, fn);
+  } finally {
+    invocation.ended = true;
+  }
+}
+
+function hostScopeCheck(
+  method: string,
+  input: { scopeKind: string; scopeId?: string },
+  proactiveCompanies: Set<string>,
+): void {
+  const invocation = fakeInvocations.getStore();
+  const company = input.scopeKind === "company" ? (input.scopeId ?? null) : null;
+  const deny = (why: string) => new Error(`Plugin is not allowed to perform "${method}": ${why}`);
+  if (invocation) {
+    if (invocation.ended) throw deny("the worker referenced a missing, expired, or unknown invocation scope");
+    if (!invocation.companyId) throw deny("company context is required");
+    if (company && company !== invocation.companyId) throw deny(`requested company "${company}" but the current invocation is scoped to company "${invocation.companyId}"`);
+    return;
+  }
+  if (company && proactiveCompanies.has(company)) return;
+  throw deny("company context is required");
+}
+
+export function createFakeContext(
+  options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
+) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
@@ -147,11 +192,18 @@ export function createFakeContext(options: { issues?: Map<string, { status: stri
   const log = (level: FakeLogEntry["level"]) => (message: string, meta?: Record<string, unknown>) => {
     logs.push({ level, message, meta });
   };
+  const proactive = new Set(options.hostScopes?.proactiveCompanies ?? []);
+  const check = (method: string, input: { scopeKind: string; scopeId?: string }) => {
+    if (options.hostScopes) hostScopeCheck(method, input, proactive);
+  };
   const ctx = {
     state: {
-      get: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
-        state.has(keyOf(input)) ? structuredClone(state.get(keyOf(input))) : null,
+      get: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {
+        check("state.get", input);
+        return state.has(keyOf(input)) ? structuredClone(state.get(keyOf(input))) : null;
+      },
       set: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }, value: unknown) => {
+        check("state.set", input);
         state.set(keyOf(input), structuredClone(value));
       },
       delete: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {

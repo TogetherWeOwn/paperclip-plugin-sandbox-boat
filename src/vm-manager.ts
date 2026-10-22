@@ -49,6 +49,7 @@ import {
 import type { RemoteEnvStage } from "./shell.js";
 import { SshManager, endpointFromSshKeyResponse, runProcess } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
+import { runOutsideInvocation } from "./proactive.js";
 import { VmStateStore, findBySandboxId } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 
@@ -1376,10 +1377,21 @@ export class BoatVmManager {
     return this.sweeping;
   }
 
-  /** Fire-and-forget sweep after lifecycle calls (throttled). */
+  /**
+   * Fire-and-forget sweep after lifecycle calls (throttled). It outlives the
+   * host request that started it, so it runs outside that request's
+   * invocation (proactive.ts).
+   */
   sweepSoon(reason: string): void {
     if (this.now() - this.lastSweepAt < SWEEP_MIN_INTERVAL_MS) return;
-    void this.sweep(reason).catch((error) => this.logger.warn("boat: sweep failed", { error: errorText(error) }));
+    void runOutsideInvocation(() => this.sweep(reason)).catch((error) =>
+      this.logger.warn("boat: sweep failed", { error: errorText(error) }),
+    );
+  }
+
+  /** Test hook: the sweep in flight, if any. */
+  sweepInFlight(): Promise<SweepReport> | null {
+    return this.sweeping;
   }
 
   private async doSweep(reason: string): Promise<SweepReport> {
@@ -1390,7 +1402,14 @@ export class BoatVmManager {
     }
     const companies = new Set<string>([...(await this.store.companies().catch(() => [])), ...[...this.configs.values()].map((c) => c.companyId)]);
     const docs = new Map<string, StateDoc>();
-    for (const companyId of companies) docs.set(companyId, await this.store.read(companyId));
+    for (const companyId of companies) {
+      try {
+        docs.set(companyId, await this.store.read(companyId));
+      } catch (error) {
+        // The host refuses state outside a configured company (see proactive.ts). Skip that company.
+        report.errors.push(`state ${companyId}: ${errorText(error)}`);
+      }
+    }
     const recordFor = (sandboxId: string): VmRecord | null => {
       for (const doc of docs.values()) {
         const record = findBySandboxId(doc, sandboxId);
