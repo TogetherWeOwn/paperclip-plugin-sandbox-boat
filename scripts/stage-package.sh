@@ -19,7 +19,9 @@
 #   - a build that does not delete Paperclip's run MCP config (run JWT) before
 #     it stops, deletes or snapshots a VM;
 #   - a build that does not link the workspace's .paperclip-runtime into /tmp
-#     (which boat never snapshots) before Paperclip syncs the run's files;
+#     (which boat never snapshots) before Paperclip syncs the run's files, or
+#     that does not make every command's tar skip .paperclip-runtime members
+#     (Paperclip's workspace extract would replace the link);
 #   - a destination that already exists.
 set -eu
 
@@ -106,6 +108,13 @@ fi
 # /tmp, which boat never snapshots, before Paperclip syncs the run's files.
 if ! grep -qF 'linkRuntimeDirScript(' "$pkg/dist/vm-manager.js" || ! grep -qF '/tmp/paperclip-boat-runtime-' "$pkg/dist/shell.js"; then
   echo "stage-package: dist does not keep Paperclip's runtime directory under /tmp; refusing (the run JWT would be in boat's per-minute snapshots)." >&2
+  exit 1
+fi
+# Every command script must tell GNU tar to skip .paperclip-runtime members:
+# Paperclip's inbound workspace tar carries one from the host, and its extract
+# would replace the link with a real directory on the saved disk.
+if ! grep -qF 'TAR_OPTIONS="--exclude=.paperclip-runtime' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not keep Paperclip's workspace extract off the runtime link; refusing (the run JWT could land on the saved disk)." >&2
   exit 1
 fi
 

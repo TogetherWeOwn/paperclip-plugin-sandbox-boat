@@ -96,6 +96,8 @@ export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && 
 
 // Sources the staged env file, removes it at once, clears the boat VM
 // credentials again (a sourced profile can export ASCII_TOKEN from ~/.bashrc),
+// tells GNU tar to skip `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR;
+// after the env file, so a TAR_OPTIONS from the run env keeps the exclude),
 // and only then runs the payload. The payload runs as a child, not exec'd:
 // this shell never had the credentials in its startup environment
 // (buildRemoteCommand), so it may stay alive as the payload's parent, and its
@@ -111,6 +113,7 @@ export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: str
     `if [ -f ${file} ]; then . ${file}; fi`,
     `{ ${remove} || true; }`,
     UNSET_BOAT_VM_CREDENTIALS,
+    TAR_SKIP_RUNTIME_DIR,
     `${payloadScript}; rc=$?; ${remove}; exit $rc`,
   ];
 }
@@ -148,7 +151,7 @@ export function buildLoginShellScript(input: {
   if (input.remoteEnv != null) {
     lines.push(...envSourcingScriptLines(input.remoteEnv, commandParts));
   } else {
-    lines.push(UNSET_BOAT_VM_CREDENTIALS, `${commandParts}; rc=$?; exit $rc`);
+    lines.push(UNSET_BOAT_VM_CREDENTIALS, TAR_SKIP_RUNTIME_DIR, `${commandParts}; rc=$?; exit $rc`);
   }
   return lines.join(" && ");
 }
@@ -164,8 +167,39 @@ export function buildLoginShellScript(input: {
 // them (docs.boat.dev/snapshots/whats-saved). So `<root>/.paperclip-runtime`
 // is made a symlink to a fresh 0700 directory under /tmp, before Paperclip
 // syncs anything: the files reach the VM's memory or scratch disk, never a
-// snapshot. Paperclip only creates and empties paths below it (`mkdir -p`,
-// `rm -rf <asset dir>`), and its workspace wipe and restore skip the name.
+// snapshot.
+//
+// The link must survive Paperclip's own sync commands. Its asset extract
+// (`rm -rf <asset dir> && mkdir -p ... && tar -xf ... -C <asset dir>`) works
+// below the link, and its workspace wipe and restore skip the name. Its
+// inbound workspace tar does not: in tog.22 (adapter-utils
+// sandbox-managed-runtime.ts) neither workspaceArchiveExclude nor the git
+// overlay copy leaves out `.paperclip-runtime`, so the tar carries the host
+// workspace's own `.paperclip-runtime/` (repository clones, detached
+// repositories), and Paperclip runs `tar -xf <tar> -C <root>`. For a
+// directory member GNU tar replaces an existing symlink of that name with a
+// real directory. With --keep-directory-symlink it keeps the link, but
+// Ubuntu's tar from 1.35+dfsg-3ubuntu0.2 (CVE-2025-45582) then refuses to
+// write through a link that leaves the extraction directory, and the extract
+// fails. Either way the run's files would land on the saved disk, or vanish
+// from the path the agent uses. So every command script tells GNU tar to skip
+// `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR, below).
+//
+// One known gap: a tar that ignores TAR_OPTIONS (busybox, bsdtar) is not
+// covered. boat's image ships GNU tar.
+
+/**
+ * Exported in every command script, right before the payload: GNU tar reads
+ * TAR_OPTIONS ahead of its command line, so each tar the payload runs (Paperclip's
+ * workspace extract, its sync-back tar, an agent's own tar) skips every member
+ * with a path component named `.paperclip-runtime`, when it extracts, creates
+ * or lists an archive. The exclude is not anchored and adds no
+ * position-sensitive option, so the command line's own `--exclude`s and member
+ * names match as before. The link and its /tmp files are left alone, and an
+ * archive an agent packs never holds the run's MCP config. Options already in
+ * TAR_OPTIONS stay, after this one.
+ */
+export const TAR_SKIP_RUNTIME_DIR = 'export TAR_OPTIONS="--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}"';
 
 /** Where the runtime directories of a VM live. Fixed: the link check below accepts only this shape. */
 export const RUNTIME_TMP_PREFIX = "/tmp/paperclip-boat-runtime-";

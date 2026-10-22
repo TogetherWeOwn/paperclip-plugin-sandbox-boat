@@ -727,8 +727,11 @@ export class BoatVmManager {
    * * `held_lease`: a run still holds the VM (an active run, or the open run
    *   window of a resumed lease), so its work is not synced back yet.
    * A VM set up by this version keeps the MCP config under /tmp, which boat
-   * never snapshots, so the stop snapshot does not get it; a VM set up before
-   * the link may keep the run JWT there. The owner accepted that residual risk.
+   * never snapshots: the link survives Paperclip's syncs, because every command's
+   * GNU tar skips `.paperclip-runtime` members (shell.ts, TAR_SKIP_RUNTIME_DIR).
+   * So the stop snapshot does not get it. A VM set up before the link, or one
+   * whose link something else replaced with a real directory, may keep the run
+   * JWT there. The owner accepted that residual risk.
    */
   private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep"; keep: KeptDiskReason; reason: string }): void {
     const why = {
@@ -737,7 +740,7 @@ export class BoatVmManager {
       held_lease: "a run still holds the VM",
     }[input.keep];
     this.logger.error(
-      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. With .paperclip-runtime linked into /tmp the file is not on the saved disk; a VM set up before the link may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
+      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. With .paperclip-runtime linked into /tmp, and every command's tar skipping it, Paperclip's syncs keep the file off the saved disk; a VM set up before the link, or one whose link something else replaced with a real directory, may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
       { sandboxId: input.sandboxId, trigger: input.trigger, keep: input.keep, reason: input.reason },
     );
   }

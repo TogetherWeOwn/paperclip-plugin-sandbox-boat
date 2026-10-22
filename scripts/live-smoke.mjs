@@ -11,7 +11,9 @@
 // .paperclip-runtime is a symlink into /tmp, so a stand-in for Paperclip's run
 // MCP config written through it never reaches /home, is in no snapshot of the
 // VM (per-minute or stop; read with GET /snapshots/{id}/tree), and is gone
-// after a stop and resume; and a payload killed by SIGTERM exits 143, not 255.
+// after a stop and resume; Paperclip's workspace extract of a host tar that
+// carries .paperclip-runtime/ (tog.22 command, the VM's own tar) leaves the link
+// and the stand-in alone; and a payload killed by SIGTERM exits 143, not 255.
 //
 // A resume within 10 minutes of a stop gets the same machine back, /tmp
 // included (docs.boat.dev/snapshots/stop), so the runtime link is kept. With
@@ -163,6 +165,40 @@ try {
     if (!lines1.includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
   }
   if (!lines1.some((line) => line.startsWith("ancestor_environ_tokens=0 "))) throw new Error("smoke check failed: expected ancestor_environ_tokens=0");
+
+  step("execute: Paperclip's workspace extract of a host tar with .paperclip-runtime/ keeps the link (tog.22 command, the VM's own tar)");
+  // The host tar is built like createTarballFromDirectory (top-level names, so it has a
+  // .paperclip-runtime/ directory member), uploaded under the runtime root, and extracted
+  // with the git-overlay command (no wipe, so the workspace marker stays). Building and
+  // listing it use `env -u TAR_OPTIONS`, because every Execute exports the exclude.
+  const extract = await exec(
+    lease1,
+    [
+      'ws="$HOME/paperclip-workspace"; rt="$ws/.paperclip-runtime/claude"; h=$(mktemp -d /tmp/smoke-host-XXXXXX) || exit 1',
+      'mkdir -p "$h/.paperclip-runtime/detached-repositories/r1" && echo host > "$h/.paperclip-runtime/detached-repositories/r1/f" && echo code > "$h/smoke-main.rs"',
+      "printf '%s\\0' .paperclip-runtime smoke-main.rs > \"$h.list\"",
+      "env -u TAR_OPTIONS tar -c --no-xattrs -f \"$rt/workspace-upload.tar\" -C \"$h\" --exclude '._*' --null -T \"$h.list\"",
+      'echo "tar_dir_member=$(env -u TAR_OPTIONS tar -tf "$rt/workspace-upload.tar" | grep -c "^\\.paperclip-runtime/$")"',
+      'mkdir -p "$ws" && tar -xf "$rt/workspace-upload.tar" -C "$ws" && rm -f "$rt/workspace-upload.tar" && echo "workspace_extract=ok"',
+      'l="$ws/.paperclip-runtime"; if [ -L "$l" ]; then echo "runtime_link_after_extract=$(readlink "$l")"; else echo "runtime_link_after_extract=replaced"; fi',
+      'echo "mcp_config_after_extract=$([ -f "$rt/mcp-config/mcp-config.json" ] && echo present || echo gone) workspace_file=$(cat "$ws/smoke-main.rs" 2>/dev/null)"',
+      'echo "host_runtime_unpacked=$([ -e "$l/detached-repositories" ] && echo yes || echo no)"',
+      // Evidence: which tar the VM has, and what it does to the link without the exclude (scratch dir under /tmp).
+      `echo "vm_tar=$(tar --version | head -1) pkg=$(dpkg-query -W -f '\${Version}' tar 2>/dev/null)"`,
+      'c=$(mktemp -d /tmp/smoke-ctl-XXXXXX) && mkdir "$c/ws" "$c/target" && ln -s "$c/target" "$c/ws/.paperclip-runtime" && env -u TAR_OPTIONS tar -cf "$c/t.tar" -C "$h" .paperclip-runtime && { env -u TAR_OPTIONS tar -xf "$c/t.tar" -C "$c/ws" 2>/dev/null; echo "control_without_exclude=$([ -L "$c/ws/.paperclip-runtime" ] && echo link-kept || echo link-replaced)"; }',
+      'rm -rf "$h" "$h.list" "$c" "$ws/smoke-main.rs"',
+    ].join("\n"),
+  );
+  const extractLines = extract.stdout.split("\n");
+  for (const expected of [
+    "tar_dir_member=1",
+    "workspace_extract=ok",
+    `runtime_link_after_extract=${lease1.metadata?.runtimeDir}`,
+    "mcp_config_after_extract=present workspace_file=code",
+    "host_runtime_unpacked=no",
+  ]) {
+    if (!extractLines.includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
+  }
 
   step("execute: a payload killed by SIGTERM reports 143 (ssh would say 255 if the payload replaced every shell)");
   const killed = await exec(lease1, "kill -TERM $$");

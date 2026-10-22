@@ -35,6 +35,7 @@ import {
   RUNTIME_SECRET_SCRUB_RESULT_RE,
   RUNTIME_TMP_PREFIX,
   SCRUB_BASHRC_ASCII_TOKEN,
+  TAR_SKIP_RUNTIME_DIR,
   buildLoginShellScript,
   buildRemoteCommand,
   buildRemoteEnvFileContents,
@@ -428,12 +429,14 @@ describe("shell", () => {
     const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
     const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
     expect(script).toContain(
-      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS=\"--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}\" && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
     );
     expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
     // The payload runs as a child of the script's shell, never as its last command, so no shell execs it.
     expect(script).not.toContain("exec 'node'");
-    expect(buildLoginShellScript({ command: "node", args: ["x.js"], remoteEnv: null })).toMatch(/&& unset ASCII_TOKEN BOAT_ID && 'node' 'x\.js'; rc=\$\?; exit \$rc$/);
+    expect(buildLoginShellScript({ command: "node", args: ["x.js"], remoteEnv: null }).endsWith(
+      ` && unset ASCII_TOKEN BOAT_ID && ${TAR_SKIP_RUNTIME_DIR} && 'node' 'x.js'; rc=$?; exit $rc`,
+    )).toBe(true);
     // That shell is started by env without boat's credentials.
     expect(buildRemoteCommand("true")).toBe("exec env -u ASCII_TOKEN -u BOAT_ID sh -c 'true'");
   });
@@ -501,6 +504,23 @@ describe("shell", () => {
           expect(run.status).toBe(0);
         }
       }
+    });
+
+    it("the payload's tar skips .paperclip-runtime, and a TAR_OPTIONS from the run env or a profile stays after the exclude", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      writeFileSync(path.join(root, ".profile"), "export TAR_OPTIONS=--profile-option\n");
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
+      const payload = 'printf "tar_options=%s\\n" "$TAR_OPTIONS"';
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["TAR_OPTIONS", "--warning=no-timestamp"]]), env });
+      const staged = spawnSync("sh", ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv: stage }))], { env, encoding: "utf8" });
+      expect(staged.stdout).toBe("tar_options=--exclude=.paperclip-runtime --warning=no-timestamp\n");
+      const bare = spawnSync("sh", ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: root, remoteEnv: null }))], { env, encoding: "utf8" });
+      expect(bare.stdout).toBe("tar_options=--exclude=.paperclip-runtime --profile-option\n");
+      rmSync(path.join(root, ".profile"));
+      const none = spawnSync("sh", ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", payload], remoteEnv: null }))], { env, encoding: "utf8" });
+      expect(none.stdout).toBe("tar_options=--exclude=.paperclip-runtime\n");
     });
 
     // sshd runs the remote command as `$SHELL -c '<command>'`. Over ssh, a
@@ -831,6 +851,115 @@ describe("shell", () => {
         const scrub = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
         expect(scrub.stdout.trim()).toBe("paperclip-boat-scrub found=1 left=0");
         expect(existsSync(path.join(dir, "claude", "mcp-config"))).toBe(false);
+      });
+
+      // Paperclip's inbound workspace tar carries the host workspace's own
+      // .paperclip-runtime/ (tog.22: workspaceArchiveExclude and the git overlay
+      // copy do not leave it out), with a directory member of that name. GNU tar
+      // replaces a symlink with a real directory for such a member. The commands
+      // below are tog.22's, run the way Execute runs them.
+      const gnuTar = spawnSync("tar", ["--version"], { encoding: "utf8" }).stdout?.includes("GNU tar") ?? false;
+      it.skipIf(!gnuTar).each([
+        { workspace: "plain (wipe, then extract)", wipe: true, order: "asset first" },
+        { workspace: "plain (wipe, then extract)", wipe: true, order: "workspace first" },
+        { workspace: "git overlay (extract over the tree)", wipe: false, order: "asset first" },
+        { workspace: "git overlay (extract over the tree)", wipe: false, order: "workspace first" },
+      ])("Paperclip's workspace extract of a host tar with .paperclip-runtime/ keeps the link, and the MCP config stays under /tmp: $workspace, $order", ({ wipe, order }) => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const q = shellQuote;
+        const plainEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
+        const ws = path.join(root, "paperclip-workspace");
+        const dir = fresh();
+        expect(link(ws, dir).status).toBe(0);
+        writeFileSync(path.join(ws, "old.txt"), "old");
+        // The host workspace, as on rbx1: a .paperclip-runtime with repository clones next to the code.
+        const host = path.join(root, "host");
+        for (const [file, body] of Object.entries({
+          ".paperclip-runtime/detached-repositories/r1/f": "host runtime file",
+          ".paperclip-runtime/claude/mcp-config/mcp-config.json": "stale host config",
+          "main.rs": "fn main() {}",
+          ".paperclip-runtime-like/keep": "not the runtime directory",
+        })) {
+          mkdirSync(path.dirname(path.join(host, file)), { recursive: true });
+          writeFileSync(path.join(host, file), body);
+        }
+        // createTarballFromDirectory: the top-level names, not ".".
+        const list = path.join(root, "entries.nul");
+        writeFileSync(list, [".paperclip-runtime", "main.rs", ".paperclip-runtime-like"].map((name) => `${name}\0`).join(""));
+        const hostTar = path.join(root, "workspace.tar");
+        execFileSync("tar", ["-c", "--no-xattrs", "-f", hostTar, "-C", host, "--exclude", "._*", "--null", "-T", list], { env: plainEnv });
+        expect(execFileSync("tar", ["-tf", hostTar], { env: plainEnv, encoding: "utf8" }).split("\n")).toContain(".paperclip-runtime/");
+        // The asset, packed on the host.
+        const assetSource = path.join(root, "asset-src");
+        mkdirSync(assetSource);
+        writeFileSync(path.join(assetSource, "mcp-config.json"), JSON.stringify({ mcpServers: { p: { headers: { Authorization: `Bearer ${jwt}` } } } }));
+        const assetTar = path.join(root, "mcp-config.tar");
+        execFileSync("tar", ["-cf", assetTar, "-C", assetSource, "mcp-config.json"], { env: plainEnv });
+        // Both tars are uploaded under <root>/.paperclip-runtime/claude, through the link.
+        const runtimeRoot = `${ws}/.paperclip-runtime/claude`;
+        const remoteWorkspaceTar = `${runtimeRoot}/workspace-upload.tar`;
+        const remoteAssetTar = `${runtimeRoot}/mcp-config-upload.tar`;
+        const assetDir = `${runtimeRoot}/mcp-config`;
+        // buildWorkspaceTarExtractCommand (wipeExceptNames: preservedNames, or null for the git overlay) and buildDefaultExtractRuntimeAssetCommand.
+        const wipeStep = wipe ? ` && find ${q(ws)} -mindepth 1 -maxdepth 1 ! -name '.paperclip-runtime' ! -name '.paperclip-upload-*' -exec rm -rf -- {} +` : "";
+        const workspaceExtract = `mkdir -p ${q(ws)}${wipeStep} && tar -xf ${q(remoteWorkspaceTar)} -C ${q(ws)} && rm -f ${q(remoteWorkspaceTar)}`;
+        const assetExtract = `rm -rf ${q(assetDir)} && mkdir -p ${q(assetDir)} && tar -xf ${q(remoteAssetTar)} -C ${q(assetDir)} && rm -f ${q(remoteAssetTar)}`;
+        // Execute: `$SHELL -c 'exec env -u ... sh -c <script>'`, the payload `sh -c <command>` with cwd = the workspace.
+        const execute = (command: string) =>
+          spawnSync("bash", ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", command], cwd: ws, remoteEnv: null }))], { env: plainEnv, encoding: "utf8" });
+        const upload = (from: string, to: string) => execute(`mkdir -p ${q(path.posix.dirname(to))} && cat ${q(from)} > ${q(to)}`);
+        const steps =
+          order === "asset first"
+            ? [() => upload(assetTar, remoteAssetTar), () => execute(assetExtract), () => upload(hostTar, remoteWorkspaceTar), () => execute(workspaceExtract)]
+            : [() => upload(hostTar, remoteWorkspaceTar), () => execute(workspaceExtract), () => upload(assetTar, remoteAssetTar), () => execute(assetExtract)];
+        for (const [index, step] of steps.entries()) {
+          const run = step();
+          expect({ index, status: run.status, stderr: run.stderr }).toEqual({ index, status: 0, stderr: "" });
+        }
+        const runtime = path.join(ws, ".paperclip-runtime");
+        // The link survived and still points at the lease's /tmp directory.
+        expect(lstatSync(runtime).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(runtime)).toBe(dir);
+        // The run's MCP config is under /tmp, where the agent finds it through the link.
+        expect(readFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
+        expect(readFileSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
+        // Nothing on the workspace's own disk holds it (grep -r does not follow the link).
+        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
+        // The workspace itself arrived; the host's runtime files were skipped, and the upload tars are gone.
+        expect(readFileSync(path.join(ws, "main.rs"), "utf8")).toBe("fn main() {}");
+        expect(readFileSync(path.join(ws, ".paperclip-runtime-like", "keep"), "utf8")).toBe("not the runtime directory");
+        expect(existsSync(path.join(ws, "old.txt"))).toBe(!wipe);
+        expect(existsSync(path.join(dir, "detached-repositories"))).toBe(false);
+        expect(spawnSync("grep", ["-rlF", "stale host config", dir], { encoding: "utf8" }).stdout).toBe("");
+        expect([existsSync(path.join(dir, "claude", "workspace-upload.tar")), existsSync(path.join(dir, "claude", "mcp-config-upload.tar"))]).toEqual([false, false]);
+
+        // Control: the same workspace extract without the plugin's script replaces the link with a real directory.
+        expect(upload(hostTar, remoteWorkspaceTar).status).toBe(0);
+        const bare = spawnSync("sh", ["-c", workspaceExtract], { cwd: ws, env: plainEnv, encoding: "utf8" });
+        expect(bare.status).toBe(0);
+        expect(lstatSync(runtime).isSymbolicLink()).toBe(false);
+        expect(readFileSync(path.join(runtime, "detached-repositories", "r1", "f"), "utf8")).toBe("host runtime file");
+        expect(existsSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"))).toBe(true);
+        expect(readFileSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"), "utf8")).toBe("stale host config");
+      });
+
+      it.skipIf(!gnuTar)("an agent's own tar through Execute never packs the run's MCP config, even when it follows the link", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+        const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
+        const ws = path.join(root, "ws");
+        const dir = fresh();
+        expect(link(ws, dir).status).toBe(0);
+        mkdirSync(path.join(dir, "claude", "mcp-config"), { recursive: true });
+        writeFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), jwt);
+        writeFileSync(path.join(ws, "main.rs"), "fn main() {}");
+        const out = path.join(root, "out.tar");
+        const script = buildLoginShellScript({ command: "tar", args: ["-chf", out, "."], cwd: ws, remoteEnv: null });
+        expect(spawnSync("sh", ["-c", buildRemoteCommand(script)], { env, encoding: "utf8" }).status).toBe(0);
+        const listed = execFileSync("tar", ["-tf", out], { env, encoding: "utf8" });
+        expect(listed).toContain("./main.rs");
+        expect(listed).not.toContain(".paperclip-runtime");
+        // Control: the same tar outside Execute follows the link and packs the file.
+        expect(execFileSync("sh", ["-c", `tar -chf - . | tar -tf -`], { cwd: ws, env, encoding: "utf8" })).toContain("./.paperclip-runtime/claude/mcp-config/mcp-config.json");
       });
 
       it("fails, with no result line and no link, when the fresh directory already exists", () => {

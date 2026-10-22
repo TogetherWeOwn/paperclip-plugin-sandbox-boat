@@ -739,7 +739,10 @@ describe("run env allowlist (incident TOG-37420)", () => {
     const before = ssh.spawned.length;
     await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "claude", args: ["-v"] } as never);
     const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("'claude'"))!.args.at(-1)!);
-    expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && 'claude' '-v'; rc=\$\?; exit \$rc$/);
+    expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS="--exclude=\.paperclip-runtime\$\{TAR_OPTIONS:\+ \$TAR_OPTIONS\}" && 'claude' '-v'; rc=\$\?; exit \$rc$/);
+    // Every Execute (Paperclip's sync commands included) tells GNU tar to leave .paperclip-runtime alone, so its link into /tmp survives.
+    expect(script.indexOf('export TAR_OPTIONS="--exclude=.paperclip-runtime')).toBeGreaterThan(unsetAt);
+    expect(script.indexOf('export TAR_OPTIONS="--exclude=.paperclip-runtime')).toBeLessThan(payloadAt);
   });
 
   it("removes boat's ASCII_TOKEN line from ~/.bashrc when it sets up a VM and after resuming one for a command", async () => {
