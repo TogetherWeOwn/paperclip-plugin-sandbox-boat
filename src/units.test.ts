@@ -137,7 +137,7 @@ describe("env policy", () => {
       expect([name, decide(name, "x", [name])]).toEqual([name, "kept"]);
     }
     expect(decide("KEY", "x", ["KEY"])).toBe("kept");
-    expect(decide("KEY", "x", ["K*"].map((entry) => entry.replace("*", "_*")))).toBe("not_allowlisted");
+    expect(decide("KEY", "x", ["K_*"])).toBe("not_allowlisted");
     // Look-alikes that are not secret names still pass through a prefix.
     for (const name of ["CARGO_MONKEY", "CARGO_KEYBOARD", "CARGO_AUTHOR", "CARGO_PATH", "CARGO_AUTH_SOCK"]) {
       expect([name, decide(name, "x", ["CARGO_*"])]).toEqual([name, "kept"]);
