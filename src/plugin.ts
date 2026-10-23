@@ -8,6 +8,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
+import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
 
@@ -43,7 +44,8 @@ const plugin = definePlugin({
       ...managerOverrides,
     });
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {
-      const report = await requireManager().sweep("schedule");
+      // The job's own invocation has no company, so run the sweep outside it (proactive.ts).
+      const report = await runOutsideInvocation(() => requireManager().sweep("schedule"));
       if (report.stopped.length || report.deleted.length || report.errors.length) {
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }
@@ -84,6 +86,8 @@ const plugin = definePlugin({
     // Never echo secrets back as normalized config values.
     if (normalizedConfig.apiKey == null) delete normalizedConfig.apiKey;
     if (normalizedConfig.costApiKey == null) delete normalizedConfig.costApiKey;
+    // Unset means the built-in allowlist; keep it unset so it follows the plugin.
+    if (normalizedConfig.envAllowlist == null) delete normalizedConfig.envAllowlist;
     return { ok: true, warnings, normalizedConfig };
   },
 

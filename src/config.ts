@@ -1,3 +1,5 @@
+import { ESSENTIAL_RUN_ENV, allowlistDelivers, invalidAllowlistEntries, isDeniedEnvFamily, parseEnvAllowlist } from "./env-policy.js";
+
 // Driver config for the boat sandbox provider. Defaults match the boat free
 // trial (docs.boat.dev/free-trial): 2 sandboxes at once, 75 starts per day,
 // 25 h of compute, auto-stop at most 2 h, sizes small and default only.
@@ -43,6 +45,18 @@ export interface BoatDriverConfig {
   sshConnectTimeoutSec: number;
   remoteWorkspaceDir: string | null;
   allowPaidNamedSnapshots: boolean;
+  /**
+   * Paperclip's own envelope flag (not a boat setting). The host passes it to
+   * the plugin and keeps only what the plugin returns as normalized config, so
+   * it must survive normalization or per-card lease reuse silently turns off.
+   */
+  reuseLease: boolean;
+  /**
+   * Run env names that may reach the VM: exact names and `NAME_*` prefixes.
+   * Null: the built-in DEFAULT_ENV_ALLOWLIST (env-policy.ts). An empty list:
+   * nothing reaches the VM. Everything else the host passes is dropped.
+   */
+  envAllowlist: string[] | null;
 }
 
 export const CONFIG_DEFAULTS = {
@@ -67,6 +81,7 @@ export const CONFIG_DEFAULTS = {
   tunnelTargetPort: 8317,
   sshConnectTimeoutSec: 15,
   allowPaidNamedSnapshots: false,
+  reuseLease: false,
 };
 
 function str(value: unknown): string | null {
@@ -131,6 +146,8 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     sshConnectTimeoutSec: Math.trunc(num(raw.sshConnectTimeoutSec, CONFIG_DEFAULTS.sshConnectTimeoutSec)),
     remoteWorkspaceDir: str(raw.remoteWorkspaceDir),
     allowPaidNamedSnapshots: bool(raw.allowPaidNamedSnapshots, CONFIG_DEFAULTS.allowPaidNamedSnapshots),
+    reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),
+    envAllowlist: parseEnvAllowlist(raw.envAllowlist),
   };
 }
 
@@ -209,6 +226,27 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
     warnings.push(
       "noEnv is off: if the boat environment is not marked safe for third parties, sandboxes receive the account's GitHub token, secrets and model logins.",
     );
+  }
+  if (config.envAllowlist && config.envAllowlist.length === 0) {
+    warnings.push(
+      `envAllowlist is empty: no run env reaches the VM (deny-all), so a Claude run gets none of ${ESSENTIAL_RUN_ENV.join(", ")} and cannot reach the model proxy or Paperclip's sandbox bridge. Remove envAllowlist to use the built-in list.`,
+    );
+  } else if (config.envAllowlist) {
+    const invalid = invalidAllowlistEntries(config.envAllowlist);
+    if (invalid.length > 0) {
+      errors.push(`envAllowlist entries must be an exact NAME or a NAME_* prefix: ${invalid.slice(0, 5).join(", ")}.`);
+    } else {
+      const missing = ESSENTIAL_RUN_ENV.filter((name) => !allowlistDelivers(name, config.envAllowlist!));
+      if (missing.length > 0) {
+        warnings.push(
+          `envAllowlist does not deliver ${missing.join(", ")}: a Claude run needs them for the model proxy and Paperclip's sandbox bridge. Secret-looking names need an exact entry; a NAME_* prefix never delivers them.`,
+        );
+      }
+      const never = config.envAllowlist.filter((entry) => isDeniedEnvFamily(entry));
+      if (never.length > 0) {
+        warnings.push(`envAllowlist names keys this plugin never sends to a VM (provider credentials): ${never.slice(0, 5).join(", ")}.`);
+      }
+    }
   }
   if (config.cliproxyTunnel && config.tunnelTargetHost === "127.0.0.1") {
     warnings.push(

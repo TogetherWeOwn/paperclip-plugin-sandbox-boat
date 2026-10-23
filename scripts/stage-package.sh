@@ -14,6 +14,14 @@
 #   - a commit older than the env-file fix (0721a3a): before it, the run env
 #     file sat in the workspace, where `git add -A` and boat snapshots could
 #     pick up the tokens in it;
+#   - a build without the run env allowlist (0.2.0): before it, every env key
+#     Paperclip passed, project secrets included, reached the VM;
+#   - a build that does not delete Paperclip's run MCP config (run JWT) before
+#     it stops, deletes or snapshots a VM;
+#   - a build that does not link the workspace's .paperclip-runtime into /tmp
+#     (which boat never snapshots) before Paperclip syncs the run's files, or
+#     that does not make every command's tar skip .paperclip-runtime members
+#     (Paperclip's workspace extract would replace the link);
 #   - a destination that already exists.
 set -eu
 
@@ -76,6 +84,37 @@ echo "$sha" > "$pkg/.source-commit"
 # The env file must never be named inside the workspace again.
 if grep -rqF '.paperclip-boat-env-' "$pkg/dist"; then
   echo "stage-package: dist still stages the env file in the workspace; refusing." >&2
+  exit 1
+fi
+# Execute must filter the run env through the allowlist (src/env-policy.ts).
+if [ ! -f "$pkg/dist/env-policy.js" ] || ! grep -qF 'filterRunEnv(params.env' "$pkg/dist/vm-manager.js"; then
+  echo "stage-package: dist has no run env allowlist; refusing (every env key would reach the VM)." >&2
+  exit 1
+fi
+# Execute must refuse every ACP process-session step, including the command.b64
+# upload of a large envelope (the old inline-only check missed it).
+if ! grep -qF 'isAcpProcessSessionCommand(params.command' "$pkg/dist/vm-manager.js" || ! grep -qF 'process-sessions' "$pkg/dist/env-policy.js"; then
+  echo "stage-package: dist does not refuse Paperclip's ACP process-session commands; refusing (its envelope carries the unfiltered env)." >&2
+  exit 1
+fi
+
+# Release, stop, destroy, the sweep and template capture must delete Paperclip's
+# run MCP config (it holds the run JWT) before boat saves the VM disk.
+if ! grep -qF 'scrubRuntimeSecretsScript(' "$pkg/dist/vm-manager.js" || ! grep -qF 'mcp-config' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not remove Paperclip's run MCP config before stops; refusing (the run JWT would stay in boat snapshots)." >&2
+  exit 1
+fi
+# Acquire, resumed leases and realize must link <root>/.paperclip-runtime into
+# /tmp, which boat never snapshots, before Paperclip syncs the run's files.
+if ! grep -qF 'linkRuntimeDirScript(' "$pkg/dist/vm-manager.js" || ! grep -qF '/tmp/paperclip-boat-runtime-' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not keep Paperclip's runtime directory under /tmp; refusing (the run JWT would be in boat's per-minute snapshots)." >&2
+  exit 1
+fi
+# Every command script must tell GNU tar to skip .paperclip-runtime members:
+# Paperclip's inbound workspace tar carries one from the host, and its extract
+# would replace the link with a real directory on the saved disk.
+if ! grep -qF 'TAR_OPTIONS="--exclude=.paperclip-runtime' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not keep Paperclip's workspace extract off the runtime link; refusing (the run JWT could land on the saved disk)." >&2
   exit 1
 fi
 

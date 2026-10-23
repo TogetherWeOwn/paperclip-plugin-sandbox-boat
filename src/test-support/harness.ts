@@ -1,5 +1,7 @@
 // Test doubles: a scripted `ssh`/`ssh-keygen` (via a mocked spawn) and a
 // minimal Paperclip plugin context (state, logger, issues, jobs).
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
 
@@ -68,9 +70,31 @@ function optionValue(args: string[], name: string): string | null {
   return null;
 }
 
+/** The script inside `sh -c '<script>'` (any prefix before it, such as `exec env -u ...`), undoing shellQuote. */
+export function scriptOfShDashC(remoteCommand: string): string | null {
+  const at = remoteCommand.indexOf("sh -c '");
+  if (at < 0 || !remoteCommand.endsWith("'")) return null;
+  return remoteCommand.slice(at + "sh -c '".length, -1).replaceAll(`'"'"'`, "'");
+}
+
+export interface FakeRuntimeLink {
+  root: string;
+  runtimeDir: string;
+}
+
 export class FakeSsh {
   readonly spawned: SpawnRecord[] = [];
   masterFailures = 0;
+  /** Per sandbox, every `.paperclip-runtime` link the plugin asked for, in order. */
+  readonly runtimeLinks = new Map<string, FakeRuntimeLink[]>();
+  /**
+   * Per sandbox (HostKeyAlias), how many run-secret paths (Paperclip's
+   * `.paperclip-runtime/<adapter>/mcp-config`) the fake VM disk holds. The
+   * plugin's scrub command removes them and reports the count.
+   */
+  readonly runtimeSecrets = new Map<string, number>();
+  /** Shared with FakeBoat.timeline: `ssh:scrub:<sandboxId>` for each scrub, in call order. */
+  timeline: string[] | null = null;
   /** Return a reply for a remote command, or undefined for the default. */
   handler: ((remoteCommand: string, stdin: string) => ExecReply | undefined) | null = null;
 
@@ -100,9 +124,12 @@ export class FakeSsh {
       return child; // stays alive until killed
     }
     const remoteCommand = args[args.length - 1];
+    const sandboxId = optionValue(args, "HostKeyAlias") ?? "";
+    if (remoteCommand.includes("paperclip-boat-scrub")) this.timeline?.push(`ssh:scrub:${sandboxId}`);
+    if (remoteCommand.includes("paperclip-boat-runtime")) this.timeline?.push(`ssh:link:${sandboxId}`);
     const respond = () => {
       record.stdin = child.stdinText;
-      const reply = this.handler?.(remoteCommand, child.stdinText) ?? this.defaultReply(remoteCommand);
+      const reply = this.handler?.(remoteCommand, child.stdinText) ?? this.defaultReply(remoteCommand, sandboxId);
       child.finish(reply.code, reply.stdout ?? "", reply.stderr ?? "");
     };
     const stdio = options?.stdio ?? [];
@@ -111,11 +138,37 @@ export class FakeSsh {
     return child;
   };
 
-  private defaultReply(remoteCommand: string): ExecReply {
+  private defaultReply(remoteCommand: string, sandboxId: string): ExecReply {
     if (remoteCommand.includes('"$d" "$s"')) {
       return { code: 0, stdout: "/home/user/paperclip-workspace\nbash\n" };
     }
+    if (remoteCommand.includes("paperclip-boat-scrub")) {
+      const found = this.runtimeSecrets.get(sandboxId) ?? 0;
+      this.runtimeSecrets.set(sandboxId, 0);
+      return { code: 0, stdout: `paperclip-boat-scrub found=${found} left=0 walk=complete\n` };
+    }
+    const link = FakeSsh.runtimeLinkOf(remoteCommand);
+    if (link) {
+      this.runtimeLinks.set(sandboxId, [...(this.runtimeLinks.get(sandboxId) ?? []), link]);
+      return { code: 0, stdout: `paperclip-boat-runtime linked ${link.runtimeDir}\n` };
+    }
     return { code: 0, stdout: "ok\n" };
+  }
+
+  /** The root and fresh /tmp directory of a runtime-link command, or null. */
+  static runtimeLinkOf(remoteCommand: string): FakeRuntimeLink | null {
+    if (!remoteCommand.includes("paperclip-boat-runtime")) return null;
+    const script = scriptOfShDashC(remoteCommand) ?? "";
+    const root = script.match(/^root='([^']*)'/)?.[1];
+    const runtimeDir = script.match(/new='(\/tmp\/paperclip-boat-runtime-[0-9a-f]{32})'/)?.[1];
+    return root && runtimeDir ? { root, runtimeDir } : null;
+  }
+
+  /** The runtime-link commands sent to one sandbox. */
+  links(sandboxId?: string): SpawnRecord[] {
+    return this.execs().filter(
+      (entry) => entry.args.at(-1)!.includes("paperclip-boat-runtime") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
+    );
   }
 
   sshCalls(): SpawnRecord[] {
@@ -129,6 +182,13 @@ export class FakeSsh {
   execs(): SpawnRecord[] {
     return this.spawned.filter((entry) => entry.command === "ssh" && !entry.args.includes("-N") && !entry.args.includes("-V"));
   }
+
+  /** The scrub commands sent to one sandbox. */
+  scrubs(sandboxId?: string): SpawnRecord[] {
+    return this.execs().filter(
+      (entry) => entry.args.at(-1)!.includes("paperclip-boat-scrub") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
+    );
+  }
 }
 
 export interface FakeLogEntry {
@@ -137,7 +197,50 @@ export interface FakeLogEntry {
   meta?: Record<string, unknown>;
 }
 
-export function createFakeContext(options: { issues?: Map<string, { status: string }> } = {}) {
+// Emulation of the Paperclip host's invocation scopes (plugin-worker-manager +
+// host-client-factory): calls made inside a host request carry its invocation;
+// a finished invocation is refused; an invocation with no company refuses
+// company state; calls outside any invocation are "proactive" and allowed only
+// for configured companies. Instance-scoped state needs a company invocation.
+export interface FakeInvocation {
+  id: string;
+  companyId: string | null;
+  ended: boolean;
+}
+
+export const fakeInvocations = new AsyncLocalStorage<FakeInvocation>();
+
+/** Run fn the way the host runs a plugin RPC: inside an invocation that ends when fn settles. */
+export async function inHostInvocation<T>(companyId: string | null, fn: () => Promise<T>): Promise<T> {
+  const invocation: FakeInvocation = { id: randomUUID(), companyId, ended: false };
+  try {
+    return await fakeInvocations.run(invocation, fn);
+  } finally {
+    invocation.ended = true;
+  }
+}
+
+function hostScopeCheck(
+  method: string,
+  input: { scopeKind: string; scopeId?: string },
+  proactiveCompanies: Set<string>,
+): void {
+  const invocation = fakeInvocations.getStore();
+  const company = input.scopeKind === "company" ? (input.scopeId ?? null) : null;
+  const deny = (why: string) => new Error(`Plugin is not allowed to perform "${method}": ${why}`);
+  if (invocation) {
+    if (invocation.ended) throw deny("the worker referenced a missing, expired, or unknown invocation scope");
+    if (!invocation.companyId) throw deny("company context is required");
+    if (company && company !== invocation.companyId) throw deny(`requested company "${company}" but the current invocation is scoped to company "${invocation.companyId}"`);
+    return;
+  }
+  if (company && proactiveCompanies.has(company)) return;
+  throw deny("company context is required");
+}
+
+export function createFakeContext(
+  options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
+) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
@@ -147,11 +250,18 @@ export function createFakeContext(options: { issues?: Map<string, { status: stri
   const log = (level: FakeLogEntry["level"]) => (message: string, meta?: Record<string, unknown>) => {
     logs.push({ level, message, meta });
   };
+  const proactive = new Set(options.hostScopes?.proactiveCompanies ?? []);
+  const check = (method: string, input: { scopeKind: string; scopeId?: string }) => {
+    if (options.hostScopes) hostScopeCheck(method, input, proactive);
+  };
   const ctx = {
     state: {
-      get: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
-        state.has(keyOf(input)) ? structuredClone(state.get(keyOf(input))) : null,
+      get: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {
+        check("state.get", input);
+        return state.has(keyOf(input)) ? structuredClone(state.get(keyOf(input))) : null;
+      },
       set: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }, value: unknown) => {
+        check("state.set", input);
         state.set(keyOf(input), structuredClone(value));
       },
       delete: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {

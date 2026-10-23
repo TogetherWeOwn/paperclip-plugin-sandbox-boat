@@ -10,8 +10,14 @@
 //     in named snapshots) but do not save /tmp
 //     (docs.boat.dev/snapshots/whats-saved).
 //   - It is removed right after it is sourced, before the payload starts, so
-//     the payload never sees it on disk. A trailing remove after the payload
-//     stays as a fallback for a script that did not get that far.
+//     the payload never sees it on disk. A trailing remove stays as a fallback
+//     for a script that did not get that far.
+//   - The script runs in a `sh` that `env -u` started without boat's
+//     ASCII_TOKEN and BOAT_ID (buildRemoteCommand), so the payload's parent
+//     shell never had them in its startup environment (/proc/<pid>/environ
+//     keeps a process's startup env even after `unset`). That shell stays
+//     the payload's parent and exits with its status, so a payload killed by
+//     a signal reports 128+n instead of ssh's 255.
 import { randomUUID } from "node:crypto";
 
 export function shellQuote(value: string): string {
@@ -20,10 +26,6 @@ export function shellQuote(value: string): string {
 
 export function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
-}
-
-export function filterStringEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
-  return Object.entries(env ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string");
 }
 
 export function assertValidEnvKeys(entries: Array<[string, string]>): void {
@@ -70,18 +72,65 @@ export function removeRemoteEnvCommand(stage: RemoteEnvStage): string {
   return `rm -f ${shellQuote(stage.path)}; rmdir ${shellQuote(stage.dir)} 2>/dev/null`;
 }
 
-// Sources the staged env file, removes it at once, and only then runs the
-// payload. The trailing remove is a fallback for a script that stopped before
-// the first one (a failed `cd` or a failed source). The payload must not end in
-// a terminal `exec`, which would skip the trailing remove.
+/**
+ * boat puts these in every VM, even with noEnv and "safe for third parties"
+ * (docs.boat.dev/security#boat-credentials-inside-a-sandbox). ASCII_TOKEN can
+ * publish any port of the VM on a public URL; nothing here needs it. boat sets
+ * it in the exec env and in an `export ASCII_TOKEN=...` line near the top of
+ * ~/.bashrc, above the interactive guard, so every shell that reads ~/.bashrc
+ * gets it again.
+ */
+export const BOAT_VM_CREDENTIAL_VARS = ["ASCII_TOKEN", "BOAT_ID"] as const;
+
+/** Clears the boat VM credentials from the payload's environment. */
+export const UNSET_BOAT_VM_CREDENTIALS = `unset ${BOAT_VM_CREDENTIAL_VARS.join(" ")}`;
+
+const ASCII_TOKEN_EXPORT_LINE = "^[[:space:]]*export[[:space:]][[:space:]]*ASCII_TOKEN=";
+
+/**
+ * Deletes boat's `export ASCII_TOKEN=...` line from ~/.bashrc, so a shell the
+ * agent starts (Claude Code's Bash tool sources the user's shell rc file) does not export the
+ * token again. Never fails: it is a best-effort step in VM setup.
+ */
+export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && grep -q '${ASCII_TOKEN_EXPORT_LINE}' "$f"; then sed -i '/${ASCII_TOKEN_EXPORT_LINE}/d' "$f"; fi; } 2>/dev/null || true`;
+
+// Sources the staged env file, removes it at once, clears the boat VM
+// credentials again (a sourced profile can export ASCII_TOKEN from ~/.bashrc),
+// tells GNU tar to skip `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR;
+// after the env file, so a TAR_OPTIONS from the run env keeps the exclude),
+// and only then runs the payload. The payload runs as a child, not exec'd:
+// this shell never had the credentials in its startup environment
+// (buildRemoteCommand), so it may stay alive as the payload's parent, and its
+// `exit $rc` hands sshd the payload's status, 128+n for a signal. The payload
+// is never the script's last command, so no shell turns it into an implicit
+// exec. The trailing remove is a fallback for a script that stopped before the
+// first one (a failed `cd` or a failed source); after the payload the file is
+// already gone.
 export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
   const file = shellQuote(stage.path);
   const remove = removeRemoteEnvCommand(stage);
   return [
     `if [ -f ${file} ]; then . ${file}; fi`,
     `{ ${remove} || true; }`,
+    UNSET_BOAT_VM_CREDENTIALS,
+    TAR_SKIP_RUNTIME_DIR,
     `${payloadScript}; rc=$?; ${remove}; exit $rc`,
   ];
+}
+
+/**
+ * The ssh remote command that runs a command script. sshd runs it as
+ * `$SHELL -c '<this>'`. That login shell, started with boat's ASCII_TOKEN and
+ * BOAT_ID, execs `env`, which execs `sh` with an environment that lacks both,
+ * so no process left between sshd and the payload holds them in
+ * /proc/<pid>/environ. The `sh` waits for the payload and exits with its
+ * status: a payload killed by signal n gives 128+n. (When the payload itself
+ * replaced the shell, sshd reported the signal and the ssh client exited 255,
+ * which reads as a lost VM.)
+ */
+export function buildRemoteCommand(script: string): string {
+  const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
+  return `exec env ${unset} sh -c ${shellQuote(script)}`;
 }
 
 export function buildLoginShellScript(input: {
@@ -102,7 +151,259 @@ export function buildLoginShellScript(input: {
   if (input.remoteEnv != null) {
     lines.push(...envSourcingScriptLines(input.remoteEnv, commandParts));
   } else {
-    lines.push(`exec ${commandParts}`);
+    lines.push(UNSET_BOAT_VM_CREDENTIALS, TAR_SKIP_RUNTIME_DIR, `${commandParts}; rc=$?; exit $rc`);
   }
   return lines.join(" && ");
+}
+
+// ---------------------------------------------------------------------------
+// Paperclip's runtime directory lives under /tmp.
+//
+// Paperclip syncs a run's runtime assets (the run MCP config with the run JWT,
+// skills, config, the bridge queue, GitHub launchers, upload tarballs) into
+// `<root>/.paperclip-runtime/<adapter>/` and re-syncs them for every run. boat
+// saves /home/user every minute while a VM runs and at every stop, and keeps
+// the older per-minute snapshots for up to about a day. /tmp is in none of
+// them (docs.boat.dev/snapshots/whats-saved). So `<root>/.paperclip-runtime`
+// is made a symlink to a fresh 0700 directory under /tmp, before Paperclip
+// syncs anything: the files reach the VM's memory or scratch disk, never a
+// snapshot.
+//
+// The link must survive Paperclip's own sync commands. Its asset extract
+// (`rm -rf <asset dir> && mkdir -p ... && tar -xf ... -C <asset dir>`) works
+// below the link, and its workspace wipe and restore skip the name. Its
+// inbound workspace tar does not: in tog.22 (adapter-utils
+// sandbox-managed-runtime.ts) neither workspaceArchiveExclude nor the git
+// overlay copy leaves out `.paperclip-runtime`, so the tar carries the host
+// workspace's own `.paperclip-runtime/` (repository clones, detached
+// repositories), and Paperclip runs `tar -xf <tar> -C <root>`. For a
+// directory member GNU tar replaces an existing symlink of that name with a
+// real directory. With --keep-directory-symlink it keeps the link, but
+// Ubuntu's tar from 1.35+dfsg-3ubuntu0.2 (CVE-2025-45582) then refuses to
+// write through a link that leaves the extraction directory, and the extract
+// fails. Either way the run's files would land on the saved disk, or vanish
+// from the path the agent uses. So every command script tells GNU tar to skip
+// `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR, below).
+//
+// One known gap: a tar that ignores TAR_OPTIONS (busybox, bsdtar) is not
+// covered. boat's image ships GNU tar.
+
+/**
+ * Exported in every command script, right before the payload: GNU tar reads
+ * TAR_OPTIONS ahead of its command line, so each tar the payload runs (Paperclip's
+ * workspace extract, its sync-back tar, an agent's own tar) skips every member
+ * with a path component named `.paperclip-runtime`, when it extracts, creates
+ * or lists an archive. The exclude is not anchored and adds no
+ * position-sensitive option, so the command line's own `--exclude`s and member
+ * names match as before. The link and its /tmp files are left alone, and an
+ * archive an agent packs never holds the run's MCP config. Options already in
+ * TAR_OPTIONS stay, after this one.
+ */
+export const TAR_SKIP_RUNTIME_DIR = 'export TAR_OPTIONS="--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}"';
+
+/** Where the runtime directories of a VM live. Fixed: the link check below accepts only this shape. */
+export const RUNTIME_TMP_PREFIX = "/tmp/paperclip-boat-runtime-";
+
+/** The line the link script prints last: whether it kept the old target or made a new one, and the target. */
+export const RUNTIME_LINK_RESULT_RE = /^paperclip-boat-runtime (linked|kept) (\/tmp\/paperclip-boat-runtime-[0-9a-f]{32})$/m;
+
+/** A fresh, unguessable runtime directory name for one VM start (one lease). */
+export function newRuntimeTmpDir(): string {
+  return `${RUNTIME_TMP_PREFIX}${randomUUID().replace(/-/g, "")}`;
+}
+
+/**
+ * A script that makes `<root>/.paperclip-runtime` a symlink into /tmp:
+ *   - A link to an existing runtime directory of ours (the exact
+ *     `/tmp/paperclip-boat-runtime-<32 hex>` shape, a real directory owned by
+ *     this user) is kept, so a second run on a running VM does not lose the
+ *     first run's files. A resume within boat's 10-minute machine keep after a
+ *     stop gets the same machine back, /tmp included, and keeps it too.
+ *   - Anything else is replaced by a link to `fresh`, made with `mkdir -m 700`
+ *     (it fails when the path exists): a link that dangles because the VM came
+ *     back on a new machine (restored from a snapshot, which has no /tmp), a
+ *     link elsewhere, a file, or a real directory (from before this version,
+ *     or made by something else). A real directory's entries move into `fresh`
+ *     first, so they leave the saved disk and a run that uses them still finds
+ *     them through the link.
+ * Prints `paperclip-boat-runtime linked|kept <target>` and exits 0 only when
+ * the link resolves to that target.
+ */
+export function linkRuntimeDirScript(root: string, fresh: string): string {
+  const cleanRoot = root.trim().replace(/\/+$/, "");
+  if (!cleanRoot.startsWith("/") || cleanRoot.length < 2) throw new Error(`runtime root must be an absolute path: ${root}`);
+  if (!fresh.startsWith(RUNTIME_TMP_PREFIX) || !/^[0-9a-f]{32}$/.test(fresh.slice(RUNTIME_TMP_PREFIX.length))) {
+    throw new Error(`runtime directory must be ${RUNTIME_TMP_PREFIX}<32 hex>: ${fresh}`);
+  }
+  // Spelled out, not [0-9a-f]: a range in a case pattern can follow the locale's collation.
+  const ours = `${RUNTIME_TMP_PREFIX}${"[0123456789abcdef]".repeat(32)}`;
+  return [
+    `root=${shellQuote(cleanRoot)}; link="$root/.paperclip-runtime"; new=${shellQuote(fresh)}`,
+    'mkdir -p "$root" || exit 1',
+    'if [ -L "$link" ]; then',
+    '  t=$(readlink "$link")',
+    `  case "$t" in ${ours}) if [ -d "$t" ] && [ ! -L "$t" ] && [ -O "$t" ]; then echo "paperclip-boat-runtime kept $t"; exit 0; fi;; esac`,
+    "fi",
+    'umask 077 && mkdir -m 700 "$new" || exit 1',
+    'if [ -d "$link" ] && [ ! -L "$link" ]; then',
+    '  find "$link" -mindepth 1 -maxdepth 1 -exec mv -f -- {} "$new"/ \\; 2>/dev/null',
+    '  rm -rf -- "$link" || exit 1',
+    'elif [ -L "$link" ] || [ -e "$link" ]; then',
+    '  rm -f -- "$link" || exit 1',
+    "fi",
+    'ln -s "$new" "$link" || exit 1',
+    '[ "$(readlink "$link")" = "$new" ] || exit 1',
+    'echo "paperclip-boat-runtime linked $new"',
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Run secrets Paperclip itself writes into the VM, outside the run env.
+//
+// claude_local writes the run's MCP config, `{"mcpServers":{...,"headers":
+// {"Authorization":"Bearer <token>"}}}`, where the "Paperclip projects" server
+// carries the run JWT (valid 48 h, accepted by the publicly exposed Paperclip
+// API). Paperclip syncs it into the VM as the `mcp-config` runtime asset:
+// `<remoteCwd>/.paperclip-runtime/<adapter>/mcp-config/mcp-config.json`
+// (tog.22: server heartbeat.ts ~25853, claude-local claude-config.ts ~175,
+// execute.ts ~658-713; adapter-utils sandbox-managed-runtime.ts ~1531 and
+// ~1690). The asset is uploaded as `<adapter dir>/mcp-config-upload.tar`
+// (plus `.paperclip-upload*` temp files) and extracted. That path is under
+// /home/user, which every boat snapshot saves, and Paperclip never removes it.
+// The plugin cannot filter it (it is a file, not env). It links
+// `.paperclip-runtime` into /tmp (linkRuntimeDirScript above), so the file
+// normally never reaches the saved disk, and it still deletes it before every
+// stop, delete and template capture it makes: a VM set up before the link, or
+// a link that something replaced with a real directory, would keep it.
+
+/** Runtime asset names, under `<root>/.paperclip-runtime/<adapter>/`, that hold run credentials. */
+export const RUNTIME_SECRET_ASSET_GLOBS = ["mcp-config", "mcp-config-upload.tar*"] as const;
+
+/**
+ * How deep the catch-all search under $HOME goes, counted to the asset:
+ * `$HOME/<ws>/.paperclip-runtime/<adapter>/mcp-config` is depth 4, so a
+ * `.paperclip-runtime` directory is looked for down to depth 4 (6 - 2).
+ */
+export const RUNTIME_SECRET_FIND_MAX_DEPTH = 6;
+
+/**
+ * The line the scrub prints last: how many paths it found, how many are left,
+ * and whether it could search every directory it had to (`complete`) or not.
+ */
+export const RUNTIME_SECRET_SCRUB_RESULT_RE = /^paperclip-boat-scrub found=(\d+) left=(\d+) walk=(complete|incomplete)$/m;
+
+/** Exit status of the scrub when nothing is left that it could see, but it could not search everywhere. */
+export const RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT = 3;
+
+// The scan of one or more runtime directories, run as `sh -c "$scan" sh <list|rm> <runtime dir>...`
+// (from the root loop, and from `find -exec ... {} +`). For each `<dir>`, an
+// asset is exactly `<dir>/<one adapter name>/mcp-config` or
+// `<dir>/<one adapter name>/mcp-config-upload.tar*`, never a deeper path such
+// as a skill's own `<dir>/claude/skills/mcp-config`. `list` prints each match
+// NUL-terminated, `rm` removes it; either way the path is one argument, never
+// a line of text. It exits non-zero when it cannot be sure it saw everything:
+// a runtime or adapter directory it cannot list or search, or a path that is
+// missing only because a directory above it cannot be searched (EACCES, not
+// ENOENT). A link whose target is truly gone (a resume on a new machine
+// empties /tmp) holds nothing.
+const RUNTIME_SCAN_SCRIPT = [
+  // reachable <path>: true when <path> exists, or when it is truly absent: the
+  // nearest existing directory above it can be searched (stat then fails with ENOENT, not EACCES).
+  "reachable() {",
+  '  p=$1',
+  '  while [ ! -e "$p" ] && [ ! -L "$p" ]; do',
+  '    case $p in */*) p=${p%/*}; [ -n "$p" ] || p=/;; *) return 0;; esac',
+  "  done",
+  '  if [ -d "$p" ] && [ ! -x "$p" ]; then echo "paperclip-boat-scrub: cannot search $p" >&2; return 1; fi',
+  "  return 0",
+  "}",
+  'm=$1; shift; ok=0',
+  'for rt do',
+  '  if [ ! -e "$rt" ]; then',
+  '    if [ -L "$rt" ]; then',
+  '      t=$(readlink -- "$rt"; echo x); t=${t%?x}',
+  '      case $t in /*) ;; *) t=${rt%/*}/$t;; esac',
+  '      reachable "$t" || ok=1',
+  '    else',
+  '      reachable "$rt" || ok=1',
+  '    fi',
+  '    continue',
+  '  fi',
+  '  [ -d "$rt" ] || continue',
+  '  if [ ! -r "$rt" ] || [ ! -x "$rt" ]; then echo "paperclip-boat-scrub: cannot list $rt" >&2; ok=1; continue; fi',
+  '  for a in "$rt"/* "$rt"/.[!.]* "$rt"/..?*; do',
+  '    [ -d "$a" ] || continue',
+  '    if [ ! -r "$a" ] || [ ! -x "$a" ]; then echo "paperclip-boat-scrub: cannot list $a" >&2; ok=1; continue; fi',
+  `    for p in ${RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `"$a"/${glob}`).join(" ")}; do`,
+  '      if [ -e "$p" ] || [ -L "$p" ]; then',
+  "        if [ \"$m\" = rm ]; then rm -rf -- \"$p\" || ok=1; else printf '%s\\0' \"$p\" || ok=1; fi",
+  "      fi",
+  "    done",
+  "  done",
+  "done",
+  "exit $ok",
+].join("\n");
+
+/**
+ * A script that deletes every `.paperclip-runtime/<adapter>/mcp-config` (and
+ * its upload tarball) under each workspace root, under the default
+ * `$HOME/paperclip-workspace`, and in every `.paperclip-runtime` under $HOME
+ * down to RUNTIME_SECRET_FIND_MAX_DEPTH (skipping node_modules, .git and
+ * target). It then looks again and prints
+ * `paperclip-boat-scrub found=<n> left=<m> walk=<complete|incomplete>`. It
+ * removes nothing else: the checkout, skills (also a skill's own
+ * `mcp-config`), config and the bridge stay.
+ *
+ * Exit 0 only when none is left and the last look searched everything: the
+ * scan of every root and runtime directory succeeded (RUNTIME_SCAN_SCRIPT) and
+ * so did `find`, whose status and errors are checked, not discarded: a
+ * directory under $HOME it cannot read makes the walk incomplete. Exit 1 when
+ * something is left, 3 (RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT) when nothing is
+ * left that it could see but the walk was incomplete, 2 when this VM's tools
+ * cannot count (nothing verified).
+ *
+ * A file name may hold a newline (repo content, or an agent steered by a
+ * prompt), so no path is ever read back as text to pick what to delete: the
+ * scan hands every match to `rm` as one argument. The counts read
+ * NUL-terminated paths (a path cannot hold a NUL) from a file under /tmp, so
+ * the walk's own status is taken before any counting pipeline; they are
+ * deduplicated with `sort -zu` because the default workspace is both a root
+ * and under $HOME, and only ever go to `wc`.
+ */
+export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
+  const absolute = [...new Set(roots.map((root) => root.trim().replace(/\/+$/, "")).filter((root) => root.startsWith("/") && root.length > 1))];
+  const rootWords = [...absolute.map(shellQuote), '"$HOME/paperclip-workspace"'].join(" ");
+  const runtimeDepth = RUNTIME_SECRET_FIND_MAX_DEPTH - 2;
+  const find =
+    `find "$HOME" -mindepth 1 -maxdepth ${runtimeDepth} \\( -name node_modules -o -name .git -o -name target \\) -prune` +
+    ' -o -name .paperclip-runtime -exec sh -c "$scan" sh "$1" {} +';
+  return [
+    `scan=${shellQuote(RUNTIME_SCAN_SCRIPT)}`,
+    // each <list|rm>: scans every root's runtime directory and every one under $HOME; fails when any part could not be searched.
+    "each() {",
+    "  w=0",
+    `  for r in ${rootWords}; do`,
+    '    sh -c "$scan" sh "$1" "$r/.paperclip-runtime" || w=1',
+    "  done",
+    '  if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then',
+    '    echo "paperclip-boat-scrub: HOME is not a directory; nothing under it was searched" >&2; w=1',
+    "  else",
+    `    ${find} || w=1`,
+    "  fi",
+    "  return $w",
+    "}",
+    // count: n = distinct matches, walk = whether every directory could be searched.
+    'count() { if each list > "$t/paths"; then walk=complete; else walk=incomplete; fi; n=$(sort -zu < "$t/paths" | tr -cd \'\\000\' | wc -c | tr -d \' \'); }',
+    // A sort or tr that drops NUL-terminated input would count 0 and pass; check the pipeline first.
+    "probe=$(printf 'x\\0x\\0y\\0' | sort -zu | tr -cd '\\000' | wc -c | tr -d ' ')",
+    'if ! t=$(mktemp -d); then each rm; echo "paperclip-boat-scrub: mktemp failed; nothing verified" >&2; exit 2; fi',
+    "trap 'rm -rf -- \"$t\"' EXIT",
+    "count; found=$n",
+    "each rm",
+    "count; left=$n",
+    `if [ "$probe" != 2 ]; then echo "paperclip-boat-scrub: this VM's sort/tr cannot count NUL-terminated paths; nothing verified" >&2; exit 2; fi`,
+    'echo "paperclip-boat-scrub found=$found left=$left walk=$walk"',
+    '[ "$left" = 0 ] || exit 1',
+    `[ "$walk" = complete ] || exit ${RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT}`,
+  ].join("\n");
 }

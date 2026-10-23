@@ -34,22 +34,32 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { PRICE_PER_HOUR, parseDriverConfig, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
+import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
+import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
+  RUNTIME_LINK_RESULT_RE,
+  RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT,
+  RUNTIME_SECRET_SCRUB_RESULT_RE,
+  SCRUB_BASHRC_ASCII_TOKEN,
   assertValidEnvKeys,
   buildLoginShellScript,
+  buildRemoteCommand,
   buildRemoteEnvFileContents,
-  filterStringEnvEntries,
+  linkRuntimeDirScript,
   newRemoteEnvStage,
+  newRuntimeTmpDir,
   removeRemoteEnvCommand,
+  scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
 } from "./shell.js";
 import type { RemoteEnvStage } from "./shell.js";
 import { SshManager, endpointFromSshKeyResponse, runProcess } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
-import { VmStateStore, findBySandboxId } from "./state.js";
+import { runOutsideInvocation } from "./proactive.js";
+import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -59,6 +69,45 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
 const STOP_POLL_INTERVAL_MS = 2000;
 const DONE_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// States in which boat accepts SSH (POST /sshkey answers machine_not_running otherwise).
+const SSH_STATES = new Set(["ready", "idle", "running"]);
+const SCRUB_TIMEOUT_MS = 60_000;
+
+/** What the run-secret scrub before a stop, delete or capture found. */
+export interface RuntimeScrubOutcome {
+  /**
+   * clean: nothing to remove; scrubbed: removed and verified; vm_not_running:
+   * nothing to reach; incomplete: nothing left that it could see, but part of
+   * the disk could not be searched, so it is not verified; failed: something is
+   * left, or the scrub did not run to a result.
+   */
+  status: "clean" | "scrubbed" | "vm_not_running" | "incomplete" | "failed";
+  removed: number;
+  detail?: string;
+}
+
+/** A scrub that leaves the disk unverified: never good enough for a template, never a reason to keep a VM running. */
+function scrubUnverified(scrub: RuntimeScrubOutcome): boolean {
+  return scrub.status === "failed" || scrub.status === "incomplete";
+}
+
+/** The reason a log gives for an unverified scrub. */
+function unverifiedScrubReason(scrub: RuntimeScrubOutcome): string {
+  return scrub.status === "incomplete"
+    ? `part of its disk could not be searched for the run MCP config (${scrub.detail ?? "unverified"})`
+    : `the run MCP config could not be removed from its disk (${scrub.detail ?? "unverified"})`;
+}
+
+/**
+ * Why a VM whose scrub (or, at a failed start, link) failed is stopped with
+ * its disk kept instead of deleted (VmManager.logKeptDisk).
+ */
+type KeptDiskReason = "stop_lease" | "stop_and_retain" | "held_lease" | "incomplete_scan" | "resumed_disk";
+
+/** A run still holds the VM: an active run, or the open run window of a resumed lease (which never joins activeRunIds). */
+function runHoldsVm(record: VmRecord | null | undefined): boolean {
+  return !!record && (record.activeRunIds.length > 0 || record.sessions.some((entry) => !entry.endedAt));
+}
 
 export interface ManagerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
@@ -165,6 +214,10 @@ export class BoatVmManager {
   private readonly hardDeadlines = new Map<string, number>();
   private readonly sandboxCompany = new Map<string, string>();
   private readonly configs = new Map<string, CachedConfig>();
+  /** Per VM, the sets of dropped env names already logged, so a run's many commands log each set once. */
+  private readonly envDropsLogged = new Map<string, Set<string>>();
+  /** Per VM, workspace roots already written to its state record (saves a state write per realize). */
+  private readonly knownRoots = new Map<string, Set<string>>();
   private lastSweepAt = 0;
   private sweeping: Promise<SweepReport> | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
@@ -194,6 +247,48 @@ export class BoatVmManager {
     } finally {
       if (this.locks.get(key) === tail) this.locks.delete(key);
     }
+  }
+
+  // Lock order: the card lock first, then `name:<sandbox name>`, then
+  // `sandbox:<id>`. Acquire, resume lease, release, destroy, capture and the
+  // sweep's stop and delete of a VM it has a record of all hold the card lock,
+  // so a new run on a card never reads the VM as running while the previous
+  // run's release stops it, and the sweep never stops or deletes a VM that a
+  // run is taking. The sweep has no card for an orphan (a VM of ours with no
+  // record), which a run whose state was lost finds by its deterministic name:
+  // acquire and resume lease also hold the name lock, and the sweep takes it
+  // for an orphan.
+  private cardLockKey(companyId: string, vmKey: string): string {
+    return `card:${companyId}:${vmKey}`;
+  }
+
+  private nameLockKey(sandboxName: string): string {
+    return `name:${sandboxName}`;
+  }
+
+  /** The card lock (when the card is known), then the name lock (when the name is known), around fn. */
+  private withVmLocks<T>(companyId: string, vmKey: string | null, sandboxName: string | null, fn: () => Promise<T>): Promise<T> {
+    const named = sandboxName ? () => this.withLock(this.nameLockKey(sandboxName), fn) : fn;
+    return vmKey ? this.withLock(this.cardLockKey(companyId, vmKey), named) : named();
+  }
+
+  /** The card key of a sandbox: from the lease metadata, else from plugin state. */
+  private async vmKeyFor(companyId: string, sandboxId: string, leaseMetadata?: Record<string, unknown> | null): Promise<string | null> {
+    const fromLease = str(leaseMetadata?.vmKey);
+    if (fromLease) return fromLease;
+    const doc = await this.store.read(companyId).catch(() => null);
+    const record = doc ? findBySandboxId(doc, sandboxId) : null;
+    return record ? record.key.split("~")[0] : null;
+  }
+
+  private async withCardLock<T>(
+    companyId: string,
+    sandboxId: string,
+    leaseMetadata: Record<string, unknown> | null | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const vmKey = await this.vmKeyFor(companyId, sandboxId, leaseMetadata);
+    return vmKey ? await this.withLock(this.cardLockKey(companyId, vmKey), fn) : await fn();
   }
 
   private opsApi(config: BoatDriverConfig): BoatApiLike {
@@ -432,7 +527,8 @@ export class BoatVmManager {
     session: SshSession,
   ): Promise<{ remoteCwd: string; shellCommand: "bash" | "sh" }> {
     const dirExpr = config.remoteWorkspaceDir ? shellQuote(config.remoteWorkspaceDir) : '"$HOME/paperclip-workspace"';
-    const script = `d=${dirExpr}; mkdir -p "$d" && if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; printf '%s\\n%s\\n' "$d" "$s"`;
+    // Also removes boat's ASCII_TOKEN line from ~/.bashrc (shell.ts), so no shell the agent starts exports it.
+    const script = `${SCRUB_BASHRC_ASCII_TOKEN}; d=${dirExpr}; mkdir -p "$d" && if command -v bash >/dev/null 2>&1; then s=bash; else s=sh; fi; printf '%s\\n%s\\n' "$d" "$s"`;
     const deadline = this.now() + config.timeoutMs;
     let last = "";
     for (let attempt = 0; ; attempt += 1) {
@@ -449,6 +545,262 @@ export class BoatVmManager {
       await this.sleep(3000);
     }
     throw new BoatProviderError("BOAT_SSH_FAILED", `SSH to boat VM ${session.sandboxId} failed: ${last.slice(0, 500) || "unknown error"}`);
+  }
+
+  // ------------------------------------------------- run secrets on the VM
+
+  /** Remember a workspace root of a VM in its state record, so a later scrub (also the sweep's, in another worker) looks there. */
+  private async rememberRemoteRoot(companyId: string, sandboxId: string, root: string | null): Promise<void> {
+    if (!root) return;
+    const known = this.knownRoots.get(sandboxId) ?? new Set<string>();
+    if (known.has(root)) return;
+    await this.store
+      .update(companyId, (doc) => {
+        const record = findBySandboxId(doc, sandboxId);
+        if (record) record.remoteRoots = mergeRemoteRoot(record.remoteRoots, root);
+      })
+      .then(() => {
+        known.add(root);
+        this.knownRoots.set(sandboxId, known);
+      })
+      .catch((error) => this.logger.warn("boat: could not record the VM workspace root", { sandboxId, error: errorText(error) }));
+  }
+
+  /** Every workspace root Paperclip may have put `.paperclip-runtime/` under on this VM. */
+  private runtimeRoots(
+    config: BoatDriverConfig,
+    sandboxId: string,
+    leaseMetadata: Record<string, unknown> | null | undefined,
+    record: VmRecord | null,
+  ): string[] {
+    return [
+      ...(record?.remoteRoots ?? []),
+      str(leaseMetadata?.remoteCwd),
+      config.remoteWorkspaceDir,
+      ...(this.knownRoots.get(sandboxId) ?? []),
+    ].filter((root): root is string => typeof root === "string" && root.length > 0);
+  }
+
+  /**
+   * Delete the run credentials Paperclip writes into the VM as files: the
+   * `mcp-config` runtime asset under `<root>/.paperclip-runtime/<adapter>/`,
+   * whose MCP headers carry the run JWT (shell.ts, scrubRuntimeSecretsScript).
+   * boat saves /home/user in every stop snapshot and named snapshot, so this
+   * runs before every stop, delete and capture the plugin makes. It uses the
+   * VM's SSH session, or opens one when the VM runs and this worker has none
+   * (`connect`). Never throws.
+   */
+  private async scrubRuntimeSecrets(input: {
+    api: BoatApiLike;
+    config: BoatDriverConfig;
+    sandboxId: string;
+    roots: readonly string[];
+    before: "stop" | "delete" | "template capture";
+    connect: boolean;
+    session?: SshSession | null;
+  }): Promise<RuntimeScrubOutcome> {
+    const { sandboxId } = input;
+    let session = input.session ?? this.ssh.getSession(sandboxId);
+    if (!session) {
+      if (!input.connect) return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: "no SSH session" });
+      const sandbox = await this.getSandbox(input.api, sandboxId).catch(() => undefined);
+      if (sandbox === null || (sandbox && !SSH_STATES.has(sandbox.state))) {
+        return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: sandbox ? `state ${sandbox.state}` : "VM gone" });
+      }
+      try {
+        session = await this.openSsh(input.api, input.config, sandboxId);
+      } catch (error) {
+        return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+      }
+    }
+    let result: Awaited<ReturnType<SshManager["run"]>>;
+    try {
+      result = await this.ssh.run(session, `sh -c ${shellQuote(scrubRuntimeSecretsScript(input.roots))}`, { timeoutMs: SCRUB_TIMEOUT_MS });
+    } catch (error) {
+      return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+    }
+    const counts = RUNTIME_SECRET_SCRUB_RESULT_RE.exec(result.stdout);
+    if (!result.timedOut && counts && counts[2] === "0") {
+      const removed = Number(counts[1]);
+      if (result.exitCode === 0 && counts[3] === "complete") {
+        return this.reportScrub(input, { status: removed > 0 ? "scrubbed" : "clean", removed });
+      }
+      if (result.exitCode === RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT && counts[3] === "incomplete") {
+        // Nothing left that it could see, but a directory it had to search was unreadable: not verified.
+        return this.reportScrub(input, { status: "incomplete", removed, detail: (result.stderr || "").trim().slice(0, 300) || "walk incomplete" });
+      }
+    }
+    if (result.exitCode === 255) {
+      const sandbox = await this.getSandbox(input.api, sandboxId).catch(() => undefined);
+      if (sandbox === null || (sandbox && !UP_STATES.has(sandbox.state))) {
+        return this.reportScrub(input, { status: "vm_not_running", removed: 0, detail: sandbox ? `state ${sandbox.state}` : "VM gone" });
+      }
+    }
+    const detail = result.timedOut
+      ? `timed out after ${SCRUB_TIMEOUT_MS / 1000} s`
+      : `exit ${result.exitCode}${counts ? `, ${counts[2]} left` : ""}: ${(result.stderr || "").trim().slice(0, 300)}`;
+    return this.reportScrub(input, { status: "failed", removed: counts ? Number(counts[1]) : 0, detail });
+  }
+
+  private reportScrub(input: { sandboxId: string; before: string }, outcome: RuntimeScrubOutcome): RuntimeScrubOutcome {
+    const meta = { sandboxId: input.sandboxId, before: input.before, removed: outcome.removed, ...(outcome.detail ? { detail: outcome.detail } : {}) };
+    if (outcome.status === "scrubbed") {
+      this.logger.info(`boat: removed Paperclip's run MCP config (it holds the run JWT) from the VM before the ${input.before}`, meta);
+    } else if (outcome.status === "failed") {
+      this.logger.error(
+        `boat: could not remove Paperclip's run MCP config (it holds the run JWT, valid up to 48 h) from the VM before the ${input.before}; the VM disk may keep it`,
+        meta,
+      );
+    } else if (outcome.status === "incomplete") {
+      this.logger.error(
+        `boat: could not verify that Paperclip's run MCP config (it holds the run JWT, valid up to 48 h) is gone from the VM before the ${input.before}: part of its disk could not be searched`,
+        meta,
+      );
+    } else if (outcome.status === "vm_not_running" && input.before !== "delete") {
+      this.logger.warn(
+        `boat: could not reach the VM to remove Paperclip's run MCP config before the ${input.before}; if boat stopped it (auto-stop), its disk may keep the run JWT until a later release removes it`,
+        meta,
+      );
+    }
+    return outcome;
+  }
+
+  /**
+   * Make `<root>/.paperclip-runtime` a symlink into a fresh 0700 directory
+   * under /tmp, or keep a valid one (shell.ts, linkRuntimeDirScript). boat
+   * never saves /tmp, so the run MCP config with the run JWT, and the other
+   * files Paperclip syncs there for each run, stay out of the per-minute and
+   * stop snapshots. Runs before Paperclip syncs anything: at acquire, at a
+   * resumed lease and at realize. Returns the /tmp directory; throws
+   * BOAT_RUNTIME_DIR_FAILED.
+   */
+  private async linkRuntimeDir(session: SshSession, root: string): Promise<string> {
+    const fresh = newRuntimeTmpDir();
+    // onVm: the script ran on the VM and failed there (not ssh's 255 or a timeout), so the disk is in a state it cannot fix.
+    const fail = (detail: string, onVm: boolean) =>
+      new BoatProviderError(
+        "BOAT_RUNTIME_DIR_FAILED",
+        `could not create ${root} with its .paperclip-runtime linked into /tmp on boat VM ${session.sandboxId}, so Paperclip's run MCP config (run JWT) would land on the saved disk: ${detail}`,
+        { onVm },
+      );
+    let result: Awaited<ReturnType<SshManager["run"]>>;
+    try {
+      result = await this.ssh.run(session, `sh -c ${shellQuote(linkRuntimeDirScript(root, fresh))}`, { timeoutMs: 60_000 });
+    } catch (error) {
+      throw fail(errorText(error).slice(0, 300), false);
+    }
+    const line = RUNTIME_LINK_RESULT_RE.exec(result.stdout);
+    if (result.timedOut || result.exitCode !== 0 || !line || (line[1] === "linked" && line[2] !== fresh)) {
+      const onVm = !result.timedOut && result.exitCode != null && result.exitCode !== 255;
+      throw fail(result.timedOut ? "timed out" : `exit ${result.exitCode}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`, onVm);
+    }
+    if (line[1] === "linked") {
+      this.logger.info("boat: linked Paperclip's runtime directory on the VM into /tmp, which boat never snapshots", {
+        sandboxId: session.sandboxId,
+        root,
+        runtimeDir: line[2],
+      });
+    }
+    return line[2];
+  }
+
+  /**
+   * After a resume for a command (auto-stop or the sweep stopped the VM
+   * mid-lease): on a new machine /tmp is empty and the links dangle (on the
+   * same machine, back within boat's 10-minute keep, they are kept). Relink
+   * every known root, so Paperclip's next sync into `.paperclip-runtime` (the
+   * sync-back at the run's end) lands in /tmp again. Best effort: logs a
+   * warning.
+   */
+  private async relinkRuntimeDirs(config: BoatDriverConfig, companyId: string, sandboxId: string, session: SshSession): Promise<void> {
+    const record = await this.store
+      .read(companyId)
+      .then((doc) => findBySandboxId(doc, sandboxId))
+      .catch(() => null);
+    const roots = new Set(this.runtimeRoots(config, sandboxId, null, record).map((root) => root.trim().replace(/\/+$/, "")));
+    for (const root of roots) {
+      if (!root.startsWith("/") || root.length < 2) continue;
+      try {
+        await this.linkRuntimeDir(session, root);
+      } catch (error) {
+        this.logger.warn("boat: could not relink Paperclip's runtime directory into /tmp after a resume", { sandboxId, root, error: errorText(error) });
+      }
+    }
+  }
+
+  /**
+   * A scrub that failed means the VM disk may still hold the run JWT, and a
+   * stop would save it in the stop snapshot (kept 14 days). So the VM is
+   * deleted instead: boat erases its disk and its snapshots, and the card's
+   * next run starts a fresh VM (from templateSnapshot when set), which costs one
+   * start. Returns false when the delete fails; the caller then stops the VM,
+   * because a running VM bills and keeps the token live. Never called where
+   * the disk must be kept (logKeptDisk).
+   */
+  private async deleteInsteadOfStop(input: {
+    api: BoatApiLike;
+    config: BoatDriverConfig;
+    companyId: string;
+    sandboxId: string;
+    runId: string | null;
+    trigger: "release" | "stop lease" | "sweep" | "failed start";
+    reason: string;
+  }): Promise<boolean> {
+    const meta = { sandboxId: input.sandboxId, trigger: input.trigger, reason: input.reason };
+    this.logger.warn(
+      `boat: deleting the VM instead of stopping it (${input.trigger}): ${input.reason}; a stop would keep its disk, run JWT included, in boat's stop snapshot for 14 days. The card's next run starts a fresh VM.`,
+      meta,
+    );
+    await this.recordStopUsage(input.config, input.companyId, input.sandboxId, input.runId).catch(() => undefined);
+    try {
+      await this.deleteSandbox(input.api, input.sandboxId);
+    } catch (error) {
+      this.logger.error("boat: could not delete the VM whose disk may keep the run JWT; stopping it instead", { ...meta, error: errorText(error) });
+      return false;
+    }
+    await this.markDeleted(input.companyId, input.sandboxId).catch((error) =>
+      this.logger.warn("boat: could not forget the deleted VM in plugin state", { sandboxId: input.sandboxId, error: errorText(error) }),
+    );
+    return true;
+  }
+
+  /**
+   * The scrub failed, but the VM's disk holds work that Paperclip still needs,
+   * so the VM is stopped and its disk kept (never deleted):
+   * * `stop_lease` / `stop_and_retain`: Paperclip asked to keep the disk. It does
+   *   that to keep a run's unexported work (a failed run, a failed native
+   *   finalize), and its export-resume recovery needs a `stopped` receipt. The
+   *   SDK forbids a delete as the fallback of a stop-and-retain. The scrub is
+   *   most likely to fail exactly then: a wedged or out-of-memory VM.
+   * * `held_lease`: a run still holds the VM (an active run, or the open run
+   *   window of a resumed lease), so its work is not synced back yet.
+   * * `incomplete_scan`: the scrub found nothing left, but could not search
+   *   part of the disk (a directory the SSH user cannot read). That is not
+   *   verified, so no template is captured from it, but it is no evidence of a
+   *   left-over run JWT either: a delete would destroy the card's work on a guess.
+   * * `resumed_disk`: a failed start of the card's resumed VM (TOG-37714). Its
+   *   disk holds the card's checkout and caches, and possibly the unexported
+   *   work of a run that failed; a freshly created VM holds nothing yet and is
+   *   deleted instead.
+   * A VM set up by this version keeps the MCP config under /tmp, which boat
+   * never snapshots: the link survives Paperclip's syncs, because every command's
+   * GNU tar skips `.paperclip-runtime` members (shell.ts, TAR_SKIP_RUNTIME_DIR).
+   * So the stop snapshot does not get it. A VM set up before the link, or one
+   * whose link something else replaced with a real directory, may keep the run
+   * JWT there. The owner accepted that residual risk.
+   */
+  private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep" | "failed start"; keep: KeptDiskReason; reason: string }): void {
+    const why = {
+      stop_lease: "Paperclip's StopLease must keep the disk",
+      stop_and_retain: "Paperclip asked to keep the disk (stop_and_retain)",
+      held_lease: "a run still holds the VM",
+      incomplete_scan: "nothing left was found, and a delete on an unverified scan would destroy the card's work",
+      resumed_disk: "it is the card's resumed VM, whose disk holds the card's work",
+    }[input.keep];
+    this.logger.error(
+      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. With .paperclip-runtime linked into /tmp, and every command's tar skipping it, Paperclip's syncs keep the file off the saved disk; a VM set up before the link, or one whose link something else replaced with a real directory, may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
+      { sandboxId: input.sandboxId, trigger: input.trigger, keep: input.keep, reason: input.reason },
+    );
   }
 
   // ---------------------------------------------------------- deadline/extend
@@ -533,17 +885,24 @@ export class BoatVmManager {
     const api = this.opsApi(config);
     await this.store.rememberCompany(params.companyId);
 
-    return await this.withLock(`${params.companyId}:${key}`, async () => {
+    return await this.withVmLocks(params.companyId, key, name, async () => {
       const doc = await this.store.read(params.companyId);
       const existing = doc.vms[key] && doc.vms[key].status !== "deleted" ? doc.vms[key] : null;
       let sandbox = existing ? await this.getSandbox(api, existing.sandboxId) : null;
       if (!sandbox && kind !== "run") sandbox = await this.findSandboxByName(api, name);
+      if (sandbox?.state === "archiving") {
+        // A stop (auto-stop, the sweep, or a stop from another worker) is still
+        // saving the disk. boat refuses a resume until it ends, so wait for it.
+        sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
+      }
       if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
 
       const context = { vmKey: key, runId: params.runId, issueId: params.issueId ?? null };
       let sandboxId = "";
       let startKind: StartKind;
       let startedNew = false;
+      // The card's existing VM was resumed: its disk holds the card's work (TOG-37714).
+      let resumedExisting = false;
       let archiveAfter: string | null = null;
       try {
         if (sandbox && UP_STATES.has(sandbox.state)) {
@@ -570,6 +929,7 @@ export class BoatVmManager {
               startKind = "resume";
               startedNew = true;
               resumed = true;
+              resumedExisting = true;
               archiveAfter = toView((response as { sandbox?: unknown } | null)?.sandbox)?.archiveAfter ?? null;
             } catch (error) {
               if (!(error instanceof BoatProviderError && error.code === "BOAT_SNAPSHOT_EXPIRED")) throw error;
@@ -632,14 +992,18 @@ export class BoatVmManager {
         if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
         const session = this.ssh.getSession(sandboxId) ?? (await this.openSsh(api, config, sandboxId));
         const remote = await this.prepareRemote(config, session);
+        // Before the lease goes back to Paperclip, which then syncs the run's runtime assets (the MCP config with the run JWT among them).
+        const runtimeDir = await this.linkRuntimeDir(session, remote.remoteCwd);
         if (startKind! === "reuse_running") await this.maybeExtend(config, sandboxId);
         await this.store.update(params.companyId, (state) => {
           const record = state.vms[key];
           if (record) {
             record.status = "running";
             record.archiveAfter = ready?.archiveAfter ?? record.archiveAfter;
+            record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remote.remoteCwd);
           }
         });
+        this.knownRoots.set(sandboxId, new Set([...(this.knownRoots.get(sandboxId) ?? []), remote.remoteCwd]));
         const lease: PluginEnvironmentLease = {
           providerLeaseId: sandboxId,
           metadata: {
@@ -652,6 +1016,7 @@ export class BoatVmManager {
             runId: params.runId,
             startKind: startKind!,
             remoteCwd: remote.remoteCwd,
+            runtimeDir,
             shellCommand: remote.shellCommand,
             tunnel: session.tunnel,
           },
@@ -662,30 +1027,65 @@ export class BoatVmManager {
         }
         return lease;
       } catch (error) {
+        // The VM's record as stored, for the workspace roots earlier runs (and other workers) recorded on it.
+        let stored: VmRecord | null = null;
         if (sandboxId) {
-          await this.store
+          stored = await this.store
             .update(params.companyId, (state) => {
               const record = state.vms[key];
-              if (!record) return;
-              record.activeRunIds = record.activeRunIds.filter((id) => id !== params.runId);
-              const open = record.sessions.find((entry) => entry.runId === params.runId && !entry.endedAt);
-              if (open) open.endedAt = this.nowIso();
+              if (record) {
+                record.activeRunIds = record.activeRunIds.filter((id) => id !== params.runId);
+                const open = record.sessions.find((entry) => entry.runId === params.runId && !entry.endedAt);
+                if (open) open.endedAt = this.nowIso();
+              }
+              const own = findBySandboxId(state, sandboxId);
+              return own ? structuredClone(own) : null;
             })
-            .catch(() => undefined);
+            .catch(() => null);
         }
         if (startedNew && sandboxId) {
-          // Never leave a VM billing after a failed start.
+          // Never leave a VM billing after a failed start. A resumed disk can
+          // still hold an earlier run's MCP config, so scrub first when SSH
+          // works, in every root the VM's record knows of.
+          const scrub = await this.scrubRuntimeSecrets({
+            api,
+            config,
+            sandboxId,
+            roots: this.runtimeRoots(config, sandboxId, null, stored),
+            before: "stop",
+            connect: false,
+          });
           await this.ssh.closeSession(sandboxId).catch(() => undefined);
-          await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
-          await this.store
-            .update(params.companyId, (state) => {
-              const record = state.vms[key];
-              if (record && record.sandboxId === sandboxId) {
-                record.status = "stopped";
-                record.lastStoppedAt = this.nowIso();
-              }
-            })
-            .catch(() => undefined);
+          // A link that failed on the VM fails again at every resume of this disk; a fresh VM does not.
+          const linkFailed = error instanceof BoatProviderError && error.code === "BOAT_RUNTIME_DIR_FAILED" && error.details.onVm === true;
+          const reason =
+            scrub.status === "failed" || (scrub.status === "incomplete" && !linkFailed)
+              ? unverifiedScrubReason(scrub)
+              : linkFailed
+                ? "its .paperclip-runtime could not be linked into /tmp"
+                : null;
+          let deleted = false;
+          if (reason && resumedExisting) {
+            // The card's own VM: stop it and keep its work (TOG-37714). Its next start links and scrubs again.
+            this.logKeptDisk({ sandboxId, trigger: "failed start", keep: "resumed_disk", reason });
+          } else if (reason && scrub.status === "incomplete" && !linkFailed) {
+            this.logKeptDisk({ sandboxId, trigger: "failed start", keep: "incomplete_scan", reason });
+          } else if (reason) {
+            // A VM this start created holds nothing of the card's yet.
+            deleted = await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId, runId: params.runId, trigger: "failed start", reason });
+          }
+          if (!deleted) {
+            await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
+            await this.store
+              .update(params.companyId, (state) => {
+                const record = state.vms[key];
+                if (record && record.sandboxId === sandboxId) {
+                  record.status = "stopped";
+                  record.lastStoppedAt = this.nowIso();
+                }
+              })
+              .catch(() => undefined);
+          }
         }
         throw error;
       }
@@ -766,21 +1166,58 @@ export class BoatVmManager {
   async resumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
+    // The same protocol as acquire: under the card (and name) lock, so a release, a capture or the
+    // sweep of this card finishes first, and a stop boat is still saving is waited for (bounded).
+    const vmKey = await this.vmKeyFor(params.companyId, params.providerLeaseId, params.leaseMetadata);
+    const sandboxName = str(params.leaseMetadata?.sandboxName);
+    return await this.withVmLocks(params.companyId, vmKey, sandboxName, () => this.resumeLeaseLocked(params, config));
+  }
+
+  private async resumeLeaseLocked(params: PluginEnvironmentResumeLeaseParams, config: BoatDriverConfig): Promise<PluginEnvironmentLease> {
     const api = this.opsApi(config);
-    const sandbox = await this.getSandbox(api, params.providerLeaseId);
+    let sandbox = await this.getSandbox(api, params.providerLeaseId);
+    // A stop (release, the sweep, auto-stop) is still saving the disk; boat refuses a resume until it ends.
+    if (sandbox?.state === "archiving") sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
     if (!sandbox || sandbox.dataExpiredAt || sandbox.state === "cancelled") {
       return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
     }
-    this.sandboxCompany.set(sandbox.id, params.companyId);
-    const session = await this.liveSession(config, params.companyId, sandbox.id);
+    const sandboxId = sandbox.id;
+    this.sandboxCompany.set(sandboxId, params.companyId);
+    const wasUp = UP_STATES.has(sandbox.state);
+    const session = await this.liveSession(config, params.companyId, sandboxId);
     const remote = await this.prepareRemote(config, session);
+    const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
+    // Before Paperclip syncs this run's runtime assets: a resume on a new machine has an empty /tmp, so the old link dangles.
+    const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
+    // Paperclip resumes a reusable lease without naming the new run, so record
+    // the run window under a synthetic id: it gives per-run cost accounting.
+    // It is not added to activeRunIds, so release still stops the VM.
+    await this.store
+      .update(params.companyId, (doc) => {
+        const record = findBySandboxId(doc, sandboxId);
+        if (!record) return;
+        const now = this.nowIso();
+        record.lastActivityAt = now;
+        record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remoteCwd);
+        record.sessions.push({
+          runId: `resumed-lease:${now}`,
+          agentId: null,
+          startKind: wasUp ? "reuse_running" : "resume",
+          size: record.size,
+          startedAt: now,
+          endedAt: null,
+          usage: null,
+        });
+      })
+      .catch((error) => this.logger.warn("boat: could not record the resumed run window", { sandboxId, error: errorText(error) }));
     return {
-      providerLeaseId: sandbox.id,
+      providerLeaseId: sandboxId,
       metadata: {
         ...(params.leaseMetadata ?? {}),
         provider: "boat",
-        sandboxId: sandbox.id,
-        remoteCwd: str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd,
+        sandboxId,
+        remoteCwd,
+        runtimeDir,
         shellCommand: remote.shellCommand,
         tunnel: session.tunnel,
         resumedLease: true,
@@ -796,11 +1233,14 @@ export class BoatVmManager {
       const again = this.ssh.getSession(sandboxId);
       if (again) return again;
       const api = this.opsApi(config);
-      const sandbox = await this.getSandbox(api, sandboxId);
+      let sandbox = await this.getSandbox(api, sandboxId);
+      // boat refuses a resume while a stop is still saving the disk: wait for it (bounded, BOAT_STOP_PENDING).
+      if (sandbox?.state === "archiving") sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
       if (!sandbox || sandbox.dataExpiredAt || sandbox.state === "cancelled") {
         throw new BoatProviderError("BOAT_VM_GONE", `boat VM ${sandboxId} no longer exists; the run must acquire a new lease.`);
       }
-      if (!UP_STATES.has(sandbox.state)) {
+      const resumed = !UP_STATES.has(sandbox.state);
+      if (resumed) {
         await this.guardBudget(config, { sandboxId, reason: "resume_for_execute" });
         const response = await this.startCall(
           "resume",
@@ -832,8 +1272,30 @@ export class BoatVmManager {
       }
       const ready = toView(await waitReady(api, sandboxId, { timeoutMs: config.timeoutMs }));
       if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
-      return await this.openSsh(api, config, sandboxId);
+      const session = await this.openSsh(api, config, sandboxId);
+      // This path (a resume for a command, or a new worker) skips acquire's setup step, and a resume
+      // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
+      await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+      if (resumed) await this.relinkRuntimeDirs(config, companyId, sandboxId, session);
+      return session;
     });
+  }
+
+  /** Poll a stopping VM until boat reports it stopped. Throws when the stop does not end in time. */
+  private async waitUntilStopped(api: BoatApiLike, sandbox: SandboxView, timeoutMs: number): Promise<SandboxView | null> {
+    const deadline = this.now() + timeoutMs;
+    let current: SandboxView | null = sandbox;
+    while (current && current.state === "archiving") {
+      if (this.now() >= deadline) {
+        throw new BoatProviderError(
+          "BOAT_STOP_PENDING",
+          `boat VM ${sandbox.id} is still stopping after ${Math.round(timeoutMs / 1000)} s; the run cannot resume it yet.`,
+        );
+      }
+      await this.sleep(STOP_POLL_INTERVAL_MS);
+      current = await this.getSandbox(api, sandbox.id);
+    }
+    return current;
   }
 
   /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
@@ -920,13 +1382,13 @@ export class BoatVmManager {
     const runId = str(params.leaseMetadata?.runId);
     const api = this.opsApi(config);
 
-    return await this.withLock(`sandbox:${sandboxId}`, async () => {
+    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       const snapshot = await this.store.update(params.companyId, (doc) => {
         const record = findBySandboxId(doc, sandboxId);
         if (!record) return null;
         if (runId) record.activeRunIds = record.activeRunIds.filter((id) => id !== runId);
         else if (mode === "stop" || params.cancelActiveWork) record.activeRunIds = [];
-        return { keyKind: record.keyKind, othersActive: record.activeRunIds.length, size: record.size };
+        return { keyKind: record.keyKind, othersActive: record.activeRunIds.length, size: record.size, record: structuredClone(record) };
       });
       const forced = mode === "stop" || params.cancelActiveWork === true || params.resourceDisposition === "stop_and_retain";
       if (snapshot && snapshot.othersActive > 0 && !forced) {
@@ -935,11 +1397,47 @@ export class BoatVmManager {
         return undefined;
       }
 
+      // Before the stop (or delete): the stop snapshot must not keep the run JWT
+      // that Paperclip left in the VM as the run's MCP config. A failed scrub
+      // does not keep the VM running (that would bill and keep the token
+      // live), and does not stop it either: the VM is deleted instead. Except
+      // where the disk must be kept (logKeptDisk): StopLease, stop_and_retain,
+      // a forced stop of a VM that another run on the card still holds, and a
+      // scrub that found nothing left but could not search the whole disk
+      // (incomplete: unverified, but no evidence to destroy the card's work on).
+      const deleting = snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain";
+      const keep: KeptDiskReason | null =
+        mode === "stop"
+          ? "stop_lease"
+          : params.resourceDisposition === "stop_and_retain"
+            ? "stop_and_retain"
+            : (snapshot?.othersActive ?? 0) > 0
+              ? "held_lease"
+              : null;
+      const scrub = await this.scrubRuntimeSecrets({
+        api,
+        config,
+        sandboxId,
+        roots: this.runtimeRoots(config, sandboxId, params.leaseMetadata, snapshot?.record ?? null),
+        before: deleting ? "delete" : "stop",
+        connect: true,
+      });
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
+      this.envDropsLogged.delete(sandboxId);
 
-      if (snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain") {
+      if (!deleting && scrubUnverified(scrub)) {
+        const trigger = mode === "stop" ? "stop lease" : "release";
+        const reason = unverifiedScrubReason(scrub);
+        if (keep || scrub.status === "incomplete") {
+          this.logKeptDisk({ sandboxId, trigger, keep: keep ?? "incomplete_scan", reason });
+        } else if (await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId, runId, trigger, reason })) {
+          return { providerLeaseId: sandboxId, state: "destroyed" };
+        }
+      }
+
+      if (deleting) {
         // A run-keyed VM can never be reused, so there is nothing to keep: delete it.
         await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch(() => undefined);
         await this.deleteSandbox(api, sandboxId);
@@ -975,7 +1473,7 @@ export class BoatVmManager {
       }
       this.logger.warn("boat: stop requested but not yet confirmed; the sweep will check it", { sandboxId });
       return undefined;
-    });
+    }));
   }
 
   private async recordRunEnd(config: BoatDriverConfig, companyId: string, sandboxId: string, runId: string): Promise<void> {
@@ -1025,6 +1523,8 @@ export class BoatVmManager {
     this.deadlines.delete(sandboxId);
     this.hardDeadlines.delete(sandboxId);
     this.lastActivity.delete(sandboxId);
+    this.envDropsLogged.delete(sandboxId);
+    this.knownRoots.delete(sandboxId);
   }
 
   async destroy(params: PluginEnvironmentDestroyLeaseParams): Promise<PluginEnvironmentTerminationReceipt | undefined> {
@@ -1033,16 +1533,31 @@ export class BoatVmManager {
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
     const api = this.opsApi(config);
-    return await this.withLock(`sandbox:${sandboxId}`, async () => {
+    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+      // The delete removes the disk, but a delete that fails leaves the VM as it
+      // is, so remove the run JWT first, the same as before a stop.
+      const record = await this.store
+        .read(params.companyId)
+        .then((doc) => findBySandboxId(doc, sandboxId))
+        .catch(() => null);
+      await this.scrubRuntimeSecrets({
+        api,
+        config,
+        sandboxId,
+        roots: this.runtimeRoots(config, sandboxId, params.leaseMetadata, record),
+        before: "delete",
+        connect: true,
+      });
       await this.ssh.closeSession(sandboxId);
       this.clearExtendTimer(sandboxId);
       this.inflight.delete(sandboxId);
+      this.envDropsLogged.delete(sandboxId);
       await this.recordStopUsage(config, params.companyId, sandboxId, null).catch(() => undefined);
       await this.deleteSandbox(api, sandboxId);
       await this.markDeleted(params.companyId, sandboxId);
       this.logger.info("boat: deleted VM (destroy lease) and forgot its card mapping", { sandboxId });
       return { providerLeaseId: sandboxId, state: "destroyed" };
-    });
+    }));
   }
 
   async realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
@@ -1052,13 +1567,11 @@ export class BoatVmManager {
     const sandboxId = params.lease.providerLeaseId;
     if (sandboxId) {
       const session = await this.liveSession(config, params.companyId, sandboxId);
-      const result = await this.ssh.run(session, `sh -c ${shellQuote(`mkdir -p ${shellQuote(remoteCwd)}`)}`, { timeoutMs: 60_000 });
-      if (result.timedOut || result.exitCode !== 0) {
-        throw new BoatProviderError(
-          "BOAT_SSH_FAILED",
-          `could not create the workspace ${remoteCwd} on boat VM ${sandboxId}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`,
-        );
-      }
+      // mkdir -p the workspace, and link its .paperclip-runtime into /tmp (kept when acquire already did) before Paperclip syncs into it.
+      const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
+      // Paperclip puts its runtime assets (the run MCP config among them) under this root.
+      await this.rememberRemoteRoot(params.companyId, sandboxId, remoteCwd);
+      return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd, runtimeDir } };
     }
     return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd } };
   }
@@ -1070,8 +1583,26 @@ export class BoatVmManager {
     }
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
-    const envEntries = filterStringEnvEntries(params.env);
+    if (isAcpProcessSessionCommand(params.command, params.args ?? [], params.env)) {
+      // The ACP launcher starts the agent from an envelope (inline, or uploaded
+      // as command.b64 in chunks) that holds the unfiltered launch env, so the
+      // allowlist below would never see it. Refuse every step of it. The
+      // command itself is not logged: its arguments can be envelope chunks.
+      this.logger.warn("boat: refused a Paperclip ACP process-session command", { sandboxId });
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr:
+          "boat: refused a Paperclip ACP process-session command. That launcher starts the agent from an envelope (PAPERCLIP_PROCESS_SESSION_COMMAND_B64, or a command.b64 file it uploads under process-sessions/) that holds the run's whole environment, which this provider cannot filter. Set the agent's engine to cli on boat environments.",
+        metadata: { provider: "boat", sandboxId, error: "BOAT_ACP_PROCESS_SESSION_REFUSED" },
+      };
+    }
+    // Default-deny env (env-policy.ts): only allowlisted names reach the VM.
+    const { kept: envEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
     assertValidEnvKeys(envEntries);
+    if (dropped.length > 0) this.logEnvDrops(sandboxId, dropped);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
     const cwd = params.cwd ?? str(params.lease.metadata?.remoteCwd) ?? undefined;
 
@@ -1147,7 +1678,11 @@ export class BoatVmManager {
       }
 
       const script = buildLoginShellScript({ command: params.command, args: params.args ?? [], cwd, remoteEnv });
-      const result = await this.ssh.run(session, `sh -c ${shellQuote(script)}`, { stdin: params.stdin, timeoutMs });
+      // sshd runs this through the user's login shell (`$SHELL -c '<this>'`),
+      // which execs `env -u ASCII_TOKEN -u BOAT_ID sh -c <script>`: the shell
+      // above the payload never had boat's credentials in its environment,
+      // and it exits with the payload's status (128+n for a signal, not 255).
+      const result = await this.ssh.run(session, buildRemoteCommand(script), { stdin: params.stdin, timeoutMs });
       let stderr = result.stderr;
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
@@ -1169,6 +1704,28 @@ export class BoatVmManager {
     } finally {
       await this.endActivity(params.companyId, sandboxId);
     }
+  }
+
+  /** Logs dropped env names (never values), once per distinct set per VM. */
+  private logEnvDrops(sandboxId: string, dropped: EnvDrop[]): void {
+    const signature = dropped
+      .map((entry) => `${entry.name}:${entry.reason}`)
+      .sort()
+      .join(",");
+    let seen = this.envDropsLogged.get(sandboxId);
+    if (!seen) {
+      seen = new Set();
+      this.envDropsLogged.set(sandboxId, seen);
+    }
+    if (seen.has(signature)) return;
+    seen.add(signature);
+    const byReason: Record<string, string[]> = {};
+    for (const entry of dropped) (byReason[entry.reason] ??= []).push(entry.name);
+    for (const names of Object.values(byReason)) names.sort();
+    this.logger.warn(`boat: dropped ${dropped.length} run env key(s) not allowed into the VM (names only)`, {
+      sandboxId,
+      dropped: byReason,
+    });
   }
 
   /** Best effort: remove a staged env file that the command script may not have reached. */
@@ -1249,6 +1806,16 @@ export class BoatVmManager {
     if (!params.providerLeaseId) throw new BoatProviderError("BOAT_NO_LEASE", "cannot capture a boat template without a sandbox lease.");
     const sandboxId = params.providerLeaseId;
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
+    // Under the card lock, so no acquire or release of the card runs between the scrub and the save.
+    return await this.withCardLock(params.companyId, sandboxId, null, () => this.captureTemplateLocked(params, sandboxId, config));
+  }
+
+  private async captureTemplateLocked(
+    params: PluginEnvironmentCaptureTemplateParams,
+    sandboxId: string,
+    config: BoatDriverConfig,
+  ): Promise<PluginEnvironmentCaptureTemplateResult> {
     const api = this.opsApi(config);
     const name = sanitizeSnapshotName(params.templateLabel, `${config.namePrefix}-tpl-${params.environmentId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase()}-${this.now().toString(36)}`);
     const list = (await api.listNamedSnapshots()) as {
@@ -1262,6 +1829,39 @@ export class BoatVmManager {
       throw new BoatProviderError(
         "BOAT_NAMED_SNAPSHOT_NOT_FREE",
         `all ${free} free boat named snapshots are used; one more costs $1.70 a month. Delete an old template, or set allowPaidNamedSnapshots.`,
+      );
+    }
+    // A named snapshot outlives every run and seeds new VMs, so it must never
+    // hold the run JWT in Paperclip's MCP config: remove it first, and refuse
+    // the capture when that cannot be verified. A stopped VM is resumed for it
+    // (budget-guarded, as for a command): its disk may come from an auto-stop
+    // that nobody scrubbed.
+    let session: SshSession;
+    try {
+      session = await this.liveSession(config, params.companyId, sandboxId);
+    } catch (error) {
+      throw new BoatProviderError(
+        "BOAT_RUNTIME_SCRUB_FAILED",
+        `could not reach boat VM ${sandboxId} to remove Paperclip's run MCP config (run JWT) before the template capture, so nothing was captured: ${errorText(error)}`,
+      );
+    }
+    const record = await this.store
+      .read(params.companyId)
+      .then((doc) => findBySandboxId(doc, sandboxId))
+      .catch(() => null);
+    const scrub = await this.scrubRuntimeSecrets({
+      api,
+      config,
+      sandboxId,
+      roots: this.runtimeRoots(config, sandboxId, null, record),
+      before: "template capture",
+      connect: false,
+      session,
+    });
+    if (scrub.status !== "clean" && scrub.status !== "scrubbed") {
+      throw new BoatProviderError(
+        "BOAT_RUNTIME_SCRUB_FAILED",
+        `could not verify that Paperclip's run MCP config (run JWT) is gone from boat VM ${sandboxId}, so no template was captured (${scrub.status}${scrub.detail ? `: ${scrub.detail}` : ""}).`,
       );
     }
     await api.saveNamedSnapshot({ sandboxId, name });
@@ -1315,6 +1915,9 @@ export class BoatVmManager {
    * staleLeaseMinutes) and deletes stopped VMs whose card is done/cancelled or
    * untouched for deleteAfterDays. Uses the configs seen in this worker; with
    * none seen yet it does nothing (boat's auto-stop deadline stays the backstop).
+   * Every stop and delete runs under the card lock (an orphan's: the name
+   * lock) and re-checks first. While a company's state cannot be read, a VM
+   * with no record may be that company's, so it is left alone.
    */
   async sweep(reason: string, options: { force?: boolean } = {}): Promise<SweepReport> {
     if (this.sweeping) return this.sweeping;
@@ -1328,10 +1931,65 @@ export class BoatVmManager {
     return this.sweeping;
   }
 
-  /** Fire-and-forget sweep after lifecycle calls (throttled). */
+  /**
+   * Fire-and-forget sweep after lifecycle calls (throttled). It outlives the
+   * host request that started it, so it runs outside that request's
+   * invocation (proactive.ts).
+   */
   sweepSoon(reason: string): void {
     if (this.now() - this.lastSweepAt < SWEEP_MIN_INTERVAL_MS) return;
-    void this.sweep(reason).catch((error) => this.logger.warn("boat: sweep failed", { error: errorText(error) }));
+    void runOutsideInvocation(() => this.sweep(reason)).catch((error) =>
+      this.logger.warn("boat: sweep failed", { error: errorText(error) }),
+    );
+  }
+
+  /** Test hook: the sweep in flight, if any. */
+  sweepInFlight(): Promise<SweepReport> | null {
+    return this.sweeping;
+  }
+
+  /** The lock the sweep holds to stop or delete a VM: its card's, or for an orphan, its name's (acquire holds both). */
+  private withSweepLock<T>(companyId: string, sandbox: SandboxView, record: VmRecord | null, fn: () => Promise<T>): Promise<T> {
+    if (record) return this.withLock(this.cardLockKey(companyId, record.key.split("~")[0]), fn);
+    return sandbox.name ? this.withLock(this.nameLockKey(sandbox.name), fn) : fn();
+  }
+
+  /**
+   * Under the sweep lock, right before a delete: is the VM still what the
+   * sweep decided on? boat still shows it stopped and unchanged since the
+   * listing; this worker ran nothing on it since; its record (if it had one) is
+   * unchanged and no run holds it; an orphan still has no record in any company.
+   */
+  private async stillDeletable(input: {
+    api: BoatApiLike;
+    sandbox: SandboxView;
+    record: VmRecord | null;
+    companyId: string;
+    docs: Map<string, StateDoc>;
+    seenActivity: number;
+  }): Promise<boolean> {
+    const { sandbox, record } = input;
+    const now = await this.getSandbox(input.api, sandbox.id);
+    if (!now || now.state !== sandbox.state || now.updatedAt !== sandbox.updatedAt || UP_STATES.has(now.state) || now.state === "archiving") return false;
+    if ((this.inflight.get(sandbox.id) ?? 0) > 0 || (this.lastActivity.get(sandbox.id) ?? 0) !== input.seenActivity) return false;
+    if (record) {
+      const fresh = findBySandboxId(await this.store.read(input.companyId), sandbox.id);
+      return (
+        !!fresh &&
+        fresh.status === record.status &&
+        fresh.key === record.key &&
+        fresh.starts === record.starts &&
+        fresh.lastStartedAt === record.lastStartedAt &&
+        fresh.lastActivityAt === record.lastActivityAt &&
+        !runHoldsVm(fresh)
+      );
+    }
+    for (const companyId of input.docs.keys()) {
+      const doc = await this.store.read(companyId).catch(() => null);
+      const owned = doc ? findBySandboxId(doc, sandbox.id) : null;
+      if (!doc || (owned && owned.status !== "deleted")) return false;
+    }
+    return true;
   }
 
   private async doSweep(reason: string): Promise<SweepReport> {
@@ -1340,9 +1998,34 @@ export class BoatVmManager {
       report.skipped = "no_config_seen";
       return report;
     }
-    const companies = new Set<string>([...(await this.store.companies().catch(() => [])), ...[...this.configs.values()].map((c) => c.companyId)]);
+    // Which companies own VMs, and their records. A company whose state cannot
+    // be read (the host refuses state outside a configured company, see
+    // proactive.ts, or the store fails) is skipped, and its VMs' ownership is
+    // unknown, not absent: they must not be taken for orphans.
+    let companiesKnown = true;
+    const remembered = await this.store.companies().catch(() => {
+      companiesKnown = false;
+      return [] as string[];
+    });
+    const companies = new Set<string>([...remembered, ...[...this.configs.values()].map((c) => c.companyId)]);
     const docs = new Map<string, StateDoc>();
-    for (const companyId of companies) docs.set(companyId, await this.store.read(companyId));
+    const unreadable = new Set<string>();
+    for (const companyId of companies) {
+      try {
+        docs.set(companyId, await this.store.read(companyId));
+      } catch (error) {
+        unreadable.add(companyId);
+        report.errors.push(`state ${companyId}: ${errorText(error)}`);
+      }
+    }
+    if (!companiesKnown) report.errors.push("state: the list of companies could not be read");
+    /** Could a company whose state is unknown own VMs of this account? (No cached config for it: it could own any.) */
+    const ownershipUnknown = (cachedList: CachedConfig[]): boolean =>
+      !companiesKnown ||
+      [...unreadable].some((companyId) => {
+        const own = [...this.configs.values()].filter((cached) => cached.companyId === companyId);
+        return own.length === 0 || own.some((cached) => cachedList.includes(cached));
+      });
     const recordFor = (sandboxId: string): VmRecord | null => {
       for (const doc of docs.values()) {
         const record = findBySandboxId(doc, sandboxId);
@@ -1375,9 +2058,16 @@ export class BoatVmManager {
         continue;
       }
       const seen = new Set(sandboxes.map((s) => s.id));
+      const unknownOwner = ownershipUnknown(cachedList);
+      const leftAlone: string[] = [];
       for (const sandbox of sandboxes) {
         const record = recordFor(sandbox.id);
         if (!record && !(sandbox.name && namePattern.test(sandbox.name))) continue; // not ours
+        if (!record && unknownOwner) {
+          // Maybe an orphan, maybe a VM of the company whose state could not be read (with an active lease): leave it.
+          leftAlone.push(sandbox.id);
+          continue;
+        }
         const config = (record && this.configs.get(record.environmentId)?.config) || primary.config;
         const api = this.opsApi(config);
         const companyId = record?.companyId ?? primary.companyId;
@@ -1394,25 +2084,67 @@ export class BoatVmManager {
             const hasActive = (record?.activeRunIds.length ?? 0) > 0;
             const shouldStop = hasActive ? idleMinutes > config.staleLeaseMinutes : idleMinutes > config.idleStopMinutes;
             if (!shouldStop) continue;
-            // Re-check right before stopping: a run may have taken the VM since the sweep began.
-            if (record) {
-              const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
-              const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
-              if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) continue;
-              if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) continue;
-            }
-            await this.ssh.closeSession(sandbox.id);
-            this.clearExtendTimer(sandbox.id);
-            const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
-            if (record) {
-              await this.store.update(companyId, (doc) => {
-                const current = findBySandboxId(doc, sandbox.id);
-                if (!current) return;
-                current.status = confirmed ? "stopped" : "stopping";
-                current.lastStoppedAt = this.nowIso();
-                current.activeRunIds = [];
+            // Stop under the card lock (an orphan: the name lock), so a run that is acquiring this VM right now
+            // finishes first; then re-check, because that run may have taken it.
+            const outcome = await this.withSweepLock(companyId, sandbox, record, async () => {
+              let held = false;
+              if (record) {
+                const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
+                const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
+                if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return null;
+                if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return null;
+                held = runHoldsVm(fresh ?? record);
+              } else {
+                // An orphan: a run (in this worker, or one that wrote a record) may have adopted it by name meanwhile.
+                if ((this.inflight.get(sandbox.id) ?? 0) > 0 || (this.lastActivity.get(sandbox.id) ?? 0) > lastActivity) return null;
+                for (const owner of docs.keys()) {
+                  const doc = await this.store.read(owner).catch(() => null);
+                  const adopted = doc ? findBySandboxId(doc, sandbox.id) : null;
+                  if (!doc || (adopted && adopted.status !== "deleted")) return null;
+                }
+              }
+              // Same as release: the stop snapshot must not keep the run JWT,
+              // so a VM whose scrub fails is deleted instead of stopped. Except
+              // a VM that a run still holds (a stale lease, or a resumed lease):
+              // its work is not synced back yet, so it is stopped, disk kept;
+              // and an incomplete scrub (nothing found, part of the disk
+              // unsearchable), which is stopped with its disk kept too.
+              const scrub = await this.scrubRuntimeSecrets({
+                api,
+                config,
+                sandboxId: sandbox.id,
+                roots: this.runtimeRoots(config, sandbox.id, null, record),
+                before: "stop",
+                connect: true,
               });
-              await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+              await this.ssh.closeSession(sandbox.id);
+              this.clearExtendTimer(sandbox.id);
+              if (scrubUnverified(scrub)) {
+                const reason = unverifiedScrubReason(scrub);
+                if (held || scrub.status === "incomplete") {
+                  this.logKeptDisk({ sandboxId: sandbox.id, trigger: "sweep", keep: held ? "held_lease" : "incomplete_scan", reason });
+                } else if (await this.deleteInsteadOfStop({ api, config, companyId, sandboxId: sandbox.id, runId: null, trigger: "sweep", reason })) {
+                  return "deleted" as const;
+                }
+              }
+              const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
+              if (record) {
+                await this.store.update(companyId, (doc) => {
+                  const current = findBySandboxId(doc, sandbox.id);
+                  if (!current) return;
+                  current.status = confirmed ? "stopped" : "stopping";
+                  current.lastStoppedAt = this.nowIso();
+                  current.activeRunIds = [];
+                });
+                await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+              }
+              return "stopped" as const;
+            });
+            if (!outcome) continue;
+            if (outcome === "deleted") {
+              report.deleted.push(sandbox.id);
+              this.logger.info("boat: sweep deleted an idle VM instead of stopping it (runtime_scrub_failed)", { sandboxId: sandbox.id, orphan: !record, reason });
+              continue;
             }
             report.stopped.push(sandbox.id);
             this.logger.info(`boat: sweep stopped an idle VM after ${Math.round(idleMinutes)} min`, {
@@ -1425,6 +2157,7 @@ export class BoatVmManager {
           }
           if (sandbox.state === "archiving") continue;
           // Stopped (archived), error or cancelled: costs nothing; delete when the card is finished or old.
+          const seenActivity = this.lastActivity.get(sandbox.id) ?? 0;
           let deleteReason: string | null = null;
           if (sandbox.dataExpiredAt) deleteReason = "disk_expired";
           if (!deleteReason && record?.issueId && this.issues) {
@@ -1440,14 +2173,28 @@ export class BoatVmManager {
             if (last > 0 && now - last > config.deleteAfterDays * 24 * 3600 * 1000) deleteReason = "untouched";
           }
           if (!deleteReason) continue;
-          if (record) await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
-          await this.deleteSandbox(api, sandbox.id);
-          if (record) await this.markDeleted(companyId, sandbox.id);
+          // Everything above was read before awaits (the issue lookup) in which a run may have
+          // resumed the card. Delete only under the card lock (an orphan: the name lock), and only
+          // when boat, plugin state and this worker still show the same stopped, unheld VM.
+          const deleted = await this.withSweepLock(companyId, sandbox, record, async () => {
+            if (!(await this.stillDeletable({ api, sandbox, record, companyId, docs, seenActivity }))) return false;
+            if (record) await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+            await this.deleteSandbox(api, sandbox.id);
+            if (record) await this.markDeleted(companyId, sandbox.id);
+            return true;
+          });
+          if (!deleted) {
+            this.logger.info("boat: sweep left a stopped VM alone: it changed while the sweep decided to delete it", { sandboxId: sandbox.id, deleteReason, reason });
+            continue;
+          }
           report.deleted.push(sandbox.id);
           this.logger.info(`boat: sweep deleted a stopped VM (${deleteReason})`, { sandboxId: sandbox.id, reason });
         } catch (error) {
           report.errors.push(`${sandbox.id}: ${errorText(error)}`);
         }
+      }
+      if (leftAlone.length > 0) {
+        this.logger.warn("boat: sweep left VMs alone whose owner is unknown while a company's plugin state cannot be read", { sandboxIds: leftAlone });
       }
       // Records whose VM no longer exists at boat: forget them.
       for (const [companyId, doc] of docs) {
