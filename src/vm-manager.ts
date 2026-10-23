@@ -1616,9 +1616,17 @@ export class BoatVmManager {
         else await this.ssh.ensureMaster(session);
       }
       await this.maybeExtend(config, sandboxId);
+      const remoteRoot = str(params.lease.metadata?.remoteCwd) ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
       const result = await syncFiles({
-        ssh: this.ssh, session, timeoutMs: config.timeoutMs,
-        remoteRoot: str(params.lease.metadata?.remoteCwd) ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace",
+        ssh: this.ssh, session, timeoutMs: config.timeoutMs, remoteRoot,
+        onDirectoryReplaced: async (target) => {
+          if (remoteRoot === target || remoteRoot.startsWith(`${target}/`)) {
+            // A directory mapping destroys the previous workspace, including
+            // its VM-owned runtime directory. Restore it before later assets
+            // or post-upload commands can place credentials there again.
+            await this.prepareRuntimeDir(session, remoteRoot);
+          }
+        },
       }, direction, params.operations);
       this.logger.info("boat: native workspace sync completed", {
         sandboxId, direction, durationMs: this.now() - startedAt,

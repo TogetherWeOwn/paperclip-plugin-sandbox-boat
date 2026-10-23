@@ -54,6 +54,10 @@ def member_parts(name):
 
 
 def excluded(name):
+    # Match Execute's TAR_SKIP_RUNTIME_DIR for directory contents. An explicit
+    # runtime asset root still works because its relative root name is '.'.
+    if '.paperclip-runtime' in name.split('/'):
+        return True
     for pattern in mapping.get('exclude') or []:
         pattern = pattern.removeprefix('./').rstrip('/')
         if fnmatch.fnmatchcase(name, pattern) or fnmatch.fnmatchcase(name, pattern.removeprefix('**/')):
