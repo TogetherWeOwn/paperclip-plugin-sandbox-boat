@@ -252,7 +252,7 @@ const manifest: PaperclipPluginManifestV1 = {
           stopConfirmTimeoutMs: {
             type: "number",
             default: 120000,
-            description: "How long release waits for boat to confirm a stop, in milliseconds.",
+            description: "How long acquire, resume and the sweep wait for boat to confirm a stop, in milliseconds. Release itself returns as soon as boat accepts the stop; the sweep confirms the snapshot save.",
             ...advanced("API"),
           },
           sshConnectTimeoutSec: {

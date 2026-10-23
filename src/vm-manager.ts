@@ -68,6 +68,11 @@ const EXTEND_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
 const STOP_POLL_INTERVAL_MS = 2000;
+// After an accepted stop, release waits at most this long for the VM to leave
+// UP before returning: returning stopped while the VM still looks up would
+// race the next run (it would reuse the running VM just as boat starts
+// archiving it). The snapshot save itself is still confirmed by the sweep.
+const STOP_ACCEPT_POLL_MS = 10_000;
 const DONE_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 // States in which boat accepts SSH (POST /sshkey answers machine_not_running otherwise).
 const SSH_STATES = new Set(["ready", "idle", "running"]);
@@ -1320,6 +1325,45 @@ export class BoatVmManager {
     return current;
   }
 
+  /**
+   * Ask boat to stop once, without waiting for the snapshot save (4-65 s).
+   * Release uses this and returns at once; the idle sweep confirms the stop.
+   * A slow release keeps the Paperclip lease active while its run is terminal,
+   * and Paperclip's orphan-lease sweep then destroys the warm VM.
+   */
+  private async requestStop(api: BoatApiLike, sandboxId: string): Promise<{ accepted: boolean; gone: boolean }> {
+    try {
+      await api.stop({ sandboxId });
+      return { accepted: true, gone: false };
+    } catch (error) {
+      const info = await describeBoatError(error);
+      if (info.status === 404) return { accepted: true, gone: true };
+      if (info.status === 409 && ["sandbox_stopping", "sandbox_not_ready", "machine_not_running"].includes(info.code ?? "")) {
+        return { accepted: true, gone: false };
+      }
+      this.logger.warn("boat: stop call failed", { sandboxId, error: formatBoatError(info) });
+      return { accepted: false, gone: false };
+    }
+  }
+
+  /**
+   * After an accepted stop that has not taken effect yet (the VM still looks
+   * up), wait briefly for it to leave UP. Returns the last view; on read
+   * failure the last known view is kept and retried until the bound, so a
+   * persistently unreadable VM reports as still up and the caller falls back.
+   */
+  private async waitUntilNotUp(api: BoatApiLike, sandboxId: string, first: SandboxView): Promise<SandboxView | null | undefined> {
+    let current: SandboxView | null | undefined = first;
+    const deadline = this.now() + STOP_ACCEPT_POLL_MS;
+    for (;;) {
+      if (current === null || (current && !UP_STATES.has(current.state))) return current;
+      if (this.now() >= deadline) return current;
+      await this.sleep(STOP_POLL_INTERVAL_MS);
+      const next = await this.getSandbox(api, sandboxId).catch(() => undefined);
+      if (next !== undefined) current = next;
+    }
+  }
+
   /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
   private async stopAndConfirm(api: BoatApiLike, sandboxId: string, timeoutMs: number): Promise<boolean> {
     try {
@@ -1468,32 +1512,64 @@ export class BoatVmManager {
         return { providerLeaseId: sandboxId, state: "destroyed" };
       }
 
-      const timeoutMs = params.cancelActiveWork ? config.stopConfirmTimeoutMs * 2 : config.stopConfirmTimeoutMs;
-      const confirmed = await this.stopAndConfirm(api, sandboxId, timeoutMs);
+      // Return as soon as boat accepts the stop and the VM leaves UP: SSH is
+      // closed and no more commands can run, so execution has ended even while
+      // boat is still saving the snapshot (4-65 s). Waiting for the save here
+      // keeps the Paperclip lease active past its run, and the orphan-lease
+      // sweep then destroys the warm VM. The idle sweep confirms the save.
+      const stop = await this.requestStop(api, sandboxId);
+      let current = await this.getSandbox(api, sandboxId).catch(() => undefined);
+      if (stop.accepted && !stop.gone && current && UP_STATES.has(current.state)) {
+        current = await this.waitUntilNotUp(api, sandboxId, current);
+      }
+      const stillUp = !!current && UP_STATES.has(current.state);
+      const alreadyStopped = stop.gone || current === null || current?.state === "archived" || current?.state === "cancelled";
+      if ((alreadyStopped || stop.accepted) && !stillUp) {
+        await this.store
+          .update(params.companyId, (doc) => {
+            const record = findBySandboxId(doc, sandboxId);
+            if (!record) return;
+            record.status = alreadyStopped ? "stopped" : "stopping";
+            record.lastStoppedAt = this.nowIso();
+            record.lastActivityAt = this.nowIso();
+            // Only a confirmed-down VM clears the other runs: they may still
+            // hold the lease while the save is pending, and clearing them
+            // would let the sweep idle-stop or delete under them.
+            if (alreadyStopped) record.activeRunIds = [];
+          })
+          .catch(() => undefined);
+        await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch((error) =>
+          this.logger.warn("boat: could not record usage after stop", { sandboxId, error: errorText(error) }),
+        );
+        if (alreadyStopped) {
+          this.logger.info("boat: stopped VM on release (billing stopped)", { sandboxId, runId });
+        } else {
+          this.logger.info("boat: stop accepted on release; the sweep confirms the snapshot save", {
+            sandboxId,
+            runId,
+            state: current?.state ?? "unknown",
+          });
+        }
+        return { providerLeaseId: sandboxId, state: "stopped" };
+      }
+      // The stop was refused, or it did not take effect: mark stopping so the
+      // sweep retries the stop instead of waiting for the idle thresholds.
       await this.store
         .update(params.companyId, (doc) => {
           const record = findBySandboxId(doc, sandboxId);
           if (!record) return;
-          record.status = confirmed ? "stopped" : "stopping";
+          record.status = "stopping";
           record.lastStoppedAt = this.nowIso();
           record.lastActivityAt = this.nowIso();
-          if (confirmed) record.activeRunIds = [];
         })
         .catch(() => undefined);
-      await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch((error) =>
-        this.logger.warn("boat: could not record usage after stop", { sandboxId, error: errorText(error) }),
-      );
-      if (confirmed) {
-        this.logger.info("boat: stopped VM on release (billing stopped)", { sandboxId, runId });
-        return { providerLeaseId: sandboxId, state: "stopped" };
-      }
       if (mode === "stop" || params.cancelActiveWork) {
         throw new BoatProviderError(
           "BOAT_STOP_UNCONFIRMED",
-          `boat did not confirm the stop of VM ${sandboxId} within ${Math.round(timeoutMs / 1000)} s; the stop stays pending at boat and the idle sweep checks it again.`,
+          `boat did not stop VM ${sandboxId} (still up); the idle sweep retries the stop.`,
         );
       }
-      this.logger.warn("boat: stop requested but not yet confirmed; the sweep will check it", { sandboxId });
+      this.logger.warn("boat: stop did not take effect; the sweep retries it", { sandboxId, stillUp });
       return undefined;
     }));
   }
@@ -2104,7 +2180,11 @@ export class BoatVmManager {
             );
             const idleMinutes = (now - lastActivity) / 60_000;
             const hasActive = (record?.activeRunIds.length ?? 0) > 0;
-            const shouldStop = hasActive ? idleMinutes > config.staleLeaseMinutes : idleMinutes > config.idleStopMinutes;
+            // A release already asked for the stop but the VM is still up (the
+            // stop had not taken effect yet): confirm it now, without waiting
+            // for the idle thresholds.
+            const confirmingRelease = record?.status === "stopping";
+            const shouldStop = confirmingRelease || (hasActive ? idleMinutes > config.staleLeaseMinutes : idleMinutes > config.idleStopMinutes);
             if (!shouldStop) continue;
             // Stop under the card lock (an orphan: the name lock), so a run that is acquiring this VM right now
             // finishes first; then re-check, because that run may have taken it.
@@ -2179,6 +2259,20 @@ export class BoatVmManager {
           }
           if (sandbox.state === "archiving") continue;
           // Stopped (archived), error or cancelled: costs nothing; delete when the card is finished or old.
+          // A release that returned on stop-accept leaves the record stopping;
+          // the first sweep that sees the save confirmed flips it to stopped.
+          if (record?.status === "stopping") {
+            await this.store
+              .update(companyId, (doc) => {
+                const current = findBySandboxId(doc, sandbox.id);
+                if (!current || current.status !== "stopping") return;
+                current.status = "stopped";
+                current.activeRunIds = [];
+              })
+              .catch(() => undefined);
+            await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+            this.logger.info("boat: sweep confirmed a release stop", { sandboxId: sandbox.id, reason });
+          }
           const seenActivity = this.lastActivity.get(sandbox.id) ?? 0;
           let deleteReason: string | null = null;
           if (sandbox.dataExpiredAt) deleteReason = "disk_expired";

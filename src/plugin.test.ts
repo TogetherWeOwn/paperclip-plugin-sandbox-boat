@@ -269,7 +269,7 @@ describe("AcquireLease", () => {
   it("waits for a stop that boat is still saving, then resumes", async () => {
     const first = await acquire("run-1");
     fake.stopMode = "never";
-    await expect(release(first)).resolves.toBeUndefined();
+    await expect(release(first)).resolves.toEqual({ providerLeaseId: first.providerLeaseId, state: "stopped" });
     const box = fake.boxes.get(first.providerLeaseId!)!;
     expect(box.state).toBe("archiving");
     // boat finishes the save while the next run waits.
@@ -472,17 +472,102 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
     expect(usageCalls.some((call) => typeof call.args.since === "string" && typeof call.args.until === "string")).toBe(true);
   });
 
-  it("returns no receipt (and does not throw) when the stop is still pending, but StopLease throws", async () => {
+  it("returns a stopped receipt at once when the stop takes 65s, so the next run reuses the VM", async () => {
     const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    // boat takes 65s to save the snapshot: the stop leaves the VM archiving.
     fake.stopMode = "never";
+    const releaseStart = clock.t;
+    const receipt = await release(lease);
+    // The release must not wait for the snapshot save: Paperclip's
+    // orphan-lease sweep destroys a still-active lease whose run is terminal,
+    // so a slow release loses the warm VM. The idle sweep confirms the stop.
+    expect(receipt).toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expect(clock.t - releaseStart).toBeLessThan(10_000);
+    expect(fake.callsOf("stop")).toHaveLength(1);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archiving");
+    const afterRelease = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
+      vms: Record<string, { status: string; activeRunIds: string[] }>;
+    };
+    expect(afterRelease.vms[`ew:${WORKSPACE}`]).toMatchObject({ status: "stopping", activeRunIds: [] });
+    // 65s later boat confirms the save; the sweep confirms it and the next run reuses the VM.
+    clock.t += 65_000;
+    fake.boxes.get(sandboxId)!.state = "archived";
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report.deleted).not.toContain(sandboxId);
+    const afterSweep = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
+      vms: Record<string, { status: string }>;
+    };
+    expect(afterSweep.vms[`ew:${WORKSPACE}`].status).toBe("stopped");
+    const second = await acquire("run-2");
+    expect(second.providerLeaseId).toBe(sandboxId);
+    expect(fake.callsOf("create")).toHaveLength(1);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+  });
+
+  it("waits briefly when an accepted stop has not taken effect yet, then returns stopped", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    const box = fake.boxes.get(sandboxId)!;
+    // Boat accepts the stop but the VM still looks up on the first reads.
+    fake.stopMode = "stays_up";
+    fake.failNext("get", () => null);
+    fake.failNext("get", () => {
+      box.state = "archiving";
+      return null;
+    });
+    const releaseStart = clock.t;
+    const receipt = await release(lease);
+    expect(receipt).toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expect(clock.t - releaseStart).toBeLessThan(10_000);
+    expect(box.state).toBe("archiving");
+  });
+
+  it("returns no receipt when an accepted stop never takes effect, and StopLease throws", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    fake.stopMode = "stays_up";
     await expect(release(lease)).resolves.toBeUndefined();
-    // Another card: this one's VM is still stopping, which a new run waits for.
+    expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
+    const afterRelease = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
+      vms: Record<string, { status: string }>;
+    };
+    // Marked stopping so the sweep retries the stop without waiting for idle thresholds.
+    expect(afterRelease.vms[`ew:${WORKSPACE}`].status).toBe("stopping");
     const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
     await expect(
       plugin.definition.onEnvironmentStopLease!({
         ...base(),
         providerLeaseId: second.providerLeaseId,
         leaseMetadata: second.metadata,
+        resourceDisposition: "stop_and_retain",
+      } as never),
+    ).rejects.toMatchObject({ code: "BOAT_STOP_UNCONFIRMED" });
+  });
+
+  it("returns a stopped receipt at once when the stop is still pending; StopLease only throws when boat refuses the stop", async () => {
+    const lease = await acquire("run-1");
+    fake.stopMode = "never";
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
+    // Another card: its stop is accepted too, so StopLease returns a receipt instead of waiting.
+    const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
+    await expect(
+      plugin.definition.onEnvironmentStopLease!({
+        ...base(),
+        providerLeaseId: second.providerLeaseId,
+        leaseMetadata: second.metadata,
+        resourceDisposition: "stop_and_retain",
+      } as never),
+    ).resolves.toEqual({ providerLeaseId: second.providerLeaseId, state: "stopped" });
+    // But when boat refuses the stop and the VM stays up, StopLease throws.
+    fake.stopMode = "immediate";
+    const third = await acquire("run-3", { executionWorkspaceId: "66666666-6666-4666-8666-666666666666" });
+    fake.failNext("stop", responseError(500, { code: "http_500" }));
+    await expect(
+      plugin.definition.onEnvironmentStopLease!({
+        ...base(),
+        providerLeaseId: third.providerLeaseId,
+        leaseMetadata: third.metadata,
         resourceDisposition: "stop_and_retain",
       } as never),
     ).rejects.toMatchObject({ code: "BOAT_STOP_UNCONFIRMED" });
@@ -1502,7 +1587,7 @@ describe("ResumeLease and RealizeWorkspace", () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
     fake.stopMode = "never";
-    await expect(release(lease)).resolves.toBeUndefined();
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
     const box = fake.boxes.get(sandboxId)!;
     expect(box.state).toBe("archiving");
     // boat finishes the save 6 s later (fake clock), while the resumed lease waits.
