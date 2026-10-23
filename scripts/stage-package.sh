@@ -18,10 +18,11 @@
 #     Paperclip passed, project secrets included, reached the VM;
 #   - a build that does not delete Paperclip's run MCP config (run JWT) before
 #     it stops, deletes or snapshots a VM;
-#   - a build that does not link the workspace's .paperclip-runtime into /tmp
-#     (which boat never snapshots) before Paperclip syncs the run's files, or
-#     that does not make every command's tar skip .paperclip-runtime members
-#     (Paperclip's workspace extract would replace the link);
+#   - a build that does not leave the workspace's .paperclip-runtime out of
+#     boat's snapshots (~/.boatignore) before Paperclip syncs the run's files,
+#     a build that links it into /tmp (Paperclip refuses that link and fails
+#     every run), or one that does not make every command's tar skip
+#     .paperclip-runtime members;
 #   - a destination that already exists.
 set -eu
 
@@ -104,17 +105,23 @@ if ! grep -qF 'scrubRuntimeSecretsScript(' "$pkg/dist/vm-manager.js" || ! grep -
   echo "stage-package: dist does not remove Paperclip's run MCP config before stops; refusing (the run JWT would stay in boat snapshots)." >&2
   exit 1
 fi
-# Acquire, resumed leases and realize must link <root>/.paperclip-runtime into
-# /tmp, which boat never snapshots, before Paperclip syncs the run's files.
-if ! grep -qF 'linkRuntimeDirScript(' "$pkg/dist/vm-manager.js" || ! grep -qF '/tmp/paperclip-boat-runtime-' "$pkg/dist/shell.js"; then
-  echo "stage-package: dist does not keep Paperclip's runtime directory under /tmp; refusing (the run JWT would be in boat's per-minute snapshots)." >&2
+# Acquire, resumed leases and realize must leave <root>/.paperclip-runtime out
+# of boat's snapshots with a ~/.boatignore rule, before Paperclip syncs the
+# run's files, and keep it a real directory: Paperclip refuses a symlink there
+# before every run (0.2.0 linked it into /tmp, and every run failed).
+if ! grep -qF 'runtimeDirScript(' "$pkg/dist/vm-manager.js" || ! grep -qF '.boatignore' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist does not leave Paperclip's runtime directory out of boat snapshots (~/.boatignore); refusing (the run JWT would be in boat's per-minute snapshots)." >&2
+  exit 1
+fi
+if grep -qF '/tmp/paperclip-boat-runtime-' "$pkg/dist/shell.js"; then
+  echo "stage-package: dist links .paperclip-runtime into /tmp; refusing (Paperclip refuses a symlinked runtime directory and fails every run)." >&2
   exit 1
 fi
 # Every command script must tell GNU tar to skip .paperclip-runtime members:
 # Paperclip's inbound workspace tar carries one from the host, and its extract
-# would replace the link with a real directory on the saved disk.
+# would unpack the host's runtime files over the run's.
 if ! grep -qF 'TAR_OPTIONS="--exclude=.paperclip-runtime' "$pkg/dist/shell.js"; then
-  echo "stage-package: dist does not keep Paperclip's workspace extract off the runtime link; refusing (the run JWT could land on the saved disk)." >&2
+  echo "stage-package: dist does not keep Paperclip's workspace extract off the runtime directory; refusing." >&2
   exit 1
 fi
 

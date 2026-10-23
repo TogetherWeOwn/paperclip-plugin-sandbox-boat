@@ -157,36 +157,40 @@ export function buildLoginShellScript(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Paperclip's runtime directory lives under /tmp.
+// Paperclip's runtime directory stays out of boat's snapshots.
 //
 // Paperclip syncs a run's runtime assets (the run MCP config with the run JWT,
 // skills, config, the bridge queue, GitHub launchers, upload tarballs) into
 // `<root>/.paperclip-runtime/<adapter>/` and re-syncs them for every run. boat
 // saves /home/user every minute while a VM runs and at every stop, and keeps
-// the older per-minute snapshots for up to about a day. /tmp is in none of
-// them (docs.boat.dev/snapshots/whats-saved). So `<root>/.paperclip-runtime`
-// is made a symlink to a fresh 0700 directory under /tmp, before Paperclip
-// syncs anything: the files reach the VM's memory or scratch disk, never a
-// snapshot.
+// the older per-minute snapshots for up to about a day. A `.boatignore` in the
+// home folder applies to the whole sandbox, with .gitignore rules
+// (docs.boat.dev/snapshots/whats-saved#leave-files-out-with-boatignore). So
+// before Paperclip syncs anything, the plugin puts the rule
+// `.paperclip-runtime/` into `~/.boatignore` (no slash before the name, so it
+// matches at any depth) and makes `<root>/.paperclip-runtime` a real 0700
+// directory. Measured on boat 2026-10-23: the per-minute and the stop
+// snapshot trees then hold each `.paperclip-runtime` as an empty directory,
+// nothing below it.
 //
-// The link must survive Paperclip's own sync commands. Its asset extract
-// (`rm -rf <asset dir> && mkdir -p ... && tar -xf ... -C <asset dir>`) works
-// below the link, and its workspace wipe and restore skip the name. Its
-// inbound workspace tar does not: in tog.22 (adapter-utils
-// sandbox-managed-runtime.ts) neither workspaceArchiveExclude nor the git
-// overlay copy leaves out `.paperclip-runtime`, so the tar carries the host
-// workspace's own `.paperclip-runtime/` (repository clones, detached
-// repositories), and Paperclip runs `tar -xf <tar> -C <root>`. For a
-// directory member GNU tar replaces an existing symlink of that name with a
-// real directory. With --keep-directory-symlink it keeps the link, but
-// Ubuntu's tar from 1.35+dfsg-3ubuntu0.2 (CVE-2025-45582) then refuses to
-// write through a link that leaves the extraction directory, and the extract
-// fails. Either way the run's files would land on the saved disk, or vanish
-// from the path the agent uses. So every command script tells GNU tar to skip
-// `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR, below).
+// It must be a real directory, not a link. Paperclip writes
+// `.paperclip-runtime/.gitignore` before every run that has an agent
+// instructions bundle (tog.22 agent-instruction-files.ts,
+// instructionGitExcludeProgram) and refuses a `.paperclip-runtime` that is a
+// symlink ("Unsafe runtime exclusion directory"), which fails the run before
+// it starts. Plugin 0.2.0 linked it into /tmp and every pilot run failed
+// there. A bind mount from /tmp is no way out either: boat's snapshots save
+// what a bind mount shows under /home/user (measured the same day).
 //
-// One known gap: a tar that ignores TAR_OPTIONS (busybox, bsdtar) is not
-// covered. boat's image ships GNU tar.
+// Paperclip's inbound workspace tar carries the host workspace's own
+// `.paperclip-runtime/` (repository clones, detached repositories; tog.22
+// adapter-utils sandbox-managed-runtime.ts: neither workspaceArchiveExclude
+// nor the git overlay copy leaves it out), and Paperclip runs
+// `tar -xf <tar> -C <root>`. So every command script tells GNU tar to skip
+// `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR, below): the host's
+// runtime files are not unpacked on the VM, and a tar an agent packs never
+// holds the run MCP config. One known gap: a tar that ignores TAR_OPTIONS
+// (busybox, bsdtar) is not covered. boat's image ships GNU tar.
 
 /**
  * Exported in every command script, right before the payload: GNU tar reads
@@ -201,59 +205,44 @@ export function buildLoginShellScript(input: {
  */
 export const TAR_SKIP_RUNTIME_DIR = 'export TAR_OPTIONS="--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}"';
 
-/** Where the runtime directories of a VM live. Fixed: the link check below accepts only this shape. */
-export const RUNTIME_TMP_PREFIX = "/tmp/paperclip-boat-runtime-";
+/** The `~/.boatignore` rule that leaves every `.paperclip-runtime` directory out of boat's snapshots. */
+export const BOATIGNORE_RUNTIME_RULE = ".paperclip-runtime/";
 
-/** The line the link script prints last: whether it kept the old target or made a new one, and the target. */
-export const RUNTIME_LINK_RESULT_RE = /^paperclip-boat-runtime (linked|kept) (\/tmp\/paperclip-boat-runtime-[0-9a-f]{32})$/m;
-
-/** A fresh, unguessable runtime directory name for one VM start (one lease). */
-export function newRuntimeTmpDir(): string {
-  return `${RUNTIME_TMP_PREFIX}${randomUUID().replace(/-/g, "")}`;
-}
+/** The line the runtime-directory script prints last: the directory it made or kept. */
+export const RUNTIME_DIR_RESULT_RE = /^paperclip-boat-runtime (made|kept) (\/.+\/\.paperclip-runtime)$/m;
 
 /**
- * A script that makes `<root>/.paperclip-runtime` a symlink into /tmp:
- *   - A link to an existing runtime directory of ours (the exact
- *     `/tmp/paperclip-boat-runtime-<32 hex>` shape, a real directory owned by
- *     this user) is kept, so a second run on a running VM does not lose the
- *     first run's files. A resume within boat's 10-minute machine keep after a
- *     stop gets the same machine back, /tmp included, and keeps it too.
- *   - Anything else is replaced by a link to `fresh`, made with `mkdir -m 700`
- *     (it fails when the path exists): a link that dangles because the VM came
- *     back on a new machine (restored from a snapshot, which has no /tmp), a
- *     link elsewhere, a file, or a real directory (from before this version,
- *     or made by something else). A real directory's entries move into `fresh`
- *     first, so they leave the saved disk and a run that uses them still finds
- *     them through the link.
- * Prints `paperclip-boat-runtime linked|kept <target>` and exits 0 only when
- * the link resolves to that target.
+ * A script that prepares `<root>/.paperclip-runtime` before Paperclip syncs
+ * anything into it:
+ *   - `~/.boatignore` gets the line `.paperclip-runtime/` unless it has it.
+ *     Other lines stay; a last line without a newline gets one first.
+ *   - A real directory is kept, with its files: a second run on a running VM
+ *     keeps the first run's files.
+ *   - A symlink (plugin 0.2.0 linked the directory into /tmp; Paperclip
+ *     refuses that) or a file is replaced by a fresh 0700 directory. A link's
+ *     target is left alone.
+ * `<root>` must be under $HOME: only there does the home `.boatignore` apply.
+ * Prints `paperclip-boat-runtime made|kept <root>/.paperclip-runtime` and
+ * exits 0 only when the directory is real and the rule is in place.
  */
-export function linkRuntimeDirScript(root: string, fresh: string): string {
+export function runtimeDirScript(root: string): string {
   const cleanRoot = root.trim().replace(/\/+$/, "");
   if (!cleanRoot.startsWith("/") || cleanRoot.length < 2) throw new Error(`runtime root must be an absolute path: ${root}`);
-  if (!fresh.startsWith(RUNTIME_TMP_PREFIX) || !/^[0-9a-f]{32}$/.test(fresh.slice(RUNTIME_TMP_PREFIX.length))) {
-    throw new Error(`runtime directory must be ${RUNTIME_TMP_PREFIX}<32 hex>: ${fresh}`);
-  }
-  // Spelled out, not [0-9a-f]: a range in a case pattern can follow the locale's collation.
-  const ours = `${RUNTIME_TMP_PREFIX}${"[0123456789abcdef]".repeat(32)}`;
+  const rule = shellQuote(BOATIGNORE_RUNTIME_RULE);
   return [
-    `root=${shellQuote(cleanRoot)}; link="$root/.paperclip-runtime"; new=${shellQuote(fresh)}`,
+    `root=${shellQuote(cleanRoot)}; dir="$root/.paperclip-runtime"; ign="$HOME/.boatignore"`,
+    'case "$root/" in */../*|*/./*) echo "paperclip-boat-runtime: $root is not a plain path" >&2; exit 1;; "$HOME"/?*) ;; *) echo "paperclip-boat-runtime: $root is not under $HOME, where .boatignore applies" >&2; exit 1;; esac',
+    `if ! grep -qxF ${rule} "$ign" 2>/dev/null; then`,
+    '  if [ -s "$ign" ] && [ -n "$(tail -c 1 "$ign")" ]; then echo >> "$ign" || exit 1; fi',
+    `  printf '%s\\n' ${rule} >> "$ign" || exit 1`,
+    "fi",
+    `grep -qxF ${rule} "$ign" || exit 1`,
     'mkdir -p "$root" || exit 1',
-    'if [ -L "$link" ]; then',
-    '  t=$(readlink "$link")',
-    `  case "$t" in ${ours}) if [ -d "$t" ] && [ ! -L "$t" ] && [ -O "$t" ]; then echo "paperclip-boat-runtime kept $t"; exit 0; fi;; esac`,
-    "fi",
-    'umask 077 && mkdir -m 700 "$new" || exit 1',
-    'if [ -d "$link" ] && [ ! -L "$link" ]; then',
-    '  find "$link" -mindepth 1 -maxdepth 1 -exec mv -f -- {} "$new"/ \\; 2>/dev/null',
-    '  rm -rf -- "$link" || exit 1',
-    'elif [ -L "$link" ] || [ -e "$link" ]; then',
-    '  rm -f -- "$link" || exit 1',
-    "fi",
-    'ln -s "$new" "$link" || exit 1',
-    '[ "$(readlink "$link")" = "$new" ] || exit 1',
-    'echo "paperclip-boat-runtime linked $new"',
+    'if [ -d "$dir" ] && [ ! -L "$dir" ]; then echo "paperclip-boat-runtime kept $dir"; exit 0; fi',
+    'if [ -L "$dir" ] || [ -e "$dir" ]; then rm -f -- "$dir" || exit 1; fi',
+    '(umask 077 && mkdir -m 700 "$dir") || exit 1',
+    '[ -d "$dir" ] && [ ! -L "$dir" ] || exit 1',
+    'echo "paperclip-boat-runtime made $dir"',
   ].join("\n");
 }
 
@@ -270,11 +259,11 @@ export function linkRuntimeDirScript(root: string, fresh: string): string {
 // ~1690). The asset is uploaded as `<adapter dir>/mcp-config-upload.tar`
 // (plus `.paperclip-upload*` temp files) and extracted. That path is under
 // /home/user, which every boat snapshot saves, and Paperclip never removes it.
-// The plugin cannot filter it (it is a file, not env). It links
-// `.paperclip-runtime` into /tmp (linkRuntimeDirScript above), so the file
-// normally never reaches the saved disk, and it still deletes it before every
-// stop, delete and template capture it makes: a VM set up before the link, or
-// a link that something replaced with a real directory, would keep it.
+// The plugin cannot filter it (it is a file, not env). `~/.boatignore` keeps
+// `.paperclip-runtime` out of every snapshot (runtimeDirScript above), and the
+// plugin still deletes the file before every stop, delete and template capture
+// it makes: a VM whose `~/.boatignore` lost the rule (the agent can edit it)
+// would keep it.
 
 /** Runtime asset names, under `<root>/.paperclip-runtime/<adapter>/`, that hold run credentials. */
 export const RUNTIME_SECRET_ASSET_GLOBS = ["mcp-config", "mcp-config-upload.tar*"] as const;
