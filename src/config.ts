@@ -39,6 +39,8 @@ export interface BoatDriverConfig {
   sshConnectTimeoutSec: number;
   remoteWorkspaceDir: string | null;
   allowPaidNamedSnapshots: boolean;
+  maxOffloadVms: number;
+  offloadIdleStopSeconds: number;
   /**
    * Paperclip's own envelope flag (not a boat setting). The host passes it to
    * the plugin and keeps only what the plugin returns as normalized config, so
@@ -76,6 +78,8 @@ export const CONFIG_DEFAULTS = {
   sshConnectTimeoutSec: 15,
   allowPaidNamedSnapshots: false,
   reuseLease: false,
+  maxOffloadVms: 4,
+  offloadIdleStopSeconds: 15,
 };
 
 function str(value: unknown): string | null {
@@ -142,6 +146,8 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     sshConnectTimeoutSec: Math.trunc(num(raw.sshConnectTimeoutSec, CONFIG_DEFAULTS.sshConnectTimeoutSec)),
     remoteWorkspaceDir: str(raw.remoteWorkspaceDir),
     allowPaidNamedSnapshots: bool(raw.allowPaidNamedSnapshots, CONFIG_DEFAULTS.allowPaidNamedSnapshots),
+    maxOffloadVms: Math.trunc(num(raw.maxOffloadVms, CONFIG_DEFAULTS.maxOffloadVms)),
+    offloadIdleStopSeconds: num(raw.offloadIdleStopSeconds, CONFIG_DEFAULTS.offloadIdleStopSeconds),
     reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),
     envAllowlist: parseEnvAllowlist(raw.envAllowlist),
   };
@@ -221,6 +227,10 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (workspaceProblem) errors.push(workspaceProblem);
   if (config.maxActive < 1) errors.push("maxActive must be at least 1.");
   if (config.maxStartsPerDay < 1) errors.push("maxStartsPerDay must be at least 1.");
+  if (config.maxOffloadVms < 1) errors.push("maxOffloadVms must be at least 1.");
+  if (config.offloadIdleStopSeconds < 1 || config.offloadIdleStopSeconds > 3600) {
+    errors.push("offloadIdleStopSeconds must be between 1 and 3600.");
+  }
   if (config.minComputeHoursLeft < 0) errors.push("minComputeHoursLeft cannot be negative.");
   if (config.timeoutMs < 10_000 || config.timeoutMs > 86_400_000) {
     errors.push("timeoutMs must be between 10000 and 86400000.");

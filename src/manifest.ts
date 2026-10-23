@@ -131,6 +131,18 @@ const manifest: PaperclipPluginManifestV1 = {
             default: 15,
             description: "The sweep stops a VM with no active run after this many idle minutes.",
           },
+          maxOffloadVms: {
+            type: "number",
+            default: 4,
+            description: "Offload pool: at most this many shared VMs for heavy commands (default 4). Beyond it, commands queue.",
+            ...advanced("Offload pool"),
+          },
+          offloadIdleStopSeconds: {
+            type: "number",
+            default: 15,
+            description: "Offload pool: stop a VM this many seconds after its last command ends (default 15).",
+            ...advanced("Offload pool"),
+          },
           maxActive: {
             type: "number",
             default: 2,
