@@ -268,6 +268,23 @@ describe("heartbeat", () => {
     expect(readBody(await broker.read(CMD, PRINCIPAL, 0)).state).toBe("running");
   });
 
+  it("also expires other dead commands known to this worker", async () => {
+    const { broker, backend, clock } = setup();
+    const other = "00000000-0000-4000-8000-000000000007";
+    await broker.submit(submitFor(), PRINCIPAL);
+    await broker.submit(submitFor(other), PRINCIPAL);
+    backend.starts[0]!.sink.started();
+    backend.starts[1]!.sink.started();
+    clock.t += 20_000;
+    await broker.heartbeat(CMD, PRINCIPAL);
+    clock.t += 20_000;
+    // CMD stays alive on its heartbeat; the other command expired with no
+    // heartbeat of its own, reaped by CMD's next heartbeat.
+    await broker.heartbeat(CMD, PRINCIPAL);
+    expect(readBody(await broker.read(CMD, PRINCIPAL, 0)).state).toBe("running");
+    expect(readBody(await broker.read(other, PRINCIPAL, 0)).state).toBe("cancelled");
+  });
+
   it("is a no-op on a terminal command", async () => {
     const { broker, backend } = setup();
     await broker.submit(submitFor(), PRINCIPAL);

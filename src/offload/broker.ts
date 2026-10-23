@@ -383,12 +383,19 @@ export class OffloadBroker {
 
   async heartbeat(commandId: string, principal: BrokerAuth): Promise<BrokerResponse> {
     const at = this.now();
+    // Worker-owned expiry rides on client heartbeats (every 5 s while any
+    // client is alive); the sweep stays the slower crash backstop.
+    await this.sweepExcept(commandId, at);
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
       if (!TERMINAL.has(resolved.state) && resolved.state !== "unknown") {
-        resolved.heartbeatDeadline = at + OFFLOAD_BOUNDS.heartbeatExpiryMs;
-        await this.save(resolved);
+        if (at >= resolved.commandDeadline) {
+          await this.expireLoaded(resolved, at, true);
+        } else {
+          resolved.heartbeatDeadline = at + OFFLOAD_BOUNDS.heartbeatExpiryMs;
+          await this.save(resolved);
+        }
       }
       return { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) };
     });
@@ -435,49 +442,58 @@ export class OffloadBroker {
     });
   }
 
+  /** Expire one loaded live record through the cancel path. Caller holds the command chain. */
+  private async expireLoaded(record: JournalRecord, now: number, timedOut: boolean): Promise<void> {
+    const handle = this.handles.get(record.commandId);
+    if (handle) {
+      try {
+        await handle.cancel();
+      } catch {
+        record.state = "unknown";
+        await this.save(record);
+        return;
+      }
+      this.handles.delete(record.commandId);
+    }
+    if (!record.remoteStarted) {
+      record.state = "not_started";
+      record.fallbackSafe = true;
+      record.result = null;
+    } else {
+      record.state = "cancelled";
+      record.result = {
+        exitCode: 143,
+        signal: 15,
+        timedOut,
+        cancelled: true,
+        syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null },
+        usageRecordId: null,
+      };
+    }
+    record.terminalAt = now;
+    await this.save(record);
+  }
+
+  private async sweepExcept(exceptId: string | null, now: number): Promise<void> {
+    for (const commandId of [...this.known]) {
+      if (commandId === exceptId) continue;
+      await this.chain(`cmd:${commandId}`, async () => {
+        const record = await this.load(commandId);
+        if (!record || TERMINAL.has(record.state) || record.state === "unknown") return;
+        const timedOut = now >= record.commandDeadline;
+        if (now < record.heartbeatDeadline && !timedOut) return;
+        await this.expireLoaded(record, now, timedOut);
+      });
+    }
+  }
+
   /**
    * Apply heartbeat expiry and command deadlines through the cancel path.
    * Iterates commands known to this worker; crash-backstop enumeration across
    * restarts belongs to the executor/sweep follow-up.
    */
   async checkExpirations(): Promise<void> {
-    for (const commandId of [...this.known]) {
-      await this.chain(`cmd:${commandId}`, async () => {
-        const record = await this.load(commandId);
-        if (!record || TERMINAL.has(record.state) || record.state === "unknown") return;
-        const now = this.now();
-        const timedOut = now >= record.commandDeadline;
-        if (now < record.heartbeatDeadline && !timedOut) return;
-        const handle = this.handles.get(commandId);
-        if (handle) {
-          try {
-            await handle.cancel();
-          } catch {
-            record.state = "unknown";
-            await this.save(record);
-            return;
-          }
-          this.handles.delete(commandId);
-        }
-        if (!record.remoteStarted) {
-          record.state = "not_started";
-          record.fallbackSafe = true;
-          record.result = null;
-        } else {
-          record.state = "cancelled";
-          record.result = {
-            exitCode: 143,
-            signal: 15,
-            timedOut,
-            cancelled: true,
-            syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null },
-            usageRecordId: null,
-          };
-        }
-        record.terminalAt = now;
-        await this.save(record);
-      });
-    }
+    await this.sweepExcept(null, this.now());
   }
 
   private sinkFor(commandId: string): OffloadOutputSink {
