@@ -1,5 +1,5 @@
 // Acceptance tests authored against the public hook contract, not an
-// implementation diff. Baseline: 41a0a43. Contract document blob:
+// implementation diff. Baseline: 0c73b94 + f1993e4. Contract document blob:
 // TogetherWeOwn/paperclip 951bf02009022b3a2e8911c8f2a4f58ac49dc00c.
 //
 // Transfer code and SshManager.run/runStream stay real. Only connection setup
@@ -55,7 +55,7 @@ beforeEach(async () => {
   const boat = new FakeBoat(clock);
   setBoatApiFactoryForTests(() => boat as unknown as BoatApiLike);
   setManagerOverridesForTests({ ssh, now: clock.now, sleep: async () => {} });
-  config = { apiKey: "boat_test_only", cliproxyTunnel: false, remoteWorkspaceDir: path.join(root, "sandbox") };
+  config = { apiKey: "boat_test_only", cliproxyTunnel: false, remoteWorkspaceDir: ssh.remoteRoot };
   await plugin.definition.setup(createFakeContext().ctx as never);
   lease = await plugin.definition.onEnvironmentAcquireLease!({
     driverKey: "boat", companyId: COMPANY, environmentId: ENVIRONMENT, config,
@@ -85,7 +85,15 @@ function requireStreaming(): StreamingSsh {
 }
 
 function params(operations: PluginSyncOperation[]) {
-  return { driverKey: "boat", companyId: COMPANY, environmentId: ENVIRONMENT, config, lease, operations };
+  // The provider sees valid VM paths; filesystem setup/assertions use scratch.
+  // Only mapping paths are translated here, never opaque command strings.
+  const remoteOperations = operations.map((operation) => ({
+    ...operation,
+    files: operation.files.map((file) => ({
+      ...file, sourcePath: ssh.remotePath(file.sourcePath), targetPath: ssh.remotePath(file.targetPath),
+    })),
+  }));
+  return { driverKey: "boat", companyId: COMPANY, environmentId: ENVIRONMENT, config, lease, operations: remoteOperations };
 }
 
 async function mode(file: string) { return (await lstat(file)).mode & 0o777; }
@@ -185,13 +193,16 @@ for (const direction of ["in", "out"] as const) {
         { operationId: "duplicate", files: [] },
       ];
       const original = structuredClone(operations);
-      expect(await sync(operations)).toEqual({ operations: [
+      const request = params(operations);
+      const originalRequest = structuredClone(request);
+      expect(await requireHook(direction)(request)).toEqual({ operations: [
         { operationId: opaque, filesTransferred: 1, bytesTransferred: 5 },
         { operationId: "duplicate", filesTransferred: 1, bytesTransferred: 3 },
         { operationId: "duplicate", filesTransferred: 0, bytesTransferred: 0 },
       ] });
       expect(await readFile(target)).toEqual(Buffer.from([0, 255, 128]));
       expect(operations).toEqual(original);
+      expect(request).toEqual(originalRequest);
       expect(existsSync(path.join(root, "not"))).toBe(false);
     });
 
@@ -460,8 +471,152 @@ for (const direction of ["in", "out"] as const) {
   });
 }
 
+describe("installed SDK postUploadCommands contract", () => {
+  // Each assertion catches silently ignored commands, command/file reordering,
+  // ambient cwd, shell-fragment rewriting, or swallowed command failures.
+  function sync(operations: PluginSyncOperation[]) { return requireHook("in")(params(operations)); }
+  function sandbox(...parts: string[]) { return path.join(root, "sandbox", ...parts); }
+
+  it("runs commands after all files, in array/operation order, with an explicit confined cwd", async () => {
+    const cwd = sandbox("command cwd ' ; $(touch cwd-pwned)");
+    await mkdir(cwd, { recursive: true });
+    await put(path.join(root, "host", "a"), "first");
+    await put(path.join(root, "host", "b"), "second");
+    const result = await sync([
+      { operationId: "upload-and-command", files: [
+        { sourcePath: path.join(root, "host", "a"), targetPath: path.join(cwd, "a"), kind: "file" },
+        { sourcePath: path.join(root, "host", "b"), targetPath: path.join(cwd, "b"), kind: "file" },
+      ], postUploadCommands: [
+        { command: "cat a b > ordered", cwd: ssh.remotePath(cwd) },
+        { command: "printf ':command-two' >> ordered", cwd: ssh.remotePath(cwd) },
+      ] },
+      { operationId: "commands-only", files: [], postUploadCommands: [
+        { command: "printf ':next-operation' >> ordered", cwd: ssh.remotePath(cwd) },
+      ] },
+    ]);
+    expect(await readFile(path.join(cwd, "ordered"), "utf8")).toBe("firstsecond:command-two:next-operation");
+    expect(result).toEqual({ operations: [
+      { operationId: "upload-and-command", filesTransferred: 2, bytesTransferred: 11 },
+      { operationId: "commands-only", filesTransferred: 0, bytesTransferred: 0 },
+    ] });
+    expect(existsSync(path.join(root, "cwd-pwned"))).toBe(false);
+    expect(existsSync(sandbox("cwd-pwned"))).toBe(false);
+  });
+
+  it("defaults absent cwd to the configured remote root, never the relay/process cwd", async () => {
+    await mkdir(sandbox(), { recursive: true });
+    await sync([{ operationId: "default-cwd", files: [], postUploadCommands: [
+      { command: "printf default-root > default-command-result" },
+    ] }]);
+    expect(await readFile(sandbox("default-command-result"), "utf8")).toBe("default-root");
+    expect(existsSync(path.join(root, "default-command-result"))).toBe(false);
+  });
+
+  it("executes the opaque command as an unchanged shell argument, not provider-concatenated fragments", async () => {
+    const cwd = sandbox("opaque");
+    await mkdir(cwd, { recursive: true });
+    const command = "# leading comment must survive\nprintf '%s' 'literal ; && $(not-executed) `nor-this`' > literal\ncat /proc/$$/cmdline > shell-argv\n# trailing comment";
+    const request = params([{ operationId: "opaque", files: [], postUploadCommands: [
+      { command, cwd: ssh.remotePath(cwd), timeoutMs: 5000 },
+    ] }]);
+    const original = structuredClone(request);
+    await requireHook("in")(request);
+    expect(await readFile(path.join(cwd, "literal"), "utf8")).toBe("literal ; && $(not-executed) `nor-this`");
+    // Linux exposes the actual shell argv. Cwd/env wrappers are fine only if
+    // they pass this command as its own byte-identical -c argument.
+    const argv = (await readFile(path.join(cwd, "shell-argv"), "utf8")).split("\0");
+    expect(argv).toContain(command);
+    expect(request).toEqual(original);
+  });
+
+  for (const failure of ["nonzero", "timeout"] as const) {
+    it(`fails fast on command ${failure}, without later commands or operations`, async () => {
+      const hook = requireHook("in");
+      const cwd = sandbox("fail-fast");
+      await mkdir(cwd, { recursive: true });
+      const source = path.join(root, "host", "source");
+      await put(source, "uploaded first");
+      const started = Date.now();
+      await expect(hook(params([
+        { operationId: "command-error", files: [
+          { sourcePath: source, targetPath: path.join(cwd, "uploaded"), kind: "file" },
+        ], postUploadCommands: [
+          { command: `cat uploaded > command-started; ${failure === "nonzero" ? "exit 29" : "exec sleep 30"}`,
+            cwd: ssh.remotePath(cwd), timeoutMs: failure === "timeout" ? 1000 : 5000 },
+          { command: "printf forbidden > later-command", cwd: ssh.remotePath(cwd) },
+        ] },
+        { operationId: "later-operation", files: [
+          { sourcePath: source, targetPath: path.join(cwd, "later-file"), kind: "file" },
+        ], postUploadCommands: [
+          { command: "printf forbidden > later-operation", cwd: ssh.remotePath(cwd) },
+        ] },
+      ]))).rejects.toThrow();
+      expect(await readFile(path.join(cwd, "command-started"), "utf8")).toBe("uploaded first");
+      expect(Date.now() - started).toBeLessThan(8000);
+      for (const file of ["later-command", "later-file", "later-operation"]) {
+        expect(existsSync(path.join(cwd, file))).toBe(false);
+      }
+    }, TIMEOUT);
+  }
+
+  it("never runs commands if this operation's file upload failed", async () => {
+    const hook = requireHook("in");
+    const cwd = sandbox("upload-failure");
+    await mkdir(cwd, { recursive: true });
+    await expect(hook(params([{ operationId: "missing-file", files: [
+      { sourcePath: path.join(root, "host", "missing"), targetPath: path.join(cwd, "target"), kind: "file" },
+    ], postUploadCommands: [{ command: "printf forbidden > must-not-run", cwd: ssh.remotePath(cwd) }] }]))).rejects.toThrow();
+    expect(existsSync(path.join(cwd, "must-not-run"))).toBe(false);
+  });
+
+  for (const cwd of ["relative", "/", "/home/user/other-workspace", "/home/user/native-sync-fixture/../other-workspace", "$HOME", "~/workspace"]) {
+    it(`rejects unconfined command cwd ${JSON.stringify(cwd)} before executing it`, async () => {
+      const hook = requireHook("in");
+      const sentinel = path.join(root, "cwd-refusal-sentinel");
+      await put(sentinel, "unchanged");
+      await expect(hook(params([{ operationId: "bad-cwd", files: [], postUploadCommands: [
+        { command: `printf CORRUPT > '${sentinel}'`, cwd },
+      ] }]))).rejects.toThrow();
+      expect(await readFile(sentinel, "utf8")).toBe("unchanged");
+    });
+  }
+
+  it("rejects a lexically confined cwd whose symlink ancestor escapes the remote root", async () => {
+    const hook = requireHook("in");
+    const outside = path.join(root, "outside-command-root");
+    await put(path.join(outside, "nested", "sentinel"), "unchanged");
+    await mkdir(sandbox(), { recursive: true });
+    await symlink(outside, sandbox("cwd-pivot"));
+    await expect(hook(params([{ operationId: "symlink-cwd", files: [], postUploadCommands: [
+      { command: "printf CORRUPT > sentinel", cwd: `${ssh.remoteRoot}/cwd-pivot/nested` },
+    ] }]))).rejects.toThrow();
+    expect(await readFile(path.join(outside, "nested", "sentinel"), "utf8")).toBe("unchanged");
+  });
+});
+
+describe("host target confinement", () => {
+  for (const kind of ["file", "directory"] as const) {
+    it(`refuses a ${kind} target under an existing host symlink ancestor`, async () => {
+      const hook = requireHook("out");
+      const source = path.join(root, "sandbox", "source");
+      const outside = path.join(root, "outside-host-target");
+      const sentinel = path.join(outside, "nested", "sentinel");
+      await put(sentinel, "unchanged");
+      await put(kind === "file" ? source : path.join(source, "sentinel"), "CORRUPT");
+      await mkdir(path.join(root, "host"), { recursive: true });
+      await symlink(outside, path.join(root, "host", "pivot"));
+      const target = path.join(root, "host", "pivot", "nested", ...(kind === "file" ? ["sentinel"] : []));
+      await expect(hook(params([{ operationId: "host-ancestor", files: [
+        { sourcePath: source, targetPath: target, kind },
+      ] }]))).rejects.toThrow();
+      expect(await readFile(sentinel, "utf8")).toBe("unchanged");
+      expect(await readlink(path.join(root, "host", "pivot"))).toBe(outside);
+    });
+  }
+});
+
 describe("outbound untrusted archive boundary (when using tar)", () => {
-  for (const attack of ["parent traversal", "absolute path", "symlink parent escape"] as const) {
+  for (const attack of ["parent traversal", "absolute path", "symlink parent escape", "symlink absolute escape", "hardlink parent escape", "symlink chain escape"] as const) {
     it(`rejects ${attack} without touching anything outside the mapped target`, async () => {
       const hook = requireHook("out");
       const source = path.join(root, "sandbox", "source");
@@ -474,7 +629,13 @@ describe("outbound untrusted archive boundary (when using tar)", () => {
         ? [{ name: "../outside-sentinel", body: "CORRUPT" }]
         : attack === "absolute path"
           ? [{ name: sentinel, body: "CORRUPT" }]
-          : [{ name: "pivot", link: ".." }, { name: "pivot/outside-sentinel", body: "CORRUPT" }];
+          : attack === "symlink absolute escape"
+            ? [{ name: "pivot", link: "/" }, { name: `pivot/${sentinel.slice(1)}`, body: "CORRUPT" }]
+            : attack === "hardlink parent escape"
+              ? [{ name: "pivot", link: "../outside-sentinel", hardlink: true }, { name: "pivot", body: "CORRUPT" }]
+              : attack === "symlink chain escape"
+                ? [{ name: "first", link: ".." }, { name: "second", link: "first" }, { name: "second/outside-sentinel", body: "CORRUPT" }]
+                : [{ name: "pivot", link: ".." }, { name: "pivot/outside-sentinel", body: "CORRUPT" }];
       const archive = path.join(root, "hostile.tar");
       await put(archive, hostileTar(entries));
       ssh.archiveOverride = archive;
@@ -580,6 +741,53 @@ describe("production streaming SSH seam", () => {
 });
 
 describe("local transfer harness controls", () => {
+  it("maps the configured VM namespace to scratch only at the SSH network boundary", async () => {
+    const session = ssh.getSession(lease.providerLeaseId!)!;
+    const host = path.join(root, "host", "literal");
+    const local = path.join(root, "sandbox", "namespace-probe");
+    const sibling = path.join(root, "sandbox-sibling", "literal");
+    expect(ssh.remotePath(host)).toBe(host);
+    expect(ssh.remotePath(sibling)).toBe(sibling);
+    expect(ssh.remotePath(local)).toBe("/home/user/native-sync-fixture/namespace-probe");
+    const request = params([{ operationId: "path-control", files: [
+      { sourcePath: host, targetPath: local, kind: "file" },
+    ] }]);
+    expect(request.operations[0].files[0]).toEqual({
+      sourcePath: host, targetPath: "/home/user/native-sync-fixture/namespace-probe", kind: "file",
+    });
+    const result = await ssh.run(session, `printf scratch-only > '${ssh.remotePath(local)}'`, { timeoutMs: 5000 });
+    expect(result.exitCode).toBe(0);
+    expect(await readFile(local, "utf8")).toBe("scratch-only");
+    expect(ssh.records.at(-1)?.args.at(-1)).toContain("/home/user/native-sync-fixture/namespace-probe");
+  });
+
+  it("preserves an opaque inner shell argument through the local namespace relay", async () => {
+    const session = ssh.getSession(lease.providerLeaseId!)!;
+    const command = "printf opaque > control-result; cat /proc/$$/cmdline > control-argv";
+    const result = await ssh.run(session, `cd '${ssh.remoteRoot}' && /bin/sh -c '${command}'`, { timeoutMs: 5000 });
+    expect(result.exitCode).toBe(0);
+    expect(await readFile(path.join(root, "sandbox", "control-result"), "utf8")).toBe("opaque");
+    expect((await readFile(path.join(root, "sandbox", "control-argv"), "utf8")).split("\0")).toContain(command);
+  });
+
+  it("propagates a real control command timeout through the relay", async () => {
+    const session = ssh.getSession(lease.providerLeaseId!)!;
+    const result = await ssh.run(session, "exec sleep 30", { timeoutMs: 1000 });
+    expect(result.timedOut).toBe(true);
+  }, TIMEOUT);
+
+  it("builds a real ustar hardlink rather than a symlink disguised as a hardlink attack", async () => {
+    const archive = path.join(root, "hardlink-fixture.tar");
+    await put(archive, hostileTar([{ name: "pivot", link: "../outside-sentinel", hardlink: true }]));
+    const child = processes.actual!("tar", ["-Ptvf", archive], { stdio: ["ignore", "pipe", "pipe"], cwd: root });
+    let listing = "";
+    child.stdout!.on("data", (chunk) => { listing += String(chunk); });
+    const [code] = await once(child, "close");
+    expect(code).toBe(0);
+    expect(listing).toContain("link to ../outside-sentinel");
+    expect(listing.startsWith("h")).toBe(true);
+  });
+
   it("executes a real local shell and preserves binary stdin/stdout", async () => {
     const session = ssh.getSession(lease.providerLeaseId!)!;
     const result = await ssh.run(session, "cat; printf stderr >&2", { stdin: "control\n", timeoutMs: 5000 });
