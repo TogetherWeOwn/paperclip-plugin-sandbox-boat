@@ -6,8 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readlinkSync,
-  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -29,18 +27,17 @@ import {
 } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
+  BOATIGNORE_RUNTIME_RULE,
   REMOTE_ENV_STAGING_ROOT,
-  RUNTIME_LINK_RESULT_RE,
+  RUNTIME_DIR_RESULT_RE,
   RUNTIME_SECRET_SCRUB_RESULT_RE,
-  RUNTIME_TMP_PREFIX,
   SCRUB_BASHRC_ASCII_TOKEN,
   TAR_SKIP_RUNTIME_DIR,
   buildLoginShellScript,
   buildRemoteCommand,
   buildRemoteEnvFileContents,
-  linkRuntimeDirScript,
   newRemoteEnvStage,
-  newRuntimeTmpDir,
+  runtimeDirScript,
   scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
@@ -49,6 +46,7 @@ import type { RemoteEnvStage } from "./shell.js";
 import { endpointFromSshKeyResponse } from "./ssh.js";
 import { resolveVmKey, sandboxNameFor, sanitizeSnapshotName } from "./vm-manager.js";
 import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
+import { PAPERCLIP_INSTRUCTION_GIT_EXCLUDE_PROGRAM } from "./test-support/paperclip-instruction-git-exclude.js";
 import { responseError, trialLimits } from "./test-support/fake-boat.js";
 
 describe("readBudget", () => {
@@ -98,6 +96,20 @@ describe("config", () => {
       apiBase: "https://boat.dev/api/v1",
       templateSnapshot: null,
     });
+  });
+
+  // The workspace root must be where the home ~/.boatignore applies, or every start fails at the runtime directory (and spends a start).
+  it("accepts remoteWorkspaceDir only as a plain absolute path below /home/user, and blank", () => {
+    const errorsFor = (remoteWorkspaceDir: unknown) =>
+      validateDriverConfig(parseDriverConfig({ apiKey: "k", remoteWorkspaceDir }), { apiKey: "k", remoteWorkspaceDir }).errors.filter((error) =>
+        error.startsWith("remoteWorkspaceDir"),
+      );
+    for (const ok of [undefined, "", "/home/user/custom-ws", "/home/user/a/b/", "/home/user/w o'rk"]) {
+      expect([ok, errorsFor(ok)]).toEqual([ok, []]);
+    }
+    for (const bad of ["/srv/ws", "/tmp/ws", "/home/user", "/home/user/", "/home/username/ws", "relative/ws", "~/ws", "$HOME/ws", "/home/user/../x", "/home/user/a/./b", "/home/user/a\nb"]) {
+      expect([bad, errorsFor(bad).length]).toEqual([bad, 1]);
+    }
   });
 });
 
@@ -936,101 +948,100 @@ describe("shell", () => {
       expect(existsSync(path.join(dir, "env.sh"))).toBe(false);
     });
 
-    // <root>/.paperclip-runtime is a symlink into /tmp, which no boat snapshot saves.
-    describe("the runtime directory link", () => {
-      const made: string[] = [];
-      afterEach(() => {
-        for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
-      });
-      const fresh = () => {
-        const dir = newRuntimeTmpDir();
-        made.push(dir);
-        return dir;
-      };
-      const link = (ws: string, dir: string, shell = "sh") =>
-        spawnSync(shell, ["-c", linkRuntimeDirScript(ws, dir)], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
-      const result = (run: ReturnType<typeof link>) => RUNTIME_LINK_RESULT_RE.exec(run.stdout)?.slice(1) ?? null;
+    // <root>/.paperclip-runtime is a real directory, and ~/.boatignore leaves it out of every boat snapshot.
+    describe("the runtime directory", () => {
+      const prepare = (ws: string, shell = "sh", home = root) =>
+        spawnSync(shell, ["-c", runtimeDirScript(ws)], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home }, encoding: "utf8" });
+      const result = (run: ReturnType<typeof prepare>) => RUNTIME_DIR_RESULT_RE.exec(run.stdout)?.slice(1) ?? null;
+      const boatignore = () => readFileSync(path.join(root, ".boatignore"), "utf8");
       const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJydW4iOiJyMSJ9.c2ln";
 
-      it.each(["sh", "bash"])("makes <root> and links its .paperclip-runtime to a fresh 0700 directory under /tmp, then keeps that link (%s)", (shell) => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      it.each(["sh", "bash"])("makes <root> and a real 0700 .paperclip-runtime, puts the rule into ~/.boatignore, then keeps both (%s)", (shell) => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const ws = path.join(root, "w o'rk");
-        const first = fresh();
-        const run = link(ws, first, shell);
-        expect(run.status).toBe(0);
-        expect(result(run)).toEqual(["linked", first]);
         const runtime = path.join(ws, ".paperclip-runtime");
-        expect(lstatSync(runtime).isSymbolicLink()).toBe(true);
-        expect(readlinkSync(runtime)).toBe(first);
-        expect(first.startsWith(RUNTIME_TMP_PREFIX)).toBe(true);
-        expect(statSync(first).mode & 0o777).toBe(0o700);
-        // A second run on the running VM keeps the link, so the first run's files stay where they are.
+        const run = prepare(ws, shell);
+        expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: "" });
+        expect(result(run)).toEqual(["made", runtime]);
+        expect(lstatSync(runtime).isDirectory()).toBe(true);
+        expect(statSync(runtime).mode & 0o777).toBe(0o700);
+        expect(boatignore()).toBe(`${BOATIGNORE_RUNTIME_RULE}\n`);
+        // A second run on the running VM keeps the directory and the first run's files, and adds no second rule.
         writeFileSync(path.join(runtime, "bridge-queue"), "x");
-        const second = fresh();
-        const again = link(ws, second, shell);
-        expect(result(again)).toEqual(["kept", first]);
-        expect(existsSync(second)).toBe(false);
+        const again = prepare(ws, shell);
+        expect(result(again)).toEqual(["kept", runtime]);
         expect(readFileSync(path.join(runtime, "bridge-queue"), "utf8")).toBe("x");
+        expect(boatignore()).toBe(`${BOATIGNORE_RUNTIME_RULE}\n`);
       });
 
-      it("replaces a link that dangles on a new machine (a snapshot restore has no /tmp), and any link, file or target that is not a runtime directory of ours", () => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      it("makes a kept .paperclip-runtime 0700 again, with its files (one made by Paperclip's mkdir -p is 0755)", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const ws = path.join(root, "ws");
         const runtime = path.join(ws, ".paperclip-runtime");
-        const first = fresh();
-        link(ws, first);
-        rmSync(first, { recursive: true }); // a resume on a new machine: snapshots do not save /tmp
-        const second = fresh();
-        expect(result(link(ws, second))).toEqual(["linked", second]);
+        mkdirSync(path.join(runtime, "claude"), { recursive: true });
+        chmodSync(runtime, 0o755);
+        writeFileSync(path.join(runtime, "claude", "keep"), "k");
+        const run = prepare(ws);
+        expect({ status: run.status, result: result(run) }).toEqual({ status: 0, result: ["kept", runtime] });
+        expect(statSync(runtime).mode & 0o777).toBe(0o700);
+        expect(readFileSync(path.join(runtime, "claude", "keep"), "utf8")).toBe("k");
+      });
+
+      it("keeps the other ~/.boatignore lines, and ends a last line that has no newline first", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
+        writeFileSync(path.join(root, ".boatignore"), "node_modules/\n.next/");
+        expect(prepare(path.join(root, "ws")).status).toBe(0);
+        expect(boatignore()).toBe(`node_modules/\n.next/\n${BOATIGNORE_RUNTIME_RULE}\n`);
+        // A rule already in place is not added again.
+        writeFileSync(path.join(root, ".boatignore"), `a/\n${BOATIGNORE_RUNTIME_RULE}\nb/`);
+        expect(prepare(path.join(root, "ws2")).status).toBe(0);
+        expect(boatignore()).toBe(`a/\n${BOATIGNORE_RUNTIME_RULE}\nb/`);
+      });
+
+      it("replaces a symlink (0.2.0 linked the directory into /tmp; Paperclip refuses that) or a file with a real directory, and leaves a link's target alone", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
+        const ws = path.join(root, "ws");
+        const runtime = path.join(ws, ".paperclip-runtime");
+        mkdirSync(ws);
         const elsewhere = path.join(root, "elsewhere");
         mkdirSync(elsewhere);
         writeFileSync(path.join(elsewhere, "keep"), "k");
-        const ourShapeButALink = fresh();
-        symlinkSync(elsewhere, ourShapeButALink);
-        const targets = [elsewhere, `${second}/../..${elsewhere}`, `${RUNTIME_TMP_PREFIX}notours`, ourShapeButALink, "file"];
-        for (const target of targets) {
-          rmSync(runtime, { force: true });
-          if (target === "file") writeFileSync(runtime, "not a link");
+        for (const target of [elsewhere, path.join(root, "gone"), "file"]) {
+          rmSync(runtime, { recursive: true, force: true });
+          if (target === "file") writeFileSync(runtime, "not a directory");
           else symlinkSync(target, runtime);
-          const next = fresh();
-          const run = link(ws, next);
-          expect({ target, result: result(run), now: readlinkSync(runtime) }).toEqual({ target, result: ["linked", next], now: next });
+          const run = prepare(ws);
+          expect({ target, result: result(run), link: lstatSync(runtime).isSymbolicLink(), dir: lstatSync(runtime).isDirectory() }).toEqual({
+            target,
+            result: ["made", runtime],
+            link: false,
+            dir: true,
+          });
         }
-        // Only the link was replaced; its old targets are untouched.
         expect(readFileSync(path.join(elsewhere, "keep"), "utf8")).toBe("k");
       });
 
-      it("moves a real .paperclip-runtime directory (a VM set up before this version) into /tmp, so its run MCP config leaves the saved disk", () => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      it("passes Paperclip's own check before a run (tog.22 instructionGitExcludeProgram), which fails on the 0.2.0 symlink", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const ws = path.join(root, "ws");
-        const files: Record<string, string> = {
-          "claude/mcp-config/mcp-config.json": jwt,
-          "claude/skills/paperclip/SKILL.md": "skill",
-          ".hidden": "h",
-          "odd\nname/f": "n",
-        };
-        for (const [file, body] of Object.entries(files)) {
-          mkdirSync(path.dirname(path.join(ws, ".paperclip-runtime", file)), { recursive: true });
-          writeFileSync(path.join(ws, ".paperclip-runtime", file), body);
-        }
-        writeFileSync(path.join(ws, "README.md"), "readme");
-        const dir = fresh();
-        const run = link(ws, dir);
-        expect(result(run)).toEqual(["linked", dir]);
-        expect(lstatSync(path.join(ws, ".paperclip-runtime")).isSymbolicLink()).toBe(true);
-        for (const [file, body] of Object.entries(files)) {
-          expect([file, readFileSync(path.join(dir, file), "utf8")]).toEqual([file, body]);
-        }
-        expect(readFileSync(path.join(ws, "README.md"), "utf8")).toBe("readme");
-        // grep -r does not follow the link: nothing on the workspace's own disk holds the JWT.
-        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
+        const exclude = () => spawnSync(process.execPath, ["-e", PAPERCLIP_INSTRUCTION_GIT_EXCLUDE_PROGRAM, ws], { encoding: "utf8" });
+        expect(prepare(ws).status).toBe(0);
+        const run = exclude();
+        expect({ status: run.status, stderr: run.stderr }).toEqual({ status: 0, stderr: "" });
+        expect(readFileSync(path.join(ws, ".paperclip-runtime", ".gitignore"), "utf8")).toBe("*\n");
+        // Control: what 0.2.0 left there. Paperclip failed every pilot run on it.
+        const tmpTarget = mkdtempSync(path.join(root, "tmp-runtime-"));
+        rmSync(path.join(ws, ".paperclip-runtime"), { recursive: true });
+        symlinkSync(tmpTarget, path.join(ws, ".paperclip-runtime"));
+        const refused = exclude();
+        expect(refused.status).not.toBe(0);
+        expect(refused.stderr).toContain("Unsafe runtime exclusion directory");
       });
 
-      it("Paperclip's asset extract and workspace wipe work through the link, and the scrub still removes the MCP config there", () => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      it("Paperclip's asset extract and workspace wipe keep the directory, and the scrub still removes the MCP config there", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const ws = path.join(root, "paperclip-workspace");
-        const dir = fresh();
-        expect(link(ws, dir).status).toBe(0);
+        expect(prepare(ws).status).toBe(0);
         // The asset, packed on the host.
         const source = path.join(root, "asset-src");
         mkdirSync(source);
@@ -1044,34 +1055,30 @@ describe("shell", () => {
         writeFileSync(path.join(ws, "old.txt"), "old");
         execFileSync("sh", ["-c", `find ${q(ws)} -mindepth 1 -maxdepth 1 ! -name '.paperclip-runtime' ! -name '.paperclip-upload-*' -exec rm -rf -- {} +`]);
         expect(existsSync(path.join(ws, "old.txt"))).toBe(false);
-        expect(readlinkSync(path.join(ws, ".paperclip-runtime"))).toBe(dir);
-        expect(realpathSync(assetDir)).toBe(realpathSync(path.join(dir, "claude", "mcp-config")));
-        expect(readFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
-        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
-        // The scrub before a stop is kept as defense in depth, and it reaches the file through the link.
+        expect(lstatSync(path.join(ws, ".paperclip-runtime")).isDirectory()).toBe(true);
+        expect(readFileSync(path.join(assetDir, "mcp-config.json"), "utf8")).toContain(jwt);
+        // The scrub before a stop is kept as defense in depth.
         const scrub = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
         expect(scrub.stdout.trim()).toBe("paperclip-boat-scrub found=1 left=0 walk=complete");
-        expect(existsSync(path.join(dir, "claude", "mcp-config"))).toBe(false);
+        expect(existsSync(assetDir)).toBe(false);
       });
 
       // Paperclip's inbound workspace tar carries the host workspace's own
       // .paperclip-runtime/ (tog.22: workspaceArchiveExclude and the git overlay
-      // copy do not leave it out), with a directory member of that name. GNU tar
-      // replaces a symlink with a real directory for such a member. The commands
-      // below are tog.22's, run the way Execute runs them.
+      // copy do not leave it out). The commands below are tog.22's, run the way
+      // Execute runs them.
       const gnuTar = spawnSync("tar", ["--version"], { encoding: "utf8" }).stdout?.includes("GNU tar") ?? false;
       it.skipIf(!gnuTar).each([
         { workspace: "plain (wipe, then extract)", wipe: true, order: "asset first" },
         { workspace: "plain (wipe, then extract)", wipe: true, order: "workspace first" },
         { workspace: "git overlay (extract over the tree)", wipe: false, order: "asset first" },
         { workspace: "git overlay (extract over the tree)", wipe: false, order: "workspace first" },
-      ])("Paperclip's workspace extract of a host tar with .paperclip-runtime/ keeps the link, and the MCP config stays under /tmp: $workspace, $order", ({ wipe, order }) => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      ])("Paperclip's workspace extract of a host tar with .paperclip-runtime/ leaves the VM's runtime directory alone: $workspace, $order", ({ wipe, order }) => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const q = shellQuote;
         const plainEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
         const ws = path.join(root, "paperclip-workspace");
-        const dir = fresh();
-        expect(link(ws, dir).status).toBe(0);
+        expect(prepare(ws).status).toBe(0);
         writeFileSync(path.join(ws, "old.txt"), "old");
         // The host workspace, as on rbx1: a .paperclip-runtime with repository clones next to the code.
         const host = path.join(root, "host");
@@ -1096,7 +1103,7 @@ describe("shell", () => {
         writeFileSync(path.join(assetSource, "mcp-config.json"), JSON.stringify({ mcpServers: { p: { headers: { Authorization: `Bearer ${jwt}` } } } }));
         const assetTar = path.join(root, "mcp-config.tar");
         execFileSync("tar", ["-cf", assetTar, "-C", assetSource, "mcp-config.json"], { env: plainEnv });
-        // Both tars are uploaded under <root>/.paperclip-runtime/claude, through the link.
+        // Both tars are uploaded under <root>/.paperclip-runtime/claude.
         const runtimeRoot = `${ws}/.paperclip-runtime/claude`;
         const remoteWorkspaceTar = `${runtimeRoot}/workspace-upload.tar`;
         const remoteAssetTar = `${runtimeRoot}/mcp-config-upload.tar`;
@@ -1118,40 +1125,31 @@ describe("shell", () => {
           expect({ index, status: run.status, stderr: run.stderr }).toEqual({ index, status: 0, stderr: "" });
         }
         const runtime = path.join(ws, ".paperclip-runtime");
-        // The link survived and still points at the lease's /tmp directory.
-        expect(lstatSync(runtime).isSymbolicLink()).toBe(true);
-        expect(readlinkSync(runtime)).toBe(dir);
-        // The run's MCP config is under /tmp, where the agent finds it through the link.
-        expect(readFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
+        expect(lstatSync(runtime).isDirectory()).toBe(true);
+        // The run's MCP config is where the agent finds it; the host's runtime files were not unpacked, and the upload tars are gone.
         expect(readFileSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"), "utf8")).toContain(jwt);
-        // Nothing on the workspace's own disk holds it (grep -r does not follow the link).
-        expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
-        // The workspace itself arrived; the host's runtime files were skipped, and the upload tars are gone.
         expect(readFileSync(path.join(ws, "main.rs"), "utf8")).toBe("fn main() {}");
         expect(readFileSync(path.join(ws, ".paperclip-runtime-like", "keep"), "utf8")).toBe("not the runtime directory");
         expect(existsSync(path.join(ws, "old.txt"))).toBe(!wipe);
-        expect(existsSync(path.join(dir, "detached-repositories"))).toBe(false);
-        expect(spawnSync("grep", ["-rlF", "stale host config", dir], { encoding: "utf8" }).stdout).toBe("");
-        expect([existsSync(path.join(dir, "claude", "workspace-upload.tar")), existsSync(path.join(dir, "claude", "mcp-config-upload.tar"))]).toEqual([false, false]);
+        expect(existsSync(path.join(runtime, "detached-repositories"))).toBe(false);
+        expect(spawnSync("grep", ["-rlF", "stale host config", runtime], { encoding: "utf8" }).stdout).toBe("");
+        expect([existsSync(path.join(runtime, "claude", "workspace-upload.tar")), existsSync(path.join(runtime, "claude", "mcp-config-upload.tar"))]).toEqual([false, false]);
 
-        // Control: the same workspace extract without the plugin's script replaces the link with a real directory.
+        // Control: the same workspace extract without the plugin's script unpacks the host's runtime files over the run's.
         expect(upload(hostTar, remoteWorkspaceTar).status).toBe(0);
         const bare = spawnSync("sh", ["-c", workspaceExtract], { cwd: ws, env: plainEnv, encoding: "utf8" });
         expect(bare.status).toBe(0);
-        expect(lstatSync(runtime).isSymbolicLink()).toBe(false);
         expect(readFileSync(path.join(runtime, "detached-repositories", "r1", "f"), "utf8")).toBe("host runtime file");
-        expect(existsSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"))).toBe(true);
         expect(readFileSync(path.join(runtime, "claude", "mcp-config", "mcp-config.json"), "utf8")).toBe("stale host config");
       });
 
-      it.skipIf(!gnuTar)("an agent's own tar through Execute never packs the run's MCP config, even when it follows the link", () => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
+      it.skipIf(!gnuTar)("an agent's own tar through Execute never packs the run's MCP config", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
         const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root };
         const ws = path.join(root, "ws");
-        const dir = fresh();
-        expect(link(ws, dir).status).toBe(0);
-        mkdirSync(path.join(dir, "claude", "mcp-config"), { recursive: true });
-        writeFileSync(path.join(dir, "claude", "mcp-config", "mcp-config.json"), jwt);
+        expect(prepare(ws).status).toBe(0);
+        mkdirSync(path.join(ws, ".paperclip-runtime", "claude", "mcp-config"), { recursive: true });
+        writeFileSync(path.join(ws, ".paperclip-runtime", "claude", "mcp-config", "mcp-config.json"), jwt);
         writeFileSync(path.join(ws, "main.rs"), "fn main() {}");
         const out = path.join(root, "out.tar");
         const script = buildLoginShellScript({ command: "tar", args: ["-chf", out, "."], cwd: ws, remoteEnv: null });
@@ -1159,26 +1157,33 @@ describe("shell", () => {
         const listed = execFileSync("tar", ["-tf", out], { env, encoding: "utf8" });
         expect(listed).toContain("./main.rs");
         expect(listed).not.toContain(".paperclip-runtime");
-        // Control: the same tar outside Execute follows the link and packs the file.
+        // Control: the same tar outside Execute packs the file.
         expect(execFileSync("sh", ["-c", `tar -chf - . | tar -tf -`], { cwd: ws, env, encoding: "utf8" })).toContain("./.paperclip-runtime/claude/mcp-config/mcp-config.json");
       });
 
-      it("fails, with no result line and no link, when the fresh directory already exists", () => {
-        root = mkdtempSync(path.join(tmpdir(), "pcb-link-"));
-        const ws = path.join(root, "ws");
-        const dir = fresh();
-        mkdirSync(dir);
-        const run = link(ws, dir);
+      it("fails closed, with no result line and no directory, when <root> is not a plain path under $HOME or ~/.boatignore cannot take the rule", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
+        const outside = mkdtempSync(path.join(tmpdir(), "pcb-rt-out-"));
+        try {
+          for (const ws of [path.join(outside, "ws"), `${root}/a/../../${path.basename(outside)}/ws`, root]) {
+            const run = prepare(ws);
+            expect({ ws, status: run.status === 0, result: result(run) }).toEqual({ ws, status: false, result: null });
+          }
+          expect(existsSync(path.join(outside, "ws"))).toBe(false);
+        } finally {
+          rmSync(outside, { recursive: true, force: true });
+        }
+        // ~/.boatignore is a directory: the rule cannot go in, so nothing is made.
+        mkdirSync(path.join(root, ".boatignore"));
+        const run = prepare(path.join(root, "ws"));
         expect(run.status).not.toBe(0);
         expect(result(run)).toBeNull();
-        expect(existsSync(path.join(ws, ".paperclip-runtime"))).toBe(false);
+        expect(existsSync(path.join(root, "ws"))).toBe(false);
       });
 
-      it("refuses to build a script for a relative root or a directory that is not a fresh runtime directory", () => {
-        expect(() => linkRuntimeDirScript("relative/ws", newRuntimeTmpDir())).toThrow(/absolute/);
-        expect(() => linkRuntimeDirScript("/w", "/tmp/elsewhere")).toThrow(/32 hex/);
-        expect(() => linkRuntimeDirScript("/w", `${RUNTIME_TMP_PREFIX}${"a".repeat(31)}`)).toThrow(/32 hex/);
-        expect(newRuntimeTmpDir()).toMatch(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/);
+      it("refuses to build a script for a relative root", () => {
+        expect(() => runtimeDirScript("relative/ws")).toThrow(/absolute/);
+        expect(() => runtimeDirScript("/")).toThrow(/absolute/);
       });
     });
   });

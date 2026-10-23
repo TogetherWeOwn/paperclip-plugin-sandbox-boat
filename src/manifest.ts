@@ -189,7 +189,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           remoteWorkspaceDir: {
             type: "string",
-            description: "Workspace path inside the VM. Blank: $HOME/paperclip-workspace.",
+            description: "Workspace path inside the VM: a plain absolute path below /home/user, used as typed (no ~ or $HOME). Blank: $HOME/paperclip-workspace.",
             ...advanced("VM"),
           },
           namePrefix: {

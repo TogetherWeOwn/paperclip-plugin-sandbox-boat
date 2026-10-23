@@ -32,14 +32,14 @@ import { boatApi, waitReady } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
-import { PRICE_PER_HOUR, parseDriverConfig, resolveApiKey, resolveCostApiKey } from "./config.js";
+import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
-  RUNTIME_LINK_RESULT_RE,
+  RUNTIME_DIR_RESULT_RE,
   RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT,
   RUNTIME_SECRET_SCRUB_RESULT_RE,
   SCRUB_BASHRC_ASCII_TOKEN,
@@ -47,10 +47,9 @@ import {
   buildLoginShellScript,
   buildRemoteCommand,
   buildRemoteEnvFileContents,
-  linkRuntimeDirScript,
   newRemoteEnvStage,
-  newRuntimeTmpDir,
   removeRemoteEnvCommand,
+  runtimeDirScript,
   scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
@@ -666,36 +665,36 @@ export class BoatVmManager {
   }
 
   /**
-   * Make `<root>/.paperclip-runtime` a symlink into a fresh 0700 directory
-   * under /tmp, or keep a valid one (shell.ts, linkRuntimeDirScript). boat
-   * never saves /tmp, so the run MCP config with the run JWT, and the other
+   * Make `<root>/.paperclip-runtime` a real 0700 directory, or keep one, and
+   * put `.paperclip-runtime/` into `~/.boatignore` (shell.ts,
+   * runtimeDirScript), so the run MCP config with the run JWT, and the other
    * files Paperclip syncs there for each run, stay out of the per-minute and
    * stop snapshots. Runs before Paperclip syncs anything: at acquire, at a
-   * resumed lease and at realize. Returns the /tmp directory; throws
+   * resumed lease and at realize. Returns the directory; throws
    * BOAT_RUNTIME_DIR_FAILED.
    */
-  private async linkRuntimeDir(session: SshSession, root: string): Promise<string> {
-    const fresh = newRuntimeTmpDir();
+  private async prepareRuntimeDir(session: SshSession, root: string): Promise<string> {
     // onVm: the script ran on the VM and failed there (not ssh's 255 or a timeout), so the disk is in a state it cannot fix.
     const fail = (detail: string, onVm: boolean) =>
       new BoatProviderError(
         "BOAT_RUNTIME_DIR_FAILED",
-        `could not create ${root} with its .paperclip-runtime linked into /tmp on boat VM ${session.sandboxId}, so Paperclip's run MCP config (run JWT) would land on the saved disk: ${detail}`,
+        `could not create ${root} with its .paperclip-runtime left out of boat's snapshots (~/.boatignore) on boat VM ${session.sandboxId}, so Paperclip's run MCP config (run JWT) would land in them: ${detail}`,
         { onVm },
       );
     let result: Awaited<ReturnType<SshManager["run"]>>;
     try {
-      result = await this.ssh.run(session, `sh -c ${shellQuote(linkRuntimeDirScript(root, fresh))}`, { timeoutMs: 60_000 });
+      result = await this.ssh.run(session, `sh -c ${shellQuote(runtimeDirScript(root))}`, { timeoutMs: 60_000 });
     } catch (error) {
       throw fail(errorText(error).slice(0, 300), false);
     }
-    const line = RUNTIME_LINK_RESULT_RE.exec(result.stdout);
-    if (result.timedOut || result.exitCode !== 0 || !line || (line[1] === "linked" && line[2] !== fresh)) {
+    const line = RUNTIME_DIR_RESULT_RE.exec(result.stdout);
+    const expected = `${root.trim().replace(/\/+$/, "")}/.paperclip-runtime`;
+    if (result.timedOut || result.exitCode !== 0 || !line || line[2] !== expected) {
       const onVm = !result.timedOut && result.exitCode != null && result.exitCode !== 255;
       throw fail(result.timedOut ? "timed out" : `exit ${result.exitCode}: ${(result.stderr || result.stdout).trim().slice(0, 300)}`, onVm);
     }
-    if (line[1] === "linked") {
-      this.logger.info("boat: linked Paperclip's runtime directory on the VM into /tmp, which boat never snapshots", {
+    if (line[1] === "made") {
+      this.logger.info("boat: made Paperclip's runtime directory on the VM, left out of boat's snapshots by ~/.boatignore", {
         sandboxId: session.sandboxId,
         root,
         runtimeDir: line[2],
@@ -706,13 +705,12 @@ export class BoatVmManager {
 
   /**
    * After a resume for a command (auto-stop or the sweep stopped the VM
-   * mid-lease): on a new machine /tmp is empty and the links dangle (on the
-   * same machine, back within boat's 10-minute keep, they are kept). Relink
-   * every known root, so Paperclip's next sync into `.paperclip-runtime` (the
-   * sync-back at the run's end) lands in /tmp again. Best effort: logs a
+   * mid-lease): prepare every known root again, so the `.boatignore` rule and
+   * the directory are in place before Paperclip's next sync into
+   * `.paperclip-runtime` (the sync-back at the run's end). Best effort: logs a
    * warning.
    */
-  private async relinkRuntimeDirs(config: BoatDriverConfig, companyId: string, sandboxId: string, session: SshSession): Promise<void> {
+  private async reprepareRuntimeDirs(config: BoatDriverConfig, companyId: string, sandboxId: string, session: SshSession): Promise<void> {
     const record = await this.store
       .read(companyId)
       .then((doc) => findBySandboxId(doc, sandboxId))
@@ -721,9 +719,9 @@ export class BoatVmManager {
     for (const root of roots) {
       if (!root.startsWith("/") || root.length < 2) continue;
       try {
-        await this.linkRuntimeDir(session, root);
+        await this.prepareRuntimeDir(session, root);
       } catch (error) {
-        this.logger.warn("boat: could not relink Paperclip's runtime directory into /tmp after a resume", { sandboxId, root, error: errorText(error) });
+        this.logger.warn("boat: could not prepare Paperclip's runtime directory again after a resume", { sandboxId, root, error: errorText(error) });
       }
     }
   }
@@ -782,12 +780,11 @@ export class BoatVmManager {
    *   disk holds the card's checkout and caches, and possibly the unexported
    *   work of a run that failed; a freshly created VM holds nothing yet and is
    *   deleted instead.
-   * A VM set up by this version keeps the MCP config under /tmp, which boat
-   * never snapshots: the link survives Paperclip's syncs, because every command's
-   * GNU tar skips `.paperclip-runtime` members (shell.ts, TAR_SKIP_RUNTIME_DIR).
-   * So the stop snapshot does not get it. A VM set up before the link, or one
-   * whose link something else replaced with a real directory, may keep the run
-   * JWT there. The owner accepted that residual risk.
+   * On a VM set up by this version, `~/.boatignore` leaves `.paperclip-runtime`
+   * out of every snapshot (shell.ts, runtimeDirScript), so the stop snapshot
+   * does not get the MCP config. A VM whose `~/.boatignore` lost the rule (the
+   * agent can edit it) may keep the run JWT there. The owner accepted that
+   * residual risk.
    */
   private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep" | "failed start"; keep: KeptDiskReason; reason: string }): void {
     const why = {
@@ -798,7 +795,7 @@ export class BoatVmManager {
       resumed_disk: "it is the card's resumed VM, whose disk holds the card's work",
     }[input.keep];
     this.logger.error(
-      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. With .paperclip-runtime linked into /tmp, and every command's tar skipping it, Paperclip's syncs keep the file off the saved disk; a VM set up before the link, or one whose link something else replaced with a real directory, may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
+      `boat: stopping the VM and keeping its disk although ${input.reason} (${input.trigger}): ${why}, and the disk may hold a run's unexported work. ~/.boatignore leaves .paperclip-runtime out of boat's snapshots; a VM whose ~/.boatignore lost that rule may keep the run JWT (valid up to 48 h) in the stop snapshot.`,
       { sandboxId: input.sandboxId, trigger: input.trigger, keep: input.keep, reason: input.reason },
     );
   }
@@ -877,6 +874,9 @@ export class BoatVmManager {
 
   async acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
+    // A config saved before this check: such a root fails at the runtime directory on every VM, so refuse it before boat spends a start.
+    const workspaceProblem = remoteWorkspaceDirProblem(config.remoteWorkspaceDir);
+    if (workspaceProblem) throw new BoatProviderError("BOAT_CONFIG_INVALID", workspaceProblem);
     this.rememberConfig(params.companyId, params.environmentId, config);
     const { key, kind } = resolveVmKey(params);
     const name = sandboxNameFor(config.namePrefix, params.companyId, params.environmentId, key);
@@ -993,7 +993,7 @@ export class BoatVmManager {
         const session = this.ssh.getSession(sandboxId) ?? (await this.openSsh(api, config, sandboxId));
         const remote = await this.prepareRemote(config, session);
         // Before the lease goes back to Paperclip, which then syncs the run's runtime assets (the MCP config with the run JWT among them).
-        const runtimeDir = await this.linkRuntimeDir(session, remote.remoteCwd);
+        const runtimeDir = await this.prepareRuntimeDir(session, remote.remoteCwd);
         if (startKind! === "reuse_running") await this.maybeExtend(config, sandboxId);
         await this.store.update(params.companyId, (state) => {
           const record = state.vms[key];
@@ -1056,13 +1056,13 @@ export class BoatVmManager {
             connect: false,
           });
           await this.ssh.closeSession(sandboxId).catch(() => undefined);
-          // A link that failed on the VM fails again at every resume of this disk; a fresh VM does not.
+          // A runtime directory that failed on the VM fails again at every resume of this disk; a fresh VM does not.
           const linkFailed = error instanceof BoatProviderError && error.code === "BOAT_RUNTIME_DIR_FAILED" && error.details.onVm === true;
           const reason =
             scrub.status === "failed" || (scrub.status === "incomplete" && !linkFailed)
               ? unverifiedScrubReason(scrub)
               : linkFailed
-                ? "its .paperclip-runtime could not be linked into /tmp"
+                ? "its .paperclip-runtime could not be prepared (~/.boatignore rule, real directory)"
                 : null;
           let deleted = false;
           if (reason && resumedExisting) {
@@ -1187,8 +1187,8 @@ export class BoatVmManager {
     const session = await this.liveSession(config, params.companyId, sandboxId);
     const remote = await this.prepareRemote(config, session);
     const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
-    // Before Paperclip syncs this run's runtime assets: a resume on a new machine has an empty /tmp, so the old link dangles.
-    const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
+    // Before Paperclip syncs this run's runtime assets: the `.boatignore` rule and the directory must be in place.
+    const runtimeDir = await this.prepareRuntimeDir(session, remoteCwd);
     // Paperclip resumes a reusable lease without naming the new run, so record
     // the run window under a synthetic id: it gives per-run cost accounting.
     // It is not added to activeRunIds, so release still stops the VM.
@@ -1276,7 +1276,7 @@ export class BoatVmManager {
       // This path (a resume for a command, or a new worker) skips acquire's setup step, and a resume
       // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
       await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
-      if (resumed) await this.relinkRuntimeDirs(config, companyId, sandboxId, session);
+      if (resumed) await this.reprepareRuntimeDirs(config, companyId, sandboxId, session);
       return session;
     });
   }
@@ -1567,8 +1567,8 @@ export class BoatVmManager {
     const sandboxId = params.lease.providerLeaseId;
     if (sandboxId) {
       const session = await this.liveSession(config, params.companyId, sandboxId);
-      // mkdir -p the workspace, and link its .paperclip-runtime into /tmp (kept when acquire already did) before Paperclip syncs into it.
-      const runtimeDir = await this.linkRuntimeDir(session, remoteCwd);
+      // mkdir -p the workspace and its .paperclip-runtime (kept when acquire already made it), left out of snapshots by ~/.boatignore, before Paperclip syncs into it.
+      const runtimeDir = await this.prepareRuntimeDir(session, remoteCwd);
       // Paperclip puts its runtime assets (the run MCP config among them) under this root.
       await this.rememberRemoteRoot(params.companyId, sandboxId, remoteCwd);
       return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd, runtimeDir } };

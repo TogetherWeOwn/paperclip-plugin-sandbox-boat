@@ -85,7 +85,7 @@ export interface FakeRuntimeLink {
 export class FakeSsh {
   readonly spawned: SpawnRecord[] = [];
   masterFailures = 0;
-  /** Per sandbox, every `.paperclip-runtime` link the plugin asked for, in order. */
+  /** Per sandbox, every `.paperclip-runtime` directory the plugin prepared, in order. */
   readonly runtimeLinks = new Map<string, FakeRuntimeLink[]>();
   /**
    * Per sandbox (HostKeyAlias), how many run-secret paths (Paperclip's
@@ -150,21 +150,20 @@ export class FakeSsh {
     const link = FakeSsh.runtimeLinkOf(remoteCommand);
     if (link) {
       this.runtimeLinks.set(sandboxId, [...(this.runtimeLinks.get(sandboxId) ?? []), link]);
-      return { code: 0, stdout: `paperclip-boat-runtime linked ${link.runtimeDir}\n` };
+      return { code: 0, stdout: `paperclip-boat-runtime made ${link.runtimeDir}\n` };
     }
     return { code: 0, stdout: "ok\n" };
   }
 
-  /** The root and fresh /tmp directory of a runtime-link command, or null. */
+  /** The root and `<root>/.paperclip-runtime` of a runtime-directory command, or null. */
   static runtimeLinkOf(remoteCommand: string): FakeRuntimeLink | null {
     if (!remoteCommand.includes("paperclip-boat-runtime")) return null;
     const script = scriptOfShDashC(remoteCommand) ?? "";
     const root = script.match(/^root='([^']*)'/)?.[1];
-    const runtimeDir = script.match(/new='(\/tmp\/paperclip-boat-runtime-[0-9a-f]{32})'/)?.[1];
-    return root && runtimeDir ? { root, runtimeDir } : null;
+    return root ? { root, runtimeDir: `${root}/.paperclip-runtime` } : null;
   }
 
-  /** The runtime-link commands sent to one sandbox. */
+  /** The runtime-directory commands sent to one sandbox. */
   links(sandboxId?: string): SpawnRecord[] {
     return this.execs().filter(
       (entry) => entry.args.at(-1)!.includes("paperclip-boat-runtime") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),

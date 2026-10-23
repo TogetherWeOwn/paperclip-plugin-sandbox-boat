@@ -332,23 +332,30 @@ describe("AcquireLease", () => {
     expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
   });
 
-  it("deletes a VM it started when the VM refuses to link .paperclip-runtime into /tmp, but only stops it when ssh lost that command in transit", async () => {
+  it("deletes a VM it started when the VM refuses to prepare .paperclip-runtime, but only stops it when ssh lost that command in transit", async () => {
     ssh.handler = (remoteCommand) =>
       remoteCommand.includes("paperclip-boat-runtime") ? { code: 1, stderr: "rm: cannot remove '.paperclip-runtime/claude': Permission denied" } : undefined;
     await expect(acquire("run-1")).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
     // That disk would fail the same way at every resume; a fresh VM does not.
     expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
     expect(fake.callsOf("stop")).toHaveLength(0);
-    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (failed start)") && String(entry.meta?.reason).includes("linked into /tmp"))).toBe(true);
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it (failed start)") && String(entry.meta?.reason).includes("could not be prepared"))).toBe(true);
     ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-runtime") ? { code: 255, stderr: "Connection reset by peer" } : undefined);
     await expect(acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" })).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
     expect(fake.callsOf("stop")).toHaveLength(1);
     expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
   });
 
+  // Such a root fails at the runtime directory on every VM (~/.boatignore applies only under $HOME): refuse it before boat spends a start.
+  it("refuses a remoteWorkspaceDir outside /home/user before it creates or resumes a VM", async () => {
+    await expect(acquire("run-1", {}, { remoteWorkspaceDir: "/srv/ws" })).rejects.toMatchObject({ code: "BOAT_CONFIG_INVALID" });
+    expect([...fake.callsOf("create"), ...fake.callsOf("resume")]).toEqual([]);
+    expect(ssh.execs()).toHaveLength(0);
+  });
+
   // TOG-37714: a resumed card VM holds the card's checkout and caches, and
   // possibly a failed run's unexported work; a fresh VM holds nothing yet.
-  it("stops a resumed card VM and keeps its disk when the link or the scrub fails at its start; only a fresh VM is deleted", async () => {
+  it("stops a resumed card VM and keeps its disk when the runtime directory or the scrub fails at its start; only a fresh VM is deleted", async () => {
     const first = await acquire("run-1");
     const sandboxId = first.providerLeaseId!;
     await release(first);
@@ -776,7 +783,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
     await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "claude", args: ["-v"] } as never);
     const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("'claude'"))!.args.at(-1)!);
     expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS="--exclude=\.paperclip-runtime\$\{TAR_OPTIONS:\+ \$TAR_OPTIONS\}" && 'claude' '-v'; rc=\$\?; exit \$rc$/);
-    // Every Execute (Paperclip's sync commands included) tells GNU tar to leave .paperclip-runtime alone, so its link into /tmp survives.
+    // Every Execute (Paperclip's sync commands included) tells GNU tar to leave .paperclip-runtime alone, so the host's runtime files are not unpacked over the run's.
     expect(script.indexOf('export TAR_OPTIONS="--exclude=.paperclip-runtime')).toBeGreaterThan(unsetAt);
     expect(script.indexOf('export TAR_OPTIONS="--exclude=.paperclip-runtime')).toBeLessThan(payloadAt);
   });
@@ -1302,23 +1309,23 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     }
   });
 
-  it("links .paperclip-runtime into a fresh /tmp directory before each lease goes to Paperclip: acquire, resume, resumed lease and realize", async () => {
+  it("prepares .paperclip-runtime (real directory, ~/.boatignore rule) before each lease goes to Paperclip: acquire, resume, resumed lease and realize", async () => {
     const first = await acquire("run-1");
     const sandboxId = first.providerLeaseId!;
     const links = () => ssh.runtimeLinks.get(sandboxId) ?? [];
     const runtimeDir = String(first.metadata?.runtimeDir);
-    expect(runtimeDir).toMatch(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/);
+    expect(runtimeDir).toBe("/home/user/paperclip-workspace/.paperclip-runtime");
     expect(links()).toEqual([{ root: "/home/user/paperclip-workspace", runtimeDir }]);
     // After the setup step, before acquire returns (Paperclip syncs the runtime assets after that).
     const commands = ssh.execs().map((call) => call.args.at(-1)!);
     expect(commands.findIndex((command) => command.includes('"$d" "$s"'))).toBeLessThan(commands.findIndex((command) => command.includes("paperclip-boat-runtime")));
     expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
     await release(first);
-    // A resumed VM can be on a new machine with an empty /tmp; the plugin always asks for a link (the VM keeps a valid one).
+    // A resumed VM: the plugin always prepares the directory again (the VM keeps a valid one).
     const second = await acquire("run-2");
     expect(second.metadata).toMatchObject({ startKind: "resume" });
     expect(second.metadata?.runtimeDir).toBe(links().at(-1)!.runtimeDir);
-    expect(second.metadata?.runtimeDir).not.toBe(runtimeDir);
+    expect(links()).toHaveLength(2);
     await release(second, { resourceDisposition: "stop_and_retain" });
     const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: second.metadata } as never);
     expect(resumed.metadata).toMatchObject({ resumedLease: true, runtimeDir: links().at(-1)!.runtimeDir });
@@ -1330,11 +1337,11 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(new Set(links().map((link) => link.root))).toEqual(new Set(["/home/user/paperclip-workspace"]));
   });
 
-  it("relinks .paperclip-runtime after resuming a VM that stopped mid-lease, before the command runs", async () => {
+  it("prepares .paperclip-runtime again after resuming a VM that stopped mid-lease, before the command runs", async () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
     await currentManager().shutdown();
-    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop; the resume may land on a new machine with an empty /tmp
+    fake.boxes.get(sandboxId)!.state = "archived"; // boat's auto-stop; the resume may land on a new machine
     const before = ssh.execs().length;
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
     expect(result.exitCode).toBe(0);
@@ -1538,9 +1545,9 @@ describe("ResumeLease and RealizeWorkspace", () => {
     const result = await plugin.definition.onEnvironmentRealizeWorkspace!({ ...base(), lease, workspace: { localPath: "/tmp/x" } } as never);
     expect(result).toEqual({
       cwd: "/home/user/paperclip-workspace",
-      metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace", runtimeDir: expect.stringMatching(/^\/tmp\/paperclip-boat-runtime-[0-9a-f]{32}$/) },
+      metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace", runtimeDir: "/home/user/paperclip-workspace/.paperclip-runtime" },
     });
-    // One command makes the workspace and links its .paperclip-runtime into /tmp.
+    // One command makes the workspace and its .paperclip-runtime, and puts the rule into ~/.boatignore.
     expect(ssh.execs().at(-1)!.args.at(-1)).toContain('mkdir -p "$root"');
     expect(ssh.execs().at(-1)!.args.at(-1)).toContain("paperclip-boat-runtime");
   });
