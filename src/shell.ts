@@ -279,54 +279,131 @@ export function linkRuntimeDirScript(root: string, fresh: string): string {
 /** Runtime asset names, under `<root>/.paperclip-runtime/<adapter>/`, that hold run credentials. */
 export const RUNTIME_SECRET_ASSET_GLOBS = ["mcp-config", "mcp-config-upload.tar*"] as const;
 
-/** How deep the catch-all search under $HOME goes (`$HOME/<ws>/.paperclip-runtime/<adapter>/mcp-config` is depth 4). */
+/**
+ * How deep the catch-all search under $HOME goes, counted to the asset:
+ * `$HOME/<ws>/.paperclip-runtime/<adapter>/mcp-config` is depth 4, so a
+ * `.paperclip-runtime` directory is looked for down to depth 4 (6 - 2).
+ */
 export const RUNTIME_SECRET_FIND_MAX_DEPTH = 6;
 
-/** The line the scrub prints last: how many paths it found and how many are left. */
-export const RUNTIME_SECRET_SCRUB_RESULT_RE = /^paperclip-boat-scrub found=(\d+) left=(\d+)$/m;
+/**
+ * The line the scrub prints last: how many paths it found, how many are left,
+ * and whether it could search every directory it had to (`complete`) or not.
+ */
+export const RUNTIME_SECRET_SCRUB_RESULT_RE = /^paperclip-boat-scrub found=(\d+) left=(\d+) walk=(complete|incomplete)$/m;
+
+/** Exit status of the scrub when nothing is left that it could see, but it could not search everywhere. */
+export const RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT = 3;
+
+// The scan of one or more runtime directories, run as `sh -c "$scan" sh <list|rm> <runtime dir>...`
+// (from the root loop, and from `find -exec ... {} +`). For each `<dir>`, an
+// asset is exactly `<dir>/<one adapter name>/mcp-config` or
+// `<dir>/<one adapter name>/mcp-config-upload.tar*`, never a deeper path such
+// as a skill's own `<dir>/claude/skills/mcp-config`. `list` prints each match
+// NUL-terminated, `rm` removes it; either way the path is one argument, never
+// a line of text. It exits non-zero when it cannot be sure it saw everything:
+// a runtime or adapter directory it cannot list or search, or a path that is
+// missing only because a directory above it cannot be searched (EACCES, not
+// ENOENT). A link whose target is truly gone (a resume on a new machine
+// empties /tmp) holds nothing.
+const RUNTIME_SCAN_SCRIPT = [
+  // reachable <path>: true when <path> exists, or when it is truly absent: the
+  // nearest existing directory above it can be searched (stat then fails with ENOENT, not EACCES).
+  "reachable() {",
+  '  p=$1',
+  '  while [ ! -e "$p" ] && [ ! -L "$p" ]; do',
+  '    case $p in */*) p=${p%/*}; [ -n "$p" ] || p=/;; *) return 0;; esac',
+  "  done",
+  '  if [ -d "$p" ] && [ ! -x "$p" ]; then echo "paperclip-boat-scrub: cannot search $p" >&2; return 1; fi',
+  "  return 0",
+  "}",
+  'm=$1; shift; ok=0',
+  'for rt do',
+  '  if [ ! -e "$rt" ]; then',
+  '    if [ -L "$rt" ]; then',
+  '      t=$(readlink -- "$rt"; echo x); t=${t%?x}',
+  '      case $t in /*) ;; *) t=${rt%/*}/$t;; esac',
+  '      reachable "$t" || ok=1',
+  '    else',
+  '      reachable "$rt" || ok=1',
+  '    fi',
+  '    continue',
+  '  fi',
+  '  [ -d "$rt" ] || continue',
+  '  if [ ! -r "$rt" ] || [ ! -x "$rt" ]; then echo "paperclip-boat-scrub: cannot list $rt" >&2; ok=1; continue; fi',
+  '  for a in "$rt"/* "$rt"/.[!.]* "$rt"/..?*; do',
+  '    [ -d "$a" ] || continue',
+  '    if [ ! -r "$a" ] || [ ! -x "$a" ]; then echo "paperclip-boat-scrub: cannot list $a" >&2; ok=1; continue; fi',
+  `    for p in ${RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `"$a"/${glob}`).join(" ")}; do`,
+  '      if [ -e "$p" ] || [ -L "$p" ]; then',
+  "        if [ \"$m\" = rm ]; then rm -rf -- \"$p\" || ok=1; else printf '%s\\0' \"$p\" || ok=1; fi",
+  "      fi",
+  "    done",
+  "  done",
+  "done",
+  "exit $ok",
+].join("\n");
 
 /**
  * A script that deletes every `.paperclip-runtime/<adapter>/mcp-config` (and
  * its upload tarball) under each workspace root, under the default
- * `$HOME/paperclip-workspace`, and anywhere under $HOME up to
- * RUNTIME_SECRET_FIND_MAX_DEPTH (skipping node_modules, .git and target). It
- * then looks again and exits 0 only when none is left, printing
- * `paperclip-boat-scrub found=<n> left=<m>`. It removes nothing else: the
- * checkout, skills, config and the bridge stay.
+ * `$HOME/paperclip-workspace`, and in every `.paperclip-runtime` under $HOME
+ * down to RUNTIME_SECRET_FIND_MAX_DEPTH (skipping node_modules, .git and
+ * target). It then looks again and prints
+ * `paperclip-boat-scrub found=<n> left=<m> walk=<complete|incomplete>`. It
+ * removes nothing else: the checkout, skills (also a skill's own
+ * `mcp-config`), config and the bridge stay.
+ *
+ * Exit 0 only when none is left and the last look searched everything: the
+ * scan of every root and runtime directory succeeded (RUNTIME_SCAN_SCRIPT) and
+ * so did `find`, whose status and errors are checked, not discarded: a
+ * directory under $HOME it cannot read makes the walk incomplete. Exit 1 when
+ * something is left, 3 (RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT) when nothing is
+ * left that it could see but the walk was incomplete, 2 when this VM's tools
+ * cannot count (nothing verified).
  *
  * A file name may hold a newline (repo content, or an agent steered by a
- * prompt), so no path is ever read back as text to pick what to delete: `each`
- * hands every match to its command as one argument, from the glob loop or from
- * `find -exec ... {} +`. The counts read NUL-terminated paths (a path cannot
- * hold a NUL), deduplicated with `sort -zu` because the default workspace is
- * both a root and under $HOME; that output only ever goes to `wc`.
+ * prompt), so no path is ever read back as text to pick what to delete: the
+ * scan hands every match to `rm` as one argument. The counts read
+ * NUL-terminated paths (a path cannot hold a NUL) from a file under /tmp, so
+ * the walk's own status is taken before any counting pipeline; they are
+ * deduplicated with `sort -zu` because the default workspace is both a root
+ * and under $HOME, and only ever go to `wc`.
  */
 export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
   const absolute = [...new Set(roots.map((root) => root.trim().replace(/\/+$/, "")).filter((root) => root.startsWith("/") && root.length > 1))];
   const rootWords = [...absolute.map(shellQuote), '"$HOME/paperclip-workspace"'].join(" ");
-  const globs = RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `"$r"/.paperclip-runtime/*/${glob}`).join(" ");
-  const findPaths = RUNTIME_SECRET_ASSET_GLOBS.map((glob) => `-path ${shellQuote(`*/.paperclip-runtime/*/${glob}`)}`).join(" -o ");
+  const runtimeDepth = RUNTIME_SECRET_FIND_MAX_DEPTH - 2;
   const find =
-    `find "$HOME" -maxdepth ${RUNTIME_SECRET_FIND_MAX_DEPTH} \\( -name node_modules -o -name .git -o -name target \\) -prune` +
-    ` -o \\( ${findPaths} \\) -prune -exec "$@" {} + 2>/dev/null`;
+    `find "$HOME" -mindepth 1 -maxdepth ${runtimeDepth} \\( -name node_modules -o -name .git -o -name target \\) -prune` +
+    ' -o -name .paperclip-runtime -exec sh -c "$scan" sh "$1" {} +';
   return [
-    // each <command...>: runs `<command...> <path>` for every match, the path as one argument.
+    `scan=${shellQuote(RUNTIME_SCAN_SCRIPT)}`,
+    // each <list|rm>: scans every root's runtime directory and every one under $HOME; fails when any part could not be searched.
     "each() {",
+    "  w=0",
     `  for r in ${rootWords}; do`,
-    `    for p in ${globs}; do`,
-    `      if [ -e "$p" ] || [ -L "$p" ]; then "$@" "$p"; fi`,
-    "    done",
+    '    sh -c "$scan" sh "$1" "$r/.paperclip-runtime" || w=1',
     "  done",
-    `  if [ -n "\${HOME:-}" ] && [ -d "$HOME" ]; then ${find}; fi`,
+    '  if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then',
+    '    echo "paperclip-boat-scrub: HOME is not a directory; nothing under it was searched" >&2; w=1',
+    "  else",
+    `    ${find} || w=1`,
+    "  fi",
+    "  return $w",
     "}",
-    "count() { each printf '%s\\0' | sort -zu | tr -cd '\\000' | wc -c | tr -d ' '; }",
+    // count: n = distinct matches, walk = whether every directory could be searched.
+    'count() { if each list > "$t/paths"; then walk=complete; else walk=incomplete; fi; n=$(sort -zu < "$t/paths" | tr -cd \'\\000\' | wc -c | tr -d \' \'); }',
     // A sort or tr that drops NUL-terminated input would count 0 and pass; check the pipeline first.
     "probe=$(printf 'x\\0x\\0y\\0' | sort -zu | tr -cd '\\000' | wc -c | tr -d ' ')",
-    "found=$(count)",
-    "each rm -rf --",
-    "left=$(count)",
+    'if ! t=$(mktemp -d); then each rm; echo "paperclip-boat-scrub: mktemp failed; nothing verified" >&2; exit 2; fi',
+    "trap 'rm -rf -- \"$t\"' EXIT",
+    "count; found=$n",
+    "each rm",
+    "count; left=$n",
     `if [ "$probe" != 2 ]; then echo "paperclip-boat-scrub: this VM's sort/tr cannot count NUL-terminated paths; nothing verified" >&2; exit 2; fi`,
-    'echo "paperclip-boat-scrub found=$found left=$left"',
-    '[ "$left" = 0 ]',
+    'echo "paperclip-boat-scrub found=$found left=$left walk=$walk"',
+    '[ "$left" = 0 ] || exit 1',
+    `[ "$walk" = complete ] || exit ${RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT}`,
   ].join("\n");
 }

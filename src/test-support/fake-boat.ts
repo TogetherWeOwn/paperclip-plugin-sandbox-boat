@@ -181,6 +181,8 @@ export class FakeBoat {
   async resume(args: Record<string, unknown>) {
     this.record("resume", args);
     const sandbox = this.need(args.sandboxId);
+    // boat refuses a resume while a stop is still saving the disk.
+    if (sandbox.state === "archiving") throw responseError(409, { code: "sandbox_stopping", message: "sandbox is stopping" });
     sandbox.state = "ready";
     if (typeof args.type === "string") sandbox.type = args.type;
     const ttl = typeof args.ttlSeconds === "number" ? args.ttlSeconds : sandbox.ttlSeconds;

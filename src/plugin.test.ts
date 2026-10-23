@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -13,7 +16,7 @@ import manifest, { DRIVER_KEY, SWEEP_JOB_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
 import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.js";
-import { FakeSsh, createFakeContext, inHostInvocation } from "./test-support/harness.js";
+import { FakeSsh, createFakeContext, inHostInvocation, scriptOfShDashC } from "./test-support/harness.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatProviderError } from "./errors.js";
 
@@ -341,6 +344,39 @@ describe("AcquireLease", () => {
     await expect(acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" })).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
     expect(fake.callsOf("stop")).toHaveLength(1);
     expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
+  });
+
+  // TOG-37714: a resumed card VM holds the card's checkout and caches, and
+  // possibly a failed run's unexported work; a fresh VM holds nothing yet.
+  it("stops a resumed card VM and keeps its disk when the link or the scrub fails at its start; only a fresh VM is deleted", async () => {
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    await release(first);
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes("paperclip-boat-runtime") ? { code: 1, stderr: "rm: cannot remove '.paperclip-runtime/claude': Permission denied" } : undefined;
+    await expect(acquire("run-2")).rejects.toMatchObject({ code: "BOAT_RUNTIME_DIR_FAILED" });
+    expect(fake.callsOf("resume")).toHaveLength(1);
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+    const kept = harness.logs.filter((entry) => entry.message.includes("stopping the VM and keeping its disk although") && entry.meta?.sandboxId === sandboxId);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ level: "error", meta: { trigger: "failed start", keep: "resumed_disk" } });
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it"))).toBe(false);
+    // The scrub fails too (the setup step failed after SSH came up): still stopped, disk kept.
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes('"$d" "$s"')
+        ? { code: 1, stderr: "mkdir: Permission denied" }
+        : remoteCommand.includes("paperclip-boat-scrub")
+          ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1 walk=complete\n" }
+          : undefined;
+    await expect(acquire("run-3")).rejects.toMatchObject({ code: "BOAT_SSH_FAILED" });
+    expect(fake.callsOf("resume")).toHaveLength(2);
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+    // The card keeps its VM: the next run resumes it.
+    ssh.handler = null;
+    const next = await acquire("run-4");
+    expect(next.providerLeaseId).toBe(sandboxId);
   });
 });
 
@@ -768,6 +804,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
         "CARGO_*",
         "RUSTUP_HOME",
         "TWO_TEST_DATABASE_URL",
+        "TWO_OTHER_DATABASE_URL",
         "PROD_DATABASE_URL",
         "PLANETSCALE_*",
         "GITHUB_TOKEN",
@@ -780,7 +817,9 @@ describe("run env allowlist (incident TOG-37420)", () => {
         CARGO_HOME: "/usr/local/cargo",
         CARGO_REGISTRY_TOKEN: "PROD_SECRET_10",
         RUSTUP_HOME: "/usr/local/rustup",
-        TWO_TEST_DATABASE_URL: "postgres://postgres:local_pw@agent-testdb:5432/two_bot_test_local",
+        TWO_TEST_DATABASE_URL: "postgres://postgres:local_pw@127.0.0.1:5432/two_bot_test_local",
+        // A one-label host is not provably the VM (a DNS search domain can resolve it elsewhere).
+        TWO_OTHER_DATABASE_URL: "postgres://postgres:PROD_SECRET_12@agent-testdb:5432/two_bot_test_local",
         PROD_DATABASE_URL: "postgres://two:PROD_SECRET_11@db.prod.example.com:5432/two",
         PLANETSCALE_PROD_URL: PROJECT_SECRETS.PLANETSCALE_PROD_URL,
         GITHUB_TOKEN: PROJECT_SECRETS.GITHUB_TOKEN,
@@ -795,10 +834,32 @@ describe("run env allowlist (incident TOG-37420)", () => {
     expect(drop?.meta?.dropped).toEqual({
       // Provider families never reach a VM, even when the allowlist names them.
       denied_family: ["GITHUB_TOKEN", "PLANETSCALE_PROD_URL"],
-      remote_database_or_credential_url: ["PROD_DATABASE_URL"],
+      remote_database_or_credential_url: ["PROD_DATABASE_URL", "TWO_OTHER_DATABASE_URL"],
       secret_name_needs_exact_entry: ["CARGO_REGISTRY_TOKEN"],
       not_allowlisted: ["PAPERCLIP_RUN_ID"],
     });
+  });
+
+  // Review round 4: the old URL tokenizer parsed only `https://o/` here and kept the value; JSON-escaped slashes hid a URL entirely.
+  it("never stages a URL whose credentials hide behind a quote, a JSON-escaped remote database URL, or a database URL whose real host is elsewhere", async () => {
+    const values: Record<string, string> = {
+      PAPERCLIP_WORKSPACE_REPO_URL: "https://o/'reilly:SYNTH_PW_QUOTE@github.com/o/r",
+      PAPERCLIP_WORKSPACES_JSON: '[{"repoUrl":"postgres:\\/\\/u:SYNTH_PW_JSON@db.example.com\\/x"}]',
+      TEST_DATABASE_URL: "postgres://u:SYNTH_PW_HOST@localhost/db?host=prod.example.net",
+      TEST2_DATABASE_URL: "postgres://u:SYNTH_PW_HEX@0xc0000214:5432/db",
+    };
+    const config = { envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), ...Object.keys(values)] };
+    const { staged, script } = await runWithEnv({ ...ALLOWED_RUN_ENV, ...values }, config);
+    for (const value of Object.values(values)) {
+      expect(staged).not.toContain(value);
+      expect(script).not.toContain(value);
+    }
+    expect(staged).not.toContain("SYNTH_PW_");
+    expect(JSON.stringify(harness.logs)).not.toContain("SYNTH_PW_");
+    const exported = [...staged.matchAll(/^export ([A-Za-z_][A-Za-z0-9_]*)=/gm)].map((match) => match[1]).sort();
+    expect(exported).toEqual(Object.keys(ALLOWED_RUN_ENV).filter((name) => !(name in values)).sort());
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect((drop?.meta?.dropped as Record<string, string[]>).remote_database_or_credential_url).toEqual(Object.keys(values).sort());
   });
 
   it("refuses a command that carries an inline env envelope instead of sending env it cannot filter", async () => {
@@ -953,8 +1014,10 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
     const script = lastScrubScript(sandboxId);
     expect(script).toContain("'/home/user/paperclip-workspace'");
-    expect(script).toContain('"$r"/.paperclip-runtime/*/mcp-config');
-    expect(script).toContain("-path '*/.paperclip-runtime/*/mcp-config-upload.tar*'");
+    // Each root's runtime directory and each one under $HOME is scanned for exactly <dir>/<adapter>/mcp-config and its upload tarball.
+    expect(script).toContain('sh -c "$scan" sh "$1" "$r/.paperclip-runtime"');
+    expect(script).toContain("-name .paperclip-runtime -exec sh -c \"$scan\" sh \"$1\" {} +");
+    expect(script).toContain('"$a"/mcp-config "$a"/mcp-config-upload.tar*');
     const removed = harness.logs.find((entry) => entry.message.includes("removed Paperclip's run MCP config"));
     expect(removed).toMatchObject({ level: "info", meta: { sandboxId, before: "stop", removed: 1 } });
     // The SSH session is closed only after the scrub.
@@ -1017,7 +1080,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
 
   const failScrub = () => {
     ssh.handler = (remoteCommand) =>
-      remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n", stderr: "rm: Permission denied" } : undefined;
+      remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1 walk=complete\n", stderr: "rm: Permission denied" } : undefined;
   };
 
   it("release deletes the VM instead of stopping it when the scrub fails, logs why, and the card's next run gets a fresh VM", async () => {
@@ -1165,6 +1228,80 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expectKeptDisk(other.providerLeaseId!, "sweep", "held_lease");
   });
 
+  // Review round 4: a scrub that could not search part of the disk reported found=0 left=0 and passed.
+  const incompleteScrub = () => {
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes("paperclip-boat-scrub")
+        ? { code: 3, stdout: "paperclip-boat-scrub found=0 left=0 walk=incomplete\n", stderr: "find: '/home/user/locked': Permission denied" }
+        : undefined;
+  };
+
+  const keptForIncompleteScan = (sandboxId: string) =>
+    harness.logs.filter(
+      (entry) => entry.message.includes("stopping the VM and keeping its disk although") && entry.meta?.sandboxId === sandboxId && entry.meta?.keep === "incomplete_scan",
+    );
+
+  it("a scrub that could not search the whole disk is not clean: capture is refused, and release and the sweep stop the VM and keep its disk instead of deleting it", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    incompleteScrub();
+    await expect(
+      plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never),
+    ).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
+    expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
+    const unverified = harness.logs.find((entry) => entry.message.includes("could not verify") && entry.meta?.sandboxId === sandboxId);
+    expect(unverified).toMatchObject({ level: "error", meta: { before: "template capture" } });
+    expect(String(unverified?.meta?.detail)).toContain("Permission denied");
+
+    await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
+    expect(keptForIncompleteScan(sandboxId)).toHaveLength(1);
+
+    // The sweep, for an idle VM that no run holds (the case that would otherwise delete on a failed scrub).
+    ssh.handler = null;
+    const other = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
+    await forgetLeasesInState();
+    incompleteScrub();
+    clock.t += 16 * 60 * 1000;
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report).toMatchObject({ stopped: [other.providerLeaseId], deleted: [] });
+    expect(fake.boxes.get(other.providerLeaseId!)?.state).toBe("archived");
+    expect(keptForIncompleteScan(other.providerLeaseId!)).toHaveLength(1);
+    expect(harness.logs.some((entry) => entry.message.includes("deleting the VM instead of stopping it"))).toBe(false);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("captureTemplate refuses when the real scrub script cannot search a directory under $HOME, and captures once it can", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    const home = mkdtempSync(path.join(tmpdir(), "pcb-capture-"));
+    const locked = path.join(home, "locked");
+    const secret = path.join(locked, ".paperclip-runtime", "claude", "mcp-config", "mcp-config.json");
+    mkdirSync(path.dirname(secret), { recursive: true });
+    writeFileSync(secret, RUN_JWT);
+    // The fake VM runs the plugin's own scrub script in a local sh, with this HOME.
+    ssh.handler = (remoteCommand) => {
+      if (!remoteCommand.includes("paperclip-boat-scrub")) return undefined;
+      const run = spawnSync("sh", ["-c", scriptOfShDashC(remoteCommand)!], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home }, encoding: "utf8" });
+      return { code: run.status ?? 1, stdout: run.stdout, stderr: run.stderr };
+    };
+    try {
+      chmodSync(locked, 0o000);
+      await expect(
+        plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never),
+      ).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
+      expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
+      chmodSync(locked, 0o755);
+      expect(readFileSync(secret, "utf8")).toBe(RUN_JWT);
+      await plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never);
+      expect(fake.callsOf("saveNamedSnapshot").map((call) => call.args.name)).toEqual(["warm"]);
+      expect(() => readFileSync(secret)).toThrow();
+    } finally {
+      chmodSync(locked, 0o755);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("links .paperclip-runtime into a fresh /tmp directory before each lease goes to Paperclip: acquire, resume, resumed lease and realize", async () => {
     const first = await acquire("run-1");
     const sandboxId = first.providerLeaseId!;
@@ -1237,7 +1374,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     await plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm" } as never);
     expect(scrubbedBefore(sandboxId, "saveNamedSnapshot")).toEqual({ scrubAt: true, methodAt: true, scrubFirst: true });
 
-    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1\n" } : undefined);
+    ssh.handler = (remoteCommand) => (remoteCommand.includes("paperclip-boat-scrub") ? { code: 1, stdout: "paperclip-boat-scrub found=1 left=1 walk=complete\n" } : undefined);
     await expect(
       plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId: sandboxId, templateLabel: "warm-2" } as never),
     ).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
@@ -1346,6 +1483,56 @@ describe("ResumeLease and RealizeWorkspace", () => {
     expect(runs.some((run) => run.runId.startsWith("resumed-lease:") && run.endedAt)).toBe(true);
   });
 
+  // Review round 4: ResumeLease resumed a VM that boat was still stopping (boat refuses that), and ran outside the card lock.
+  it("a resumed lease waits for a stop that boat is still saving, then resumes", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    fake.stopMode = "never";
+    await expect(release(lease)).resolves.toBeUndefined();
+    const box = fake.boxes.get(sandboxId)!;
+    expect(box.state).toBe("archiving");
+    // boat finishes the save 6 s later (fake clock), while the resumed lease waits.
+    const savedAt = clock.t + 6000;
+    let saved = false;
+    for (let i = 0; i < 20; i += 1) {
+      fake.failNext("get", () => {
+        if (!saved && clock.t >= savedAt) {
+          box.state = "archived";
+          saved = true;
+        }
+        return null;
+      });
+    }
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    expect(resumed.providerLeaseId).toBe(sandboxId);
+    expect(fake.callsOf("resume")).toHaveLength(1);
+    expect(box.state).toBe("ready");
+    expect(sleeps.filter((ms) => ms === 2000).length).toBeGreaterThan(0);
+  });
+
+  it("a resumed lease refuses, without starting anything, a VM whose stop does not end in time", async () => {
+    const lease = await acquire("run-1");
+    fake.stopMode = "never";
+    await release(lease);
+    await expect(
+      plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never),
+    ).rejects.toMatchObject({ code: "BOAT_STOP_PENDING" });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+  });
+
+  it("a resumed lease that overlaps the card's release waits for it, then resumes the stopped VM", async () => {
+    const lease = await acquire("run-1");
+    const sandboxId = lease.providerLeaseId!;
+    const releasing = release(lease, { resourceDisposition: "stop_and_retain" });
+    const resuming = plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    await expect(releasing).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
+    const resumed = await resuming;
+    expect(resumed.providerLeaseId).toBe(sandboxId);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
+    const order = fake.calls.filter((call) => call.method === "stop" || call.method === "resume").map((call) => call.method);
+    expect(order).toEqual(["stop", "resume"]);
+  });
+
   it("realizes the workspace directory on the VM", async () => {
     const lease = await acquire("run-1");
     const result = await plugin.definition.onEnvironmentRealizeWorkspace!({ ...base(), lease, workspace: { localPath: "/tmp/x" } } as never);
@@ -1428,6 +1615,136 @@ describe("idle sweep", () => {
     await acquire("run-1");
     await harness.jobs.get(SWEEP_JOB_KEY)!({ jobKey: SWEEP_JOB_KEY, runId: "j1", trigger: "schedule", scheduledAt: new Date().toISOString() });
     expect(fake.callsOf("sandboxes").length).toBeGreaterThan(0);
+  });
+
+  /** A promise that only settles when `open` is called, and a promise that settles when someone waits on it. */
+  function barrier() {
+    let open!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    const reached = new Promise<void>((resolve) => (entered = resolve));
+    return { gate, reached, open, entered };
+  }
+
+  // Review round 4: the sweep chose to delete a stopped VM from what it read
+  // before an awaited issue lookup, and deleted it without the card lock.
+  it("the sweep's delete of a stopped VM re-checks under the card lock: a run that resumed the card meanwhile keeps its VM and mapping", async () => {
+    await plugin.definition.onShutdown?.();
+    const issues = new Map([[ISSUE, { status: "in_progress" }]]);
+    await setup({ issues });
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    await release(first);
+    await currentManager().sweepInFlight();
+    clock.t += 8 * 24 * 3600 * 1000; // untouched past deleteAfterDays
+    const pause = barrier();
+    const realGet = harness.ctx.issues.get;
+    harness.ctx.issues.get = async (issueId: string) => {
+      pause.entered();
+      await pause.gate;
+      return issues.get(issueId) ?? null;
+    };
+    const sweeping = currentManager().sweep("test", { force: true });
+    await pause.reached;
+    // While the sweep waits on the card's issue, a new run resumes the card's VM.
+    const second = await acquire("run-2");
+    expect(second.providerLeaseId).toBe(sandboxId);
+    harness.ctx.issues.get = realGet;
+    pause.open();
+    const report = await sweeping;
+    expect(report.deleted).toEqual([]);
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
+    const doc = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as { vms: Record<string, { sandboxId: string; status: string; activeRunIds: string[] }> };
+    expect(doc.vms[`ew:${WORKSPACE}`]).toMatchObject({ sandboxId, status: "running", activeRunIds: ["run-2"] });
+    // Once the run releases it and it is untouched again, the sweep still cleans it up.
+    await release(second);
+    clock.t += 8 * 24 * 3600 * 1000;
+    expect((await currentManager().sweep("test", { force: true })).deleted).toEqual([sandboxId]);
+  });
+
+  it("the sweep's delete of a stopped orphan waits for a run that is adopting it by name, and then leaves it alone", async () => {
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    await release(first);
+    await currentManager().sweepInFlight();
+    harness.state.clear(); // plugin state lost: the VM is an orphan the next run finds by its name
+    clock.t += 8 * 24 * 3600 * 1000;
+    const pause = barrier();
+    const realLimits = fake.limits.bind(fake);
+    fake.limits = async (args: Record<string, unknown> = {}) => {
+      pause.entered();
+      await pause.gate;
+      return await realLimits(args);
+    };
+    // The run finds the orphan by name and stops at the budget check before its resume.
+    const adopting = acquire("run-2");
+    await pause.reached;
+    const sweeping = currentManager().sweep("test", { force: true });
+    for (let i = 0; i < 50; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    fake.limits = realLimits;
+    pause.open();
+    const second = await adopting;
+    expect(second.providerLeaseId).toBe(sandboxId);
+    const report = await sweeping;
+    expect(report.deleted).toEqual([]);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
+  });
+
+  it("the sweep's stop of an idle orphan waits for a run that is adopting it by name, then leaves it running", async () => {
+    const first = await acquire("run-1");
+    const sandboxId = first.providerLeaseId!;
+    await currentManager().sweepInFlight();
+    harness.state.clear(); // plugin state lost while the VM runs: an orphan
+    clock.t += 20 * 60 * 1000; // idle past idleStopMinutes
+    const pause = barrier();
+    const realList = fake.sandboxes.bind(fake);
+    let calls = 0;
+    fake.sandboxes = async (args: Record<string, unknown> = {}) => {
+      calls += 1;
+      if (calls === 1) {
+        // The run's lookup by name; the sweep's own listing below passes.
+        pause.entered();
+        await pause.gate;
+      }
+      return await realList(args);
+    };
+    const adopting = acquire("run-2");
+    await pause.reached;
+    const sweeping = currentManager().sweep("test", { force: true });
+    for (let i = 0; i < 50; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    pause.open();
+    const second = await adopting;
+    expect(second.providerLeaseId).toBe(sandboxId);
+    expect(second.metadata).toMatchObject({ startKind: "reuse_running" });
+    const report = await sweeping;
+    fake.sandboxes = realList;
+    expect(report.stopped).toEqual([]);
+    expect(fake.callsOf("stop")).toHaveLength(0);
+    expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
+  });
+
+  // Review round 4: an unreadable company state hid its records, so its VMs looked like orphans.
+  it("treats VMs as of unknown ownership while a company's state cannot be read: no orphan stop or delete, other companies still swept", async () => {
+    const OTHER = "66666666-6666-4666-8666-666666666666";
+    const unreadable = await acquire("run-a");
+    const readable = await acquire("run-b", { companyId: OTHER, executionWorkspaceId: "77777777-7777-4777-8777-777777777777" });
+    await currentManager().sweepInFlight();
+    const realGet = harness.ctx.state.get;
+    harness.ctx.state.get = async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {
+      if (input.scopeKind === "company" && input.scopeId === COMPANY) throw new Error("state store unavailable");
+      return await realGet(input);
+    };
+    clock.t += 61 * 60 * 1000; // past idleStopMinutes and staleLeaseMinutes
+    const report = await currentManager().sweep("test", { force: true });
+    expect(report.errors.some((line) => line.startsWith(`state ${COMPANY}`))).toBe(true);
+    expect(report.stopped).toEqual([readable.providerLeaseId]);
+    expect(report.deleted).toEqual([]);
+    expect(fake.boxes.get(unreadable.providerLeaseId!)?.state).toBe("ready");
+    expect(fake.boxes.get(readable.providerLeaseId!)?.state).toBe("archived");
+    // Readable again: its lease is now stale, and it is stopped like any other.
+    harness.ctx.state.get = realGet;
+    expect((await currentManager().sweep("test", { force: true })).stopped).toEqual([unreadable.providerLeaseId]);
   });
 });
 

@@ -13,7 +13,10 @@
 // VM (per-minute or stop; read with GET /snapshots/{id}/tree), and is gone
 // after a stop and resume; Paperclip's workspace extract of a host tar that
 // carries .paperclip-runtime/ (tog.22 command, the VM's own tar) leaves the link
-// and the stand-in alone; and a payload killed by SIGTERM exits 143, not 255.
+// and the stand-in alone; a payload killed by SIGTERM exits 143, not 255; the
+// scrub's walk completes on boat's image (verified at release), a skill's own
+// skills/mcp-config/ survives it, and a template capture is refused while a
+// directory under $HOME cannot be searched (nothing is saved).
 //
 // A resume within 10 minutes of a stop gets the same machine back, /tmp
 // included (docs.boat.dev/snapshots/stop), so the runtime link is kept. With
@@ -35,7 +38,11 @@ if (!process.env.BOAT_API_KEY) {
 
 const state = new Map();
 const key = (input) => `${input.scopeKind}|${input.scopeId ?? ""}|${input.namespace ?? ""}|${input.stateKey}`;
-const log = (level) => (message, meta) => console.log(`[${new Date().toISOString()}] ${level} ${message}${meta ? " " + JSON.stringify(meta) : ""}`);
+const logs = [];
+const log = (level) => (message, meta) => {
+  logs.push({ level, message, meta });
+  console.log(`[${new Date().toISOString()}] ${level} ${message}${meta ? " " + JSON.stringify(meta) : ""}`);
+};
 const manager = new BoatVmManager({
   state: {
     get: async (input) => (state.has(key(input)) ? structuredClone(state.get(key(input))) : null),
@@ -141,7 +148,9 @@ try {
       // writes it, through the link: it must never reach /home, and the resumed disk must not have it.
       'rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; mkdir -p "$rt/mcp-config" "$rt/skills" && ' +
       'printf "{\\"mcpServers\\":{\\"smoke\\":{\\"headers\\":{\\"Authorization\\":\\"Bearer smoke-not-a-jwt\\"}}}}" > "$rt/mcp-config/mcp-config.json" && ' +
-      'echo smoke > "$rt/mcp-config-upload.tar" && echo skill > "$rt/skills/smoke.md" && echo "planted_mcp_config=yes"; ' +
+      'echo smoke > "$rt/mcp-config-upload.tar" && echo skill > "$rt/skills/smoke.md" && ' +
+      // A skill's own mcp-config below the adapter directory is not the run's asset: the scrub must keep it.
+      'mkdir -p "$rt/skills/mcp-config" && echo keep > "$rt/skills/mcp-config/important.txt" && echo "planted_mcp_config=yes"; ' +
       'echo "planted_on_home_disk=$(timeout 60 grep -rlF smoke-not-a-jwt "$HOME" 2>/dev/null | wc -l)"; ' +
       'echo "tunnel_http=$(curl -s -o /dev/null -m 5 -w %{http_code} http://127.0.0.1:8317/ || echo fail)"; ' +
       'echo warm > "$HOME/paperclip-workspace/.smoke-marker"',
@@ -200,6 +209,29 @@ try {
     if (!extractLines.includes(expected)) throw new Error(`smoke check failed: expected ${expected}`);
   }
 
+  step("captureTemplate is refused while a directory under $HOME cannot be searched (the scrub's walk is incomplete); nothing is saved");
+  const locked = await exec(lease1, 'd="$HOME/smoke-locked/.paperclip-runtime/claude/mcp-config"; mkdir -p "$d" && echo smoke-not-a-jwt > "$d/mcp-config.json" && chmod 000 "$HOME/smoke-locked" && echo locked=yes');
+  if (!locked.stdout.split("\n").includes("locked=yes")) throw new Error("smoke check failed: could not plant the locked directory");
+  const savesBefore = logs.length;
+  const refused = await manager.captureTemplate({ ...base, providerLeaseId: sandboxId, templateLabel: `pcsmoke-refused-${stamp}` }).then(
+    () => null,
+    (error) => error,
+  );
+  console.log(`capture_refused=${refused?.code ?? "no"}`);
+  if (refused?.code !== "BOAT_RUNTIME_SCRUB_FAILED") throw new Error(`smoke check failed: expected BOAT_RUNTIME_SCRUB_FAILED, got ${refused?.code ?? "a capture"}`);
+  if (!logs.slice(savesBefore).some((entry) => entry.message.includes("could not verify") && String(entry.meta?.detail ?? "").includes("smoke-locked"))) {
+    throw new Error("smoke check failed: the refusal did not name the unreadable directory");
+  }
+  // The refused capture's scrub still removed what it could reach, the stand-in included: put it back for the release check.
+  const unlocked = await exec(
+    lease1,
+    'chmod 755 "$HOME/smoke-locked" && rm -rf "$HOME/smoke-locked" && rt="$HOME/paperclip-workspace/.paperclip-runtime/claude" && ' +
+      'echo "skill_mcp_config_after_refused_capture=$([ -e "$rt/skills/mcp-config/important.txt" ] && echo present || echo gone)" && ' +
+      'mkdir -p "$rt/mcp-config" && echo "{}" > "$rt/mcp-config/mcp-config.json" && echo smoke > "$rt/mcp-config-upload.tar" && echo unlocked=yes',
+  );
+  if (!unlocked.stdout.split("\n").includes("skill_mcp_config_after_refused_capture=present")) throw new Error("smoke check failed: the scrub removed a skill's own mcp-config");
+  if (!unlocked.stdout.split("\n").includes("unlocked=yes")) throw new Error("smoke check failed: could not remove the locked directory");
+
   step("execute: a payload killed by SIGTERM reports 143 (ssh would say 255 if the payload replaced every shell)");
   const killed = await exec(lease1, "kill -TERM $$");
   if (killed.exitCode !== 143) throw new Error(`smoke check failed: expected exit 143 for SIGTERM, got ${killed.exitCode}`);
@@ -216,8 +248,14 @@ try {
   console.log(`running_snapshots=${runningSnapshots}`);
   if (runningSnapshots === 0) console.log("warning: boat took no snapshot of the running VM within 240 s; only the stop snapshot is checked below");
 
-  step("release run 1 (stop)");
-  console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease1.metadata }, "release")));
+  step("release run 1 (stop): the scrub's walk must complete and verify on boat's image");
+  const releaseLogsFrom = logs.length;
+  const receipt1 = await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease1.metadata }, "release");
+  console.log(JSON.stringify(receipt1));
+  const releaseLogs = logs.slice(releaseLogsFrom);
+  if (receipt1?.state !== "stopped") throw new Error(`smoke check failed: expected a stop receipt, got ${JSON.stringify(receipt1)}`);
+  if (!releaseLogs.some((entry) => entry.message.includes("removed Paperclip's run MCP config"))) throw new Error("smoke check failed: the release scrub did not verify a removal");
+  if (releaseLogs.some((entry) => entry.level === "error")) throw new Error("smoke check failed: the release logged an error (unverified scrub?)");
 
   step("snapshots: none holds the /tmp runtime directory or an MCP config (GET /snapshots/{id}/tree)");
   const trees = await snapshotTrees(sandboxId);
@@ -239,12 +277,14 @@ try {
       'cat "$HOME/paperclip-workspace/.smoke-marker"; rt="$HOME/paperclip-workspace/.paperclip-runtime/claude"; ' +
         'echo "mcp_config=$([ -e "$rt/mcp-config" ] && echo present || echo gone) upload_tar=$([ -e "$rt/mcp-config-upload.tar" ] && echo present || echo gone)"; ' +
         'echo "skills=$([ -e "$rt/skills/smoke.md" ] && echo present || echo gone)"; ' +
+        'echo "skill_mcp_config=$([ -e "$rt/skills/mcp-config/important.txt" ] && echo present || echo gone)"; ' +
         'echo "runtime_link_now=$(readlink "$HOME/paperclip-workspace/.paperclip-runtime")"',
     );
     for (const expected of ["warm", "mcp_config=gone upload_tar=gone", `runtime_link_now=${lease.metadata?.runtimeDir}`]) {
       if (!run.stdout.split("\n").includes(expected)) throw new Error(`smoke check failed (${label}): expected ${expected}`);
     }
-    return run.stdout.split("\n").find((line) => line.startsWith("skills=")) ?? "";
+    const lines = run.stdout.split("\n");
+    return `${lines.find((line) => line.startsWith("skills=")) ?? ""} ${lines.find((line) => line.startsWith("skill_mcp_config=")) ?? ""}`;
   };
 
   step("acquire run 2 (resume the same card VM within 10 minutes: the same machine)");
@@ -254,7 +294,7 @@ try {
   const sameMachine = lease2.metadata?.runtimeDir === lease1.metadata?.runtimeDir;
   const skills2 = await checkRuntimeAfterResume(lease2, "run 2");
   console.log(`runtime_dir_after_quick_resume=${sameMachine ? "kept (same machine)" : "fresh (new machine)"} ${skills2}`);
-  if (sameMachine && skills2 !== "skills=present") throw new Error("smoke check failed: a kept runtime directory lost its files");
+  if (sameMachine && skills2 !== "skills=present skill_mcp_config=present") throw new Error(`smoke check failed: a kept runtime directory lost its files (${skills2})`);
 
   step("release run 2 (stop)");
   console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease2.metadata }, "release")));
@@ -266,7 +306,7 @@ try {
     console.log(JSON.stringify(lease3.metadata));
     if (lease3.metadata?.runtimeDir === lease2.metadata?.runtimeDir) throw new Error("smoke check failed: expected a fresh runtime directory on a new machine");
     const skills3 = await checkRuntimeAfterResume(lease3, "run 3");
-    if (skills3 !== "skills=gone") throw new Error("smoke check failed: the new machine's /tmp still had the old runtime files");
+    if (skills3 !== "skills=gone skill_mcp_config=gone") throw new Error("smoke check failed: the new machine's /tmp still had the old runtime files");
     console.log("runtime_dir_after_new_machine_resume=fresh skills=gone");
     step("release run 3 (stop)");
     console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease3.metadata }, "release")));

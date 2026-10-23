@@ -26,7 +26,6 @@ import {
   filterRunEnv,
   isAcpProcessSessionCommand,
   parseEnvAllowlist,
-  urlsInText,
 } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
 import {
@@ -225,7 +224,10 @@ describe("env policy", () => {
       ["one header, then a payload run with no closing dot", `eyJa.eyJ${fill("a")}`, "kept"],
       ["letters with no ://", fill("a"), "kept"],
       ["scheme characters, no letter", fill("1+.-"), "kept"],
-      ["one URL whose authority is all colons", `a://${fill(":")}`, "kept"],
+      // URL-like but not one parseable URL: dropped (fail closed), and decided fast.
+      ["one URL whose authority is all colons", `a://${fill(":")}`, "remote_database_or_credential_url"],
+      ["user:password@ shapes with no scheme", fill("a:a@"), "remote_database_or_credential_url"],
+      ["colon runs with no @", `x${fill(":a")}`, "kept"],
       ["a JWT after 256 KB of eyJ", `${fill("eyJ")} ${jwt}`, "jwt"],
       ["a Bearer JWT after 256 KB of letters", `${fill("a")} Bearer ${jwt}`, "jwt"],
       ["a remote database URL after 256 KB of letters", `${fill("a")} postgres://u:p@db.example.com/x`, "remote_database_or_credential_url"],
@@ -243,18 +245,24 @@ describe("env policy", () => {
     }
   });
 
-  it("finds JWTs and URLs exactly where the old backtracking patterns did (fuzzed against them)", () => {
+  it("finds JWTs exactly where the old backtracking pattern did, and never keeps a credential shape outside a VM-local URL authority (fuzzed)", () => {
     const oldJwt = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./;
-    const oldUrl = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/g;
     let seed = 20261022;
     const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const text = (parts: string[]) => Array.from({ length: 1 + Math.floor(next() * 16) }, () => parts[Math.floor(next() * parts.length)]).join("");
+    // Any `user:password@` a parser could see: a `:` and then an `@` in the same run of non-separator characters.
+    const credentialShape = /:[^\s/@]*@/;
+    const localAuthority = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/?#@]*@(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#][^@]*)?$/i;
+    let keptWithAt = 0;
     for (let i = 0; i < 20_000; i += 1) {
       const a = text(["e", "y", "J", "eyJ", "eyJ", "a", "Z", "9", ".", ".", "-", "_", " ", '"', "="]);
       expect([a, containsJwtInText(a)]).toEqual([a, oldJwt.test(a)]);
-      const b = text(["a", "Z", "1", "+", ".", "-", ":", "/", "//", "://", "://", " ", '"', "<", "@", "p"]);
-      expect([b, [...urlsInText(b)]]).toEqual([b, [...b.matchAll(oldUrl)].map((match) => match[0])]);
+      const b = text(["a", "Z", "1", "+", ".", "-", ":", "/", "//", "://", "://", " ", '"', "'", "\\/", "<", "@", "p", "localhost", "127.0.0.1", "?", "#", "%3A%2F%2F"]);
+      if (decide("TEST_DATABASE_URL", b, ["TEST_DATABASE_URL"]) !== "kept" && decide("PAPERCLIP_WORKSPACE_REPO_URL", b) !== "kept") continue;
+      if (b.includes("@")) keptWithAt += 1;
+      if (credentialShape.test(b)) expect([b, localAuthority.test(b.trim())]).toEqual([b, true]);
     }
+    expect(keptWithAt).toBeGreaterThan(0);
   });
 
   it("never delivers provider credential families, JWTs, or database URLs that leave the VM, even when listed exactly", () => {
@@ -273,12 +281,109 @@ describe("env policy", () => {
   });
 
   it("a database URL that stays on the VM needs an exact entry", () => {
-    const local = "postgres://postgres:pw@agent-testdb:5432/two_bot_test_local";
+    const local = "postgres://postgres:pw@127.0.0.1:5432/two_bot_test_local";
     expect(decide("TWO_TEST_DATABASE_URL", local, ["TWO_*"])).toBe("secret_name_needs_exact_entry");
     expect(decide("TWO_TEST_DATABASE_URL", local, ["TWO_TEST_DATABASE_URL"])).toBe("kept");
     expect(decide("TEST_DATABASE_URL", "postgres://p:p@127.0.0.1:5432/t", ["TEST_DATABASE_URL"])).toBe("kept");
     expect(decide("TEST_DATABASE_URL", "postgres://p:p@[::1]:5432/t", ["TEST_DATABASE_URL"])).toBe("kept");
     expect(decide("TEST_DATABASE_URL", "postgres://p:p@192.168.1.4:5432/t", ["TEST_DATABASE_URL"])).toBe("remote_database_or_credential_url");
+  });
+
+  // Review round 4: a URL tokenizer that stops at a quote parsed only a
+  // harmless prefix, and a JSON-escaped URL was not seen at all.
+  it("never takes a parsed URL prefix as proof: a value with anything URL-like is kept only when it is, as a whole, one URL that is safe", () => {
+    const remote = "remote_database_or_credential_url";
+    for (const [name, value] of [
+      // The username holds an apostrophe; the old tokenizer stopped there and parsed only https://o/.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://o/'reilly:synthetic-password@github.com/o/r"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", 'https://o/"reilly:synthetic-password@github.com/o/r'],
+      // A remote database URL with JSON-escaped slashes, inside JSON and as a bare value.
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"repoUrl":"postgres:\\/\\/u:synthetic-password@db.example.com\\/x"}]'],
+      ["PAPERCLIP_WORKSPACES_JSON", '{"u":"postgres:\\u002f\\u002fu:synthetic-password@db.example.com/x"}'],
+      // An `@` behind a JSON escape: the raw text shows no URL at all.
+      ["PAPERCLIP_WORKSPACES_JSON", '{"u":"u:synthetic-password\\u0040db.example.com"}'],
+      ["PAPERCLIP_WORKSPACES_JSON", 'prefix "postgres:\\/\\/u:synthetic-password@db.example.com\\/x"'],
+      ["PAPERCLIP_WORKSPACES_JSON", "postgres%3A%2F%2Fu%3Asynthetic-password%40db.example.com%2Fx"],
+      // user:password@host with no scheme at all.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "u:synthetic-password@db.example.com/x"],
+      // A safe URL followed by a second one, or a credential hidden in its path or query.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/o/r https://u:synthetic-password@evil.example/x"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/o/r#https://u:synthetic-password@evil.example/x"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/o/r/u:synthetic-password@evil.example"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/o/r?next=https%3A%2F%2Fu%3Ap%40evil.example"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://api.example.com/x?access_token=synthetic-token"],
+      // A token in the username alone is a credential too.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://ghp_synthetic@github.com/o/r"],
+      // Whitespace, a backslash or a control character inside a URL reads differently to different parsers.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/o/r\nhttps://u:synthetic-password@evil.example/x"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://evil.example\\@github.com/o/r"],
+      // JSON whose string leaf is not one whole URL.
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"note":"clone https://github.com/o/r then u:synthetic-password@db.example.com"}]'],
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"https://u:synthetic-password@evil.example/x":1}]'],
+      // A URL-like value that does not parse at all.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://[not-an-ip/x"],
+    ] as const) {
+      expect([name, value, decide(name, value)]).toEqual([name, value, remote]);
+    }
+    // A JWT behind JSON escapes is found once the JSON is decoded.
+    expect(decide("PAPERCLIP_WORKSPACES_JSON", '{"t":"\\u0065yJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln"}')).toBe("jwt");
+    // What a run needs still passes: one whole URL with no credentials, or JSON whose URL leaves are each one whole safe URL.
+    for (const [name, value] of [
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://github.com/TogetherWeOwn/two-bot-next"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://registry.npmjs.org/@types%2fnode"],
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"repoUrl":"https://github.com/o/r","cwd":"/home/user/w","ref":"main"}]'],
+      ["PAPERCLIP_WORKSPACES_JSON", '[{"repoUrl":"https:\\/\\/github.com\\/o\\/r"}]'],
+      ["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"],
+      ["PAPERCLIP_API_URL", "https://paperclip.example/api"],
+      ["PATH", "/usr/local/bin:/usr/bin:/bin"],
+      ["PAPERCLIP_WAKE_REASON", "issue_assigned"],
+    ] as const) {
+      expect([name, value, decide(name, value)]).toEqual([name, value, "kept"]);
+    }
+  });
+
+  // Review round 4: libpq takes `host=` from the query over the authority, and
+  // the resolver reads 0xc0000214 as 192.0.2.20.
+  it("validates a database URL's effective destination: only literal loopback or a unix socket, and no host override", () => {
+    const allow = ["TEST_DATABASE_URL", "REDIS_CONN"];
+    const remote = "remote_database_or_credential_url";
+    for (const value of [
+      "postgres://u:synthetic-password@localhost/db?host=prod.example.net",
+      "postgres://u:synthetic-password@localhost/db?sslmode=require&HOST=prod.example.net",
+      "postgres://u:synthetic-password@localhost/db?%68ost=prod.example.net",
+      "postgres://u:synthetic-password@localhost/db?hostaddr=192.0.2.20",
+      "postgres://u:synthetic-password@localhost/db?service=prod",
+      "postgres://u:synthetic-password@localhost/db?host=/tmp,prod.example.net",
+      "postgres://u:synthetic-password@localhost:5432,prod.example.net:5432/db",
+      "mysql://u:synthetic-password@localhost/db?socket=/tmp/s&host=prod.example.net",
+      // Numeric IP spellings: hex, decimal integer, octal, short dotted.
+      "postgres://u:synthetic-password@0xc0000214:5432/db",
+      "postgres://u:synthetic-password@3221226004:5432/db",
+      "postgres://u:synthetic-password@0300.0.2.20:5432/db",
+      "postgres://u:synthetic-password@192.2.20:5432/db",
+      // Loopback spellings other than the literal ones, and one-label names (DNS search domains can make them remote).
+      "postgres://u:synthetic-password@0x7f000001:5432/db",
+      "postgres://u:synthetic-password@127.1:5432/db",
+      "postgres://u:synthetic-password@127.0.0.2:5432/db",
+      "postgres://u:synthetic-password@agent-testdb:5432/db",
+      "postgres://u:synthetic-password@%6c%6fcalhost/db",
+      "rediss://default:synthetic-password@0x7f000001:6379",
+    ]) {
+      const name = value.startsWith("redis") ? "REDIS_CONN" : "TEST_DATABASE_URL";
+      expect([value, decide(name, value, allow)]).toEqual([value, remote]);
+    }
+    // The same rule for any URL with credentials: an IP spelling that only canonicalizes to loopback is not proof.
+    expect(decide("LOCAL_SERVICE_URL", "http://u:synthetic-password@0x7f000001:8080/", ["LOCAL_SERVICE_URL"])).toBe(remote);
+    for (const value of [
+      "postgres://u:synthetic-password@127.0.0.1:5432/t",
+      "postgres://u:synthetic-password@[::1]:5432/t",
+      "postgres://u:synthetic-password@LOCALHOST/t?sslmode=disable",
+      "postgresql:///t?host=/var/run/postgresql",
+      "postgres://u:synthetic-password@%2Fvar%2Frun%2Fpostgresql/t",
+      "mysql://u:synthetic-password@localhost/t?socket=/tmp/mysql.sock",
+    ]) {
+      expect([value, decide("TEST_DATABASE_URL", value, allow)]).toEqual([value, "kept"]);
+    }
   });
 
   it("reports dropped names only, and an invalid name without echoing it", () => {
@@ -607,6 +712,10 @@ describe("shell", () => {
         "srv/w o'rk/.paperclip-runtime/codex/mcp-config/mcp-config.json": jwt,
         // Kept: everything else under the runtime root, and look-alikes outside it.
         "home/paperclip-workspace/.paperclip-runtime/claude/skills/paperclip/SKILL.md": "skill",
+        // A skill's own mcp-config below the adapter directory is not the run's asset (review round 4).
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/mcp-config/important.txt": "skill data",
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/mcp-config-upload.tar": "skill data",
+        "srv/w o'rk/.paperclip-runtime/codex/skills/mcp-config/important.txt": "skill data",
         "home/paperclip-workspace/.paperclip-runtime/claude/config/settings.json": "{}",
         "home/paperclip-workspace/.paperclip-runtime/claude/paperclip-bridge/queue/requests/r1.json": "{}",
         "home/paperclip-workspace/src/mcp-config/keep.json": "{}",
@@ -624,9 +733,9 @@ describe("shell", () => {
       const script = scrubRuntimeSecretsScript([tree.at("srv/w o'rk") + "/", "relative/ignored"]);
       const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home };
       const first = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
-      expect(first.stdout.trim()).toBe("paperclip-boat-scrub found=5 left=0");
+      expect(first.stdout.trim()).toBe("paperclip-boat-scrub found=5 left=0 walk=complete");
       expect(first.status).toBe(0);
-      expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(first.stdout)?.slice(1)).toEqual(["5", "0"]);
+      expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(first.stdout)?.slice(1)).toEqual(["5", "0", "complete"]);
       for (const gone of [
         "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config",
         "home/paperclip-workspace/.paperclip-runtime/claude/mcp-config-upload.tar",
@@ -638,6 +747,9 @@ describe("shell", () => {
       }
       for (const kept of [
         "home/paperclip-workspace/.paperclip-runtime/claude/skills/paperclip/SKILL.md",
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/mcp-config/important.txt",
+        "home/paperclip-workspace/.paperclip-runtime/claude/skills/mcp-config-upload.tar",
+        "srv/w o'rk/.paperclip-runtime/codex/skills/mcp-config/important.txt",
         "home/paperclip-workspace/.paperclip-runtime/claude/config/settings.json",
         "home/paperclip-workspace/.paperclip-runtime/claude/paperclip-bridge/queue/requests/r1.json",
         "home/paperclip-workspace/src/mcp-config/keep.json",
@@ -649,7 +761,7 @@ describe("shell", () => {
       expect(grep.stdout).toBe("");
       // Idempotent: a second run finds nothing and succeeds.
       const second = spawnSync("sh", ["-c", script], { env, encoding: "utf8" });
-      expect(second.stdout.trim()).toBe("paperclip-boat-scrub found=0 left=0");
+      expect(second.stdout.trim()).toBe("paperclip-boat-scrub found=0 left=0 walk=complete");
       expect(second.status).toBe(0);
     });
 
@@ -692,7 +804,7 @@ describe("shell", () => {
         expect([dir, existsSync(tree.at(dir)), existsSync(path.dirname(tree.at(dir)))]).toEqual([dir, false, true]);
       }
       // Five from the base tree, three decoys; each counted once.
-      expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=8 left=0");
+      expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=8 left=0 walk=complete");
       expect(run.status).toBe(0);
       expect(spawnSync("grep", ["-rlF", tree.jwt, root], { encoding: "utf8" }).stdout).toBe("");
     });
@@ -703,11 +815,100 @@ describe("shell", () => {
       chmodSync(locked, 0o555);
       try {
         const run = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home }, encoding: "utf8" });
-        expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=4 left=1");
+        expect(run.stdout.trim()).toBe("paperclip-boat-scrub found=4 left=1 walk=complete");
         expect(run.status).not.toBe(0);
         expect(existsSync(path.join(locked, "mcp-config.json"))).toBe(true);
       } finally {
         chmodSync(locked, 0o755);
+      }
+    });
+
+    // Review round 4: find's errors went to /dev/null and its status was lost
+    // in the counting pipeline, so a subtree the SSH user cannot search read
+    // as clean (found=0 left=0) while it kept a run MCP config.
+    const asUser = process.getuid?.() !== 0;
+    it.skipIf(!asUser)("the scrub fails verification (walk=incomplete, exit 3) when it cannot search a directory under $HOME, a root, or a runtime directory", () => {
+      const tree = runtimeTree();
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home };
+      const hidden = {
+        // Under $HOME: an intermediate directory the user cannot search.
+        home: "home/locked/.paperclip-runtime/claude/mcp-config/mcp-config.json",
+        // A workspace root whose ancestor cannot be searched.
+        root: "srv/locked/ws/.paperclip-runtime/claude/mcp-config/mcp-config.json",
+        // An adapter directory that can be searched but not listed (its upload tarball glob would match nothing).
+        adapter: "srv/open/ws/.paperclip-runtime/codex/mcp-config-upload.tar",
+      };
+      for (const file of Object.values(hidden)) {
+        mkdirSync(path.dirname(tree.at(file)), { recursive: true });
+        writeFileSync(tree.at(file), tree.jwt);
+      }
+      const roots = [tree.at("srv/locked/ws"), tree.at("srv/open/ws")];
+      const locks: Array<[string, number]> = [
+        ["home/locked", 0o000],
+        ["srv/locked", 0o000],
+        ["srv/open/ws/.paperclip-runtime/codex", 0o311],
+      ];
+      const scrub = () => {
+        const run = spawnSync("sh", ["-c", scrubRuntimeSecretsScript(roots)], { env, encoding: "utf8" });
+        return { run, result: RUNTIME_SECRET_SCRUB_RESULT_RE.exec(run.stdout)?.slice(1) ?? null };
+      };
+      const unlockAll = () => {
+        for (const [dir] of locks) chmodSync(tree.at(dir), 0o755);
+      };
+      try {
+        for (const [dir, mode] of locks) chmodSync(tree.at(dir), mode);
+        const { run, result } = scrub();
+        // The four reachable ones are removed; the three behind the locks are not found, so nothing is verified.
+        expect(result).toEqual(["4", "0", "incomplete"]);
+        expect(run.status).toBe(3);
+        expect(run.stderr).toMatch(/Permission denied|cannot/);
+      } finally {
+        unlockAll();
+      }
+      for (const file of Object.values(hidden)) expect([file, existsSync(tree.at(file))]).toEqual([file, true]);
+      // Readable again: the walk completes and the three hidden ones are removed.
+      const clean = scrub();
+      expect(clean.result).toEqual(["3", "0", "complete"]);
+      expect(clean.run.status).toBe(0);
+      for (const file of Object.values(hidden)) expect([file, existsSync(tree.at(file))]).toEqual([file, false]);
+      // Each lock alone makes the walk incomplete, with nothing left to find.
+      for (const [dir, mode] of locks) {
+        try {
+          chmodSync(tree.at(dir), mode);
+          const one = scrub();
+          expect([dir, one.result, one.run.status]).toEqual([dir, ["0", "0", "incomplete"], 3]);
+        } finally {
+          unlockAll();
+        }
+      }
+    });
+
+    it("the scrub fails verification when HOME is unset or is not a directory", () => {
+      const tree = runtimeTree();
+      for (const env of [{ PATH: process.env.PATH ?? "/usr/bin:/bin" }, { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.at("no-such-home") }]) {
+        const run = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([])], { env, encoding: "utf8" });
+        expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(run.stdout)?.[3]).toBe("incomplete");
+        expect(run.status).toBe(3);
+      }
+    });
+
+    it("the scrub treats a runtime link whose target is gone as empty, but one whose target it cannot reach as incomplete", () => {
+      const tree = runtimeTree();
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tree.home };
+      const ws = tree.at("srv/linked");
+      mkdirSync(ws, { recursive: true });
+      symlinkSync(tree.at("tmp-gone/paperclip-boat-runtime-x"), path.join(ws, ".paperclip-runtime"));
+      mkdirSync(tree.at("tmp-gone"));
+      const gone = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env, encoding: "utf8" });
+      expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(gone.stdout)?.slice(1)).toEqual(["4", "0", "complete"]);
+      if (!asUser) return;
+      chmodSync(tree.at("tmp-gone"), 0o000);
+      try {
+        const unreachable = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env, encoding: "utf8" });
+        expect(RUNTIME_SECRET_SCRUB_RESULT_RE.exec(unreachable.stdout)?.slice(1)).toEqual(["0", "0", "incomplete"]);
+        expect(unreachable.status).toBe(3);
+      } finally {
+        chmodSync(tree.at("tmp-gone"), 0o755);
       }
     });
 
@@ -849,7 +1050,7 @@ describe("shell", () => {
         expect(spawnSync("grep", ["-rlF", jwt, ws], { encoding: "utf8" }).stdout).toBe("");
         // The scrub before a stop is kept as defense in depth, and it reaches the file through the link.
         const scrub = spawnSync("sh", ["-c", scrubRuntimeSecretsScript([ws])], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root }, encoding: "utf8" });
-        expect(scrub.stdout.trim()).toBe("paperclip-boat-scrub found=1 left=0");
+        expect(scrub.stdout.trim()).toBe("paperclip-boat-scrub found=1 left=0 walk=complete");
         expect(existsSync(path.join(dir, "claude", "mcp-config"))).toBe(false);
       });
 

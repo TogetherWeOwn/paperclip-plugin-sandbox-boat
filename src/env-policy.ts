@@ -12,17 +12,27 @@
 //        DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_;
 //      - a value with a JWT in it anywhere (a host-verifiable bearer
 //        credential, such as Paperclip's run token), also behind "Bearer " or
-//        inside JSON;
-//      - a database URL or a URL with a password, unless every such URL in the
-//        value points at the VM itself (loopback, or a one-label host name such
-//        as a container on the VM). A `..._DATABASE_URL` or `..._DB_URL` name
-//        (also _URI, _DSN) counts as a database URL whatever its value, so it
-//        needs a VM-local URL in it.
+//        inside JSON (JSON escapes decoded);
+//      - a value with anything URL-like in it (`scheme://`, also JSON-escaped
+//        or percent-encoded, or a `user:password@`) that is not, as a whole,
+//        one URL in unambiguous characters, or JSON whose every URL-like string
+//        is one. A URL that parses is never proof that the text around it is
+//        safe;
+//      - a database URL, or a URL with credentials (a user, a password or a
+//        credential query parameter), unless its effective destination is the
+//        VM itself: the literal host localhost, 127.0.0.1 or [::1], an empty
+//        host or a unix socket path, and no query parameter that names another
+//        endpoint (libpq's host, hostaddr, service, ...; a host or socket of
+//        absolute paths is a socket). No other IP spelling and no one-label
+//        name counts: a resolver reads 0xc0000214 as 192.0.2.20, and a DNS
+//        search domain can take a one-label name off the VM. A
+//        `..._DATABASE_URL` or `..._DB_URL` name (also _URI, _DSN) counts as a
+//        database URL whatever its value, so it must be one such URL.
 //   3. Delivered only when the allowlist names it exactly, never through a
 //      prefix: a name with TOKEN, SECRET, PASSWORD, PASSWD, PASSPHRASE,
 //      PRIVATE_KEY, API_KEY, APIKEY, ACCESS_KEY, CREDENTIAL, COOKIE, SIGNING,
 //      HMAC or SALT in it, or ending in KEY (_KEY, or the whole name), _AUTH or
-//      _PAT, and a VM-local database URL or URL with a password. A `..._TOKENS`
+//      _PAT, and a VM-local database URL or URL with credentials. A `..._TOKENS`
 //      name with a whole-number value is a token budget
 //      (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
 //
@@ -118,19 +128,30 @@ const WHOLE_NUMBER_RE = /^\d+$/;
 // over each run at most once.
 const JWT_WHOLE_VALUE_RE = /^(?:[Bb]earer\s+)?eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
 const DATABASE_SCHEME_RE =
-  /^(?:postgres(?:ql)?|mysql2?|mariadb|mongodb(?:\+srv)?|rediss?|libsql|sqlserver|mssql|cockroachdb|clickhouse|amqps?|prisma(?:\+postgres)?)(?:\+[a-z0-9]+)?:$/i;
+  /^(?:postgres(?:ql)?|mysql2?|mariadb|mongodb(?:\+srv)?|rediss?|libsql|sqlserver|mssql|cockroachdb|clickhouse|amqps?|prisma(?:\+postgres)?)(?:\+[a-z0-9]+)?$/i;
 const DATABASE_NAME_RE = /(?:^|_)(?:DATABASE|DB)(?:_|$)/i;
 const URL_NAME_RE = /(?:_URL|_URI|_DSN|^DSN)$/i;
-// A URL in the text: `scheme://` and what follows up to a space, quote or `<>`.
-// Same matches as /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+/g, but a match may
-// only start where a run of scheme characters starts (the lookbehind), so a
-// long run with no `://` after it is walked once, not once per offset. The run
-// may begin with digits or `+.-`; the URL (group 1) starts at its first letter,
-// where the old pattern started too.
-const URL_IN_TEXT_RE = /(?<![A-Za-z0-9+.-])[0-9+.-]*([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>`]+)/g;
-// `scheme://user:password@` in a URL that `new URL` cannot parse. The user part
-// stops at the first `:`, so no split of a long `::::` run is tried twice.
-const URL_PASSWORD_FALLBACK_RE = /:\/\/[^/@\s:]*:[^/@\s]+@/;
+// Anything URL-like in a text. Each pattern is linear in the text (fixed-length
+// alternatives, or a run that stops at the next `:`), so a large value cannot
+// make them backtrack. A value that matches one is kept only when it is, as a
+// whole, one URL that is safe (inspectValue).
+const URL_LIKE_RES: readonly RegExp[] = [
+  // A scheme separator `://`, also JSON-escaped (`:\/\/`, `/`) or percent-encoded.
+  /(?::|%3a|\\u003a)(?:\\?\/|%2f|\\u002f){2}/i,
+  // `user:password@` with or without a scheme: a `:`, then an `@` before any space, `/` or other `:`.
+  /:[^\s/@:]*@/,
+];
+// One whole URL, in characters every URL parser reads the same way: no space
+// or control character, no quote, backslash, `<>`, backtick, `{}`, `|` or `^`.
+const WHOLE_URL_RE = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([A-Za-z0-9\-._~!$&()*+,;=:@%[\]]*)((?:[/?#][A-Za-z0-9\-._~!$&()*+,;=:@%[\]/?#]*)?)$/;
+// The only hosts that are the VM itself to every parser and resolver: literal loopback.
+const LOOPBACK_HOSTPORT_RE = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i;
+// Query parameters that change where a client connects (libpq host/hostaddr/service, a socket, a server, a proxy).
+const ENDPOINT_PARAM_RE = /host|addr|server|service|socket|proxy|dsn|url|uri|endpoint/i;
+// Of those, the ones that name a unix socket when their value is an absolute path.
+const SOCKET_PARAM_RE = /^(?:host|socket)$/i;
+// Query parameters that carry a credential.
+const CREDENTIAL_PARAM_RE = /pass|pwd|token|secret|key|auth|cred|signature|^sig$|session|jwt|bearer/i;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ALLOWLIST_ENTRY_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:_\*)?$/;
 
@@ -193,51 +214,141 @@ function compile(entries: readonly string[]): CompiledAllowlist {
   return { exact, prefixes };
 }
 
-function isVmLocalHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
-  if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
-  // A one-label name (a container or /etc/hosts entry on the VM). An IP address
-  // or a dotted name can reach off the VM.
-  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(host) && !/^\d+$/.test(host);
+/** Does the text hold anything URL-like: a scheme separator (also escaped) or a `user:password@`? */
+export function looksUrlLike(text: string): boolean {
+  return URL_LIKE_RES.some((re) => re.test(text));
 }
 
-interface UrlScan {
-  /** Database URLs and URLs with a password found in the value. */
-  sensitive: number;
-  /** How many of those point off the VM, or could not be parsed. */
-  remote: number;
-  /** Every URL found, sensitive or not. */
-  total: number;
-  /** URLs among `total` that point off the VM, or could not be parsed. */
-  totalRemote: number;
+/** What one whole URL carries and where it leads. */
+interface UrlFacts {
+  /** A database scheme (postgres, mysql, redis, ...). */
+  database: boolean;
+  /** Userinfo (a user, a password or both) or a credential query parameter. */
+  credential: boolean;
+  /** The effective destination is the VM itself: literal loopback or a unix socket, and no other endpoint parameter. */
+  local: boolean;
 }
 
-/** Every `scheme://...` URL in the text, in order (URL_IN_TEXT_RE). */
-export function* urlsInText(value: string): Generator<string> {
-  for (const match of value.matchAll(URL_IN_TEXT_RE)) yield match[1];
+function decodeUrlPart(text: string): string | null {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return null;
+  }
 }
 
-function scanUrls(value: string): UrlScan {
-  const scan: UrlScan = { sensitive: 0, remote: 0, total: 0, totalRemote: 0 };
-  for (const text of urlsInText(value)) {
-    scan.total += 1;
-    let url: URL | null = null;
-    try {
-      url = new URL(text);
-    } catch {
-      url = null;
-    }
-    const local = url != null && isVmLocalHost(url.hostname);
-    if (!local) scan.totalRemote += 1;
-    const database = DATABASE_SCHEME_RE.test(text.slice(0, text.indexOf(":") + 1));
-    const password = url != null ? url.password.length > 0 : URL_PASSWORD_FALLBACK_RE.test(text);
-    if (database || password) {
-      scan.sensitive += 1;
-      if (!local) scan.remote += 1;
+/**
+ * Read a text as exactly one URL, or return null. Every decision is made on the
+ * text itself, not on what one parser makes of it: the text must be one
+ * `scheme://authority[/path][?query][#fragment]` in unambiguous characters,
+ * with at most one `@`, in the authority; its path, query and fragment must hold
+ * nothing URL-like; and `new URL` must accept it. The destination counts as
+ * the VM only for the literal hosts `localhost`, `127.0.0.1` and `[::1]` (no
+ * other IP spelling, no one-label name: a resolver or a DNS search domain can
+ * take those off the VM), an empty host, or a percent-encoded socket path, and
+ * only when no query parameter names another endpoint (libpq's `host`,
+ * `hostaddr`, `service`, ...), except a `host`/`socket` of absolute paths.
+ */
+function wholeUrlFacts(text: string): UrlFacts | null {
+  const match = WHOLE_URL_RE.exec(text);
+  if (!match) return null;
+  const [, scheme, authority, rest] = match;
+  if (looksUrlLike(rest)) return null;
+  const at = authority.indexOf("@");
+  if (at !== authority.lastIndexOf("@")) return null;
+  try {
+    new URL(text);
+  } catch {
+    return null;
+  }
+  const hostport = at >= 0 ? authority.slice(at + 1) : authority;
+  let credential = at >= 0;
+  const endpoints: Array<[string, string]> = [];
+  const queryAt = rest.indexOf("?");
+  if (queryAt >= 0) {
+    const fragmentAt = rest.indexOf("#", queryAt);
+    const query = rest.slice(queryAt + 1, fragmentAt >= 0 ? fragmentAt : undefined);
+    for (const pair of query.split(/[&;]/)) {
+      if (pair.length === 0) continue;
+      const eq = pair.indexOf("=");
+      const name = decodeUrlPart(eq >= 0 ? pair.slice(0, eq) : pair);
+      const value = decodeUrlPart(eq >= 0 ? pair.slice(eq + 1) : "");
+      if (name == null || value == null) return null;
+      if (CREDENTIAL_PARAM_RE.test(name)) credential = true;
+      if (ENDPOINT_PARAM_RE.test(name)) endpoints.push([name, value]);
     }
   }
-  return scan;
+  const decodedHost = decodeUrlPart(hostport);
+  const localAuthority = hostport === "" || LOOPBACK_HOSTPORT_RE.test(hostport) || (decodedHost != null && decodedHost.startsWith("/"));
+  const localEndpoints = endpoints.every(
+    ([name, value]) => SOCKET_PARAM_RE.test(name) && value.length > 0 && value.split(",").every((entry) => entry.startsWith("/")),
+  );
+  return { database: DATABASE_SCHEME_RE.test(scheme), credential, local: localAuthority && localEndpoints };
+}
+
+/** What a value holds, read fail-closed. */
+interface ValueInspection {
+  /** URL-like text that is not one whole URL (also inside JSON): the value must not reach the VM. */
+  unsafe: boolean;
+  /** The value is, as a whole, one URL (the only form a database-named variable may take). */
+  whole: boolean;
+  /** Every URL found: the value itself, or each JSON string that is one. */
+  urls: UrlFacts[];
+  /** A JWT that only shows once JSON escapes are decoded. */
+  jwt: boolean;
+}
+
+/** Every string (keys included) in a parsed JSON value, iteratively (no recursion limit). */
+function jsonStrings(root: unknown): string[] {
+  const out: string[] = [];
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (typeof item === "string") out.push(item);
+    else if (Array.isArray(item)) stack.push(...item);
+    else if (item && typeof item === "object") {
+      for (const [key, value] of Object.entries(item)) {
+        out.push(key);
+        stack.push(value);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Never take a URL that parses as proof that the value around it is safe. A
+ * value with nothing URL-like in it passes. One that has something URL-like
+ * passes only as one whole URL (wholeUrlFacts), or as JSON whose every
+ * URL-like string (keys too, JSON escapes decoded) is one whole URL. Anything
+ * else is unsafe. JSON with escapes is decoded even when the raw text looks
+ * harmless, because escapes such as `\u0065yJ` (`eyJ`) or `\u0040` (`@`)
+ * hide a JWT or a `user:password@` from the raw-text checks.
+ */
+function inspectValue(value: string): ValueInspection {
+  const text = value.trim();
+  const urlLike = looksUrlLike(text);
+  if (urlLike) {
+    const whole = wholeUrlFacts(text);
+    if (whole) return { unsafe: false, whole: true, urls: [whole], jwt: false };
+  }
+  if (!urlLike && !text.includes("\\")) return { unsafe: false, whole: false, urls: [], jwt: false };
+  let parsed: unknown;
+  try {
+    parsed = /^[[{"]/.test(text) ? JSON.parse(text) : undefined;
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === undefined) return { unsafe: urlLike, whole: false, urls: [], jwt: false };
+  const inspection: ValueInspection = { unsafe: false, whole: false, urls: [], jwt: false };
+  for (const entry of jsonStrings(parsed)) {
+    if (containsJwt(entry)) inspection.jwt = true;
+    if (!looksUrlLike(entry)) continue;
+    const facts = wholeUrlFacts(entry.trim());
+    if (facts) inspection.urls.push(facts);
+    else inspection.unsafe = true;
+  }
+  return inspection;
 }
 
 function isBase64UrlChar(code: number): boolean {
@@ -296,14 +407,16 @@ function decide(name: string, value: string, allow: CompiledAllowlist): EnvDropR
   if (isDeniedEnvFamily(name)) return "denied_family";
   if (containsJwt(value)) return "jwt";
 
-  const urls = scanUrls(value);
-  if (urls.remote > 0) return "remote_database_or_credential_url";
+  const inspection = inspectValue(value);
+  if (inspection.jwt) return "jwt";
+  if (inspection.unsafe) return "remote_database_or_credential_url";
+  if (inspection.urls.some((url) => (url.credential || url.database) && !url.local)) return "remote_database_or_credential_url";
   const databaseName = DATABASE_NAME_RE.test(name) && URL_NAME_RE.test(name);
-  if (databaseName && (urls.total === 0 || urls.totalRemote > 0)) return "remote_database_or_credential_url";
+  if (databaseName && !(inspection.whole && inspection.urls[0].local)) return "remote_database_or_credential_url";
 
   const tokenBudget = TOKEN_BUDGET_NAME_RE.test(name) && WHOLE_NUMBER_RE.test(value.trim());
   const secretName = SECRET_NAME_RE.test(name) && !tokenBudget;
-  const sensitive = secretName || urls.sensitive > 0 || databaseName;
+  const sensitive = secretName || inspection.urls.some((url) => url.credential || url.database) || databaseName;
   if (sensitive && !exact) return "secret_name_needs_exact_entry";
   return null;
 }

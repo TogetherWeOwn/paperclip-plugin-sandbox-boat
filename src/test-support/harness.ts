@@ -145,7 +145,7 @@ export class FakeSsh {
     if (remoteCommand.includes("paperclip-boat-scrub")) {
       const found = this.runtimeSecrets.get(sandboxId) ?? 0;
       this.runtimeSecrets.set(sandboxId, 0);
-      return { code: 0, stdout: `paperclip-boat-scrub found=${found} left=0\n` };
+      return { code: 0, stdout: `paperclip-boat-scrub found=${found} left=0 walk=complete\n` };
     }
     const link = FakeSsh.runtimeLinkOf(remoteCommand);
     if (link) {
