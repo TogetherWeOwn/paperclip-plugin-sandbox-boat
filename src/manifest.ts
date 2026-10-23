@@ -67,7 +67,7 @@ const manifest: PaperclipPluginManifestV1 = {
       // on the environment, Paperclip stops the VM after each run (release with
       // stop_and_retain) and resumes the same VM for the card's next run
       // (ResumeLease). Never use "warm": it keeps the VM running between runs.
-      sandboxCapabilities: { reusableLeases: true },
+      sandboxCapabilities: { reusableLeases: true, nativeSyncIn: true, nativeSyncOut: true },
       supportsTemplateCapture: true,
       templateRefKind: "snapshot",
       templateConfigBinding: { field: "templateSnapshot" },

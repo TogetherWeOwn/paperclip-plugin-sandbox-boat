@@ -27,6 +27,9 @@ import type {
   PluginEnvironmentReleaseLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentTerminationReceipt,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
+  PluginEnvironmentSyncResult,
 } from "@paperclipai/plugin-sdk";
 import { boatApi, waitReady } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
@@ -59,6 +62,7 @@ import type { RemoteEnvStage } from "./shell.js";
 import { SshManager, endpointFromSshKeyResponse, runProcess } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
 import { runOutsideInvocation } from "./proactive.js";
+import { syncFiles } from "./file-sync.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 
@@ -1596,6 +1600,35 @@ export class BoatVmManager {
       return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd, runtimeDir } };
     }
     return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd } };
+  }
+
+  async sync(params: PluginEnvironmentSyncInParams | PluginEnvironmentSyncOutParams, direction: "in" | "out"): Promise<PluginEnvironmentSyncResult> {
+    const sandboxId = params.lease.providerLeaseId;
+    if (!sandboxId) throw new Error("No provider lease ID available for native sync.");
+    const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
+    this.beginActivity(config, sandboxId);
+    const startedAt = this.now();
+    try {
+      let session = await this.liveSession(config, params.companyId, sandboxId);
+      if (!this.ssh.masterAlive(session)) {
+        if (await this.sessionLost(config, sandboxId)) session = await this.liveSession(config, params.companyId, sandboxId);
+        else await this.ssh.ensureMaster(session);
+      }
+      await this.maybeExtend(config, sandboxId);
+      const result = await syncFiles({
+        ssh: this.ssh, session, timeoutMs: config.timeoutMs,
+        remoteRoot: str(params.lease.metadata?.remoteCwd) ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace",
+      }, direction, params.operations);
+      this.logger.info("boat: native workspace sync completed", {
+        sandboxId, direction, durationMs: this.now() - startedAt,
+        filesTransferred: result.operations.reduce((sum, op) => sum + op.filesTransferred, 0),
+        bytesTransferred: result.operations.reduce((sum, op) => sum + op.bytesTransferred, 0),
+      });
+      return result;
+    } finally {
+      await this.endActivity(params.companyId, sandboxId);
+    }
   }
 
   async execute(params: PluginEnvironmentExecuteParams): Promise<PluginEnvironmentExecuteResult> {

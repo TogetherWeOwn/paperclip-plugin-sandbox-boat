@@ -16,6 +16,8 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 export interface SshEndpoint {
   host: string;
@@ -258,6 +260,16 @@ export class SshManager {
     return await runProcess("ssh", args, { stdin: options.stdin, timeoutMs: options.timeoutMs });
   }
 
+  /** Binary transport over the same pinned connection; run() remains control-only. */
+  async runStream(session: SshSession, remoteCommand: string, options: StreamProcessOptions): Promise<SshExecutionResult> {
+    const key = await this.ensureKey();
+    return await runStreamProcess("ssh", [
+      "-T", "-o", `ControlPath=${session.controlPath}`, "-o", "ControlMaster=no",
+      ...commonSshOptions(session, key.privateKeyPath),
+      `${session.endpoint.user}@${session.endpoint.host}`, remoteCommand,
+    ], options);
+  }
+
   async closeSession(sandboxId: string): Promise<void> {
     const session = this.sessions.get(sandboxId);
     if (!session) return;
@@ -327,6 +339,76 @@ function killQuietly(child: ChildProcess): void {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface StreamProcessOptions {
+  stdin?: Readable;
+  stdout?: Writable;
+  maxOutputBytes?: number;
+  timeoutMs: number;
+}
+
+/** Backpressured binary IO, bounded control output, and cleanup on either pipe's failure. */
+export async function runStreamProcess(command: string, args: string[], options: StreamProcessOptions): Promise<SshExecutionResult> {
+  const cap = options.maxOutputBytes ?? 256 * 1024;
+  if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+    throw new Error("Invalid streaming process limits.");
+  }
+  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let failure: Error | undefined;
+  let timedOut = false;
+  let closed = false;
+  let killTimer: NodeJS.Timeout | undefined;
+  const abort = (error: Error) => {
+    failure ??= error;
+    options.stdin?.destroy(error);
+    child.stdin.destroy(error);
+    child.stdout.destroy(error);
+    options.stdout?.destroy(error);
+    if (!closed) {
+      child.kill("SIGTERM");
+      killTimer ??= setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
+    }
+  };
+  const completion = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    child.once("error", (error) => abort(error));
+    child.once("close", (code, signal) => {
+      closed = true;
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ code, signal });
+    });
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort(new Error("Streaming process timed out."));
+  }, options.timeoutMs);
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  function collector(chunks: Buffer[]): Writable {
+    let bytes = 0;
+    return new Writable({ write(chunk: Buffer, _encoding, done) {
+      bytes += chunk.length;
+      if (bytes > cap) done(new Error("Streaming process control output exceeds its byte limit."));
+      else { chunks.push(Buffer.from(chunk)); done(); }
+    } });
+  }
+  // Observe every pipe immediately: waiting for exit first deadlocks a full pipe.
+  const pipes = [
+    pipeline(child.stdout, options.stdout ?? collector(stdout)),
+    pipeline(child.stderr, collector(stderr)),
+    pipeline(options.stdin ?? Readable.from([]), child.stdin),
+  ];
+  for (const pipe of pipes) void pipe.catch((error: Error) => abort(error));
+  try {
+    const result = await completion;
+    await Promise.allSettled(pipes);
+    if (failure && !timedOut) throw failure;
+    return { exitCode: timedOut ? null : result.code, signal: result.signal, timedOut,
+      stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+  }
 }
 
 /** Spawn a process, collect output, enforce a timeout. Secrets go through stdin only, never argv. */
