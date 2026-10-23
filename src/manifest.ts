@@ -1,4 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import { BOAT_SIZES } from "./size-policy.js";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
 export const PLUGIN_VERSION = "0.2.1";
@@ -85,7 +86,34 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             enum: ["small", "default", "large", "xlarge"],
             default: "default",
-            description: "VM size. small $0.018/h (2 vCPU, 4 GB), default $0.036/h (4 vCPU, 8 GB). The trial allows small and default only.",
+            description: "Fallback size when the task class has no measured data (default: default). Otherwise sizeCostTable selects the lowest cost per job. Plan limits still apply.",
+          },
+          taskClass: {
+            type: "string",
+            default: "default",
+            pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$",
+            description: "Workload class to look up in sizeCostTable. Acquire may override it with executionWorkspaceSettings.boatTaskClass; it is retained with the lease.",
+          },
+          sizeCostTable: {
+            type: "object",
+            default: {},
+            description: "Measured completed jobs by task class and size; refresh weekly from the pilot JSONL log. Expected cost = hourlyRate * durationSeconds / 3600. No data: configured size (default). Equal cost: faster wins.",
+            additionalProperties: {
+              type: "object",
+              additionalProperties: false,
+              properties: Object.fromEntries(BOAT_SIZES.map((size) => [size, {
+                type: "object",
+                required: ["durationSeconds", "hourlyRate", "measuredAt"],
+                additionalProperties: false,
+                properties: {
+                  durationSeconds: { type: "number", exclusiveMinimum: 0 },
+                  hourlyRate: { type: "number", exclusiveMinimum: 0 },
+                  measuredAt: { type: "string", format: "date-time" },
+                  sampleCount: { type: "integer", minimum: 1, default: 1 },
+                },
+              }])),
+            },
+            ...advanced("Measured size policy"),
           },
           templateSnapshot: {
             type: "string",

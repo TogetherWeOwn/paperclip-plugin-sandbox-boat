@@ -1,4 +1,8 @@
 import { ESSENTIAL_RUN_ENV, allowlistDelivers, invalidAllowlistEntries, isDeniedEnvFamily, parseEnvAllowlist } from "./env-policy.js";
+import { BOAT_SIZES, parseSizeCostTable, parseTaskClass } from "./size-policy.js";
+import type { BoatSize, SizeCostTable } from "./size-policy.js";
+export { BOAT_SIZES, PRICE_PER_HOUR } from "./size-policy.js";
+export type { BoatSize } from "./size-policy.js";
 
 // Driver config for the boat sandbox provider. Defaults match the boat free
 // trial (docs.boat.dev/free-trial): 2 sandboxes at once, 75 starts per day,
@@ -6,23 +10,13 @@ import { ESSENTIAL_RUN_ENV, allowlistDelivers, invalidAllowlistEntries, isDenied
 
 export const DEFAULT_API_BASE = "https://boat.dev/api/v1";
 
-export const BOAT_SIZES = ["small", "default", "large", "xlarge"] as const;
-export type BoatSize = (typeof BOAT_SIZES)[number];
-
-// List prices per hour (docs.boat.dev/machines). Used only to estimate a cost
-// when boat's own usage meter (GET /sandboxes/{id}/usage) cannot be read.
-export const PRICE_PER_HOUR: Record<BoatSize, number> = {
-  small: 0.018,
-  default: 0.036,
-  large: 0.072,
-  xlarge: 0.2,
-};
-
 export interface BoatDriverConfig {
   apiKey: string | null;
   costApiKey: string | null;
   apiBase: string;
   size: BoatSize;
+  taskClass: string;
+  sizeCostTable: SizeCostTable;
   templateSnapshot: string | null;
   boatEnvironment: string | null;
   noEnv: boolean;
@@ -124,6 +118,8 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     costApiKey: str(raw.costApiKey),
     apiBase: normalizeApiBase(str(raw.apiBase)),
     size,
+    taskClass: parseTaskClass(raw.taskClass),
+    sizeCostTable: parseSizeCostTable(raw.sizeCostTable),
     templateSnapshot: str(raw.templateSnapshot),
     boatEnvironment: str(raw.boatEnvironment),
     noEnv: bool(raw.noEnv, CONFIG_DEFAULTS.noEnv),

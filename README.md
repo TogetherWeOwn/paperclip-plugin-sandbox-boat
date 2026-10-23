@@ -116,7 +116,9 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | Key | Default | Notes |
 | - | - | - |
 | `apiKey` | - | A boat key with the `ci` preset: `boat api-key create <name> --preset ci --ttl 30d`. Falls back to `BOAT_API_KEY` on the host. |
-| `size` | `default` | `small` costs $0.018/h and `default` $0.036/h. The trial allows only these two. |
+| `size` | `default` | Fallback when this task class has no measurements. Existing explicitly configured sizes remain the fallback; measured data takes precedence. |
+| `taskClass` | `default` | Class to look up in `sizeCostTable`. Acquire can override with `executionWorkspaceSettings.boatTaskClass`. |
+| `sizeCostTable` | `{}` | Completed-job measurements by class and size; cheapest computed cost wins. Refresh weekly as below. |
 | `templateSnapshot` | none | A named snapshot to create new card VMs from. |
 | `autoStopMinutes` | 120 | The trial allows at most 120. |
 | `idleStopMinutes` | 15 | |
@@ -135,6 +137,58 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
+
+## Measured size policy
+
+A lower hourly price is not necessarily a cheaper completed job. On each AcquireLease and reusable ResumeLease, the plugin selects the size with the lowest **`hourlyRate * durationSeconds / 3600`** for the task class. Equal costs prefer the shorter measured duration. Prices in the measurements are USD per **whole VM-hour**, not per vCPU-hour. Only sizes with successful measurements participate; failed starts and out-of-memory attempts are not cheap completed jobs.
+
+Configure measurements on the sandbox environment, for example:
+
+```json
+{
+  "taskClass": "rust-build-test-clippy",
+  "sizeCostTable": {
+    "rust-build-test-clippy": {
+      "default": { "durationSeconds": 316, "hourlyRate": 0.036, "measuredAt": "2026-10-23T07:20:59.605Z", "sampleCount": 1 },
+      "large": { "durationSeconds": 182, "hourlyRate": 0.072, "measuredAt": "2026-10-23T07:20:59.605Z", "sampleCount": 1 }
+    }
+  }
+}
+```
+
+These are the reported 2026-10-23 Rust benchmark totals (build all test binaries, edit plus core unit tests, clippy all targets). Expected cost is **$0.00316 on default** against **$0.00364 on large**: default wins despite large being faster. Small failed both attempts; it has no completed-job measurement. This measures that Rust job, **not** a whole agent run or a model-wait task. Benchmark unrelated task classes separately; do not copy the Rust timing into them.
+
+Class names are 1–64 letters, digits, dots, underscores or hyphens, starting with a letter or digit. Durations and hourly rates must be positive finite numbers, `measuredAt` an ISO timestamp with timezone, and `sampleCount` a positive integer (omitted: 1). Invalid policy config is refused with `BOAT_SIZE_POLICY_INVALID` before any VM starts; config validation returns the error to the caller.
+
+- **No measurements for the class:** use `size`, which defaults to `default`; expected cost is `null`, never a fabricated zero. The plugin does not guess the class from an issue title, command or adapter type. Use environment `taskClass` or workspace setting `boatTaskClass`. The class is retained in lease metadata for reusable resumes.
+- **Already running:** share the actual VM without stopping or resizing it. Metadata and per-run usage retain its real size; an unrecognized or missing running size fails closed with `BOAT_SIZE_UNKNOWN` instead of guessing. A stopped (`archived`) card VM can change size on its next lease without losing its disk. Automatic mid-lease command reconnects retain the current size.
+- **Plan limits remain authoritative:** every create/resume still passes `GET /limits`, daily/hourly/minute start guards, active-VM and compute limits. The policy never tries a different size to bypass a failed guard. No extra benchmark VMs are launched by selection.
+- **Audit:** structured `boat: size choice for lease` logs and lease `sizeChoice` metadata contain class, size, source (`measured`, `fallback`, `running_vm`), expected cost, duration, measurement timestamp and sample count. These are predictions, not a replacement for Boat's usage meter. A shared VM without a matching measurement has `null` expected cost.
+
+### Weekly refresh from the pilot cost log
+
+The offline refresh utility consumes one JSON object per completed or failed job. Use the same workload definition and timing boundary for every size within a class. Log complete jobs, including build/setup time and retries required to finish; do not log a failed attempt as a fast success. `hourlyRate` is the price in effect for that sample. CPU and peak-RSS fields may be kept alongside these required fields; they are not substituted for wall duration.
+
+```jsonl
+{"taskClass":"rust-build-test-clippy","size":"default","status":"completed","durationSeconds":316,"hourlyRate":0.036,"measuredAt":"2026-10-23T07:20:59.605Z"}
+{"taskClass":"rust-build-test-clippy","size":"large","status":"completed","durationSeconds":182,"hourlyRate":0.072,"measuredAt":"2026-10-23T07:20:59.605Z"}
+{"taskClass":"rust-build-test-clippy","size":"small","status":"failed"}
+```
+
+Run both commands from a repository source checkout; staged and published plugin packages do not include `scripts/recompute-size-cost-table.mjs`.
+
+```sh
+npm run build
+node scripts/recompute-size-cost-table.mjs /path/to/pilot.jsonl > /path/to/size-policy-patch.json
+# Reproduce a historical weekly window:
+node scripts/recompute-size-cost-table.mjs /path/to/pilot.jsonl --now 2026-10-23T08:00:00Z
+```
+
+Output is `{ "sizeCostTable": { ... } }`. It uses completed samples in the trailing seven days, skips failures and older samples, and fails on malformed or future-dated completed rows rather than silently selecting a cheap bad measurement or clearing the table after a clock error. It averages per-job cost for each class/size; a duration-weighted effective hourly rate preserves that average if prices changed. Measurement age and sample count remain visible in the table.
+
+**Operator procedure, once per week:** run the utility on the pilot log, inspect the resulting patch, and replace only `sizeCostTable` on the environment (preserve API-key references and other settings). An empty result clears the measurements and restores the configured fallback. Save through environment config validation. The plugin keeps the last saved table until replaced; it does not silently expire data or mutate environment settings. This utility has no network calls, starts no VMs, and installs no cron or routine. Scheduling and applying weekly updates belong to the environment operator.
+
+Heavy-command-only offload is a separate execution mode and is not implemented by the size selector.
 
 ## Run env allowlist
 
