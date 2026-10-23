@@ -413,11 +413,28 @@ export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
 // supervisor does. Stderr stays shared through marker and diagnostics;
 // stdin stays shared so the payload keeps its input.
 const RUN_SUPERVISOR_SCRIPT = String.raw`
+import ctypes
 import os
 import signal
 import subprocess
 import sys
-child = subprocess.Popen(['/bin/sh', '-c', sys.argv[2]], start_new_session=True)
+parent_pid = os.getpid()
+
+
+def bind_parent():
+    # A detached payload must not keep the channel's pipes alive if the
+    # supervisor is killed. Linux preserves this binding across ordinary exec.
+    # This supervisor is single-threaded, so preexec_fn cannot inherit locks
+    # held by another thread. Fail closed if the kernel cannot bind the child.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        raise OSError(ctypes.get_errno(), 'Cannot bind remote payload to supervisor')
+    # The parent may have died between fork and prctl; no signal is retroactive.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+child = subprocess.Popen(['/bin/sh', '-c', sys.argv[2]], start_new_session=True, preexec_fn=bind_parent)
 
 
 def forward(signum, _frame):
