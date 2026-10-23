@@ -32,7 +32,7 @@ import { boatApi, waitReady } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
-import { PRICE_PER_HOUR, parseDriverConfig, resolveApiKey, resolveCostApiKey } from "./config.js";
+import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
@@ -874,6 +874,9 @@ export class BoatVmManager {
 
   async acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
+    // A config saved before this check: such a root fails at the runtime directory on every VM, so refuse it before boat spends a start.
+    const workspaceProblem = remoteWorkspaceDirProblem(config.remoteWorkspaceDir);
+    if (workspaceProblem) throw new BoatProviderError("BOAT_CONFIG_INVALID", workspaceProblem);
     this.rememberConfig(params.companyId, params.environmentId, config);
     const { key, kind } = resolveVmKey(params);
     const name = sandboxNameFor(config.namePrefix, params.companyId, params.environmentId, key);

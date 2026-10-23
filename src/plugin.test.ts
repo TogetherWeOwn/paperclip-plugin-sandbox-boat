@@ -346,6 +346,13 @@ describe("AcquireLease", () => {
     expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
   });
 
+  // Such a root fails at the runtime directory on every VM (~/.boatignore applies only under $HOME): refuse it before boat spends a start.
+  it("refuses a remoteWorkspaceDir outside /home/user before it creates or resumes a VM", async () => {
+    await expect(acquire("run-1", {}, { remoteWorkspaceDir: "/srv/ws" })).rejects.toMatchObject({ code: "BOAT_CONFIG_INVALID" });
+    expect([...fake.callsOf("create"), ...fake.callsOf("resume")]).toEqual([]);
+    expect(ssh.execs()).toHaveLength(0);
+  });
+
   // TOG-37714: a resumed card VM holds the card's checkout and caches, and
   // possibly a failed run's unexported work; a fresh VM holds nothing yet.
   it("stops a resumed card VM and keeps its disk when the runtime directory or the scrub fails at its start; only a fresh VM is deleted", async () => {

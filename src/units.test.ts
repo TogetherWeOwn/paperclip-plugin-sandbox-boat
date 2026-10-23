@@ -97,6 +97,20 @@ describe("config", () => {
       templateSnapshot: null,
     });
   });
+
+  // The workspace root must be where the home ~/.boatignore applies, or every start fails at the runtime directory (and spends a start).
+  it("accepts remoteWorkspaceDir only as a plain absolute path below /home/user, and blank", () => {
+    const errorsFor = (remoteWorkspaceDir: unknown) =>
+      validateDriverConfig(parseDriverConfig({ apiKey: "k", remoteWorkspaceDir }), { apiKey: "k", remoteWorkspaceDir }).errors.filter((error) =>
+        error.startsWith("remoteWorkspaceDir"),
+      );
+    for (const ok of [undefined, "", "/home/user/custom-ws", "/home/user/a/b/", "/home/user/w o'rk"]) {
+      expect([ok, errorsFor(ok)]).toEqual([ok, []]);
+    }
+    for (const bad of ["/srv/ws", "/tmp/ws", "/home/user", "/home/user/", "/home/username/ws", "relative/ws", "~/ws", "$HOME/ws", "/home/user/../x", "/home/user/a/./b", "/home/user/a\nb"]) {
+      expect([bad, errorsFor(bad).length]).toEqual([bad, 1]);
+    }
+  });
 });
 
 describe("env policy", () => {
@@ -958,6 +972,19 @@ describe("shell", () => {
         expect(result(again)).toEqual(["kept", runtime]);
         expect(readFileSync(path.join(runtime, "bridge-queue"), "utf8")).toBe("x");
         expect(boatignore()).toBe(`${BOATIGNORE_RUNTIME_RULE}\n`);
+      });
+
+      it("makes a kept .paperclip-runtime 0700 again, with its files (one made by Paperclip's mkdir -p is 0755)", () => {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-rt-"));
+        const ws = path.join(root, "ws");
+        const runtime = path.join(ws, ".paperclip-runtime");
+        mkdirSync(path.join(runtime, "claude"), { recursive: true });
+        chmodSync(runtime, 0o755);
+        writeFileSync(path.join(runtime, "claude", "keep"), "k");
+        const run = prepare(ws);
+        expect({ status: run.status, result: result(run) }).toEqual({ status: 0, result: ["kept", runtime] });
+        expect(statSync(runtime).mode & 0o777).toBe(0o700);
+        expect(readFileSync(path.join(runtime, "claude", "keep"), "utf8")).toBe("k");
       });
 
       it("keeps the other ~/.boatignore lines, and ends a last line that has no newline first", () => {

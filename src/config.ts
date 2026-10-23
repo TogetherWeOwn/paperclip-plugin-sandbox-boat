@@ -151,7 +151,27 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
   };
 }
 
-const UUID_SECRET_REF_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** The VM user's home on boat; boat's snapshots save it (docs.boat.dev/snapshots/whats-saved). */
+export const BOAT_VM_HOME = "/home/user";
+
+/**
+ * Why a remoteWorkspaceDir cannot be used, or null. It must be a plain
+ * absolute path below the VM home: only there does the home `~/.boatignore`
+ * (shell.ts, runtimeDirScript) leave `.paperclip-runtime` out of boat's
+ * snapshots, so any other root fails every start (each one spends a start).
+ * The path is used as typed (no ~ or $HOME expansion).
+ */
+export function remoteWorkspaceDirProblem(value: string | null): string | null {
+  if (value == null) return null;
+  const segments = value.replace(/\/+$/, "").split("/");
+  const belowHome = value.startsWith(`${BOAT_VM_HOME}/`) && segments.length > BOAT_VM_HOME.split("/").length;
+  const plain = !segments.some((segment) => segment === "." || segment === "..");
+  // A control character (a newline above all) would break the path the VM reports back.
+  if (belowHome && plain && !/[\u0000-\u001f\u007f]/.test(value)) return null;
+  return `remoteWorkspaceDir must be a plain absolute path below ${BOAT_VM_HOME} (for example ${BOAT_VM_HOME}/paperclip-workspace, no . or .. segments, no ~ or $HOME), where ~/.boatignore keeps .paperclip-runtime out of boat's snapshots: ${JSON.stringify(value)}.`;
+}
+
+const UUID_SECRET_REF_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isSecretRef(value: string): boolean {
   return UUID_SECRET_REF_RE.test(value);
@@ -201,6 +221,8 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (config.deleteAfterDays < 1 || config.deleteAfterDays > 13) {
     errors.push("deleteAfterDays must be between 1 and 13 (boat deletes a stopped disk after 14 days).");
   }
+  const workspaceProblem = remoteWorkspaceDirProblem(config.remoteWorkspaceDir);
+  if (workspaceProblem) errors.push(workspaceProblem);
   if (config.maxActive < 1) errors.push("maxActive must be at least 1.");
   if (config.maxStartsPerDay < 1) errors.push("maxStartsPerDay must be at least 1.");
   if (config.minComputeHoursLeft < 0) errors.push("minComputeHoursLeft cannot be negative.");

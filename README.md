@@ -131,7 +131,7 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](#run-env-allowlist). A list you set replaces the built-in one; an empty list (`[]`) sends nothing. |
 | `noEnv` | true | |
 | `boatEnvironment` | account default | |
-| `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | |
+| `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | A plain absolute path below `/home/user`, used as typed (no `~` or `$HOME`). Anything else is a config error (`BOAT_CONFIG_INVALID` at acquire, before any start): the home `.boatignore` applies only there. |
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |

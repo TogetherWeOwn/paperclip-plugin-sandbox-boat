@@ -216,7 +216,8 @@ export const RUNTIME_DIR_RESULT_RE = /^paperclip-boat-runtime (made|kept) (\/.+\
  * anything into it:
  *   - `~/.boatignore` gets the line `.paperclip-runtime/` unless it has it.
  *     Other lines stay; a last line without a newline gets one first.
- *   - A real directory is kept, with its files: a second run on a running VM
+ *   - A real directory is kept, with its files, and made 0700 (one that
+ *     Paperclip's `mkdir -p` made is 0755): a second run on a running VM
  *     keeps the first run's files.
  *   - A symlink (plugin 0.2.0 linked the directory into /tmp; Paperclip
  *     refuses that) or a file is replaced by a fresh 0700 directory. A link's
@@ -238,7 +239,7 @@ export function runtimeDirScript(root: string): string {
     "fi",
     `grep -qxF ${rule} "$ign" || exit 1`,
     'mkdir -p "$root" || exit 1',
-    'if [ -d "$dir" ] && [ ! -L "$dir" ]; then echo "paperclip-boat-runtime kept $dir"; exit 0; fi',
+    'if [ -d "$dir" ] && [ ! -L "$dir" ]; then chmod 700 -- "$dir" || exit 1; echo "paperclip-boat-runtime kept $dir"; exit 0; fi',
     'if [ -L "$dir" ] || [ -e "$dir" ]; then rm -f -- "$dir" || exit 1; fi',
     '(umask 077 && mkdir -m 700 "$dir") || exit 1',
     '[ -d "$dir" ] && [ ! -L "$dir" ] || exit 1',
