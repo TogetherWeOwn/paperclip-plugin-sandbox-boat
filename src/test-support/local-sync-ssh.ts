@@ -44,6 +44,9 @@ export interface ProcessRecord {
 const runner = fileURLToPath(new URL("./local-sync-ssh.py", import.meta.url));
 
 export class LocalSyncSsh extends SshManager {
+  // A valid configured VM namespace, backed only by run-owned scratch. The
+  // network stand-in translates it at exec, leaving production validation real.
+  readonly remoteRoot = "/home/user/native-sync-fixture";
   readonly records: ProcessRecord[] = [];
   readonly bufferedPayloads: number[] = [];
   readonly sessionMap = new Map<string, SshSession>();
@@ -59,6 +62,12 @@ export class LocalSyncSsh extends SshManager {
   }
 
   get archiveInjected(): string { return path.join(this.root, "archive-injected"); }
+
+  remotePath(file: string): string {
+    const localRoot = path.join(this.root, "sandbox");
+    return file === localRoot || file.startsWith(`${localRoot}/`)
+      ? `${this.remoteRoot}${file.slice(localRoot.length)}` : file;
+  }
 
   // Never contact boat or invoke ssh/ssh-keygen. Only session setup is fake.
   override async ensureKey() {
@@ -115,7 +124,7 @@ export class LocalSyncSsh extends SshManager {
         const config = path.join(this.root, `ssh-call-${this.records.length}.json`);
         writeFileSync(config, JSON.stringify({
           root: this.root,
-          command: `umask 022; ${args.at(-1)}`,
+          command: `umask 022; ${args.at(-1)!.replaceAll(this.remoteRoot, path.join(this.root, "sandbox"))}`,
           gate: this.gate,
           exitCode: this.exitCode,
           archiveOverride: this.archiveOverride,
@@ -216,7 +225,7 @@ export async function put(file: string, bytes: string | Buffer, mode = 0o644) {
 }
 
 /** Hand-built malicious ustar fixture; never used to implement a transfer. */
-export function hostileTar(entries: { name: string; body?: string; link?: string }[]): Buffer {
+export function hostileTar(entries: { name: string; body?: string; link?: string; hardlink?: boolean }[]): Buffer {
   const blocks: Buffer[] = [];
   for (const entry of entries) {
     const header = Buffer.alloc(512);
@@ -234,7 +243,7 @@ export function hostileTar(entries: { name: string; body?: string; link?: string
     header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124, 12, "ascii");
     header.write("00000000000\0", 136, 12, "ascii");
     header.fill(32, 148, 156);
-    header[156] = entry.link ? 50 : 48;
+    header[156] = entry.link ? (entry.hardlink ? 49 : 50) : 48;
     if (entry.link) header.write(entry.link, 157, 100, "utf8");
     header.write("ustar\0", 257, 6, "ascii");
     header.write("00", 263, 2, "ascii");
