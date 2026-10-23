@@ -12,12 +12,14 @@
 // master, so each command reuses one connection instead of a new handshake.
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { cancelRemoteCommand, parseRunMarker, stripRunMarker, wrapRemoteCommand } from "./shell.js";
 
 export interface SshEndpoint {
   host: string;
@@ -60,6 +62,7 @@ export interface SshLogger {
 
 const SIGKILL_GRACE_MS = 250;
 const MASTER_RESTART_MIN_INTERVAL_MS = 10_000;
+const REMOTE_CANCEL_TIMEOUT_MS = 10_000;
 
 /** Parse the POST /sandboxes/{id}/sshkey answer into a connect target. */
 export function endpointFromSshKeyResponse(response: {
@@ -263,11 +266,32 @@ export class SshManager {
   /** Binary transport over the same pinned connection; run() remains control-only. */
   async runStream(session: SshSession, remoteCommand: string, options: StreamProcessOptions): Promise<SshExecutionResult> {
     const key = await this.ensureKey();
-    return await runStreamProcess("ssh", [
+    const slave = (command: string) => [
       "-T", "-o", `ControlPath=${session.controlPath}`, "-o", "ControlMaster=no",
       ...commonSshOptions(session, key.privateKeyPath),
-      `${session.endpoint.user}@${session.endpoint.host}`, remoteCommand,
-    ], options);
+      `${session.endpoint.user}@${session.endpoint.host}`, command,
+    ];
+    // Fresh hex id per call, so the remote marker cannot collide with payload output.
+    const runId = randomUUID().replace(/-/g, "");
+    const result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId)), options);
+    const stderr = stripRunMarker(result.stderr, runId);
+    if (!result.timedOut) return { ...result, stderr };
+    // The local client is dead, but closing a multiplexed channel does not stop
+    // the VM-side job. Cancel it over a fresh channel on the same master, and
+    // only then report the timeout, so nothing changes the VM after we return.
+    // The master itself is never signalled; a wedged master only fails this
+    // best-effort cancellation, never the timeout result.
+    const pgid = parseRunMarker(result.stderr, runId);
+    if (pgid !== null) {
+      try {
+        await runStreamProcess("ssh", slave(cancelRemoteCommand(pgid)), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
+      } catch (error) {
+        this.logger.warn("boat: timed-out remote command may still be running; cancellation failed", {
+          sandboxId: session.sandboxId, reason: (error as Error).message,
+        });
+      }
+    }
+    return { ...result, stderr };
   }
 
   async closeSession(sandboxId: string): Promise<void> {
@@ -370,6 +394,20 @@ export async function runStreamProcess(command: string, args: string[], options:
       killTimer ??= setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
     }
   };
+  // A multiplexed ssh slave's stderr stays open until its remote job ends,
+  // which outlives the signalled slave itself. Once the slave exits, detach
+  // stderr from its pipeline without an error: already-buffered bytes (the
+  // cancellation marker) survive, the collector ends cleanly, and close —
+  // which only needs the exit plus drained stdio — resolves promptly.
+  // Non-ssh children are unaffected: their stderr ends with the process.
+  let stderrDetached = false;
+  const detachStderr = () => {
+    if (command !== "ssh" || stderrDetached) return;
+    stderrDetached = true;
+    child.stderr.unpipe();
+    child.stderr.destroy();
+  };
+  child.once("exit", detachStderr);
   const completion = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
     child.once("error", (error) => abort(error));
     child.once("close", (code, signal) => {

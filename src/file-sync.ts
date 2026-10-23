@@ -132,9 +132,11 @@ async function postUpload(context: SyncContext, operation: PluginSyncOperation):
     }
     const timeoutMs = control.timeoutMs ?? context.timeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Invalid post-upload timeout.");
+    // An explicit command timeout replaces the provider default; the default
+    // is only the fallback for commands without their own (manifest timeoutMs).
     check(await context.ssh.runStream(context.session,
       buildRemoteCommand(`${TAR_SKIP_RUNTIME_DIR}; exec python3 -c ${shellQuote(POST_UPLOAD_SCRIPT)} ${shellQuote(cwd)} ${shellQuote(control.command)}`),
-      { timeoutMs: Math.min(timeoutMs, context.timeoutMs) }));
+      { timeoutMs }));
   }
 }
 

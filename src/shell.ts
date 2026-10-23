@@ -397,3 +397,102 @@ export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
     `[ "$walk" = complete ] || exit ${RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT}`,
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Supervised remote commands: run a payload in its own process group so a
+// multiplexed timeout can cancel the VM-side job, not just the local client.
+// ---------------------------------------------------------------------------
+// A tiny supervisor, stdlib-only like the transfer helper. It starts the
+// payload in a NEW SESSION (its own process group), prints the group id to
+// stderr, forwards TERM/INT/HUP to the group, and exits with the payload's
+// status (128+n for a signal). argv carries only the marker and the payload
+// command; nothing is sourced or eval'd beyond sh -c of that same payload.
+// The supervisor shares stdio with the payload (no pipes of its own), then
+// closes its own stdout copy after flushing the marker: the channel sees
+// payload-stdout EOF as soon as the payload exits, not when the reaping
+// supervisor does. Stderr stays shared through marker and diagnostics;
+// stdin stays shared so the payload keeps its input.
+const RUN_SUPERVISOR_SCRIPT = String.raw`
+import os
+import signal
+import subprocess
+import sys
+child = subprocess.Popen(['/bin/sh', '-c', sys.argv[2]], start_new_session=True)
+
+
+def forward(signum, _frame):
+    # Forward, then exit at once with 128+n. Never wait() here: a wait inside
+    # the handler races the main wait for the child's exit status and can hang
+    # instead of reaping. The payload group already got the signal; a caller
+    # that needs the group gone escalates itself (see cancelRemoteCommand).
+    # Restore defaults first so a second signal kills us immediately.
+    for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(caught, signal.SIG_DFL)
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+    raise SystemExit(128 + signum)
+
+
+for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(caught, forward)
+sys.stderr.write(sys.argv[1] + str(child.pid) + '\n')
+sys.stderr.flush()
+# Close our own stdout copy before waiting: our caller drains the payload's
+# stdout as a pipe, and our duplicate write end would hold that pipe open
+# after the payload exits. Stderr stays open: the marker above and the
+# payload's diagnostics share it, and our exit closes it promptly because we
+# never outlive the payload except to reap it.
+os.close(1)
+code = child.wait()
+sys.exit(code if code >= 0 else 128 - code)
+`;
+
+/**
+ * Run the payload in its own process group and announce the group's id on
+ * stderr before the payload starts. A new session (not a backgrounded
+ * subshell: job control is off without a tty, so `&` stays in the caller's
+ * group) makes the payload a group leader regardless of sshd behavior, so
+ * cancelling the negative pid reaches the payload and its descendants but
+ * nothing else. Exit status, stdin and stdout pass through untouched; the
+ * marker line is removed from stderr before results return.
+ * The supervisor stays on the channel and forwards TERM/INT/HUP to the
+ * group, so a plain channel close still interrupts the payload; the
+ * explicit cancellation command stays the guarantee for multiplexed timeouts.
+ */
+export function wrapRemoteCommand(command: string, runId: string): string {
+  return `exec python3 -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)}`;
+}
+
+/** TERM a remote process group, escalate to KILL, wait for it to be gone. Always exits 0: cancellation is best-effort. */
+export function cancelRemoteCommand(pgid: number): string {
+  return [
+    `P=${pgid}`,
+    "kill -TERM -$P 2>/dev/null",
+    "i=0; while kill -0 -$P 2>/dev/null; do i=$((i+1)); if [ $i -ge 50 ]; then break; fi; sleep 0.02; done",
+    "kill -KILL -$P 2>/dev/null",
+    "i=0; while kill -0 -$P 2>/dev/null; do i=$((i+1)); if [ $i -ge 25 ]; then break; fi; sleep 0.02; done",
+    "exit 0",
+  ].join("; ");
+}
+
+function isMarkerLine(line: string, prefix: string): boolean {
+  return line.startsWith(prefix) && /^\d+$/.test(line.slice(prefix.length));
+}
+
+export function parseRunMarker(stderr: string, runId: string): number | null {
+  const prefix = `PCSYNC:${runId}:`;
+  for (const line of stderr.split("\n")) {
+    if (!isMarkerLine(line, prefix)) continue;
+    const pid = Number(line.slice(prefix.length));
+    if (Number.isSafeInteger(pid) && pid > 1) return pid;
+  }
+  return null;
+}
+
+export function stripRunMarker(stderr: string, runId: string): string {
+  const prefix = `PCSYNC:${runId}:`;
+  return stderr.split("\n").filter((line) => !isMarkerLine(line, prefix)).join("\n");
+}
+
