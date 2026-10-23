@@ -24,6 +24,14 @@ _Avoid_: Agent home
 Execution through the existing local command path after establishing that the offload command never started remotely.
 _Avoid_: Retry anywhere
 
+**Staged return**:
+A command's returned workspace changes preserved separately for explicit local inspection and application, without changing live source files.
+_Avoid_: Automatic writeback
+
+**Uncertain execution**:
+An offload command whose remote start or result cannot yet be established, so it cannot safely be replayed locally.
+_Avoid_: Safe timeout retry
+
 **Idle tail**:
 The billed interval after a machine's last active command and before it stops, attributed separately from command execution.
 _Avoid_: Free idle
