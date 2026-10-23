@@ -1215,6 +1215,7 @@ export class BoatVmManager {
         const record = findBySandboxId(doc, sandboxId);
         if (!record) return;
         const now = this.nowIso();
+        record.status = "running";
         record.lastActivityAt = now;
         record.size = config.size;
         record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remoteCwd);
@@ -1304,6 +1305,14 @@ export class BoatVmManager {
       // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
       await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
       if (resumed) await this.reprepareRuntimeDirs(config, companyId, sandboxId, session);
+      else {
+        await this.store
+          .update(companyId, (state) => {
+            const record = findBySandboxId(state, sandboxId);
+            if (record?.status === "stopping") record.status = "running";
+          })
+          .catch(() => undefined);
+      }
       return session;
     });
   }
@@ -1352,7 +1361,7 @@ export class BoatVmManager {
    * failure the last known view is kept and retried until the bound, so a
    * persistently unreadable VM reports as still up and the caller falls back.
    */
-  private async waitUntilNotUp(api: BoatApiLike, sandboxId: string, first: SandboxView): Promise<SandboxView | null | undefined> {
+  private async waitUntilNotUp(api: BoatApiLike, sandboxId: string, first: SandboxView | undefined): Promise<SandboxView | null | undefined> {
     let current: SandboxView | null | undefined = first;
     const deadline = this.now() + STOP_ACCEPT_POLL_MS;
     for (;;) {
@@ -1519,10 +1528,10 @@ export class BoatVmManager {
       // sweep then destroys the warm VM. The idle sweep confirms the save.
       const stop = await this.requestStop(api, sandboxId);
       let current = await this.getSandbox(api, sandboxId).catch(() => undefined);
-      if (stop.accepted && !stop.gone && current && UP_STATES.has(current.state)) {
+      if (stop.accepted && !stop.gone && (current === undefined || (current && UP_STATES.has(current.state)))) {
         current = await this.waitUntilNotUp(api, sandboxId, current);
       }
-      const stillUp = !!current && UP_STATES.has(current.state);
+      const stillUp = !stop.gone && (current === undefined || (current !== null && UP_STATES.has(current.state)));
       const alreadyStopped = stop.gone || current === null || current?.state === "archived" || current?.state === "cancelled";
       if ((alreadyStopped || stop.accepted) && !stillUp) {
         await this.store
@@ -1566,7 +1575,7 @@ export class BoatVmManager {
       if (mode === "stop" || params.cancelActiveWork) {
         throw new BoatProviderError(
           "BOAT_STOP_UNCONFIRMED",
-          `boat did not stop VM ${sandboxId} (still up); the idle sweep retries the stop.`,
+          `boat did not confirm VM ${sandboxId} left UP (still up or status unreadable); the idle sweep retries the stop.`,
         );
       }
       this.logger.warn("boat: stop did not take effect; the sweep retries it", { sandboxId, stillUp });
@@ -2192,6 +2201,7 @@ export class BoatVmManager {
               let held = false;
               if (record) {
                 const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
+                if (confirmingRelease && fresh?.status !== "stopping") return null;
                 const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
                 if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return null;
                 if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return null;
@@ -2262,16 +2272,22 @@ export class BoatVmManager {
           // A release that returned on stop-accept leaves the record stopping;
           // the first sweep that sees the save confirmed flips it to stopped.
           if (record?.status === "stopping") {
-            await this.store
-              .update(companyId, (doc) => {
+            await this.withSweepLock(companyId, sandbox, record, async () => {
+              // The listing may predate a successor run. Re-read boat under the
+              // card lock, and keep that lock through the usage ledger closure.
+              const live = await this.getSandbox(api, sandbox.id);
+              if (!live || UP_STATES.has(live.state) || live.state === "archiving") return;
+              const flipped = await this.store.update(companyId, (doc) => {
                 const current = findBySandboxId(doc, sandbox.id);
-                if (!current || current.status !== "stopping") return;
+                if (!current || current.status !== "stopping" || current.lastStoppedAt !== record.lastStoppedAt || current.starts !== record.starts) return false;
                 current.status = "stopped";
                 current.activeRunIds = [];
-              })
-              .catch(() => undefined);
-            await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
-            this.logger.info("boat: sweep confirmed a release stop", { sandboxId: sandbox.id, reason });
+                return true;
+              });
+              if (!flipped) return;
+              await this.recordStopUsage(config, companyId, sandbox.id, null).catch(() => undefined);
+              this.logger.info("boat: sweep confirmed a release stop", { sandboxId: sandbox.id, reason });
+            });
           }
           const seenActivity = this.lastActivity.get(sandbox.id) ?? 0;
           let deleteReason: string | null = null;
