@@ -259,6 +259,19 @@ try {
   if (!releaseLogs.some((entry) => entry.message.includes("removed Paperclip's run MCP config"))) throw new Error("smoke check failed: the release scrub did not verify a removal");
   if (releaseLogs.some((entry) => entry.level === "error")) throw new Error("smoke check failed: the release logged an error (unverified scrub?)");
 
+  step("wait for the stop snapshot save (release returns on stop-accept; the sweep confirms it in production)");
+  for (let waited = 0; ; waited += 5000) {
+    const info = await sdk.get({ sandboxId });
+    const state = info.sandbox?.state;
+    console.log(`stop_state=${state} waited=${waited / 1000}s`);
+    // Archived and cancelled are the expected ends; error and failed are
+    // terminal too (the sweep treats them as costs-nothing), so stop waiting
+    // and let the snapshot check below report what is actually there.
+    if (state === "archived" || state === "cancelled" || state === "error" || state === "failed") break;
+    if (waited >= 120_000) throw new Error(`smoke check failed: VM still ${state} 120s after release`);
+    await sleep(5000);
+  }
+
   step("snapshots: none holds anything below .paperclip-runtime or an MCP config (GET /snapshots/{id}/tree)");
   const trees = await snapshotTrees(sandboxId);
   console.log(JSON.stringify(trees));

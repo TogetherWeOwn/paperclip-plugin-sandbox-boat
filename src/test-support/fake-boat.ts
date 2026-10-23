@@ -70,8 +70,8 @@ export class FakeBoat {
   limitsResponse: Record<string, unknown> = trialLimits();
   usageDollarsPerSecond = 0.00001;
   usageSeconds = new Map<string, number>();
-  /** "immediate": stop archives at once; "never": stays archiving. */
-  stopMode: "immediate" | "never" = "immediate";
+  /** "immediate": stop archives at once; "never": stays archiving; "stays_up": the stop is accepted but the VM still looks up. */
+  stopMode: "immediate" | "never" | "stays_up" = "immediate";
   namedSnapshotPolls = 1;
   namedAllowance = { free: 10, used: 0 };
   /** Shared with FakeSsh.timeline: each API method, in call order. */
@@ -173,7 +173,7 @@ export class FakeBoat {
   async stop(args: Record<string, unknown>) {
     this.record("stop", args);
     const sandbox = this.need(args.sandboxId);
-    sandbox.state = this.stopMode === "immediate" ? "archived" : "archiving";
+    if (this.stopMode !== "stays_up") sandbox.state = this.stopMode === "immediate" ? "archived" : "archiving";
     sandbox.updatedAt = new Date(this.clock.now());
     return { ok: true, type: "sandbox.stopping", id: sandbox.id, status: "archiving", sandbox: this.view(sandbox) };
   }
