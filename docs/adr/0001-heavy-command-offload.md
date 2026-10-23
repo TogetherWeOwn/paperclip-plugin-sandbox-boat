@@ -1,10 +1,10 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Borrow a Boat VM for a heavy command, not for model waiting
 
-Keep the agent and its lightweight tools on the local execution host. Opted-in Cargo invocations borrow a VM from a bounded repository pool through the plugin, then release it to a 15-second idle countdown. This is a proposed design, not an implemented capability or approval to start implementation: the design grill, confirmation, and exact-head review must finish first.
+Keep the agent and its lightweight tools on the local execution host. Opted-in Cargo invocations borrow a VM from a bounded repository pool through the plugin, then release it to a 15-second idle countdown. The requester accepted the complete design on 2026-10-23 after the design grill. This records a design decision, not an implemented capability: exact-head CI and independent review must pass and this ADR must merge before implementation starts.
 
 ## Evidence and objective
 
@@ -36,13 +36,13 @@ Existing whole-run leases remain unchanged and separately named. Their release, 
 
 ## Resolved design choices
 
-The requester settled the design grill on 2026-10-23. These choices narrow v1; they are not whole-design confirmation or permission to implement:
+The requester settled the design grill and subsequently confirmed the complete design on 2026-10-23. These choices narrow v1; implementation still requires the reviewed, merged ADR:
 
 - **Narrow workloads:** public-source, secret-free builds/tests only. Commands needing host services, DB/Redis, private registries or provider credentials remain local. Disposable guest fixtures require a separate follow-up, not an addition to this pilot.
 - **Stage first:** every returned workspace change is staged for explicit application using normal local editing/review tools. V1 never automatically overwrites or deletes a local file, even when its baseline is unchanged or a mutation lease is available. Broader generated paths and automatic application are future scope.
 - **Bounded uncertainty:** reconcile an ambiguous submit for at most ten seconds using the same command ID, then return exit 75 with that ID if still unresolved. Never replay locally without a durable never-started receipt. A definitive running receipt resumes ordinary output/heartbeat handling; ten seconds is a recovery limit, not a command runtime limit.
 
-The frontier is now empty: the dependent choices below use these answers, without adding fixtures, automatic application or a longer recovery mode. Shared-understanding confirmation against the complete latest plan is still required.
+The frontier is now empty: the dependent choices below use these answers, without adding fixtures, automatic application or a longer recovery mode. Shared-understanding confirmation against the complete design was accepted on 2026-10-23 at 10:15:53Z; the decisions below are unchanged.
 
 ## Command lifecycle and concurrency
 
@@ -212,6 +212,6 @@ After executor, routes and sync are merged/installed and the grill is closed, an
 
 ## Grill gate and rollback
 
-The three frontier decisions are resolved as recorded above. Their consequences are narrow service-free eligibility, an empty initial generated-path allowlist and artifact-only explicit application, and ten-second recovery with visible failure accounting. No further requester-owned choice is open; host/guest capability feasibility remains implementation verification, never a question to answer by assumption. Before any implementation, obtain shared-understanding confirmation against the complete latest plan revision. Question answers alone are not that confirmation. Keep the ADR proposed and its PR draft until confirmation; then record acceptance and pass exact-head CI plus independent review before merge. Existing implementation cards retain their design blockers until this ADR is merged; the independent whole-run sync slice remains outside this gate.
+The three frontier decisions are resolved as recorded above. Their consequences are narrow service-free eligibility, an empty initial generated-path allowlist and artifact-only explicit application, and ten-second recovery with visible failure accounting. No further requester-owned choice is open; host/guest capability feasibility remains implementation verification, never a question to answer by assumption. The requester accepted shared understanding of complete plan revision 2 on 2026-10-23 at 10:15:53Z, separately from the question answers. Acceptance clears the design-confirmation hold, not the exact-head CI and independent-review merge gates. Existing implementation cards retain their design blockers until this ADR is merged; the independent whole-run sync slice remains outside this gate.
 
 **Rollback:** unset `BOAT_OFFLOAD` (or set it to `0`) and Cargo takes exactly the pre-existing local execution path, with its admission/cache limits unchanged. The agent remains local; do not switch it back to a whole-run VM as the default rollback. Existing accepted commands are cancelled/reconciled and drained by the broker with their outputs/receipts preserved; then the pool's idle countdown/sweep stops unused machines. Disabling opt-in must not delete workspaces, command evidence or data. Removing the shim from PATH is an optional equivalent follow-up, not required for rollback.
