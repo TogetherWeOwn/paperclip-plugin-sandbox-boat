@@ -175,6 +175,8 @@ The offline refresh utility consumes one JSON object per completed or failed job
 {"taskClass":"rust-build-test-clippy","size":"small","status":"failed"}
 ```
 
+Run both commands from a repository source checkout; staged and published plugin packages do not include `scripts/recompute-size-cost-table.mjs`.
+
 ```sh
 npm run build
 node scripts/recompute-size-cost-table.mjs /path/to/pilot.jsonl > /path/to/size-policy-patch.json

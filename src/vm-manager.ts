@@ -899,7 +899,7 @@ export class BoatVmManager {
       }
       if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
 
-      const runningSize = sandbox && UP_STATES.has(sandbox.state) ? requireBoatSize(sandbox.type) : undefined;
+      const runningSize = sandbox && sandbox.state !== "archived" ? requireBoatSize(sandbox.type) : undefined;
       const sizeChoice = selectSize(config, taskClass, runningSize);
       config.size = sizeChoice.size;
       const context = { vmKey: key, runId: params.runId, issueId: params.issueId ?? null };
@@ -1193,7 +1193,7 @@ export class BoatVmManager {
     this.sandboxCompany.set(sandboxId, params.companyId);
     const wasUp = UP_STATES.has(sandbox.state);
     const taskClass = parseTaskClass(params.leaseMetadata?.taskClass, config.taskClass);
-    const runningSize = wasUp ? requireBoatSize(sandbox.type) : undefined;
+    const runningSize = sandbox.state !== "archived" ? requireBoatSize(sandbox.type) : undefined;
     const sizeChoice = selectSize(config, taskClass, runningSize);
     config.size = sizeChoice.size;
     this.logger.info("boat: size choice for lease", { sandboxId, ...sizeChoice });
