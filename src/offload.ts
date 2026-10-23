@@ -291,6 +291,7 @@ export class OffloadExecutor {
     this.clearIdleTimer(vm);
     vm.stopDueAt = null;
     vm.stopAttempts = 0;
+    this.stopFailures.delete(vm.sandboxId);
     return { kind: "run", vm, warm: "warm" };
   }
 
@@ -405,6 +406,7 @@ export class OffloadExecutor {
     if (result.status === "unknown") {
       await this.withAdmission(async () => {
         vm.quarantined = true;
+        this.stopFailures.delete(vm.sandboxId);
         vm.busy = false;
         vm.generation += 1;
         this.clearIdleTimer(vm);
