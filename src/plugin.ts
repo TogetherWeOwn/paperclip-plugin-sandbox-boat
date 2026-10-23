@@ -7,6 +7,7 @@ import type {
   PluginEnvironmentValidationResult,
 } from "@paperclipai/plugin-sdk";
 import { parseDriverConfig, validateDriverConfig } from "./config.js";
+import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
@@ -79,7 +80,13 @@ const plugin = definePlugin({
   },
 
   async onEnvironmentValidateConfig(params: PluginEnvironmentValidateConfigParams): Promise<PluginEnvironmentValidationResult> {
-    const config = parseDriverConfig(params.config);
+    let config;
+    try {
+      config = parseDriverConfig(params.config);
+    } catch (error) {
+      if (!(error instanceof BoatProviderError && error.code === "BOAT_SIZE_POLICY_INVALID")) throw error;
+      return { ok: false, errors: [error.message] };
+    }
     const { errors, warnings } = validateDriverConfig(config, params.config);
     if (errors.length > 0) return { ok: false, errors, warnings };
     const normalizedConfig: Record<string, unknown> = { ...config };

@@ -34,6 +34,7 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
+import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
@@ -874,6 +875,7 @@ export class BoatVmManager {
 
   async acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
+    const taskClass = parseTaskClass(params.executionWorkspaceSettings?.boatTaskClass, config.taskClass);
     // A config saved before this check: such a root fails at the runtime directory on every VM, so refuse it before boat spends a start.
     const workspaceProblem = remoteWorkspaceDirProblem(config.remoteWorkspaceDir);
     if (workspaceProblem) throw new BoatProviderError("BOAT_CONFIG_INVALID", workspaceProblem);
@@ -897,7 +899,11 @@ export class BoatVmManager {
       }
       if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
 
+      const runningSize = sandbox && UP_STATES.has(sandbox.state) ? requireBoatSize(sandbox.type) : undefined;
+      const sizeChoice = selectSize(config, taskClass, runningSize);
+      config.size = sizeChoice.size;
       const context = { vmKey: key, runId: params.runId, issueId: params.issueId ?? null };
+      this.logger.info("boat: size choice for lease", { ...context, ...sizeChoice });
       let sandboxId = "";
       let startKind: StartKind;
       let startedNew = false;
@@ -914,7 +920,7 @@ export class BoatVmManager {
           if (sandbox) {
             await this.guardBudget(config, context);
             const target = sandbox;
-            const sizeChange = target.state === "archived" && target.type && target.type !== config.size ? { type: config.size } : {};
+            const sizeChange = target.state === "archived" && target.type !== config.size ? { type: config.size } : {};
             try {
               const response = await this.startCall(
                 "resume",
@@ -1013,6 +1019,8 @@ export class BoatVmManager {
             vmKey: key,
             vmKeyKind: kind,
             size: config.size,
+            taskClass,
+            sizeChoice: { ...sizeChoice },
             runId: params.runId,
             startKind: startKind!,
             remoteCwd: remote.remoteCwd,
@@ -1184,7 +1192,12 @@ export class BoatVmManager {
     const sandboxId = sandbox.id;
     this.sandboxCompany.set(sandboxId, params.companyId);
     const wasUp = UP_STATES.has(sandbox.state);
-    const session = await this.liveSession(config, params.companyId, sandboxId);
+    const taskClass = parseTaskClass(params.leaseMetadata?.taskClass, config.taskClass);
+    const runningSize = wasUp ? requireBoatSize(sandbox.type) : undefined;
+    const sizeChoice = selectSize(config, taskClass, runningSize);
+    config.size = sizeChoice.size;
+    this.logger.info("boat: size choice for lease", { sandboxId, ...sizeChoice });
+    const session = await this.liveSession(config, params.companyId, sandboxId, true);
     const remote = await this.prepareRemote(config, session);
     const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
     // Before Paperclip syncs this run's runtime assets: the `.boatignore` rule and the directory must be in place.
@@ -1198,6 +1211,7 @@ export class BoatVmManager {
         if (!record) return;
         const now = this.nowIso();
         record.lastActivityAt = now;
+        record.size = config.size;
         record.remoteRoots = mergeRemoteRoot(record.remoteRoots, remoteCwd);
         record.sessions.push({
           runId: `resumed-lease:${now}`,
@@ -1221,12 +1235,15 @@ export class BoatVmManager {
         shellCommand: remote.shellCommand,
         tunnel: session.tunnel,
         resumedLease: true,
+        size: config.size,
+        taskClass,
+        sizeChoice: { ...sizeChoice },
       },
     };
   }
 
   /** An SSH session to a running VM. Resumes a stopped VM first (budget-guarded): auto-stop or the sweep may have stopped it. */
-  private async liveSession(config: BoatDriverConfig, companyId: string, sandboxId: string): Promise<SshSession> {
+  private async liveSession(config: BoatDriverConfig, companyId: string, sandboxId: string, resize = false): Promise<SshSession> {
     const existing = this.ssh.getSession(sandboxId);
     if (existing) return existing;
     return await this.withLock(`sandbox:${sandboxId}`, async () => {
@@ -1241,15 +1258,19 @@ export class BoatVmManager {
       }
       const resumed = !UP_STATES.has(sandbox.state);
       if (resumed) {
-        await this.guardBudget(config, { sandboxId, reason: "resume_for_execute" });
+        // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
+        const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
+        const startConfig = { ...config, size };
+        await this.guardBudget(startConfig, { sandboxId, reason: "resume_for_execute" });
         const response = await this.startCall(
           "resume",
-          config,
+          startConfig,
           () =>
             api.resume({
               sandboxId,
               failFast: config.failFast,
               ttlSeconds: this.ttlSeconds(config, this.hardDeadlines.get(sandboxId) ?? null),
+              ...(size !== sandbox.type && sandbox.state === "archived" ? { type: size } : {}),
             }),
           async () => {
             const now = await this.getSandbox(api, sandboxId);
@@ -1263,6 +1284,7 @@ export class BoatVmManager {
             const record = findBySandboxId(state, sandboxId);
             if (!record) return;
             record.status = "running";
+            record.size = size;
             record.starts += 1;
             record.lastStartedAt = this.nowIso();
           })
