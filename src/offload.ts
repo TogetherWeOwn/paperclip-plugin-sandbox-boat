@@ -4,12 +4,15 @@
 // Scope: warm pick, resume/create up to maxOffloadVms, FIFO queue, idle stop
 // after C with generation-guarded timers, start/compute budget fallback to
 // OFFLOAD_UNAVAILABLE, per-command usage + expected-cost log, idempotency by
-// commandId. Sweep backstop, durable recovery, sync adapter, cancel/read routes
-// and C=300 adaptive policy are follow-ups, not in this unwired slice.
+// commandId. Durable journal/receipt recovery is injectable; live dispatch,
+// guest lifecycle enforcement, sweep wiring and adaptive policy remain unwired.
 import { checkBudget, readBudget } from "./budget.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { PRICE_PER_HOUR } from "./size-policy.js";
+import { OffloadJournal, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
+export { OffloadGuestRunner } from "./offload-guest.js";
+export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
 
 export interface OffloadCommand {
   commandId: string;
@@ -19,6 +22,9 @@ export interface OffloadCommand {
   repoId: string;
   profileId: string;
   argv: string[];
+  executionWorkspaceId?: string;
+  cwdRelative?: string;
+  env?: Record<string, string>;
   queueTimeoutMs?: number;
   timeoutMs?: number;
 }
@@ -99,13 +105,13 @@ export interface OffloadLogger {
   error(message: string, meta?: Record<string, unknown>): void;
 }
 
-export interface OffloadDeps {
+export interface OffloadDeps extends Partial<OffloadDurableDeps> {
   boat: BoatApiLike;
   logger: OffloadLogger;
   now: () => number;
   timers?: OffloadTimers;
   config: OffloadExecutorConfig;
-  runCommand: (sandboxId: string, command: OffloadCommand) => Promise<{ exitCode: number; seconds: number }>;
+  runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<{ exitCode: number; seconds: number }>;
 }
 
 interface PoolVm {
@@ -160,6 +166,7 @@ export class OffloadExecutor {
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
   private readonly runCommand: OffloadDeps["runCommand"];
+  private readonly durable: OffloadJournal | null;
   private readonly pool: PoolVm[] = [];
   private readonly queue: Queued[] = [];
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
@@ -185,7 +192,57 @@ export class OffloadExecutor {
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
     };
-    this.runCommand = deps.runCommand;
+    const hasDurableDeps = deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
+    if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
+      throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
+    }
+    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDeps & OffloadDurableDeps, this.now, {
+      hold: (identity) => this.restoreHold(identity),
+      release: (identity) => this.releaseHold(identity),
+    }) : null;
+    this.runCommand = this.durable
+      ? (vm, command) => this.durable!.run(vm, command, deps.runCommand)
+      : deps.runCommand;
+  }
+
+  async recover(): Promise<void> { await this.requireDurable().recover(); }
+  async collectGarbage(): Promise<void> { await this.requireDurable().collectGarbage(); }
+  async readCommand(companyId: string, runId: string, commandId: string) {
+    return await this.requireDurable().readCommand(companyId, runId, commandId);
+  }
+  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string) {
+    return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason);
+  }
+  private requireDurable(): OffloadJournal {
+    if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
+    return this.durable;
+  }
+
+  private async restoreHold(identity: OffloadIdentity): Promise<void> {
+    await this.withAdmission(async () => {
+      let vm = this.pool.find((entry) => entry.sandboxId === identity.sandboxId);
+      if (!vm) {
+        vm = { sandboxId: identity.sandboxId, busy: false, stopped: false, quarantined: true,
+          lastActiveAt: this.now(), generation: identity.journalGeneration, idleHandle: null, stopDueAt: null, stopAttempts: 0 };
+        this.pool.push(vm);
+      }
+      vm.quarantined = true;
+      vm.generation += 1;
+      this.clearIdleTimer(vm);
+    });
+  }
+
+  private async releaseHold(identity: OffloadIdentity): Promise<void> {
+    const vm = this.pool.find((entry) => entry.sandboxId === identity.sandboxId);
+    if (!vm) return;
+    // A verified old result permits capacity again, but not an assumption that
+    // the VM survived a restart in running state. Resume under the budget gate.
+    await this.withAdmission(async () => {
+      vm.quarantined = false;
+      vm.busy = false;
+      vm.stopped = true;
+      vm.lastActiveAt = this.now();
+    });
   }
 
   getUsage(): OffloadUsageRow[] {
@@ -197,7 +254,7 @@ export class OffloadExecutor {
     // Existing IDs still return their real receipt, never a false safe fallback.
     this.closed = true;
     if (this.shutdownTask) return await this.shutdownTask;
-    const pending = [...this.inFlight.values()];
+    const pending = [...this.inFlight.values(), ...(this.durable?.pending() ?? [])];
     const task = this.drain(pending);
     this.shutdownTask = task;
     try {
@@ -211,7 +268,7 @@ export class OffloadExecutor {
     await this.withAdmission(async () => {
       for (const entry of this.queue.splice(0)) {
         if (entry.timerHandle != null) this.timers.clear(entry.timerHandle);
-        entry.resolve(this.finish(entry.command.commandId, this.unavailable(entry.command, "executor shutdown")));
+        entry.resolve(this.finish(this.cacheKey(entry.command), this.unavailable(entry.command, "executor shutdown")));
       }
       for (const vm of this.pool) {
         this.clearIdleTimer(vm);
@@ -236,8 +293,21 @@ export class OffloadExecutor {
   }
 
   async execute(command: OffloadCommand): Promise<OffloadResult> {
+    // Snapshot caller-owned objects before any await; mutating argv or env must
+    // never change the payload after its durable digest was accepted.
+    const snapshot = structuredClone(command);
+    return this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
+  }
+
+  private cacheKey(command: OffloadCommand): string {
+    // Preserve the legacy unwired cache contract; durable IDs are run-scoped.
+    return this.durable ? commandKey(command) : command.commandId;
+  }
+
+  private async executeVolatile(command: OffloadCommand): Promise<OffloadResult> {
+    const key = this.cacheKey(command);
     const digest = digestOf(command);
-    const seen = this.journal.get(command.commandId);
+    const seen = this.journal.get(key);
     if (seen) {
       if (seen.digest !== digest) {
         throw Object.assign(new Error(`OFFLOAD_IDEMPOTENCY_CONFLICT: commandId ${command.commandId} was already accepted with a different payload.`), { code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
@@ -245,17 +315,16 @@ export class OffloadExecutor {
       if (seen.result) return seen.result;
       // A duplicate joins the original admission, queue wait and execution.
       // It must never compete for another VM or write an unavailable receipt.
-      return await this.inFlight.get(command.commandId)!;
+      return await this.inFlight.get(key)!;
     }
-    // Intent and the shared promise are installed synchronously before any
-    // admission callback can run. Persistence across restarts is still unwired.
-    this.journal.set(command.commandId, { digest, result: null });
+    // This cache joins live waiters only. Durable replay is checked outside it.
+    this.journal.set(key, { digest, result: null });
     const pending = this.executeAccepted(command);
-    this.inFlight.set(command.commandId, pending);
+    this.inFlight.set(key, pending);
     try {
       return await pending;
     } finally {
-      this.inFlight.delete(command.commandId);
+      this.inFlight.delete(key);
     }
   }
 
@@ -273,12 +342,12 @@ export class OffloadExecutor {
   private async executeAccepted(command: OffloadCommand): Promise<OffloadResult> {
     const enqueuedAt = this.now();
     const claimed = await this.withAdmission(() => this.claimSlot(command));
-    if (claimed.kind === "unavailable") return this.finish(command.commandId, this.unavailable(command, claimed.reason));
+    if (claimed.kind === "unavailable") return this.finish(this.cacheKey(command), this.unavailable(command, claimed.reason));
     const dispatch = claimed.kind === "queued" ? await claimed.wait : claimed;
     if (!("kind" in dispatch)) return dispatch;
     if (this.closed) {
       // Shutdown may have fenced a create/resume or handoff before spawn.
-      const result = this.finish(command.commandId, this.unavailable(command, "executor shutdown"));
+      const result = this.finish(this.cacheKey(command), this.unavailable(command, "executor shutdown"));
       await this.releaseVm(dispatch.vm);
       return result;
     }
@@ -354,7 +423,7 @@ export class OffloadExecutor {
       void this.withAdmission(async () => {
         const at = this.queue.indexOf(entry);
         if (at < 0) return;
-        const result = this.finish(command.commandId, this.unavailable(command, `queue timeout after ${timeoutMs} ms`));
+        const result = this.finish(this.cacheKey(command), this.unavailable(command, `queue timeout after ${timeoutMs} ms`));
         this.queue.splice(at, 1);
         entry.timerHandle = null;
         entry.resolve(result);
@@ -389,7 +458,13 @@ export class OffloadExecutor {
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: "command transport failed; reconcile the guest receipt before replay or VM reuse" };
     }
-    this.finish(command.commandId, result);
+    try {
+      if (this.durable) await this.durable.finish(command, result);
+    } catch (error) {
+      await this.quarantineVm(vm, command);
+      throw error;
+    }
+    this.finish(this.cacheKey(command), result);
     this.usage.push({ commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId, sandboxId: vm.sandboxId, warm, queueWaitMs, seconds: result.seconds, dollars: result.dollars, exitCode: result.exitCode, outcome: result.status, estimated: result.status === "unknown", at: new Date(this.now()).toISOString() });
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
@@ -404,18 +479,22 @@ export class OffloadExecutor {
       estimated: result.status === "unknown",
     });
     if (result.status === "unknown") {
-      await this.withAdmission(async () => {
-        vm.quarantined = true;
-        this.stopFailures.delete(vm.sandboxId);
-        vm.busy = false;
-        vm.generation += 1;
-        this.clearIdleTimer(vm);
-        this.logger.warn("boat offload VM quarantined; guest receipt reconciliation required", { commandId: command.commandId, sandboxId: vm.sandboxId });
-      });
+      await this.quarantineVm(vm, command);
     } else {
       await this.releaseVm(vm);
     }
     return result;
+  }
+
+  private async quarantineVm(vm: PoolVm, command: OffloadCommand): Promise<void> {
+    await this.withAdmission(async () => {
+      vm.quarantined = true;
+      this.stopFailures.delete(vm.sandboxId);
+      vm.busy = false;
+      vm.generation += 1;
+      this.clearIdleTimer(vm);
+      this.logger.warn("boat offload VM quarantined; guest receipt reconciliation required", { commandId: command.commandId, sandboxId: vm.sandboxId });
+    });
   }
 
   private async releaseVm(vm: PoolVm): Promise<void> {
