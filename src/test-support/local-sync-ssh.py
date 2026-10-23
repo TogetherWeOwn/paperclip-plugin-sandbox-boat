@@ -49,7 +49,13 @@ def checkpoint(direction, count):
     marker = Path(gate["reached"])
     if marker.exists():
         return
-    marker.write_text(str(count))
+    # Existence is the reader's gate: publish only after the complete count.
+    pending = marker.with_name(marker.name + '.publishing.' + str(os.getpid()))
+    try:
+        pending.write_text(str(count))
+        os.replace(pending, marker)
+    finally:
+        pending.unlink(missing_ok=True)
     deadline = time.monotonic() + 12
     while not Path(gate["release"]).exists():
         if interrupted.is_set():
