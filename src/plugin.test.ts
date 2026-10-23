@@ -109,6 +109,13 @@ describe("manifest", () => {
     expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep"]);
     expect(harness.jobs.has(SWEEP_JOB_KEY)).toBe(true);
   });
+
+  it("reports the package.json version, so Paperclip records the version that is installed", () => {
+    // Paperclip's upgrade stores manifest.version. 0.2.1 shipped with package.json at 0.2.1 and
+    // the manifest still at 0.2.0, so the host recorded 0.2.0 for the 0.2.1 code.
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    expect(manifest.version).toBe(pkg.version);
+  });
 });
 
 describe("ValidateConfig", () => {
