@@ -56,6 +56,9 @@ export class LocalSyncSsh extends SshManager {
   spawnError = false;
   failLocalTar = false;
   archiveOverride?: string;
+  // Literal test sentinels model VM-provided credentials; never inherit real
+  // boat credentials from the test runner's environment.
+  remoteEnv: Record<string, string> = {};
 
   constructor(readonly root: string, private readonly actualSpawn: typeof spawn) {
     super({ info() {}, warn() {} });
@@ -99,7 +102,9 @@ export class LocalSyncSsh extends SshManager {
   override async run(session: SshSession, command: string, options: { stdin?: string; timeoutMs: number }) {
     const result = await super.run(session, command, options);
     this.bufferedPayloads.push(Math.max(Buffer.byteLength(options.stdin ?? ""), Buffer.byteLength(result.stdout)));
-    return result;
+    // run() carries inline control output (including pwd/runtime-ready paths).
+    // Restore the VM namespace there; runStream's binary payload is untouched.
+    return { ...result, stdout: result.stdout.replaceAll(path.join(this.root, "sandbox"), this.remoteRoot) };
   }
 
   // Passed to vi.mock(node:child_process). Every SSH exec launches the local
@@ -130,7 +135,7 @@ export class LocalSyncSsh extends SshManager {
           archiveOverride: this.archiveOverride,
           archiveInjected: this.archiveInjected,
         }), { mode: 0o600 });
-        child = this.actualSpawn("python3", [runner, config], { ...options, cwd: this.root, env });
+        child = this.actualSpawn("python3", [runner, config], { ...options, cwd: this.root, env: { ...env, ...this.remoteEnv } });
       }
     } else if (command === "tar" && this.failLocalTar) {
       child = this.actualSpawn("/bin/sh", ["-c", "printf 'test archiver failure\\n' >&2; exit 27"], { ...options, cwd: this.root, env });

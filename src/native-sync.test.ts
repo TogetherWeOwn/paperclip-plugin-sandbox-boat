@@ -14,6 +14,7 @@ import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { once } from "node:events";
 import { pipeline } from "node:stream/promises";
+import { pluginManifestV1Schema } from "@paperclipai/shared";
 import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
 import type { PluginEnvironmentLease, PluginSyncOperation } from "@paperclipai/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -129,7 +130,12 @@ describe("native sync opt-in", () => {
 
   it("declares both native transport capabilities on the boat environment driver", () => {
     const driver = manifest.environmentDrivers?.find((entry) => entry.driverKey === "boat");
-    expect(driver).toMatchObject({ nativeSyncIn: true, nativeSyncOut: true });
+    expect(driver?.sandboxCapabilities).toMatchObject({ nativeSyncIn: true, nativeSyncOut: true });
+    // The pinned SDK rejects unsupported top-level extras; validate the actual
+    // manifest, not a test-created driver that could hide an invalid opt-in.
+    const parsed = pluginManifestV1Schema.parse(manifest);
+    expect(parsed.environmentDrivers?.find((entry) => entry.driverKey === "boat")?.sandboxCapabilities)
+      .toMatchObject({ nativeSyncIn: true, nativeSyncOut: true });
   });
 
   it("advertises both verbs through the real SDK initialize handshake", async () => {
