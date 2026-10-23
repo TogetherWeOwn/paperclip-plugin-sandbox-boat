@@ -10,7 +10,7 @@ import stat
 import sys
 import tarfile
 
-CHUNK = 64 * 1024
+CHUNK = 16 * 1024
 MAX_METADATA = 256 * 1024
 MAX_DIRECTORIES = 100000
 mapping = json.loads(sys.argv[2])
