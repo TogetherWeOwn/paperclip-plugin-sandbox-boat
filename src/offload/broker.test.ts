@@ -143,6 +143,34 @@ describe("submit", () => {
   });
 });
 
+describe("recordRefusal", () => {
+  it("journals a deterministic refusal as not_started without dispatching", async () => {
+    const { broker, backend } = setup();
+    await broker.recordRefusal(submitFor(), PRINCIPAL, "incompatible workload");
+    const view = readBody(await broker.read(CMD, PRINCIPAL, 0));
+    expect(view.state).toBe("not_started");
+    expect(view.remoteStarted).toBe(false);
+    expect(view.fallbackSafe).toBe(true);
+    expect(backend.starts.length).toBe(0);
+  });
+
+  it("is idempotent for the same payload and conflicts on a different one", async () => {
+    const { broker } = setup();
+    await broker.recordRefusal(submitFor(), PRINCIPAL, "x");
+    await broker.recordRefusal(submitFor(), PRINCIPAL, "x");
+    await expect(broker.recordRefusal({ ...submitFor(), argv: ["build"] }, PRINCIPAL, "x")).rejects.toThrow("OFFLOAD_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("lets a duplicate submit observe the refusal without a second dispatch", async () => {
+    const { broker, backend } = setup();
+    await broker.recordRefusal(submitFor(), PRINCIPAL, "x");
+    const again = await broker.submit(submitFor(), PRINCIPAL);
+    expect(again.status).toBe(200);
+    expect((again.body as OffloadReadResponse).state).toBe("not_started");
+    expect(backend.starts.length).toBe(0);
+  });
+});
+
 describe("read", () => {
   it("rejects unknown command ids", async () => {
     const { broker } = setup();

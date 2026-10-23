@@ -190,6 +190,22 @@ Output is `{ "sizeCostTable": { ... } }`. It uses completed samples in the trail
 
 Heavy-command-only offload is a separate execution mode and is not implemented by the size selector.
 
+## Cargo offload shim (`bin/boat-offload-cargo`)
+
+Design: `docs/adr/0001-heavy-command-offload.md`. Status: routes, broker and shim are implemented; remote execution wires in when the executor grows start/cancel, so today every submit journals `not_started` and the shim falls back to the existing bounded local path.
+
+Install the shim as `cargo` ahead of the real executable for opted-in runs (`BOAT_OFFLOAD=1`); anything else, including unset and `0`, runs local cargo with no broker calls. Eligible subcommands are `build`, `test`, `check`, `clippy`, `nextest run` and `llvm-cov` compilation/test modes on an installed profile toolchain. Everything else (`fmt`, `add`, `update`, `metadata`, help/version, install, custom aliases, `--config`/`-Z`, compound shell text, `RUSTFLAGS` builds) stays local. Only an explicit nonsecret env (`CARGO_TERM_COLOR`, `RUST_BACKTRACE`) reaches the request; the run token travels in HTTP headers only.
+
+Diagnostics never collide with cargo flags:
+
+```sh
+boat-offload-cargo --dry-run -- test --locked        # classify, no VM/sync/journal effect
+boat-offload-cargo --dry-run --json -- test --locked # versioned envelope on stdout
+boat-offload-cargo --json -- test --locked           # run; result envelope on stderr
+```
+
+Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
+
 ## Run env allowlist
 
 ### Why

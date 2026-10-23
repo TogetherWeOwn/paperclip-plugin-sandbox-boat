@@ -17,7 +17,11 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "boat-offload-cargo": "./bin/boat-offload-cargo"
+  },
   "files": [
+    "bin",
     "dist",
     "README.md",
     "LICENSE"

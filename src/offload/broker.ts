@@ -31,6 +31,19 @@ export interface BrokerPrincipal {
   profileId: string;
 }
 
+/** Read-like calls bind only company + run; the journal holds the rest. */
+export interface BrokerAuth {
+  companyId: string;
+  runId: string;
+}
+
+/** Placeholder backend until the TOG-38024 executor grows start/cancel. */
+export class NeverDispatchBackend implements OffloadBackend {
+  start(): OffloadBackendHandle {
+    throw new Error("OFFLOAD_UNAVAILABLE: remote execution is not wired yet; the broker journals not_started and the shim falls back.");
+  }
+}
+
 export interface OffloadJournalStore {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown): Promise<void>;
@@ -199,8 +212,54 @@ export class OffloadBroker {
     return { status: 202, body };
   }
 
+  /**
+   * Journal a deterministic pre-acceptance refusal (incompatible workload,
+   * unsupported confinement) as a terminal never-started receipt, so a future
+   * dispatch of the same ID is impossible. Counts toward the per-run bound;
+   * past the bound the refusal still stands, deterministically, without a
+   * receipt. Never starts the backend.
+   */
+  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<void> {
+    await this.chain(`run:${principal.runId}`, async () => {
+      const digest = digestOf(request);
+      const existing = await this.load(request.commandId);
+      if (existing) {
+        if (existing.digest !== digest) {
+          throw Object.assign(new Error(`OFFLOAD_IDEMPOTENCY_CONFLICT: commandId ${request.commandId} was already accepted with a different payload.`), { code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+        }
+        return;
+      }
+      const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
+      if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return;
+      const now = this.now();
+      await this.save({
+        version: 1,
+        commandId: request.commandId,
+        companyId: principal.companyId,
+        runId: principal.runId,
+        cardId: principal.cardId,
+        repoId: principal.repoId,
+        profileId: principal.profileId,
+        digest,
+        state: "not_started",
+        remoteStarted: false,
+        fallbackSafe: true,
+        events: [],
+        outputBytes: 0,
+        result: null,
+        terminalError: null,
+        heartbeatDeadline: now + OFFLOAD_BOUNDS.heartbeatExpiryMs,
+        commandDeadline: now + request.timeoutMs,
+        createdAt: now,
+        terminalAt: now,
+      });
+      await this.store.set(countKey(principal.runId), count + 1);
+      this.known.add(request.commandId);
+    });
+  }
+
   /** Resolve a command for read-like calls: guards, expiry, restart hold. */
-  private async resolve(commandId: string, principal: BrokerPrincipal): Promise<JournalRecord | BrokerResponse> {
+  private async resolve(commandId: string, principal: BrokerAuth): Promise<JournalRecord | BrokerResponse> {
     const record = await this.load(commandId);
     if (!record) {
       const tomb = (await this.store.get(tombKey(commandId))) as Tombstone | null;
@@ -314,7 +373,7 @@ export class OffloadBroker {
     });
   }
 
-  async read(commandId: string, principal: BrokerPrincipal, after: number, limitBytes: number = OFFLOAD_BOUNDS.readLimitBytes): Promise<BrokerResponse> {
+  async read(commandId: string, principal: BrokerAuth, after: number, limitBytes: number = OFFLOAD_BOUNDS.readLimitBytes): Promise<BrokerResponse> {
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
@@ -322,7 +381,7 @@ export class OffloadBroker {
     });
   }
 
-  async heartbeat(commandId: string, principal: BrokerPrincipal): Promise<BrokerResponse> {
+  async heartbeat(commandId: string, principal: BrokerAuth): Promise<BrokerResponse> {
     const at = this.now();
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
@@ -335,7 +394,7 @@ export class OffloadBroker {
     });
   }
 
-  async cancel(commandId: string, principal: BrokerPrincipal, _reason: string): Promise<BrokerResponse> {
+  async cancel(commandId: string, principal: BrokerAuth, _reason: string): Promise<BrokerResponse> {
     const at = this.now();
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
