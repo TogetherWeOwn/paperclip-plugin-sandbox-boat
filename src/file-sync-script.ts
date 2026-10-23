@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import stat
 import sys
 import tarfile
@@ -65,6 +66,24 @@ def excluded(name):
         if '/' not in pattern and any(fnmatch.fnmatchcase(p, pattern) for p in name.split('/')):
             return True
     return False
+
+
+def preflight():
+    def visit(file, name, ancestors):
+        if name != '.' and excluded(name):
+            return
+        target = mapping['targetPath'] if name == '.' else mapping['targetPath'] + '/' + name
+        print(json.dumps(target), flush=True)
+        info = os.stat(file, follow_symlinks=bool(mapping.get('followSymlinks')))
+        if not stat.S_ISDIR(info.st_mode):
+            return
+        key = (info.st_dev, info.st_ino)
+        if key in ancestors or len(ancestors) >= 256:
+            raise ValueError('directory symlink cycle or excessive depth')
+        with os.scandir(file) as children:
+            for child in children:
+                visit(child.path, child.name if name == '.' else name + '/' + child.name, ancestors | {key})
+    visit(mapping['sourcePath'], '.', set())
 
 
 def send():
@@ -228,6 +247,17 @@ def receive():
         os.close(parent)
 
 
+def interrupted(signum, frame):
+    # Python's default TERM/HUP exits skip finally, leaking partial scratch.
+    # Unwind once, allowing the receiver to close and unlink through its dir-fd.
+    for caught in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(caught, signal.SIG_IGN)
+    raise InterruptedError('native sync interrupted')
+
+
+for caught in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    signal.signal(caught, interrupted)
+
 absolute(mapping['sourcePath'])
 absolute(mapping['targetPath'])
 if mapping['kind'] not in ('file', 'directory'):
@@ -239,6 +269,8 @@ if sys.argv[1] == 'send':
     send()
 elif sys.argv[1] == 'receive':
     receive()
+elif sys.argv[1] == 'preflight':
+    preflight()
 else:
     raise ValueError('invalid sync action')
 `;

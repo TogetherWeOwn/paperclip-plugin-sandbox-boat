@@ -1,6 +1,6 @@
 import path from "node:path";
-import { lstat, opendir, stat } from "node:fs/promises";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import type { PluginEnvironmentSyncResult, PluginSyncFileMapping, PluginSyncOperation } from "@paperclipai/plugin-sdk";
 import { FILE_SYNC_SCRIPT } from "./file-sync-script.js";
 import { buildRemoteCommand, shellQuote, TAR_SKIP_RUNTIME_DIR } from "./shell.js";
@@ -94,29 +94,39 @@ async function preflightInbound(operation: PluginSyncOperation, timeoutMs: numbe
   for (const file of operation.files) {
     refuse(file.targetPath);
     if (file.kind !== "directory") continue;
-    const visit = async (source: string, target: string, ancestors: Set<string>): Promise<void> => {
-      if (Date.now() > deadline) throw new Error("Native sync source preflight timed out.");
-      refuse(target);
-      const info = file.followSymlinks ? await stat(source) : await lstat(source);
-      if (!info.isDirectory()) return;
-      const identity = `${info.dev}:${info.ino}`;
-      if (ancestors.has(identity) || ancestors.size >= 256) throw new Error("Native sync directory cycle or excessive depth.");
-      const next = new Set([...ancestors, identity]);
-      for await (const entry of await opendir(source)) {
-        // Omitted runtime members cannot carry an uploaded envelope. Explicit
-        // asset roots still work: only descendant names are skipped.
-        if (entry.name !== ".paperclip-runtime") await visit(path.join(source, entry.name), path.posix.join(target, entry.name), next);
-      }
-    };
-    await visit(file.sourcePath, file.targetPath, new Set());
+    const mapping = JSON.stringify(file);
+    if (Buffer.byteLength(mapping) > 64 * 1024) throw new Error("Native sync mapping exceeds metadata limit.");
+    // Ask the sender's own exclusion matcher for the paths it would transmit.
+    // Stream bounded JSON lines rather than collecting a whole workspace list;
+    // keep the ACP decision in the existing provider policy, not a Python copy.
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    const paths = new Writable({ write(chunk: Buffer, _encoding, done) {
+      try {
+        const lines = (pending + decoder.write(chunk)).split("\n");
+        pending = lines.pop()!;
+        for (const line of lines) {
+          if (Buffer.byteLength(line) > 64 * 1024) throw new Error("Native sync preflight path exceeds metadata limit.");
+          refuse(JSON.parse(line) as string);
+        }
+        if (Buffer.byteLength(pending) > 64 * 1024) throw new Error("Native sync preflight path exceeds metadata limit.");
+        done();
+      } catch (error) { done(error as Error); }
+    } });
+    check(await runStreamProcess("python3", ["-c", FILE_SYNC_SCRIPT, "preflight", mapping], {
+      timeoutMs: Math.max(1, deadline - Date.now()), stdout: paths,
+    }));
+    if (pending || decoder.end()) throw new Error("Native sync preflight returned an incomplete path.");
   }
 }
 
 async function postUpload(context: SyncContext, operation: PluginSyncOperation): Promise<void> {
-  const root = absolute(context.remoteRoot);
+  // Directory config/cwd accepts trailing separators; do not normalize away
+  // internal empty, dot or traversal components before the canonical check.
+  const root = absolute(context.remoteRoot.replace(/\/+$/, ""));
   const roots = [root, ...operation.files.map((f) => f.kind === "directory" ? f.targetPath : path.posix.dirname(f.targetPath))];
   for (const control of operation.postUploadCommands ?? []) {
-    const cwd = absolute(control.cwd ?? root);
+    const cwd = absolute((control.cwd ?? root).replace(/\/+$/, ""));
     if (!roots.some((allowed) => allowed !== "/" && (cwd === allowed || cwd.startsWith(`${allowed}/`)))) {
       throw new Error("Post-upload cwd escapes the operation's sandbox target roots.");
     }
