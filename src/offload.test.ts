@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { FakeBoat, trialLimits } from "./test-support/fake-boat.js";
 import type { BoatApiLike } from "./boat-client.js";
+import { JsonState, usage } from "./test-support/account-admission.fixture.js";
 
 // RED: this module does not exist yet. These tests define the v1 offload
 // executor contract from TOG-38024: shared pool, warm pick, resume/create,
@@ -14,7 +15,10 @@ interface FakeTimer {
   cb: () => void;
 }
 
+let nextAccount = 0;
+
 function testSetup() {
+  const account = { state: new JsonState(), accountId: `legacy-offload-account-${++nextAccount}`, poolId: "legacy-offload" };
   const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
   const now = () => clock.t;
   const fake = new FakeBoat({ now });
@@ -58,7 +62,7 @@ function testSetup() {
       logs.push({ level: "error", message, meta });
     },
   };
-  return { clock, now, fake, timers, set, clear, advance, logs, logger };
+  return { account, clock, now, fake, timers, set, clear, advance, logs, logger };
 }
 
 function cmd(partial: Partial<OffloadCommand> & { commandId: string }): OffloadCommand {
@@ -83,6 +87,7 @@ describe("offload executor", () => {
   it("reuses the warmest idle VM without a new start", async () => {
     const { fake, logger, now, set, clear } = setup;
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -110,6 +115,7 @@ describe("offload executor", () => {
   it("counts one cold start for the first command", async () => {
     const { fake, logger, now, set, clear } = setup;
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -126,6 +132,7 @@ describe("offload executor", () => {
   it("stops the VM C seconds after the last command ends", async () => {
     const { fake, logger, now, set, clear, advance } = setup;
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -147,6 +154,7 @@ describe("offload executor", () => {
       release = resolve;
     });
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -174,6 +182,7 @@ describe("offload executor", () => {
     const { fake, logger, now, set, clear } = setup;
     const releases = new Map<string, () => void>();
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -222,6 +231,7 @@ describe("offload executor", () => {
     const { fake, logger, now, set, clear } = setup;
     fake.limitsResponse = trialLimits({ starts: { day: { limit: 75, remaining: 0, used: 75 }, hour: { limit: 25, remaining: 25, used: 0 }, minute: { limit: 5, remaining: 5, used: 0 }, unlimited: false } });
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -240,6 +250,7 @@ describe("offload executor", () => {
     const { fake, logger, now, set, clear } = setup;
     fake.failNext("limits", new Error("limits down"));
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -253,24 +264,27 @@ describe("offload executor", () => {
     await executor.shutdown();
   });
 
-  it("records usage per command and logs an expected-cost line", async () => {
+  it("persists pending usage per command and logs an expected-cost line", async () => {
     const { fake, logger, now, set, clear, logs } = setup;
+    fake.usage = async () => { throw new Error("synthetic meter unavailable"); };
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
       timers: { set, clear },
       config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
-      runCommand: async () => ({ exitCode: 0, seconds: 63 }),
+      runCommand: async () => { setup.clock.t += 63_000; return { exitCode: 0, seconds: 63 }; },
     });
     const result = await executor.execute(cmd({ commandId: "cmd-usage-1", runId: "run-9", cardId: "card-9" }));
     expect(result.status).toBe("completed");
-    const rows = executor.getUsage();
+    const rows = usage(executor);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ commandId: "cmd-usage-1", runId: "run-9", cardId: "card-9", warm: "cold" });
+    expect(rows[0]).toMatchObject({ commandId: "cmd-usage-1", runId: "run-9", cardId: "card-9", warm: "cold",
+      kind: "command", usageRecordId: expect.any(String), meterProvenance: "pending", queueWaitMs: expect.any(Number) });
+    expect(rows[0]!.usageRecordId.length).toBeGreaterThan(0);
     expect(typeof rows[0]!.seconds).toBe("number");
     expect(typeof rows[0]!.dollars).toBe("number");
-    expect(typeof rows[0]!.queueWaitMs).toBe("number");
     expect(rows[0]!.sandboxId).toMatch(/^bx_/);
     const costLine = logs.find((entry) => entry.message.includes("expected-cost"));
     expect(costLine).toBeDefined();
@@ -278,11 +292,13 @@ describe("offload executor", () => {
     // No secrets in the cost line.
     expect(JSON.stringify(costLine)).not.toMatch(/sk-/);
     await executor.shutdown();
+    expect(usage(executor)).toMatchObject([{ usageRecordId: rows[0]!.usageRecordId, meterProvenance: "pending" }]);
   });
 
   it("cancels a pending idle stop when a new command reserves the VM", async () => {
     const { fake, logger, now, set, clear, advance } = setup;
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
@@ -306,6 +322,7 @@ describe("offload executor", () => {
     const { fake, logger, now, set, clear } = setup;
     let runs = 0;
     const executor = new OffloadExecutor({
+      ...setup.account,
       boat: fake as unknown as BoatApiLike,
       logger,
       now,
