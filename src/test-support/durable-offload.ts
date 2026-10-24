@@ -34,7 +34,7 @@ export function command(commandId = "command-1", partial: Partial<Command> = {})
 export function digest(cmd: Command): string {
   const canonical = (v: unknown): unknown => Array.isArray(v) ? v.map(canonical)
     : v && typeof v === "object" ? Object.fromEntries(Object.entries(v)
-      .sort(([a], [b]) => a.localeCompare(b)).map(([k, value]) => [k, canonical(value)])) : v;
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, value]) => [k, canonical(value)])) : v;
   return createHash("sha256").update(JSON.stringify(canonical(cmd))).digest("hex");
 }
 export interface Identity {

@@ -95,7 +95,7 @@ export const offloadError = (code: string) => Object.assign(new Error(code), { c
 export function commandDigest(command: OffloadCommand): string {
   const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
     : value && typeof value === "object" ? Object.fromEntries(Object.entries(value)
-      .sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, canonical(child)])) : value;
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, child]) => [key, canonical(child)])) : value;
   return createHash("sha256").update(JSON.stringify(canonical(command))).digest("hex");
 }
 
@@ -176,8 +176,18 @@ export class OffloadJournal {
     return record?.state === "not_started" ? record.result : null;
   }
 
+  // Re-read durable state inside the record fence. A snapshot taken before the
+  // fence may predate a live execution object or a racing commit; the fence
+  // orders callbacks but cannot merge separate objects, so every pre-start
+  // decision must validate the current durable state before committing.
+  private async refresh(record: OffloadRecord): Promise<void> {
+    const key = commandKey(record);
+    Object.assign(record, parseRecord(await this.deps.journalStore.get(key), key));
+  }
+
   private async beforeStart(record: OffloadRecord, patch: Partial<OffloadRecord>): Promise<void> {
     await this.transition(record, async () => {
+      await this.refresh(record);
       if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
       await this.commit(record, patch);
     });
@@ -207,6 +217,10 @@ export class OffloadJournal {
           if (!TERMINAL.has(record.state) && !PRE_START.has(record.state) && !record.identity) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         }
       });
+      // A rejected scan must not wedge the journal: clear the cache so the next
+      // call retries reconciliation after a transient store failure. Awaiting
+      // callers still observe this rejection.
+      this.startup.catch(() => { this.startup = null; });
     }
     await this.startup;
   }
@@ -255,6 +269,9 @@ export class OffloadJournal {
     this.active.set(key, record);
     try {
       await this.transition(record, async () => {
+        // A cancellation may have committed not_started between admission and
+        // this fence; never overwrite that refusal with a stale queued commit.
+        await this.refresh(record);
         if (PRE_START.has(record.state)) await this.commit(record, { state: "queued" });
       });
       if (record.state === "not_started") return record.result!;
@@ -405,20 +422,26 @@ export class OffloadJournal {
     await this.checkRun(companyId, runId);
     await this.recover();
     const key = commandKey({ companyId, runId, commandId });
-    const record = this.active.get(key) ?? parseRecord(await this.deps.journalStore.get(key), key);
-    const view = await this.transition(record, async () => {
-      // Starting and cancellation use the same record fence. Once intent wins,
-      // running cancellation/descendant cleanup belongs to the lifecycle adapter.
+    const snapshot = this.active.get(key) ?? parseRecord(await this.deps.journalStore.get(key), key);
+    const outcome = await this.transition(snapshot, async () => {
+      // Re-resolve inside the fence: the pre-fence snapshot may predate a live
+      // execution object holding the same key. Prefer the live object so the
+      // fence arbitrates on one record; otherwise refresh the snapshot from
+      // durable state so a stale read can neither clobber a later state nor
+      // report fallbackSafe for a command that already ran. Cancellation only
+      // ever moves a record forward from a pre-start state to not_started.
+      const record = this.active.get(key) ?? snapshot;
+      if (record === snapshot) await this.refresh(record);
       if (PRE_START.has(record.state)) {
         const result = this.unavailable(record, "cancelled before durable starting intent");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
       }
-      return this.view(record);
+      return { view: this.view(record), command: record.command, result: record.result };
     });
     // Queue capacity/VM ownership is released only after the refusal commit,
     // outside the record fence so pool and journal locks cannot invert.
-    if (view.state === "not_started" && record.command && record.result) await this.pool.cancel(record.command, record.result);
-    return view;
+    if (outcome.view.state === "not_started" && outcome.command && outcome.result) await this.pool.cancel(outcome.command, outcome.result);
+    return outcome.view;
   }
 
   async collectGarbage(): Promise<void> {
