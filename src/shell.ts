@@ -397,3 +397,232 @@ export function scrubRuntimeSecretsScript(roots: readonly string[]): string {
     `[ "$walk" = complete ] || exit ${RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT}`,
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Supervised remote commands: run a payload in its own process group so a
+// multiplexed timeout can cancel the VM-side job, not just the local client.
+// ---------------------------------------------------------------------------
+// A private, random per-command record serializes remote admission with
+// cancellation, independently of channel output. Never follow a /tmp symlink
+// or trust another user's record. Both commands hold the same inode lock.
+const RUN_REGISTRY_SCRIPT = String.raw`
+import fcntl
+import json
+import os
+import stat
+import time
+
+
+def open_run_record(filename):
+    fd = os.open(filename, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise RuntimeError('Unsafe remote command record')
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Remote command record lock timed out')
+                time.sleep(.01)
+        record = os.fdopen(fd, 'r+')
+    except BaseException:
+        os.close(fd)
+        raise
+    return record
+
+
+def load_run_record(record):
+    text = record.read(1025)
+    if len(text) > 1024:
+        raise RuntimeError('Oversized remote command record')
+    value = json.loads(text) if text else {}
+    if not isinstance(value, dict):
+        raise RuntimeError('Invalid remote command record')
+    return value
+
+
+def save_run_record(record, value):
+    record.seek(0)
+    record.truncate()
+    json.dump(value, record)
+    record.flush()
+
+
+def process_start(pid):
+    try:
+        with open('/proc/' + str(pid) + '/stat') as source:
+            return source.read().rsplit(')', 1)[1].split()[19]
+    except FileNotFoundError:
+        return None
+`;
+
+// Stdlib-only supervisor. The payload has its own session/group and a Linux
+// parent-death binding. A pipe gates exec until its group identity is committed
+// under the registry lock. No payload bytes can precede cancellation ownership.
+const RUN_SUPERVISOR_SCRIPT = String.raw`
+${RUN_REGISTRY_SCRIPT}
+import ctypes
+import signal
+import subprocess
+import sys
+parent_pid = os.getpid()
+
+
+def bind_parent():
+    # A detached payload must not keep the channel's pipes alive if the
+    # supervisor is killed. Linux preserves this binding across ordinary exec.
+    # This supervisor is single-threaded, so preexec_fn cannot inherit locks
+    # held by another thread. Fail closed if the kernel cannot bind the child.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        raise OSError(ctypes.get_errno(), 'Cannot bind remote payload to supervisor')
+    # The parent may have died between fork and prctl; no signal is retroactive.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+filename = sys.argv[3]
+record = open_run_record(filename) if filename else None
+child = None
+read_gate, write_gate = os.pipe()
+try:
+    previous = load_run_record(record) if record else {}
+    if previous.get('cancelled'):
+        # Cancellation won admission. Consume its tombstone, never start work.
+        os.unlink(filename)
+        sys.exit(125)
+    if previous:
+        raise RuntimeError('Remote command identity already admitted')
+    gate_script = "import os, sys; fd = int(sys.argv[2]); admitted = os.read(fd, 1); os.close(fd); sys.exit(125) if admitted != b'1' else os.execv('/bin/sh', ['sh', '-c', sys.argv[1]])"
+    child = subprocess.Popen([sys.executable, '-c', gate_script, sys.argv[2], str(read_gate)],
+                             start_new_session=True, preexec_fn=bind_parent, pass_fds=(read_gate,))
+    if record:
+        save_run_record(record, {'pgid': child.pid, 'start': process_start(child.pid)})
+    os.write(write_gate, b'1')
+except BaseException:
+    if child:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+    raise
+finally:
+    os.close(read_gate)
+    os.close(write_gate)
+    if record:
+        record.close()
+
+
+def forward(signum, _frame):
+    # Forward, then exit at once with 128+n. Never wait() here: a wait inside
+    # the handler races the main wait for the child's exit status and can hang
+    # instead of reaping. The payload group already got the signal; a caller
+    # that needs the group gone escalates itself (see cancelRemoteCommand).
+    # Restore defaults first so a second signal kills us immediately.
+    for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(caught, signal.SIG_DFL)
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+    raise SystemExit(128 + signum)
+
+
+for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(caught, forward)
+sys.stderr.write(sys.argv[1] + str(child.pid) + '\n')
+sys.stderr.flush()
+# Close our own stdout copy before waiting: our caller drains the payload's
+# stdout as a pipe, and our duplicate write end would hold that pipe open
+# after the payload exits. Stderr stays open: the marker above and the
+# payload's diagnostics share it, and our exit closes it promptly because we
+# never outlive the payload except to reap it.
+os.close(1)
+code = child.wait()
+sys.exit(code if code >= 0 else 128 - code)
+`;
+
+/**
+ * Preserve binary stdio/status while supervising a separate payload group.
+ * Credential removal is an exec boundary BEFORE the long-lived supervisor.
+ * Managed calls register the group under a caller-known random identity before
+ * payload exec; the stderr marker is diagnostic only, never cancellation authority.
+ * Their caller must finalize the record on every outcome (see SshManager).
+ */
+export function wrapRemoteCommand(command: string, runId: string, managed = false): string {
+  const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
+  const record = managed ? remoteRunRecord(runId) : "";
+  return `exec env ${unset} python3 -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
+}
+
+function remoteRunRecord(runId: string): string {
+  if (!/^[a-f0-9]{32}$/.test(runId)) throw new Error("Invalid remote cancellation identity.");
+  return `/tmp/paperclip-boat-run-${runId}`;
+}
+
+const RUN_CANCEL_SCRIPT = String.raw`
+${RUN_REGISTRY_SCRIPT}
+import signal
+import sys
+
+
+def alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def wait_group(pgid, seconds):
+    deadline = time.monotonic() + seconds
+    while alive(pgid) and time.monotonic() < deadline:
+        time.sleep(.01)
+
+
+filename = sys.argv[1]
+with open_run_record(filename) as record:
+    value = load_run_record(record)
+    pgid = value.get('pgid')
+    if pgid is None:
+        # The transport may not have delivered its command yet. Keep this
+        # admission revocation until that one delayed invocation consumes it
+        # (or the VM is deleted). Removing it now would resurrect late work.
+        save_run_record(record, {'cancelled': True})
+    else:
+        if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp() or not isinstance(value.get('start'), str):
+            raise RuntimeError('Invalid remote process identity')
+        current_start = process_start(pgid)
+        # An existing group retains its leader's PID even after the leader is
+        # reaped. A recycled leader with a different start time is NOT our job.
+        if current_start is not None and current_start != value['start']:
+            raise RuntimeError('Remote process identity changed')
+        for signum, grace in ((signal.SIGTERM, 1), (signal.SIGKILL, .5)):
+            try:
+                os.killpg(pgid, signum)
+            except ProcessLookupError:
+                break
+            wait_group(pgid, grace)
+        os.unlink(filename)
+`;
+
+/** Revoke admission or stop the registered group, without needing channel output. */
+export function cancelRemoteCommand(runId: string): string {
+  const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
+  return `exec env ${unset} python3 -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+}
+
+function isMarkerLine(line: string, prefix: string): boolean {
+  return line.startsWith(prefix) && /^\d+$/.test(line.slice(prefix.length));
+}
+
+export function stripRunMarker(stderr: string, runId: string): string {
+  const prefix = `PCSYNC:${runId}:`;
+  return stderr.split("\n").filter((line) => !isMarkerLine(line, prefix)).join("\n");
+}
+

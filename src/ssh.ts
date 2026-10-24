@@ -12,10 +12,14 @@
 // master, so each command reuses one connection instead of a new handshake.
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { cancelRemoteCommand, stripRunMarker, wrapRemoteCommand } from "./shell.js";
 
 export interface SshEndpoint {
   host: string;
@@ -58,6 +62,7 @@ export interface SshLogger {
 
 const SIGKILL_GRACE_MS = 250;
 const MASTER_RESTART_MIN_INTERVAL_MS = 10_000;
+const REMOTE_CANCEL_TIMEOUT_MS = 10_000;
 
 /** Parse the POST /sandboxes/{id}/sshkey answer into a connect target. */
 export function endpointFromSshKeyResponse(response: {
@@ -258,6 +263,40 @@ export class SshManager {
     return await runProcess("ssh", args, { stdin: options.stdin, timeoutMs: options.timeoutMs });
   }
 
+  /** Binary transport over the same pinned connection; run() remains control-only. */
+  async runStream(session: SshSession, remoteCommand: string, options: StreamProcessOptions): Promise<SshExecutionResult> {
+    const key = await this.ensureKey();
+    const slave = (command: string) => [
+      "-T", "-o", `ControlPath=${session.controlPath}`, "-o", "ControlMaster=no",
+      ...commonSshOptions(session, key.privateKeyPath),
+      `${session.endpoint.user}@${session.endpoint.host}`, command,
+    ];
+    // The caller knows this identity BEFORE submitting work. Neither admission
+    // revocation nor group cancellation depends on receiving a stderr marker.
+    const runId = randomUUID().replace(/-/g, "");
+    let result: SshExecutionResult | undefined;
+    try {
+      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true)), options);
+      return { ...result, stderr: stripRunMarker(result.stderr, runId) };
+    } finally {
+      // Local pipe/cap errors throw, while timeouts return a result. Both must
+      // finish bounded remote cleanup BEFORE releasing activity/rejecting. On
+      // success this also removes the registration and any background children.
+      // Never signal the shared master, and never replace the original failure.
+      try {
+        const cleanup = await runStreamProcess("ssh", slave(cancelRemoteCommand(runId)), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
+        if (cleanup.timedOut || cleanup.exitCode !== 0) {
+          throw new Error(`Remote command cleanup failed: ${cleanup.stderr.trim() || "timeout or nonzero exit"}`);
+        }
+      } catch (error) {
+        this.logger.warn("boat: remote command cleanup failed; remote work may still be running", {
+          sandboxId: session.sandboxId, reason: (error as Error).message,
+        });
+        if (result && !result.timedOut && result.exitCode === 0) throw error;
+      }
+    }
+  }
+
   async closeSession(sandboxId: string): Promise<void> {
     const session = this.sessions.get(sandboxId);
     if (!session) return;
@@ -327,6 +366,90 @@ function killQuietly(child: ChildProcess): void {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface StreamProcessOptions {
+  stdin?: Readable;
+  stdout?: Writable;
+  maxOutputBytes?: number;
+  timeoutMs: number;
+}
+
+/** Backpressured binary IO, bounded control output, and cleanup on either pipe's failure. */
+export async function runStreamProcess(command: string, args: string[], options: StreamProcessOptions): Promise<SshExecutionResult> {
+  const cap = options.maxOutputBytes ?? 256 * 1024;
+  if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+    throw new Error("Invalid streaming process limits.");
+  }
+  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let failure: Error | undefined;
+  let timedOut = false;
+  let closed = false;
+  let killTimer: NodeJS.Timeout | undefined;
+  const abort = (error: Error) => {
+    failure ??= error;
+    options.stdin?.destroy(error);
+    child.stdin.destroy(error);
+    child.stdout.destroy(error);
+    options.stdout?.destroy(error);
+    if (!closed) {
+      child.kill("SIGTERM");
+      killTimer ??= setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
+    }
+  };
+  // A multiplexed ssh slave's stderr stays open until its remote job ends,
+  // which outlives the signalled slave itself. Once the slave exits, detach
+  // stderr from its pipeline without an error: already-buffered bytes (the
+  // cancellation marker) survive, the collector ends cleanly, and close —
+  // which only needs the exit plus drained stdio — resolves promptly.
+  // Non-ssh children are unaffected: their stderr ends with the process.
+  let stderrDetached = false;
+  const detachStderr = () => {
+    if (command !== "ssh" || stderrDetached) return;
+    stderrDetached = true;
+    child.stderr.unpipe();
+    child.stderr.destroy();
+  };
+  child.once("exit", detachStderr);
+  const completion = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    child.once("error", (error) => abort(error));
+    child.once("close", (code, signal) => {
+      closed = true;
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ code, signal });
+    });
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort(new Error("Streaming process timed out."));
+  }, options.timeoutMs);
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  function collector(chunks: Buffer[]): Writable {
+    let bytes = 0;
+    return new Writable({ write(chunk: Buffer, _encoding, done) {
+      bytes += chunk.length;
+      if (bytes > cap) done(new Error("Streaming process control output exceeds its byte limit."));
+      else { chunks.push(Buffer.from(chunk)); done(); }
+    } });
+  }
+  // Observe every pipe immediately: waiting for exit first deadlocks a full pipe.
+  const pipes = [
+    pipeline(child.stdout, options.stdout ?? collector(stdout)),
+    pipeline(child.stderr, collector(stderr)),
+    pipeline(options.stdin ?? Readable.from([]), child.stdin),
+  ];
+  for (const pipe of pipes) void pipe.catch((error: Error) => abort(error));
+  try {
+    const result = await completion;
+    await Promise.allSettled(pipes);
+    if (failure && !timedOut) throw failure;
+    return { exitCode: timedOut ? null : result.code, signal: result.signal, timedOut,
+      stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
+  } finally {
+    clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
+  }
 }
 
 /** Spawn a process, collect output, enforce a timeout. Secrets go through stdin only, never argv. */

@@ -132,6 +132,14 @@ const plugin = definePlugin({
     return await requireManager().realizeWorkspace(params);
   },
 
+  async onEnvironmentSyncIn(params) {
+    return await requireManager().sync(params, "in");
+  },
+
+  async onEnvironmentSyncOut(params) {
+    return await requireManager().sync(params, "out");
+  },
+
   async onEnvironmentExecute(params) {
     return await requireManager().execute(params);
   },
