@@ -780,7 +780,7 @@ export interface StagedChange {
   supported: boolean;
   baselineSha256: string | null;
   returnedSha256: string | null;
-  /** Live-workspace hash observed at stage time (null when absent). Reading it never mutates live files. */
+  /** Live-workspace hash at stage time, "non-regular" for other node types, or null when absent. Never mutates live files. */
   liveSha256: string | null;
   /** Staged remote bytes under the artifact dir, or null for proposed deletes, escapes and over-cap entries. */
   stagedRelPath: string | null;
@@ -948,6 +948,6 @@ async function liveHash(liveRoot: string, rel: string): Promise<string | null> {
   const st = await fsp.lstat(abs).catch(() => null);
   if (!st) return null;
   if (st.isSymbolicLink()) return symlinkHash(await fsp.readlink(abs));
-  if (!st.isFile()) return null;
+  if (!st.isFile()) return "non-regular";
   return sha256Hex(await fsp.readFile(abs));
 }
