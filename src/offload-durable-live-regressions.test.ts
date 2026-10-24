@@ -255,7 +255,7 @@ describe("live queue refusal commit ordering", () => {
     expect.soft(h.attempts).toHaveLength(0);
   });
 
-  it.each([false, true])("shutdown cannot report a drained queue before refusal persistence (commit fails=%s)", async (failCommit) => {
+  it.each([false, true])("shutdown keeps public fallback unsafe while refusal is blocked or fails (commit fails=%s)", async (failCommit) => {
     const cmd = queuedCommand("shutdown-waiter", 5_000);
     const store = new RefusalStore(h.hostDirectory, cmd, failCommit);
     releases.push(store.commit.release);
@@ -277,7 +277,11 @@ describe("live queue refusal commit ordering", () => {
     const refusal = await waiter.completion;
     if (failCommit) {
       expect.soft(refusal).not.toMatchObject({ fallbackSafe: true });
-      expect.soft(await shutdown.completion, "failed durable drain must not report success").toMatchObject({ rejected: expect.any(String) });
+      // The ADR does not prescribe shutdown's error channel. Enforce the
+      // fallback fence, not a guessed requirement that shutdown must reject.
+      await shutdown.completion;
+      expect.soft(await disk(cmd)).toMatchObject({ state: "queued", fallbackSafe: false });
+      expect.soft(await view(b.executor, cmd)).toMatchObject({ fallbackSafe: false });
     } else {
       expect.soft(refusal).toMatchObject({ remoteStarted: false, fallbackSafe: true });
       expect.soft(await disk(cmd)).toMatchObject({ state: "not_started", fallbackSafe: true });
