@@ -596,6 +596,90 @@ describe("collectAndStage", () => {
   });
 });
 
+describe("collectAndStage live non-regular paths", () => {
+  it("reports a conflict when the guest deletes a file the live tree replaced with a directory", async () => {
+    const live = makeTemp();
+    const guest = makeTemp();
+    const staging = path.join(makeTemp(), "cmd-nonreg-del");
+    writeTree(live, { "Cargo.lock": "v1\n" });
+    writeTree(guest, { "Cargo.lock": "v1\n" });
+    const uploaded = (await captureManifest(live)).manifest;
+    // The guest command deleted the file; meanwhile the live tree replaced it with a directory.
+    rmSync(path.join(guest, "Cargo.lock"));
+    rmSync(path.join(live, "Cargo.lock"));
+    mkdirSync(path.join(live, "Cargo.lock"));
+    writeFileSync(path.join(live, "Cargo.lock", "keep.txt"), "local\n");
+    const result = await collectAndStage({ liveRoot: live, uploaded, guest: new LocalGuestStore(), guestDir: guest, stagingDir: staging });
+    expect(result.state).toBe("conflict");
+    expect(result.conflictPaths).toEqual(["Cargo.lock"]);
+    const change = result.changes.find((c) => c.path === "Cargo.lock")!;
+    expect(change.op).toBe("proposed-delete");
+    expect(change.liveSha256).toBe("non-regular");
+    expect(change.returnedSha256).toBeNull();
+    expect(change.stagedRelPath).toBeNull();
+    // Both versions preserved: the live directory is untouched.
+    expect(lstatSync(path.join(live, "Cargo.lock")).isDirectory()).toBe(true);
+    expect(readFileSync(path.join(live, "Cargo.lock", "keep.txt"), "utf8")).toBe("local\n");
+  });
+
+  it("reports a conflict when the guest creates a file where the live tree holds a directory", async () => {
+    const live = makeTemp();
+    const guest = makeTemp();
+    const staging = path.join(makeTemp(), "cmd-nonreg-create");
+    writeTree(live, { "src/main.rs": "x\n" });
+    writeTree(guest, { "src/main.rs": "x\n" });
+    const uploaded = (await captureManifest(live)).manifest;
+    // After the push the live tree grew a directory where the guest wrote a new snapshot file.
+    mkdirSync(path.join(live, "new.snap"));
+    writeFileSync(path.join(live, "new.snap", "keep.txt"), "local\n");
+    writeFileSync(path.join(guest, "new.snap"), "snap\n");
+    const result = await collectAndStage({ liveRoot: live, uploaded, guest: new LocalGuestStore(), guestDir: guest, stagingDir: staging });
+    expect(result.state).toBe("conflict");
+    expect(result.changedPaths).toEqual(["new.snap"]);
+    expect(result.conflictPaths).toEqual(["new.snap"]);
+    const change = result.changes.find((c) => c.path === "new.snap")!;
+    expect(change.op).toBe("create");
+    expect(change.supported).toBe(true);
+    expect(change.liveSha256).toBe("non-regular");
+    expect(readFileSync(path.join(staging, change.stagedRelPath!), "utf8")).toBe("snap\n");
+    expect(lstatSync(path.join(live, "new.snap")).isDirectory()).toBe(true);
+    expect(readFileSync(path.join(live, "new.snap", "keep.txt"), "utf8")).toBe("local\n");
+  });
+
+  it("treats a convergent delete as staged with a null live hash", async () => {
+    const live = makeTemp();
+    const guest = makeTemp();
+    const staging = path.join(makeTemp(), "cmd-convergent-del");
+    writeTree(live, { "Cargo.lock": "v1\n" });
+    writeTree(guest, { "Cargo.lock": "v1\n" });
+    const uploaded = (await captureManifest(live)).manifest;
+    rmSync(path.join(guest, "Cargo.lock"));
+    rmSync(path.join(live, "Cargo.lock"));
+    const result = await collectAndStage({ liveRoot: live, uploaded, guest: new LocalGuestStore(), guestDir: guest, stagingDir: staging });
+    expect(result.state).toBe("staged");
+    expect(result.conflictPaths).toEqual([]);
+    const change = result.changes.find((c) => c.path === "Cargo.lock")!;
+    expect(change.op).toBe("proposed-delete");
+    expect(change.liveSha256).toBeNull();
+  });
+
+  it("treats a clean create over an absent live path as staged with a null live hash", async () => {
+    const live = makeTemp();
+    const guest = makeTemp();
+    const staging = path.join(makeTemp(), "cmd-clean-create");
+    writeTree(live, { "src/main.rs": "x\n" });
+    writeTree(guest, { "src/main.rs": "x\n" });
+    const uploaded = (await captureManifest(live)).manifest;
+    writeFileSync(path.join(guest, "new.snap"), "snap\n");
+    const result = await collectAndStage({ liveRoot: live, uploaded, guest: new LocalGuestStore(), guestDir: guest, stagingDir: staging });
+    expect(result.state).toBe("staged");
+    expect(result.conflictPaths).toEqual([]);
+    const change = result.changes.find((c) => c.path === "new.snap")!;
+    expect(change.op).toBe("create");
+    expect(change.liveSha256).toBeNull();
+  });
+});
+
 describe("rsync transport spec", () => {
   it("builds a pinned-SSH delta push that preserves times and modes and never deletes", async () => {
     const args = buildRsyncPushArgs(
