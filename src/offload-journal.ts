@@ -145,6 +145,7 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
 interface JournalPool {
   hold(identity: OffloadIdentity): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
+  cancel(command: OffloadCommand, result: OffloadResult): Promise<void>;
 }
 
 // One authoritative worker only. Exclusive create fences duplicate IDs, not
@@ -155,6 +156,32 @@ export class OffloadJournal {
   private readonly inFlight = new Map<string, { digest: string; task: Promise<OffloadResult> }>();
   private readonly active = new Map<string, OffloadRecord>();
   private readonly held = new Map<string, OffloadIdentity>();
+  private readonly transitions = new Map<string, Promise<unknown>>();
+
+  // Cancellation and starting arbitrate on one record, never on a global lock
+  // held across queue-refusal I/O or guest sync/transport.
+  private async transition<T>(record: OffloadRecord, fn: () => Promise<T>): Promise<T> {
+    const key = commandKey(record);
+    const previous = this.transitions.get(key) ?? Promise.resolve();
+    const task = previous.then(fn, fn);
+    const fence = task.catch(() => undefined);
+    this.transitions.set(key, fence);
+    try { return await task; } finally {
+      if (this.transitions.get(key) === fence) this.transitions.delete(key);
+    }
+  }
+
+  preStartResult(command: OffloadCommand): OffloadResult | null {
+    const record = this.active.get(commandKey(command));
+    return record?.state === "not_started" ? record.result : null;
+  }
+
+  private async beforeStart(record: OffloadRecord, patch: Partial<OffloadRecord>): Promise<void> {
+    await this.transition(record, async () => {
+      if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+      await this.commit(record, patch);
+    });
+  }
 
   constructor(private readonly deps: OffloadDurableDeps, private readonly now: () => number, private readonly pool: JournalPool) {}
 
@@ -227,10 +254,12 @@ export class OffloadJournal {
     if (!fresh) return await this.replay(record);
     this.active.set(key, record);
     try {
-      await this.commit(record, { state: "queued" });
+      await this.transition(record, async () => {
+        if (PRE_START.has(record.state)) await this.commit(record, { state: "queued" });
+      });
+      if (record.state === "not_started") return record.result!;
       const result = await launch();
-      if (result.status === "unavailable") await this.finish(command, result);
-      return result;
+      return result.status === "unavailable" ? await this.finish(command, result) : result;
     } finally {
       this.active.delete(key);
     }
@@ -245,13 +274,16 @@ export class OffloadJournal {
   async run(sandboxId: string, command: OffloadCommand,
     transport: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<{ exitCode: number; seconds: number }>) {
     const record = this.active.get(commandKey(command))!;
-    await this.commit(record, { state: "syncing_in" });
+    await this.beforeStart(record, { state: "syncing_in" });
+    // Start the sync in the same continuation as the state check. A subsequent
+    // cancellation can fence spawn, but need not abort an already-running push.
+    if (record.state === "not_started") throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
     await this.deps.sync.push(sandboxId, command);
     const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
     if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
     const identity: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
       digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
-    await this.commit(record, { state: "starting", identity, remoteStarted: null });
+    await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
     const result = await transport(sandboxId, command, identity);
     // The legacy transport resolves at exit, not at spawn. Do not claim a
     // running acknowledgement until it actually returns evidence of execution.
@@ -262,16 +294,27 @@ export class OffloadJournal {
     return result;
   }
 
-  async finish(command: OffloadCommand, result: OffloadResult): Promise<void> {
+  async finish(command: OffloadCommand, result: OffloadResult): Promise<OffloadResult> {
     const record = this.active.get(commandKey(command))!;
-    if (result.status === "unavailable") {
-      await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
-    } else if (result.status === "unknown") {
-      await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
-      await this.hold(record);
-    } else {
-      await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
-    }
+    const committed = await this.transition(record, async () => {
+      if (TERMINAL.has(record.state)) return record.result!;
+      // No transport is invoked before the starting commit. A sync/boot-ID
+      // failure is therefore a known non-start, not identity-less uncertainty.
+      if (PRE_START.has(record.state) && result.status === "unknown") {
+        result = this.unavailable(command, "command failed before durable starting intent");
+      }
+      if (result.status === "unavailable") {
+        if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+        await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+      } else if (result.status === "unknown") {
+        await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
+      } else {
+        await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
+      }
+      return result;
+    });
+    if (committed.status === "unknown") await this.hold(record);
+    return committed;
   }
 
   private unavailable(command: Pick<OffloadCommand, "commandId">, reason: string): OffloadResult {
@@ -361,17 +404,21 @@ export class OffloadJournal {
   async cancelCommand(companyId: string, runId: string, commandId: string, _reason: string): Promise<OffloadCommandView> {
     await this.checkRun(companyId, runId);
     await this.recover();
-    return await this.serialize(async () => {
-      const key = commandKey({ companyId, runId, commandId });
-      const record = parseRecord(await this.deps.journalStore.get(key), key);
-      // In-process dispatch owns its reservation until it acknowledges a fence.
-      // Running cancellation/descendant cleanup belongs to the lifecycle adapter.
-      if (PRE_START.has(record.state) && !this.inFlight.has(key)) {
+    const key = commandKey({ companyId, runId, commandId });
+    const record = this.active.get(key) ?? parseRecord(await this.deps.journalStore.get(key), key);
+    const view = await this.transition(record, async () => {
+      // Starting and cancellation use the same record fence. Once intent wins,
+      // running cancellation/descendant cleanup belongs to the lifecycle adapter.
+      if (PRE_START.has(record.state)) {
         const result = this.unavailable(record, "cancelled before durable starting intent");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
       }
       return this.view(record);
     });
+    // Queue capacity/VM ownership is released only after the refusal commit,
+    // outside the record fence so pool and journal locks cannot invert.
+    if (view.state === "not_started" && record.command && record.result) await this.pool.cancel(record.command, record.result);
+    return view;
   }
 
   async collectGarbage(): Promise<void> {

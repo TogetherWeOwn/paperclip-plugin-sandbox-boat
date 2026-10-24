@@ -10,7 +10,7 @@ import { checkBudget, readBudget } from "./budget.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { PRICE_PER_HOUR } from "./size-policy.js";
-import { OffloadJournal, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
+import { OffloadJournal, commandDigest, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
 export { OffloadGuestRunner } from "./offload-guest.js";
 export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
 
@@ -133,12 +133,9 @@ type Claim = Reservation | { kind: "unavailable"; reason: string } | { kind: "qu
 interface Queued {
   command: OffloadCommand;
   resolve: (result: Dispatch) => void;
+  reject: (error: unknown) => void;
   timerHandle: unknown | null;
-}
-
-function digestOf(command: OffloadCommand): string {
-  // Internal payload identity; never included in logs or usage.
-  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId, argv: command.argv });
+  refusal: Promise<void> | null;
 }
 
 function sandboxIdOf(response: unknown): string | null {
@@ -199,6 +196,7 @@ export class OffloadExecutor {
     this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDeps & OffloadDurableDeps, this.now, {
       hold: (identity) => this.restoreHold(identity),
       release: (identity) => this.releaseHold(identity),
+      cancel: (command, result) => this.cancelQueued(command, result),
     }) : null;
     this.runCommand = this.durable
       ? (vm, command) => this.durable!.run(vm, command, deps.runCommand)
@@ -265,16 +263,15 @@ export class OffloadExecutor {
   }
 
   private async drain(pending: Promise<OffloadResult>[]): Promise<void> {
-    await this.withAdmission(async () => {
-      for (const entry of this.queue.splice(0)) {
-        if (entry.timerHandle != null) this.timers.clear(entry.timerHandle);
-        entry.resolve(this.finish(this.cacheKey(entry.command), this.unavailable(entry.command, "executor shutdown")));
-      }
+    const refusals = await this.withAdmission(async () => {
+      const tasks = this.queue.map((entry) => this.refuseQueued(entry, "executor shutdown"));
       for (const vm of this.pool) {
         this.clearIdleTimer(vm);
         if (!vm.busy && !vm.stopped && !vm.quarantined) await this.stopVm(vm);
       }
+      return tasks;
     });
+    await Promise.allSettled(refusals);
     // Do not interrupt a healthy command. Its release stops the VM immediately
     // while closed; no new idle countdown is installed during shutdown.
     await Promise.allSettled(pending);
@@ -306,7 +303,7 @@ export class OffloadExecutor {
 
   private async executeVolatile(command: OffloadCommand): Promise<OffloadResult> {
     const key = this.cacheKey(command);
-    const digest = digestOf(command);
+    const digest = commandDigest(command);
     const seen = this.journal.get(key);
     if (seen) {
       if (seen.digest !== digest) {
@@ -366,6 +363,8 @@ export class OffloadExecutor {
 
   private async claimSlot(command: OffloadCommand): Promise<Claim> {
     if (this.closed) return { kind: "unavailable", reason: "executor shutdown" };
+    const cancelled = this.durable?.preStartResult(command);
+    if (cancelled?.status === "unavailable") return { kind: "unavailable", reason: cancelled.reason };
     // Warmest idle first (running, not stopped or uncertain).
     let best: PoolVm | null = null;
     for (const vm of this.pool) {
@@ -414,23 +413,52 @@ export class OffloadExecutor {
     }
     const timeoutMs = command.queueTimeoutMs ?? this.config.queueTimeoutMs;
     let resolveWait!: Queued["resolve"];
-    const wait = new Promise<Dispatch>((resolve) => {
+    let rejectWait!: Queued["reject"];
+    const wait = new Promise<Dispatch>((resolve, reject) => {
       resolveWait = resolve;
+      rejectWait = reject;
     });
-    const entry: Queued = { command, resolve: resolveWait, timerHandle: null };
+    const entry: Queued = { command, resolve: resolveWait, reject: rejectWait, timerHandle: null, refusal: null };
     // Queue expiry and dispatch compare-and-transition under the same lock.
     entry.timerHandle = this.timers.set(() => {
       void this.withAdmission(async () => {
-        const at = this.queue.indexOf(entry);
-        if (at < 0) return;
-        const result = this.finish(this.cacheKey(command), this.unavailable(command, `queue timeout after ${timeoutMs} ms`));
-        this.queue.splice(at, 1);
-        entry.timerHandle = null;
-        entry.resolve(result);
-      });
+        if (!this.queue.includes(entry)) return;
+        void this.refuseQueued(entry, `queue timeout after ${timeoutMs} ms`);
+      }).catch(() => this.logger.warn("boat offload queue timeout could not acquire admission", { commandId: command.commandId }));
     }, timeoutMs);
     this.queue.push(entry);
     return { kind: "queued", wait };
+  }
+
+  private async cancelQueued(command: OffloadCommand, result: OffloadResult): Promise<void> {
+    await this.withAdmission(async () => {
+      const at = this.queue.findIndex((entry) => this.cacheKey(entry.command) === this.cacheKey(command));
+      if (at < 0) return;
+      const [entry] = this.queue.splice(at, 1);
+      if (entry!.timerHandle != null) this.timers.clear(entry!.timerHandle);
+      entry!.timerHandle = null;
+      entry!.resolve(this.finish(this.cacheKey(command), result));
+    });
+  }
+
+  // Called under admission, but never await storage while holding that lock.
+  // A refusing (including failed-refusal) entry occupies capacity and cannot
+  // receive a VM until its durable never-started result has been committed.
+  private refuseQueued(entry: Queued, reason: string): Promise<void> {
+    if (entry.refusal) return entry.refusal;
+    if (entry.timerHandle != null) this.timers.clear(entry.timerHandle);
+    entry.timerHandle = null;
+    entry.refusal = (async () => {
+      let result = this.unavailable(entry.command, reason);
+      try {
+        if (this.durable) result = await this.durable.finish(entry.command, result);
+        await this.cancelQueued(entry.command, result);
+      } catch (error) {
+        entry.reject(error);
+        this.logger.warn("boat offload queue refusal uncommitted; slot retained", { commandId: entry.command.commandId });
+      }
+    })();
+    return entry.refusal;
   }
 
   private async budgetRefusal(): Promise<string | null> {
@@ -448,7 +476,7 @@ export class OffloadExecutor {
 
   private async runOnVm(vm: PoolVm, command: OffloadCommand, warm: OffloadWarm, queueWaitMs: number): Promise<OffloadResult> {
     const startedAt = this.now();
-    let result: Extract<OffloadResult, { status: "completed" | "unknown" }>;
+    let result: OffloadResult;
     try {
       const { exitCode, seconds } = await this.runCommand(vm.sandboxId, command);
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
@@ -459,12 +487,16 @@ export class OffloadExecutor {
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: "command transport failed; reconcile the guest receipt before replay or VM reuse" };
     }
     try {
-      if (this.durable) await this.durable.finish(command, result);
+      if (this.durable) result = await this.durable.finish(command, result);
     } catch (error) {
       await this.quarantineVm(vm, command);
       throw error;
     }
     this.finish(this.cacheKey(command), result);
+    if (result.status === "unavailable") {
+      await this.releaseVm(vm);
+      return result;
+    }
     this.usage.push({ commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId, sandboxId: vm.sandboxId, warm, queueWaitMs, seconds: result.seconds, dollars: result.dollars, exitCode: result.exitCode, outcome: result.status, estimated: result.status === "unknown", at: new Date(this.now()).toISOString() });
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
@@ -501,7 +533,8 @@ export class OffloadExecutor {
     await this.withAdmission(async () => {
       vm.lastActiveAt = this.now();
       if (!this.closed) {
-        const next = this.queue.shift();
+        const nextAt = this.queue.findIndex((entry) => !entry.refusal);
+        const next = nextAt >= 0 ? this.queue.splice(nextAt, 1)[0] : undefined;
         if (next) {
           if (next.timerHandle != null) this.timers.clear(next.timerHandle);
           next.timerHandle = null;
