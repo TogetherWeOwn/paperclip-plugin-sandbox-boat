@@ -77,6 +77,7 @@ export interface StateClientLike {
     input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string },
     value: unknown,
   ): Promise<void>;
+  delete(input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string }): Promise<void>;
 }
 
 const NAMESPACE = "boat-sandbox";

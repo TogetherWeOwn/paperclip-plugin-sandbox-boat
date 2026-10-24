@@ -61,6 +61,8 @@ import type { SshSession } from "./ssh.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
+import { NeverDispatchBackend, OffloadBroker, type OffloadJournalStore } from "./offload/broker.js";
+import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
 const UP_STATES = new Set(["init", "provisioning", "provisioned", "cloning", "ready", "idle", "running"]);
@@ -124,10 +126,18 @@ export interface IssueReader {
   get(issueId: string, companyId: string): Promise<{ status?: string | null } | null>;
 }
 
+export interface ExecutionWorkspaceReader {
+  get(
+    workspaceId: string,
+    companyId: string,
+  ): Promise<{ repoUrl: string | null; projectId: string; projectWorkspaceId: string | null; path: string | null; cwd: string | null } | null>;
+}
+
 export interface ManagerDeps {
   state: StateClientLike;
   logger: ManagerLogger;
   issues?: IssueReader | null;
+  executionWorkspaces?: ExecutionWorkspaceReader | null;
   ssh?: SshManager;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -208,6 +218,9 @@ export class BoatVmManager {
   private readonly ssh: SshManager;
   private readonly logger: ManagerLogger;
   private readonly issues: IssueReader | null;
+  private readonly executionWorkspaces: ExecutionWorkspaceReader | null;
+  private readonly offloadState: StateClientLike;
+  private readonly offloadBrokers = new Map<string, OffloadBroker>();
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly locks = new Map<string, Promise<unknown>>();
@@ -231,9 +244,75 @@ export class BoatVmManager {
     this.store = new VmStateStore(deps.state);
     this.logger = deps.logger;
     this.issues = deps.issues ?? null;
+    this.executionWorkspaces = deps.executionWorkspaces ?? null;
+    this.offloadState = deps.state;
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.ssh = deps.ssh ?? new SshManager(deps.logger, this.sleep);
+  }
+
+  // ---------------------------------------------------------------- offload
+
+  private offloadStore(companyId: string): OffloadJournalStore {
+    const state = this.offloadState;
+    const scope = (stateKey: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey });
+    return {
+      get: async (key) => state.get(scope(key)),
+      set: async (key, value) => {
+        await state.set(scope(key), value);
+      },
+      delete: async (key) => {
+        await state.delete(scope(key));
+      },
+    };
+  }
+
+  private offloadBroker(companyId: string): OffloadBroker {
+    let broker = this.offloadBrokers.get(companyId);
+    if (!broker) {
+      // Until the TOG-38024 executor grows start/cancel, every submit journals
+      // not_started and the shim falls back locally: safe by construction.
+      broker = new OffloadBroker({ store: this.offloadStore(companyId), backend: new NeverDispatchBackend(), now: this.now });
+      this.offloadBrokers.set(companyId, broker);
+    }
+    return broker;
+  }
+
+  private offloadRouteHost(companyId: string) {
+    const workspaces = this.executionWorkspaces;
+    return {
+      broker: this.offloadBroker(companyId),
+      workspaces: {
+        get: async (workspaceId: string, company: string) => (workspaces ? workspaces.get(workspaceId, company) : null),
+      },
+      profile: V1_PROFILE,
+    };
+  }
+
+  async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
+    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId));
+  }
+
+  async offloadRead(
+    companyId: string,
+    actor: RouteActor,
+    params: { commandId?: string },
+    query: Record<string, string | string[]>,
+  ): Promise<{ status: number; body: unknown }> {
+    return handleRead({ actor, companyId, params, query }, this.offloadRouteHost(companyId));
+  }
+
+  async offloadHeartbeat(companyId: string, actor: RouteActor, params: { commandId?: string }): Promise<{ status: number; body: unknown }> {
+    return handleHeartbeat({ actor, companyId, params }, this.offloadRouteHost(companyId));
+  }
+
+  async offloadCancel(
+    companyId: string,
+    actor: RouteActor,
+    params: { commandId?: string },
+    body: unknown,
+  ): Promise<{ status: number; body: unknown }> {
+    return handleCancel({ actor, companyId, params, body }, this.offloadRouteHost(companyId));
   }
 
   // ---------------------------------------------------------------- helpers

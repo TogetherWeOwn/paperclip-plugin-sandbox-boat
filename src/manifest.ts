@@ -24,6 +24,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "jobs.schedule",
     "api.routes.register",
     "issues.read",
+    "execution.workspaces.read",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -53,6 +54,34 @@ const manifest: PaperclipPluginManifestV1 = {
       auth: "board",
       capability: "api.routes.register",
       companyResolution: { from: "body", key: "companyId" },
+    },
+    {
+      routeKey: "offload_exec",
+      method: "POST",
+      path: "/offload/exec",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
+    {
+      routeKey: "offload_read",
+      method: "GET",
+      path: "/offload/commands/:commandId",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
+    {
+      routeKey: "offload_heartbeat",
+      method: "POST",
+      path: "/offload/commands/:commandId/heartbeat",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
+    {
+      routeKey: "offload_cancel",
+      method: "POST",
+      path: "/offload/commands/:commandId/cancel",
+      auth: "agent",
+      capability: "api.routes.register",
     },
   ],
   environmentDrivers: [
