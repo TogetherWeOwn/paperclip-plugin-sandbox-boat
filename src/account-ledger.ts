@@ -83,6 +83,7 @@ interface AccountDoc {
   intents: Intent[];
   usage: AccountUsageRow[];
   countedResumeUntil: number | null;
+  reconcileCursor?: number;
 }
 export interface AdmissionRequest {
   operation: Intent["operation"];
@@ -422,7 +423,14 @@ export class AccountLedger {
     await this.locked(async () => {
       const doc = await this.read();
       try { await this.observe(api, doc, allowCachedLimits); } catch { /* Never free a reservation on unreadable limits. */ }
-      const ids = [...new Set(doc.intents.map((i) => i.sandboxId).filter((id): id is string => id != null))].slice(0, 100);
+      const all = [...new Set(doc.intents.map((i) => i.sandboxId).filter((id): id is string => id != null))];
+      const active = new Set(doc.intents.filter((i) => i.active && i.sandboxId != null).map((i) => i.sandboxId!));
+      const history = all.filter((id) => !active.has(id));
+      const cursor = Number.isSafeInteger(doc.reconcileCursor) && doc.reconcileCursor! >= 0 ? doc.reconcileCursor! % Math.max(1, history.length) : 0;
+      // Live holds always get a terminal-receipt check. Rotate historical bills
+      // so an old hundred-VM prefix cannot starve new holds or late corrections.
+      const ids = [...active, ...history.slice(cursor), ...history.slice(0, cursor)].slice(0, 100);
+      doc.reconcileCursor = (cursor + Math.max(0, ids.length - active.size)) % Math.max(1, history.length);
       for (const id of ids) {
         try {
           const listed = inventory?.find((vm) => vm.id === id);

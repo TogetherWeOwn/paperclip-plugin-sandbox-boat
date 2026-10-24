@@ -28,7 +28,7 @@ Each offload command has a stable usage record ID, sanitized identity metadata a
 
 `reconcile()` updates the same rows when provider readings arrive, including after reconstruction. Missing readings stay pending. A failed multi-read correction does not overwrite an already-converged provider bill. Interval totals are compared with the full provider reading, allowing bounded SDK rounding (USD is rounded to six decimals).
 
-The existing whole-run worker sweep invokes account reconciliation and reuses its provider inventory. This recovers terminal holds and pending usage without adding an HTTP route or enabling offload execution. Direct executor reconciliation is also available to the future pool owner. The current sweep's cadence is still not a promise of a 15-second crash-recovery stop.
+Each reconciliation pass prioritizes live holds and rotates the historical VM subset using a persisted cursor, so old bills cannot starve recent terminal receipts. The existing whole-run worker sweep invokes account reconciliation and reuses its provider inventory. This recovers terminal holds and pending usage without adding an HTTP route or enabling offload execution. Direct executor reconciliation is also available to the future pool owner. The current sweep's cadence is still not a promise of a 15-second crash-recovery stop.
 
 ## Verification boundary
 
