@@ -25,7 +25,9 @@ vi.mock("node:child_process", async () => {
         return transport.actual("/nonexistent-ssh-test-only", [], options);
       }
       if (mode === "timeout") {
-        return transport.actual("sh", ["-c", "sleep 15"], options);
+        // exec: dash would fork sleep as a grandchild that outlives the
+        // timeout kill and trips the loopback runner's fail-closed teardown.
+        return transport.actual("sh", ["-c", "exec sleep 15"], options);
       }
       if (!finalization && mode === "error") {
         return transport.actual("sh", ["-c", "printf fast; exit 19"], options);
