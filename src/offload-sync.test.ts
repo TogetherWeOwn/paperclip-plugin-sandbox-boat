@@ -998,6 +998,21 @@ describe("LocalGuestStore.push metadata-only sync", () => {
 });
 
 describe("LocalGuestStore.readBounded", () => {
+  /** Test double: an open hook whose handle stats `size` but streams `chunks`. */
+  function fakeOpen({ size, chunks }: { size: number; chunks: Buffer[] }): typeof fsp.open {
+    const handle = {
+      stat: async () => ({ isFile: () => true, size }),
+      createReadStream: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield* chunks;
+        },
+        destroy() {},
+      }),
+      close: async () => {},
+    };
+    return (async () => handle) as unknown as typeof fsp.open;
+  }
+
   it("returns bytes within the cap, null past it, and never follows links", async () => {
     const guest = makeTemp();
     writeTree(guest, { "small.snap": "s\n", "big.snap": `${"x".repeat(100)}\n` });
@@ -1016,6 +1031,23 @@ describe("LocalGuestStore.readBounded", () => {
     symlinkSync(outside, path.join(guest, "sub"));
     const store = new LocalGuestStore();
     await expect(store.readBounded(guest, "sub/secret.txt", 1024)).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+  });
+
+  it("returns null when the stream outgrows the cap even though stat passed", async () => {
+    const guest = makeTemp();
+    writeTree(guest, { "small.snap": "s\n" });
+    // Stats 2 bytes (passes both pre-checks) but streams 24: a guest file that
+    // grew between stat and read, or a size-zero reporter like /proc/version.
+    const chunks = [Buffer.alloc(8, 1), Buffer.alloc(8, 2), Buffer.alloc(8, 3)];
+    const store = new LocalGuestStore({ open: fakeOpen({ size: 2, chunks }) });
+    await expect(store.readBounded(guest, "small.snap", 16)).resolves.toBeNull();
+  });
+
+  it("returns bytes when the hooked stream stays within the cap", async () => {
+    const guest = makeTemp();
+    writeTree(guest, { "small.snap": "s\n" });
+    const store = new LocalGuestStore({ open: fakeOpen({ size: 2, chunks: [Buffer.from("abc")] }) });
+    expect((await store.readBounded(guest, "small.snap", 16))?.toString()).toBe("abc");
   });
 });
 

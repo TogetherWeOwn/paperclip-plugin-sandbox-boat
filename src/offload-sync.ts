@@ -454,6 +454,8 @@ export interface GuestStore {
 export interface LocalGuestStoreOptions {
   /** Test hook: runs before each copy or metadata fix; throwing aborts the push mid-transfer. */
   beforeCopy?: (entry: SyncFileEntry) => void;
+  /** Test hook: opens guest files for bounded reads; defaults to fsp.open. Lets tests stream more bytes than stat reported. */
+  open?: typeof fsp.open;
 }
 
 export class LocalGuestStore implements GuestStore {
@@ -568,9 +570,10 @@ export class LocalGuestStore implements GuestStore {
     const abs = await resolveContained(path.resolve(guestDir), relPath);
     const pre = await fsp.lstat(abs).catch(() => null);
     if (!pre || !pre.isFile() || pre.size > maxBytes) return null;
+    const open = this.opts.open ?? fsp.open;
     let handle: fsp.FileHandle;
     try {
-      handle = await fsp.open(abs, O_RDONLY | O_NOFOLLOW);
+      handle = await open(abs, O_RDONLY | O_NOFOLLOW);
     } catch (error) {
       if (isGuestVanished(error) || (error as { code?: string })?.code === "ELOOP") return null;
       throw error;
