@@ -32,6 +32,10 @@ function submitFor(commandId: string = CMD): OffloadSubmitRequest {
   };
 }
 
+function persisted(store: MapStore): unknown {
+  return store.data.get(`offload.cmd.${CMD}`);
+}
+
 class MapStore implements OffloadJournalStore {
   readonly data = new Map<string, unknown>();
   async get(key: string): Promise<unknown> {
@@ -312,6 +316,7 @@ describe("journal write failures and sweep cost", () => {
     expect(cancelled.state).toBe("unknown");
     expect(cancelled.fallbackSafe).toBe(false);
     expect(readBody(await broker.read(CMD, PRINCIPAL, 0)).fallbackSafe).toBe(false);
+    expect(persisted(store)).toMatchObject({ state: "unknown", fallbackSafe: false });
   });
 
   it("does not serve a complete result after an output write was lost", async () => {
@@ -333,6 +338,32 @@ describe("journal write failures and sweep cost", () => {
     const view = readBody(await broker.read(CMD, PRINCIPAL, 0));
     expect(view.state).toBe("unknown");
     expect(view.fallbackSafe).toBe(false);
+    // The raw journal, not just the in-process view, must keep the hold: a
+    // restarted worker has no poison set and serves the persisted state as-is.
+    expect(persisted(store)).toMatchObject({ state: "unknown", fallbackSafe: false });
+  });
+
+  it("keeps the persisted unknown hold when a started() write is lost and the backend then fails to start", async () => {
+    const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
+    const store = new MapStore();
+    const backend = new FakeBackend();
+    const broker = new OffloadBroker({ store, backend, now: () => clock.t });
+    await broker.submit(submitFor(), PRINCIPAL);
+    const realSet = store.set.bind(store);
+    store.set = async () => {
+      store.set = realSet;
+      throw new Error("transient write loss");
+    };
+    const sink = backend.starts[0]!.sink;
+    sink.started();
+    sink.failToStart("cancelled during start");
+    await broker.read(CMD, PRINCIPAL, 0);
+    expect(persisted(store)).toMatchObject({ state: "unknown", fallbackSafe: false });
+    // A restarted broker over the same journal must not offer the local fallback.
+    const restarted = new OffloadBroker({ store, backend: new FakeBackend(), now: () => clock.t });
+    const view = readBody(await restarted.read(CMD, PRINCIPAL, 0));
+    expect(view.fallbackSafe).toBe(false);
+    expect(view.state).not.toBe("not_started");
   });
 
   it("stops scanning terminal commands: a heartbeat reads only live work", async () => {

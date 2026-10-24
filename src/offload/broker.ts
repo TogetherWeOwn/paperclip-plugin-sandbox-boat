@@ -521,6 +521,9 @@ export class OffloadBroker {
         try {
           const record = await this.load(commandId);
           if (!record || TERMINAL.has(record.state)) return;
+          // Later backend callbacks must not move a poisoned record: the
+          // persisted unknown hold stands until the executor reconciles it.
+          if (this.poisoned.has(commandId)) return;
           const { save, after } = fn(record);
           if (save) await this.save(record);
           after?.();
