@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { cancelRemoteCommand, parseRunMarker, stripRunMarker, wrapRemoteCommand } from "./shell.js";
+import { cancelRemoteCommand, stripRunMarker, wrapRemoteCommand } from "./shell.js";
 
 export interface SshEndpoint {
   host: string;
@@ -271,27 +271,30 @@ export class SshManager {
       ...commonSshOptions(session, key.privateKeyPath),
       `${session.endpoint.user}@${session.endpoint.host}`, command,
     ];
-    // Fresh hex id per call, so the remote marker cannot collide with payload output.
+    // The caller knows this identity BEFORE submitting work. Neither admission
+    // revocation nor group cancellation depends on receiving a stderr marker.
     const runId = randomUUID().replace(/-/g, "");
-    const result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId)), options);
-    const stderr = stripRunMarker(result.stderr, runId);
-    if (!result.timedOut) return { ...result, stderr };
-    // The local client is dead, but closing a multiplexed channel does not stop
-    // the VM-side job. Cancel it over a fresh channel on the same master, and
-    // only then report the timeout, so nothing changes the VM after we return.
-    // The master itself is never signalled; a wedged master only fails this
-    // best-effort cancellation, never the timeout result.
-    const pgid = parseRunMarker(result.stderr, runId);
-    if (pgid !== null) {
+    let result: SshExecutionResult | undefined;
+    try {
+      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true)), options);
+      return { ...result, stderr: stripRunMarker(result.stderr, runId) };
+    } finally {
+      // Local pipe/cap errors throw, while timeouts return a result. Both must
+      // finish bounded remote cleanup BEFORE releasing activity/rejecting. On
+      // success this also removes the registration and any background children.
+      // Never signal the shared master, and never replace the original failure.
       try {
-        await runStreamProcess("ssh", slave(cancelRemoteCommand(pgid)), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
+        const cleanup = await runStreamProcess("ssh", slave(cancelRemoteCommand(runId)), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
+        if (cleanup.timedOut || cleanup.exitCode !== 0) {
+          throw new Error(`Remote command cleanup failed: ${cleanup.stderr.trim() || "timeout or nonzero exit"}`);
+        }
       } catch (error) {
-        this.logger.warn("boat: timed-out remote command may still be running; cancellation failed", {
+        this.logger.warn("boat: remote command cleanup failed; remote work may still be running", {
           sandboxId: session.sandboxId, reason: (error as Error).message,
         });
+        if (result && !result.timedOut && result.exitCode === 0) throw error;
       }
     }
-    return { ...result, stderr };
   }
 
   async closeSession(sandboxId: string): Promise<void> {
