@@ -97,7 +97,7 @@ export function readBudget(response: unknown): BudgetSnapshot {
   };
 }
 
-export function checkBudget(snapshot: BudgetSnapshot, config: BoatDriverConfig, size: BoatSize): BudgetRefusal | null {
+export function checkBudget(snapshot: BudgetSnapshot, config: Pick<BoatDriverConfig, "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">, size: BoatSize): BudgetRefusal | null {
   const nothingStarted = "Nothing was started or billed.";
   if (!snapshot.canStart) {
     return {
