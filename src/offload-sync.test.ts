@@ -17,6 +17,7 @@ import {
   isReturnEligible,
   planPush,
   renderFilesFromList,
+  resolveContained,
 } from "./offload-sync.js";
 
 function makeTemp(): string {
@@ -619,6 +620,7 @@ describe("rsync transport spec", () => {
     expect(joined).not.toContain("--delete");
     expect(joined).toContain("ControlPath=/tmp/pcboat/abc.ctl");
     expect(joined).toContain("ControlMaster=no");
+    expect(joined).toContain("ForwardAgent=no");
     expect(joined).toContain("HostKeyAlias=sandbox-abc");
     expect(joined).toContain("user@10.0.0.9:/home/user/card-1");
     for (const exclude of ["target/", ".git/", "node_modules/", ".paperclip-runtime/", ".env"]) {
@@ -635,5 +637,239 @@ describe("rsync transport spec", () => {
 describe("SyncError", () => {
   it("carries a machine-readable code", () => {
     expect(new SyncError("SYNC_TRAVERSAL", "nope").code).toBe("SYNC_TRAVERSAL");
+  });
+});
+
+function raceErr(code: string): NodeJS.ErrnoException {
+  const err = new Error(`simulated ${code} race`) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+describe("captureManifest structural races", () => {
+  it("retries when a file vanishes between readdir and lstat", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/a.rs": "a\n", "src/b.rs": "b\n" });
+    let calls = 0;
+    const realLstat = fsp.lstat;
+    const fs = {
+      ...fsp,
+      lstat: (async (p: string) => {
+        calls += 1;
+        if (calls === 1) throw raceErr("ENOENT");
+        return realLstat(p);
+      }) as typeof fsp.lstat,
+    };
+    const { manifest } = await captureManifest(root, { fs });
+    expect(manifest.files.map((f) => f.path).sort()).toEqual(["src/a.rs", "src/b.rs"]);
+  });
+
+  it("retries when a directory vanishes between stack push and readdir", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/a.rs": "a\n" });
+    let calls = 0;
+    const realReaddir = fsp.readdir;
+    const fs = {
+      ...fsp,
+      readdir: (async (p: string, opts: { withFileTypes: true }) => {
+        calls += 1;
+        if (calls === 2) throw raceErr("ENOENT");
+        return realReaddir(p, opts);
+      }) as unknown as typeof fsp.readdir,
+    };
+    const { manifest } = await captureManifest(root, { fs });
+    expect(manifest.files.map((f) => f.path)).toEqual(["src/a.rs"]);
+  });
+
+  it("reports never-started when the tree races on both attempts", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/a.rs": "a\n" });
+    const fs = {
+      ...fsp,
+      lstat: (async (_p: string) => {
+        throw raceErr("ENOENT");
+      }) as typeof fsp.lstat,
+    };
+    await expect(captureManifest(root, { fs })).rejects.toMatchObject({ code: "SYNC_CONCURRENT_EDIT" });
+  });
+});
+
+describe("captureSnapshot freeze races", () => {
+  it("recaptures when a source file vanishes between hashing and copying", async () => {
+    const root = makeTemp();
+    const snapDir = makeTemp();
+    writeTree(root, { "src/a.rs": "v1\n" });
+    let copies = 0;
+    const realCopyFile = fsp.copyFile;
+    const fs = {
+      ...fsp,
+      copyFile: (async (src: string, dest: string) => {
+        if (src === path.join(root, "src/a.rs") && copies === 0) {
+          copies += 1;
+          throw raceErr("ENOENT");
+        }
+        return realCopyFile(src, dest);
+      }) as typeof fsp.copyFile,
+    };
+    const { manifest } = await captureSnapshot(root, snapDir, { fs });
+    expect(manifest.files.map((f) => f.path)).toEqual(["src/a.rs"]);
+    expect(readFileSync(path.join(snapDir, "src/a.rs"), "utf8")).toBe("v1\n");
+  });
+});
+
+describe("planPush metadata changes", () => {
+  it("sends a mode-only change so a chmod +x build script does not stay stale", async () => {
+    const root = makeTemp();
+    writeTree(root, { "scripts/build.sh": "echo hi\n" });
+    const abs = path.join(root, "scripts/build.sh");
+    chmodSync(abs, 0o644);
+    const before = (await captureManifest(root)).manifest;
+    chmodSync(abs, 0o755);
+    const after = (await captureManifest(root)).manifest;
+    expect(planPush(before, after).toSend.map((f) => f.path)).toEqual(["scripts/build.sh"]);
+  });
+
+  it("sends an mtime-only change so touched files keep cargo fingerprints honest", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/a.rs": "a\n" });
+    const before = (await captureManifest(root)).manifest;
+    const abs = path.join(root, "src/a.rs");
+    const later = new Date(Date.now() + 5000);
+    utimesSync(abs, later, later);
+    const after = (await captureManifest(root)).manifest;
+    expect(planPush(before, after).toSend.map((f) => f.path)).toEqual(["src/a.rs"]);
+  });
+});
+
+describe("LocalGuestStore.push metadata-only sync", () => {
+  it("applies a mode change without rewriting bytes", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "scripts/build.sh": "echo hi\n" });
+    chmodSync(path.join(live, "scripts/build.sh"), 0o644);
+    const store = new LocalGuestStore();
+    const first = await captureSnapshot(live, snapDir);
+    await store.push(snapDir, planPush(null, first.manifest).toSend, guest);
+    chmodSync(path.join(live, "scripts/build.sh"), 0o755);
+    const second = await captureSnapshot(live, snapDir);
+    const plan = planPush(first.manifest, second.manifest);
+    expect(plan.toSend.map((f) => f.path)).toEqual(["scripts/build.sh"]);
+    const result = await store.push(snapDir, plan.toSend, guest);
+    expect(result.files).toBe(1);
+    expect(result.bytes).toBe(0);
+    expect(lstatSync(path.join(guest, "scripts/build.sh")).mode & 0o777).toBe(0o755);
+    expect(readFileSync(path.join(guest, "scripts/build.sh"), "utf8")).toBe("echo hi\n");
+  });
+
+  it("applies an mtime-only change in place", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "src/a.rs": "a\n" });
+    const store = new LocalGuestStore();
+    const first = await captureSnapshot(live, snapDir);
+    await store.push(snapDir, planPush(null, first.manifest).toSend, guest);
+    const liveAbs = path.join(live, "src/a.rs");
+    const later = new Date(Date.now() + 5000);
+    utimesSync(liveAbs, later, later);
+    const second = await captureSnapshot(live, snapDir);
+    const plan = planPush(first.manifest, second.manifest);
+    expect(plan.toSend.map((f) => f.path)).toEqual(["src/a.rs"]);
+    const result = await store.push(snapDir, plan.toSend, guest);
+    expect(result.files).toBe(1);
+    expect(result.bytes).toBe(0);
+    expect(Math.floor(lstatSync(path.join(guest, "src/a.rs")).mtimeMs)).toBe(Math.floor(later.getTime()));
+  });
+});
+
+describe("LocalGuestStore.readBounded", () => {
+  it("returns bytes within the cap, null past it, and never follows links", async () => {
+    const guest = makeTemp();
+    writeTree(guest, { "small.snap": "s\n", "big.snap": `${"x".repeat(100)}\n` });
+    symlinkSync("small.snap", path.join(guest, "link.snap"));
+    const store = new LocalGuestStore();
+    expect((await store.readBounded(guest, "small.snap", 1024))?.toString()).toBe("s\n");
+    expect(await store.readBounded(guest, "big.snap", 8)).toBeNull();
+    expect(await store.readBounded(guest, "link.snap", 1024)).toBeNull();
+    expect(await store.readBounded(guest, "missing.snap", 1024)).toBeNull();
+  });
+
+  it("refuses reads through a symlinked parent", async () => {
+    const guest = makeTemp();
+    const outside = makeTemp();
+    writeFileSync(path.join(outside, "secret.txt"), "secret\n");
+    symlinkSync(outside, path.join(guest, "sub"));
+    const store = new LocalGuestStore();
+    await expect(store.readBounded(guest, "sub/secret.txt", 1024)).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+  });
+});
+
+describe("collectAndStage bounded staging", () => {
+  it("skips the read entirely when the scanned size already exceeds the remaining budget", async () => {
+    const live = makeTemp();
+    const guestDir = makeTemp();
+    writeTree(live, { "Cargo.lock": "v1\n" });
+    writeTree(guestDir, { "Cargo.lock": `v1\n${"y".repeat(100)}\n` });
+    const uploaded = (await captureManifest(live)).manifest;
+    const inner = new LocalGuestStore();
+    let reads = 0;
+    const counting = Object.create(inner);
+    counting.readBounded = async (...args: [string, string, number]) => {
+      reads += 1;
+      return inner.readBounded(...args);
+    };
+    counting.read = async (...args: [string, string]) => {
+      reads += 1;
+      // Legacy entry point, kept in the spy so the pre-check test also fails
+      // against an implementation that still reads instead of bounding.
+      return (inner as unknown as { read: (...a: [string, string]) => Promise<Buffer> }).read(...args);
+    };
+    const result = await collectAndStage({
+      liveRoot: live, uploaded, guest: counting, guestDir, stagingDir: path.join(makeTemp(), "cmd-cap"), maxStagedBytes: 8,
+    });
+    expect(result.truncated).toBe(true);
+    expect(reads).toBe(0);
+    expect(result.changes.find((c) => c.path === "Cargo.lock")!.stagedRelPath).toBeNull();
+  });
+});
+
+describe("resolveContained", () => {
+  it("resolves in-mirror paths and rejects lexical traversal", async () => {
+    const root = makeTemp();
+    expect(await resolveContained(root, "a/b.txt")).toBe(path.resolve(root, "a/b.txt"));
+    await expect(resolveContained(root, "../x")).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+  });
+
+  it("rejects paths under a symlinked parent", async () => {
+    const root = makeTemp();
+    const outside = makeTemp();
+    symlinkSync(outside, path.join(root, "sub"));
+    await expect(resolveContained(root, "sub/file.txt")).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+  });
+});
+
+describe("mirror parent-symlink containment", () => {
+  it("refuses pushes through a symlinked mirror parent", async () => {
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    const outside = makeTemp();
+    writeTree(snapDir, { "sub/file.txt": "x\n" });
+    symlinkSync(outside, path.join(guest, "sub"));
+    const store = new LocalGuestStore();
+    await expect(
+      store.push(snapDir, [{ path: "sub/file.txt", size: 2, mtimeMs: 1, mode: 0o644, sha256: "x" }], guest),
+    ).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+    expect(existsSync(path.join(outside, "file.txt"))).toBe(false);
+  });
+
+  it("refuses prune deletes through a symlinked mirror parent", async () => {
+    const guest = makeTemp();
+    const outside = makeTemp();
+    writeFileSync(path.join(outside, "keep.txt"), "keep\n");
+    symlinkSync(outside, path.join(guest, "sub"));
+    const store = new LocalGuestStore();
+    await expect(store.pruneMirror(guest, ["sub/keep.txt"])).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
+    expect(readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep\n");
   });
 });

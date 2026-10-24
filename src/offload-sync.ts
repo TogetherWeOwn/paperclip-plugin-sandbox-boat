@@ -165,6 +165,27 @@ function resolveWithin(root: string, rel: string): string {
   return abs;
 }
 
+/**
+ * resolveWithin plus a parent-link guard: lexical containment cannot see a
+ * symlinked mirror parent redirecting every op below it. The leaf itself may
+ * be a link (callers handle those); any link strictly between the root and the
+ * leaf is refused. Nonexistent middles cannot be links, so the walk continues
+ * upward through them; only a link present at check time is caught.
+ */
+export async function resolveContained(root: string, rel: string): Promise<string> {
+  const abs = resolveWithin(root, rel);
+  const stop = path.resolve(root);
+  let dir = path.dirname(abs);
+  while (dir.startsWith(stop + path.sep)) {
+    const st = await fsp.lstat(dir).catch(() => null);
+    if (st?.isSymbolicLink()) {
+      throw new SyncError("SYNC_TRAVERSAL", `refusing ${JSON.stringify(rel)}: ${dir} is a symlink out of the mirror.`);
+    }
+    dir = path.dirname(dir);
+  }
+  return abs;
+}
+
 async function hashOpenFile(handle: fsp.FileHandle, preSize: number, preMtimeMs: number): Promise<{ bytes: Buffer; size: number; mtimeMs: number }> {
   const before = await handle.stat();
   if (before.size !== preSize || before.mtimeMs !== preMtimeMs) throw new ConcurrentEdit();
@@ -212,35 +233,30 @@ async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExclude
   while (stack.length > 0) {
     const rel = stack.pop()!;
     const abs = rel === "" ? base : path.join(base, rel);
-    const entries = await io.readdir(abs, { withFileTypes: true });
+    const entries = await raceToRetry(() => io.readdir(abs, { withFileTypes: true }));
     const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of sorted) {
       const entryRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
       const entryAbs = path.join(base, entryRel);
       if (entry.isSymbolicLink()) {
-        const target = await io.readlink(entryAbs);
+        const target = await raceToRetry(() => io.readlink(entryAbs));
         if (path.isAbsolute(target) || !withinRoot(base, path.dirname(entryAbs), target)) {
           throw new SyncError("SYNC_ESCAPING_SYMLINK", `refusing symlink ${entryRel} -> ${target}: it leaves the source root.`);
         }
         if (isExcluded(entryRel, false, excludes)) continue;
-        const st = await io.lstat(entryAbs);
+        const st = await raceToRetry(() => io.lstat(entryAbs));
         files.push({ path: entryRel, size: Buffer.byteLength(target), mtimeMs: st.mtimeMs, mode: st.mode & 0o777, sha256: symlinkHash(target), symlink: target });
       } else if (entry.isDirectory()) {
         if (isExcluded(entryRel, true, excludes)) continue;
         stack.push(entryRel);
       } else if (entry.isFile()) {
         if (isExcluded(entryRel, false, excludes)) continue;
-        const pre = await io.lstat(entryAbs);
-        let handle: fsp.FileHandle;
+        const pre = await raceToRetry(() => io.lstat(entryAbs));
+        // Deleted, swapped for a link, or file<->dir exchanged anywhere between
+        // readdir and read: retry the capture instead of throwing a raw errno.
+        const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW));
         try {
-          handle = await io.open(entryAbs, O_RDONLY | O_NOFOLLOW);
-        } catch (error) {
-          // Swapped for a link, or deleted, between readdir and open: retry the capture.
-          if (isRaceError(error)) throw new ConcurrentEdit();
-          throw error;
-        }
-        try {
-          const { bytes: content, size, mtimeMs } = await hashOpenFile(handle, pre.size, pre.mtimeMs);
+          const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs));
           bytes += size;
           if (bytes > maxBytes) throw new SyncError("SYNC_SOURCE_TOO_LARGE", `source under ${root} exceeds the ${maxBytes}-byte cap.`);
           files.push({ path: entryRel, size, mtimeMs, mode: pre.mode & 0o777, sha256: sha256Hex(content) });
@@ -263,7 +279,21 @@ function withinRoot(base: string, linkDir: string, target: string): boolean {
 
 function isRaceError(error: unknown): boolean {
   const code = (error as { code?: string })?.code;
-  return code === "ELOOP" || code === "ENOENT" || code === "ENXIO";
+  // ENOENT/ENOTDIR: deleted or file<->dir swapped mid-walk. ELOOP: swapped for
+  // a link (or O_NOFOLLOW refused one). ENXIO: device node vanished. EISDIR: a
+  // file became a dir between list and read. EINVAL: a link became a regular
+  // file between list and readlink.
+  return code === "ELOOP" || code === "ENOENT" || code === "ENXIO" || code === "ENOTDIR" || code === "EISDIR" || code === "EINVAL";
+}
+
+/** Translate a structural source race into a capture retry; every other error propagates. */
+async function raceToRetry<T>(op: () => Promise<T>): Promise<T> {
+  try {
+    return await op();
+  } catch (error) {
+    if (isRaceError(error)) throw new ConcurrentEdit();
+    throw error;
+  }
 }
 
 /**
@@ -300,7 +330,12 @@ async function freezeAndVerify(root: string, snapshotDir: string, manifest: Sour
       if (frozen !== entry.symlink || symlinkHash(frozen) !== entry.sha256) return false;
       continue;
     }
-    await io.copyFile(src, dest);
+    try {
+      await io.copyFile(src, dest);
+    } catch (error) {
+      if (isRaceError(error)) return false; // Vanished or swapped mid-freeze: recapture.
+      throw error;
+    }
     await io.chmod(dest, entry.mode);
     // Node sets whole milliseconds only; the rsync production path preserves full precision.
     await io.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
@@ -318,12 +353,16 @@ export interface PushPlan {
   bytesToSend: number;
 }
 
-/** Content-hash delta: unchanged trees plan zero files; same-size/same-mtime edits still match by hash. */
+/**
+ * Content-hash delta: unchanged trees plan zero files; same-size/same-mtime
+ * edits still match by hash, while mode/mtime-only edits plan a metadata-only
+ * sync so the guest never keeps a stale executable bit or an older mtime.
+ */
 export function planPush(previous: SourceManifest | null, snapshot: SourceManifest): PushPlan {
   const prev = new Map((previous?.files ?? []).map((f) => [f.path, f]));
   const toSend = snapshot.files.filter((f) => {
     const old = prev.get(f.path);
-    return !old || old.sha256 !== f.sha256 || old.symlink !== f.symlink;
+    return !old || old.sha256 !== f.sha256 || old.symlink !== f.symlink || old.mode !== f.mode || old.mtimeMs !== f.mtimeMs;
   });
   const current = new Set(snapshot.files.map((f) => f.path));
   const toDeleteFromMirror = (previous?.files ?? []).map((f) => f.path).filter((p) => !current.has(p));
@@ -355,11 +394,18 @@ export interface GuestStore {
   push(snapshotDir: string, entries: SyncFileEntry[], guestDir: string): Promise<TransferResult>;
   pruneMirror(guestDir: string, relPaths: string[]): Promise<{ removed: number }>;
   scan(guestDir: string): Promise<Map<string, GuestFileState>>;
-  read(guestDir: string, relPath: string): Promise<Buffer>;
+  /**
+   * Stream one guest file, capped: at most maxBytes are ever buffered. Returns
+   * null when the bytes are unavailable (missing, not a regular file, or over
+   * maxBytes) so the caller keeps metadata and marks the artifact truncated.
+   * Never follows symlinks. Throws SYNC_TRAVERSAL on traversal or a symlinked
+   * parent; other errors propagate.
+   */
+  readBounded(guestDir: string, relPath: string, maxBytes: number): Promise<Buffer | null>;
 }
 
 export interface LocalGuestStoreOptions {
-  /** Test hook: runs before each copy; throwing aborts the push mid-transfer. */
+  /** Test hook: runs before each copy or metadata fix; throwing aborts the push mid-transfer. */
   beforeCopy?: (entry: SyncFileEntry) => void;
 }
 
@@ -373,8 +419,9 @@ export class LocalGuestStore implements GuestStore {
     let bytes = 0;
     let skipped = 0;
     for (const entry of entries) {
-      const dest = resolveWithin(guest, entry.path);
-      if (await guestMatches(dest, entry)) {
+      const dest = await resolveContained(guest, entry.path);
+      const match = await matchGuestEntry(dest, entry);
+      if (match === "identical") {
         skipped += 1;
         continue;
       }
@@ -384,6 +431,10 @@ export class LocalGuestStore implements GuestStore {
       if (entry.symlink !== undefined) {
         await fsp.rm(dest, { recursive: true, force: true });
         await fsp.symlink(entry.symlink, dest);
+      } else if (match === "metadata-only") {
+        // Same bytes: fix the mode/mtime in place without rewriting the file.
+        await fsp.chmod(dest, entry.mode);
+        await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
       } else {
         const st = await fsp.lstat(dest).catch(() => null);
         if (st && (st.isSymbolicLink() || st.isDirectory())) await fsp.rm(dest, { recursive: true, force: true });
@@ -393,7 +444,7 @@ export class LocalGuestStore implements GuestStore {
         await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
       }
       files += 1;
-      bytes += entry.size;
+      bytes += match === "metadata-only" ? 0 : entry.size;
     }
     return { files, bytes, skipped };
   }
@@ -402,7 +453,7 @@ export class LocalGuestStore implements GuestStore {
     const guest = path.resolve(guestDir);
     let removed = 0;
     for (const rel of relPaths) {
-      const abs = resolveWithin(guest, rel);
+      const abs = await resolveContained(guest, rel);
       const st = await fsp.lstat(abs).catch(() => null);
       if (!st || (!st.isFile() && !st.isSymbolicLink())) continue;
       await fsp.rm(abs, { force: true });
@@ -419,14 +470,30 @@ export class LocalGuestStore implements GuestStore {
     while (stack.length > 0) {
       const rel = stack.pop()!;
       const abs = rel === "" ? guest : path.join(guest, rel);
-      const entries = await fsp.readdir(abs, { withFileTypes: true });
+      // Only real directories are ever pushed, but a planted link swapped in
+      // mid-scan must not redirect the descent outside the mirror.
+      const dirSt = await fsp.lstat(abs).catch(() => null);
+      if (!dirSt) continue;
+      if (dirSt.isSymbolicLink()) {
+        throw new SyncError("SYNC_TRAVERSAL", `refusing to descend into symlinked guest dir ${rel === "" ? "." : rel}.`);
+      }
+      const entries = await fsp.readdir(abs, { withFileTypes: true }).catch((error: unknown) => {
+        if (isGuestVanished(error)) return null;
+        throw error;
+      });
+      if (!entries) continue;
       for (const entry of entries) {
         const entryRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
         const entryAbs = path.join(guest, entryRel);
         if (entry.isSymbolicLink()) {
           if (isExcluded(entryRel, false, excludes)) continue;
-          const target = await fsp.readlink(entryAbs);
-          const st = await fsp.lstat(entryAbs);
+          const target = await fsp.readlink(entryAbs).catch((error: unknown) => {
+            if (isGuestVanished(error)) return null;
+            throw error;
+          });
+          if (target === null) continue;
+          const st = await fsp.lstat(entryAbs).catch(() => null);
+          if (!st) continue;
           if (path.isAbsolute(target) || !withinRoot(guest, path.dirname(entryAbs), target)) {
             out.set(entryRel, { size: 0, mtimeMs: st.mtimeMs, sha256: "", escaping: true });
           } else {
@@ -437,33 +504,114 @@ export class LocalGuestStore implements GuestStore {
           stack.push(entryRel);
         } else if (entry.isFile()) {
           if (isExcluded(entryRel, false, excludes)) continue;
-          const content = await fsp.readFile(entryAbs);
-          const st = await fsp.lstat(entryAbs);
-          out.set(entryRel, { size: content.length, mtimeMs: st.mtimeMs, sha256: sha256Hex(content) });
+          const hashed = await hashGuestFile(entryAbs);
+          if (!hashed) continue; // Vanished mid-scan.
+          if ("escaping" in hashed) {
+            out.set(entryRel, { size: 0, mtimeMs: 0, sha256: "", escaping: true });
+          } else {
+            out.set(entryRel, { size: hashed.size, mtimeMs: hashed.mtimeMs, sha256: hashed.sha256 });
+          }
         }
       }
     }
     return out;
   }
 
-  async read(guestDir: string, relPath: string): Promise<Buffer> {
-    const abs = resolveWithin(path.resolve(guestDir), relPath);
-    const st = await fsp.lstat(abs);
-    if (!st.isFile()) throw new SyncError("SYNC_GUEST_READ", `refusing to read non-file ${relPath} from the guest mirror.`);
-    return fsp.readFile(abs);
+  async readBounded(guestDir: string, relPath: string, maxBytes: number): Promise<Buffer | null> {
+    const abs = await resolveContained(path.resolve(guestDir), relPath);
+    const pre = await fsp.lstat(abs).catch(() => null);
+    if (!pre || !pre.isFile() || pre.size > maxBytes) return null;
+    let handle: fsp.FileHandle;
+    try {
+      handle = await fsp.open(abs, O_RDONLY | O_NOFOLLOW);
+    } catch (error) {
+      if (isGuestVanished(error) || (error as { code?: string })?.code === "ELOOP") return null;
+      throw error;
+    }
+    try {
+      const st = await handle.stat();
+      if (!st.isFile() || st.size > maxBytes) return null;
+      // Stream with an enforced cap: a file that grows mid-read still never
+      // buffers more than maxBytes plus one chunk.
+      const stream = handle.createReadStream();
+      const chunks: Buffer[] = [];
+      let total = 0;
+      try {
+        for await (const chunk of stream) {
+          const buf = chunk as Buffer;
+          total += buf.length;
+          if (total > maxBytes) return null;
+          chunks.push(buf);
+        }
+      } finally {
+        stream.destroy();
+      }
+      return Buffer.concat(chunks);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
   }
 }
 
-async function guestMatches(dest: string, entry: SyncFileEntry): Promise<boolean> {
-  const st = await fsp.lstat(dest).catch(() => null);
-  if (!st) return false;
-  if (entry.symlink !== undefined) {
-    if (!st.isSymbolicLink()) return false;
-    return (await fsp.readlink(dest)) === entry.symlink;
+/** The guest changed under us (deleted path): skip it, never crash the collection. */
+function isGuestVanished(error: unknown): boolean {
+  const code = (error as { code?: string })?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+type GuestHash = { size: number; mtimeMs: number; sha256: string } | { escaping: true } | null;
+
+/** Stream-hash one guest file with bounded memory. Null when it vanishes; escaping when it is a link. */
+async function hashGuestFile(abs: string): Promise<GuestHash> {
+  let handle: fsp.FileHandle;
+  try {
+    handle = await fsp.open(abs, O_RDONLY | O_NOFOLLOW);
+  } catch (error) {
+    if ((error as { code?: string })?.code === "ELOOP") return { escaping: true };
+    if (isGuestVanished(error)) return null;
+    throw error;
   }
-  if (!st.isFile()) return false;
-  if (st.size !== entry.size) return false;
-  return sha256Hex(await fsp.readFile(dest)) === entry.sha256;
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) return null;
+    const hash = createHash("sha256");
+    const stream = handle.createReadStream();
+    let size = 0;
+    try {
+      for await (const chunk of stream) {
+        const buf = chunk as Buffer;
+        size += buf.length;
+        hash.update(buf);
+      }
+    } finally {
+      stream.destroy();
+    }
+    return { size, mtimeMs: st.mtimeMs, sha256: hash.digest("hex") };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+type GuestMatch = "identical" | "metadata-only" | "different";
+
+/**
+ * Compare a mirror path against a manifest entry. Same bytes with a stale
+ * mode or mtime is metadata-only: the push fixes it in place without
+ * rewriting the file. Mtimes compare floored, matching what utimes can set.
+ */
+async function matchGuestEntry(dest: string, entry: SyncFileEntry): Promise<GuestMatch> {
+  const st = await fsp.lstat(dest).catch(() => null);
+  if (!st) return "different";
+  if (entry.symlink !== undefined) {
+    if (!st.isSymbolicLink()) return "different";
+    return (await fsp.readlink(dest)) === entry.symlink ? "identical" : "different";
+  }
+  if (!st.isFile()) return "different";
+  if (st.size !== entry.size) return "different";
+  if (sha256Hex(await fsp.readFile(dest)) !== entry.sha256) return "different";
+  const modeOk = (st.mode & 0o777) === (entry.mode & 0o777);
+  const mtimeOk = Math.floor(st.mtimeMs) === Math.floor(entry.mtimeMs);
+  return modeOk && mtimeOk ? "identical" : "metadata-only";
 }
 
 export interface RsyncPushSpec {
@@ -517,6 +665,8 @@ export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, gue
     `ControlPath=${spec.controlPath}`,
     "-o",
     "ControlMaster=no",
+    "-o",
+    "ForwardAgent=no",
     "-o",
     "LogLevel=ERROR",
     "-i",
@@ -608,7 +758,10 @@ export interface CollectOptions {
  * Compare the guest mirror to the uploaded manifest (whatever the command's
  * exit was) and download return-eligible writes into a command-scoped staging
  * directory. Never writes or deletes a live workspace file. Divergent local
- * content yields state conflict with both versions preserved.
+ * content yields state conflict with both versions preserved. Guest bytes are
+ * pre-checked against the staging budget and streamed through a capped read,
+ * so an oversized guest file truncates the artifact instead of exhausting
+ * memory.
  */
 export async function collectAndStage(opts: CollectOptions): Promise<StageResult> {
   void opts.mutationLease;
@@ -646,16 +799,13 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
   let fileIndex = 0;
   for (const change of changes) {
     if (change.op === "proposed-delete" || change.returnedSha256 === null) continue;
-    let content: Buffer;
-    try {
-      content = await opts.guest.read(opts.guestDir, change.path);
-    } catch (error) {
-      if (!isMissingError(error)) throw error;
-      truncated = true; // Vanished between scan and read: metadata is kept, bytes are not.
+    if ((guest.get(change.path)?.size ?? 0) > remaining) {
+      truncated = true; // Too big per the scan: never even open it.
       continue;
     }
-    if (content.length > remaining) {
-      truncated = true;
+    const content = await opts.guest.readBounded(opts.guestDir, change.path, remaining);
+    if (!content) {
+      truncated = true; // Vanished, swapped, or grew past the budget: metadata is kept, bytes are not.
       continue;
     }
     fileIndex += 1;
@@ -742,9 +892,4 @@ async function liveHash(liveRoot: string, rel: string): Promise<string | null> {
   if (st.isSymbolicLink()) return symlinkHash(await fsp.readlink(abs));
   if (!st.isFile()) return null;
   return sha256Hex(await fsp.readFile(abs));
-}
-
-function isMissingError(error: unknown): boolean {
-  const code = (error as { code?: string })?.code;
-  return code === "ENOENT" || code === "ENOTDIR";
 }
