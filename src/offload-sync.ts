@@ -233,17 +233,27 @@ async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExclude
   while (stack.length > 0) {
     const rel = stack.pop()!;
     const abs = rel === "" ? base : path.join(base, rel);
+    if (rel !== "") {
+      // A stacked dir is only a pathname from an earlier listing: a
+      // concurrent dir-to-symlink swap between push and descent must not
+      // redirect the readdir outside the root. The caller-supplied root
+      // itself is exempt (it may legitimately be a link, e.g. macOS tmpdir).
+      const dirSt = await raceToRetry(() => io.lstat(abs));
+      if (dirSt.isSymbolicLink() || !dirSt.isDirectory()) throw new ConcurrentEdit();
+    }
     const entries = await raceToRetry(() => io.readdir(abs, { withFileTypes: true }));
     const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of sorted) {
       const entryRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
       const entryAbs = path.join(base, entryRel);
       if (entry.isSymbolicLink()) {
+        // Excluded names skip before any link validation: target/ as a link
+        // is still target/, whether its target escapes or stays in-root.
+        if (isExcluded(entryRel, false, excludes) || isExcluded(entryRel, true, excludes)) continue;
         const target = await raceToRetry(() => io.readlink(entryAbs));
         if (path.isAbsolute(target) || !withinRoot(base, path.dirname(entryAbs), target)) {
           throw new SyncError("SYNC_ESCAPING_SYMLINK", `refusing symlink ${entryRel} -> ${target}: it leaves the source root.`);
         }
-        if (isExcluded(entryRel, false, excludes)) continue;
         const st = await raceToRetry(() => io.lstat(entryAbs));
         files.push({ path: entryRel, size: Buffer.byteLength(target), mtimeMs: st.mtimeMs, mode: st.mode & 0o777, sha256: symlinkHash(target), symlink: target });
       } else if (entry.isDirectory()) {
@@ -297,10 +307,37 @@ async function raceToRetry<T>(op: () => Promise<T>): Promise<T> {
 }
 
 /**
+ * mkdir -p into a possibly reused snapshot dir, level by level without
+ * following anything: a stale file or link where a directory must be (a past
+ * file->dir type change) is replaced instead of erroring or redirecting the
+ * freeze. Callers may pass a fresh dir or reuse one across captures.
+ */
+async function ensureSnapDir(io: ManifestFs, snap: string, dir: string): Promise<void> {
+  const rel = path.relative(snap, dir);
+  if (rel === "" || rel.startsWith("..")) {
+    await io.mkdir(dir, { recursive: true });
+    return;
+  }
+  let cur = snap;
+  for (const seg of rel.split(path.sep)) {
+    cur = path.join(cur, seg);
+    const st = await io.lstat(cur).catch(() => null);
+    if (!st) {
+      await io.mkdir(cur);
+    } else if (!st.isDirectory()) {
+      await io.rm(cur, { recursive: true, force: true });
+      await io.mkdir(cur);
+    }
+  }
+}
+
+/**
  * Capture the manifest and freeze an immutable copy under snapshotDir: later
  * live edits (or symlink swaps) cannot change what the push sends. Verifies
  * the frozen bytes hash to the manifest; on a hash/copy race retries the
- * whole capture once, then throws SYNC_CONCURRENT_EDIT.
+ * whole capture once, then throws SYNC_CONCURRENT_EDIT. The snapshot dir may
+ * be fresh or reused: stale links, dirs and files from a previous capture
+ * are replaced, so link<->file and file<->dir type changes freeze correctly.
  */
 export async function captureSnapshot(
   root: string,
@@ -320,16 +357,21 @@ async function freezeAndVerify(root: string, snapshotDir: string, manifest: Sour
   const snap = path.resolve(snapshotDir);
   for (const entry of manifest.files) {
     const src = resolveWithin(base, entry.path);
-    const dest = resolveWithin(snap, entry.path);
-    await io.mkdir(path.dirname(dest), { recursive: true });
+    const dest = await resolveContained(snap, entry.path);
+    await ensureSnapDir(io, snap, path.dirname(dest));
     if (entry.symlink !== undefined) {
       // Recreate the captured link; copying would follow the live path instead.
-      await io.rm(dest, { force: true }).catch(() => undefined);
+      // Recursive: a reused dir may hold a stale directory at this path.
+      await io.rm(dest, { recursive: true, force: true }).catch(() => undefined);
       await io.symlink(entry.symlink, dest);
       const frozen = await io.readlink(dest);
       if (frozen !== entry.symlink || symlinkHash(frozen) !== entry.sha256) return false;
       continue;
     }
+    // A reused dir may hold a stale link or directory here: copyFile would
+    // write through the link (or fail on the dir), so only files survive.
+    const destSt = await io.lstat(dest).catch(() => null);
+    if (destSt && !destSt.isFile()) await io.rm(dest, { recursive: true, force: true });
     try {
       await io.copyFile(src, dest);
     } catch (error) {
@@ -531,26 +573,34 @@ export class LocalGuestStore implements GuestStore {
     try {
       const st = await handle.stat();
       if (!st.isFile() || st.size > maxBytes) return null;
-      // Stream with an enforced cap: a file that grows mid-read still never
-      // buffers more than maxBytes plus one chunk.
       const stream = handle.createReadStream();
-      const chunks: Buffer[] = [];
-      let total = 0;
       try {
-        for await (const chunk of stream) {
-          const buf = chunk as Buffer;
-          total += buf.length;
-          if (total > maxBytes) return null;
-          chunks.push(buf);
-        }
+        return await collectStreamCapped(stream, maxBytes);
       } finally {
         stream.destroy();
       }
-      return Buffer.concat(chunks);
     } finally {
       await handle.close().catch(() => undefined);
     }
   }
+}
+
+/**
+ * Drain a byte stream while capping total buffered bytes: returns null the
+ * moment the stream exceeds maxBytes, so a file that grows mid-read still
+ * never buffers more than maxBytes plus one chunk. The caller keeps the
+ * entry's metadata and marks the artifact truncated.
+ */
+export async function collectStreamCapped(stream: AsyncIterable<Buffer | Uint8Array | string>, maxBytes: number): Promise<Buffer | null> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) return null;
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 
 /** The guest changed under us (deleted path): skip it, never crash the collection. */

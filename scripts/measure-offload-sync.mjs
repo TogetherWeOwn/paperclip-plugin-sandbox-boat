@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // Measures the host-side cost of an unchanged-tree delta sync:
-// capture the manifest twice (cold then warm page cache), plan the delta
-// against the previous capture, and push the plan into a temp mirror with
-// LocalGuestStore. Prints per-phase files/bytes/ms plus clock conditions.
+// freeze an immutable snapshot twice (cold then warm page cache), plan the
+// delta against the previous capture, and push the plan from the snapshot
+// into a temp mirror with LocalGuestStore. Prints per-phase files/bytes/ms
+// plus clock conditions.
 //
 // Usage: node scripts/measure-offload-sync.mjs <source-dir>
-// Exit 2 when the warm capture+plan+push exceeds 1000 ms.
+// Exit 2 when the warm snapshot+plan+push exceeds 1000 ms.
 //
 // This covers the host half of the acceptance ("a delta push of an unchanged
 // two-bot-next tree takes 1 s or less on a warm VM"). The warm-VM rsync leg
@@ -15,7 +16,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir, loadavg, cpus } from "node:os";
 import path from "node:path";
-import { captureManifest, planPush, LocalGuestStore } from "../dist/offload-sync.js";
+import { captureSnapshot, planPush, LocalGuestStore } from "../dist/offload-sync.js";
 
 const dir = process.argv[2];
 if (!dir) {
@@ -31,16 +32,20 @@ const conditions = {
   loadavg1m: loadavg()[0],
 };
 
-const cold = await captureManifest(dir);
+// Fresh command-scoped snapshot dirs, matching production: the copy, chmod,
+// utimes and rehash of every file are part of the measured cost.
+const coldSnap = mkdtempSync(path.join(tmpdir(), "offload-sync-snap-cold-"));
+const cold = await captureSnapshot(dir, coldSnap);
+const warmSnap = mkdtempSync(path.join(tmpdir(), "offload-sync-snap-warm-"));
 const warmStart = Date.now();
-const warm = await captureManifest(dir);
-const warmCaptureMs = Date.now() - warmStart;
+const warm = await captureSnapshot(dir, warmSnap);
+const warmSnapshotMs = Date.now() - warmStart;
 const planStart = Date.now();
 const plan = planPush(cold.manifest, warm.manifest);
 const planMs = Date.now() - planStart;
 const mirror = mkdtempSync(path.join(tmpdir(), "offload-sync-measure-"));
 const pushStart = Date.now();
-const pushed = await new LocalGuestStore().push(mirror, plan.toSend, path.join(mirror, "guest"));
+const pushed = await new LocalGuestStore().push(warmSnap, plan.toSend, path.join(mirror, "guest"));
 const pushMs = Date.now() - pushStart;
 void pushed;
 
@@ -49,13 +54,13 @@ const report = {
   sourceDir: dir,
   files: warm.stats.files,
   bytes: warm.stats.bytes,
-  coldCaptureMs: cold.stats.elapsedMs,
-  warmCaptureMs,
+  coldSnapshotMs: cold.stats.elapsedMs,
+  warmSnapshotMs,
   planMs,
   planToSend: plan.toSend.length,
   planToDelete: plan.toDeleteFromMirror.length,
   pushMs,
-  warmTotalMs: warmCaptureMs + planMs + pushMs,
+  warmTotalMs: warmSnapshotMs + planMs + pushMs,
 };
 console.log(JSON.stringify(report, null, 2));
 
@@ -64,6 +69,6 @@ if (plan.toSend.length !== 0 || plan.toDeleteFromMirror.length !== 0) {
   process.exit(2);
 }
 if (report.warmTotalMs > 1000) {
-  console.error(`warm capture+plan+push took ${report.warmTotalMs} ms, over the 1000 ms budget`);
+  console.error(`warm snapshot+plan+push took ${report.warmTotalMs} ms, over the 1000 ms budget`);
   process.exit(2);
 }

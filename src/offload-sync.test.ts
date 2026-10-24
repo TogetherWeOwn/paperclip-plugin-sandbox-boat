@@ -14,6 +14,7 @@ import {
   captureManifest,
   captureSnapshot,
   collectAndStage,
+  collectStreamCapped,
   isReturnEligible,
   planPush,
   renderFilesFromList,
@@ -694,6 +695,137 @@ describe("captureManifest structural races", () => {
   });
 });
 
+describe("captureManifest dir-symlink race", () => {
+  it("retries a transient dir-to-symlink swap instead of capturing outside content", async () => {
+    const root = makeTemp();
+    const outside = makeTemp();
+    writeTree(root, { "a/inner.txt": "inner\n" });
+    writeFileSync(path.join(outside, "secret.txt"), "secret\n");
+    const realReaddir = fsp.readdir;
+    const rootAbs = path.resolve(root);
+    const aAbs = path.join(root, "a");
+    let rootReads = 0;
+    const fs = {
+      ...fsp,
+      readdir: (async (p: string, opts: { withFileTypes: true }) => {
+        if (p === rootAbs) {
+          rootReads += 1;
+          // Transient: restored before the retry lists the root again.
+          if (rootReads === 2) {
+            rmSync(aAbs);
+            mkdirSync(aAbs, { recursive: true });
+            writeFileSync(path.join(aAbs, "inner.txt"), "inner\n");
+          }
+        }
+        const entries = await realReaddir(p, opts);
+        if (p === rootAbs && rootReads === 1) {
+          // Race: dir swapped for a link to outside between listing and descent.
+          rmSync(aAbs, { recursive: true });
+          symlinkSync(outside, aAbs);
+        }
+        return entries;
+      }) as unknown as typeof fsp.readdir,
+    };
+    const { manifest } = await captureManifest(root, { fs });
+    expect(manifest.files.map((f) => f.path)).toEqual(["a/inner.txt"]);
+  });
+
+  it("reports a persistent dir-to-symlink swap instead of following it outside", async () => {
+    const root = makeTemp();
+    const outside = makeTemp();
+    writeTree(root, { "a/inner.txt": "inner\n" });
+    writeFileSync(path.join(outside, "secret.txt"), "secret\n");
+    const realReaddir = fsp.readdir;
+    const rootAbs = path.resolve(root);
+    const aAbs = path.join(root, "a");
+    let swapped = false;
+    const fs = {
+      ...fsp,
+      readdir: (async (p: string, opts: { withFileTypes: true }) => {
+        const entries = await realReaddir(p, opts);
+        if (p === rootAbs && !swapped) {
+          // Race after the listing: the stacked dir is a link by descent time.
+          swapped = true;
+          rmSync(aAbs, { recursive: true });
+          symlinkSync(outside, aAbs);
+        }
+        return entries;
+      }) as unknown as typeof fsp.readdir,
+    };
+    // First attempt retries on the swapped dir; the retry sees a stable
+    // escaping link and reports it precisely instead of following it.
+    await expect(captureManifest(root, { fs })).rejects.toMatchObject({ code: "SYNC_ESCAPING_SYMLINK" });
+  });
+});
+
+describe("captureManifest excluded symlinks", () => {
+  it("skips an excluded dir name even when it is an escaping symlink", async () => {
+    const root = makeTemp();
+    const outside = makeTemp();
+    writeTree(root, { "src/main.rs": "x\n" });
+    symlinkSync(outside, path.join(root, "target"));
+    const { manifest } = await captureManifest(root);
+    expect(manifest.files.map((f) => f.path)).toEqual(["src/main.rs"]);
+  });
+
+  it("skips excluded secret files even when they are escaping symlinks", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/main.rs": "x\n" });
+    symlinkSync("/etc/hostname", path.join(root, ".env"));
+    const { manifest } = await captureManifest(root);
+    expect(manifest.files.map((f) => f.path)).toEqual(["src/main.rs"]);
+  });
+
+  it("skips excluded dir names nested at any depth, in-root or escaping", async () => {
+    const root = makeTemp();
+    const outside = makeTemp();
+    writeTree(root, { "src/main.rs": "x\n", "sub/keep.rs": "y\n" });
+    symlinkSync(outside, path.join(root, "sub/target"));
+    symlinkSync("src", path.join(root, "target"));
+    const { manifest } = await captureManifest(root);
+    expect(manifest.files.map((f) => f.path).sort()).toEqual(["src/main.rs", "sub/keep.rs"]);
+  });
+});
+
+describe("captureManifest open race", () => {
+  it("retries when a file is swapped for a same-size link between lstat and open", async () => {
+    const root = makeTemp();
+    const original = "original-bytes-1";
+    const tampered = "tampered-bytes-!";
+    expect(tampered.length).toBe(original.length);
+    writeTree(root, { "a.txt": original, "decoy.txt": tampered });
+    const fixed = new Date(1_700_000_000_000);
+    const aAbs = path.join(root, "a.txt");
+    utimesSync(aAbs, fixed, fixed);
+    utimesSync(path.join(root, "decoy.txt"), fixed, fixed);
+    let swapped = false;
+    const realOpen = fsp.open;
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        if (p === aAbs && !swapped) {
+          swapped = true;
+          // Transient file->link swap inside open: only O_NOFOLLOW (ELOOP)
+          // distinguishes this from a clean read, because size and mtime match.
+          rmSync(aAbs);
+          symlinkSync("decoy.txt", aAbs);
+          try {
+            return await realOpen(p, flags);
+          } finally {
+            rmSync(aAbs);
+            writeFileSync(aAbs, original);
+            utimesSync(aAbs, fixed, fixed);
+          }
+        }
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+    };
+    const { manifest } = await captureManifest(root, { fs });
+    expect(swapped).toBe(true);
+    expect(manifest.files.find((f) => f.path === "a.txt")!.sha256).toBe(createHash("sha256").update(original).digest("hex"));
+  });
+});
+
 describe("captureSnapshot freeze races", () => {
   it("recaptures when a source file vanishes between hashing and copying", async () => {
     const root = makeTemp();
@@ -714,6 +846,49 @@ describe("captureSnapshot freeze races", () => {
     const { manifest } = await captureSnapshot(root, snapDir, { fs });
     expect(manifest.files.map((f) => f.path)).toEqual(["src/a.rs"]);
     expect(readFileSync(path.join(snapDir, "src/a.rs"), "utf8")).toBe("v1\n");
+  });
+});
+
+describe("captureSnapshot reuse", () => {
+  it("recapturing into a reused dir replaces a stale link with the new file bytes", async () => {
+    const root = makeTemp();
+    const snap = makeTemp();
+    writeTree(root, { "b.txt": "B1\n" });
+    symlinkSync("b.txt", path.join(root, "a.txt"));
+    await captureSnapshot(root, snap);
+    expect(lstatSync(path.join(snap, "a.txt")).isSymbolicLink()).toBe(true);
+    // The live link becomes a regular file; recapture into the same dir.
+    rmSync(path.join(root, "a.txt"));
+    writeFileSync(path.join(root, "a.txt"), "A2\n");
+    const { manifest } = await captureSnapshot(root, snap);
+    const snapA = path.join(snap, "a.txt");
+    expect(lstatSync(snapA).isFile()).toBe(true);
+    expect(readFileSync(snapA, "utf8")).toBe("A2\n");
+    expect(manifest.files.find((f) => f.path === "a.txt")!.sha256).toBe(sha256File(snapA));
+    // The link target was not clobbered through the stale link.
+    expect(readFileSync(path.join(snap, "b.txt"), "utf8")).toBe("B1\n");
+  });
+
+  it("recapturing into a reused dir survives file-dir type changes in both directions", async () => {
+    const root = makeTemp();
+    const snap = makeTemp();
+    writeTree(root, { "sub/inner.txt": "i\n", "flat.txt": "F1\n", "lnk/deep.txt": "d\n", "tgt.txt": "T\n" });
+    await captureSnapshot(root, snap);
+    // dir -> file, file -> dir, dir -> symlink.
+    rmSync(path.join(root, "sub"), { recursive: true });
+    writeFileSync(path.join(root, "sub"), "S2\n");
+    rmSync(path.join(root, "flat.txt"));
+    mkdirSync(path.join(root, "flat.txt"));
+    writeFileSync(path.join(root, "flat.txt/k.txt"), "K\n");
+    rmSync(path.join(root, "lnk"), { recursive: true });
+    symlinkSync("tgt.txt", path.join(root, "lnk"));
+    const { manifest } = await captureSnapshot(root, snap);
+    expect(readFileSync(path.join(snap, "sub"), "utf8")).toBe("S2\n");
+    expect(readFileSync(path.join(snap, "flat.txt/k.txt"), "utf8")).toBe("K\n");
+    expect(lstatSync(path.join(snap, "lnk")).isSymbolicLink()).toBe(true);
+    for (const f of manifest.files) {
+      if (f.symlink === undefined) expect(sha256File(path.join(snap, f.path))).toBe(f.sha256);
+    }
   });
 });
 
@@ -831,6 +1006,45 @@ describe("collectAndStage bounded staging", () => {
     expect(result.truncated).toBe(true);
     expect(reads).toBe(0);
     expect(result.changes.find((c) => c.path === "Cargo.lock")!.stagedRelPath).toBeNull();
+  });
+
+  it("marks truncated when a guest file outgrows the budget mid-read, keeping metadata", async () => {
+    const live = makeTemp();
+    const guestDir = makeTemp();
+    writeTree(live, { "Cargo.lock": "v1\n" });
+    writeTree(guestDir, { "Cargo.lock": "v1\n# g\n" });
+    const uploaded = (await captureManifest(live)).manifest;
+    const inner = new LocalGuestStore();
+    // Small on scan (passes the pre-check) but unreadable past the budget at read time.
+    const growing = Object.create(inner);
+    growing.readBounded = async () => null;
+    const staging = path.join(makeTemp(), "cmd-grow");
+    const result = await collectAndStage({ liveRoot: live, uploaded, guest: growing, guestDir, stagingDir: staging });
+    expect(result.truncated).toBe(true);
+    expect(result.state).toBe("staged");
+    const change = result.changes.find((c) => c.path === "Cargo.lock")!;
+    expect(change.stagedRelPath).toBeNull();
+    expect(change.returnedSha256).not.toBeNull();
+    expect(JSON.parse(readFileSync(path.join(staging, "manifest.json"), "utf8")).truncated).toBe(true);
+  });
+});
+
+describe("collectStreamCapped", () => {
+  it("buffers a stream that stays within the cap", async () => {
+    async function* chunks() {
+      yield Buffer.from("ab");
+      yield Buffer.from("c");
+    }
+    expect((await collectStreamCapped(chunks(), 8))?.toString()).toBe("abc");
+  });
+
+  it("returns null when the stream grows past the cap mid-read", async () => {
+    async function* growing() {
+      yield Buffer.alloc(8, 1);
+      yield Buffer.alloc(8, 2);
+      yield Buffer.alloc(8, 3);
+    }
+    await expect(collectStreamCapped(growing(), 16)).resolves.toBeNull();
   });
 });
 
