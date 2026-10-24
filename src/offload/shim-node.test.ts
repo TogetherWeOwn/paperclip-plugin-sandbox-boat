@@ -56,6 +56,16 @@ describe("createSpawn", () => {
     expect(out).toHaveLength(0);
   });
 
+  it("exposes the child so a caller can forward a signal", async () => {
+    const spawn = createSpawn();
+    const result = await spawn("/bin/sh", ["-c", "sleep 30"], process.env as Record<string, string>, {
+      onSpawn: (kill) => {
+        setTimeout(() => kill("SIGTERM"), 50);
+      },
+    });
+    expect(result.signal).toBe("SIGTERM");
+  });
+
   it("reports a terminating signal", async () => {
     const spawn = createSpawn();
     const result = await spawn("/bin/sh", ["-c", "kill -TERM $$"], process.env as Record<string, string>);

@@ -150,7 +150,10 @@ export class OffloadBroker {
   private readonly backend: OffloadBackend;
   private readonly now: () => number;
   private readonly handles = new Map<string, OffloadBackendHandle>();
+  /** Live (non-terminal) commands only; swept on every heartbeat. */
   private readonly known = new Set<string>();
+  /** Commands whose sink journal write failed: their persisted state is untrustworthy. */
+  private readonly poisoned = new Set<string>();
   private readonly chains = new Map<string, Promise<unknown>>();
 
   constructor(deps: OffloadBrokerDeps) {
@@ -169,7 +172,14 @@ export class OffloadBroker {
 
   private async load(commandId: string): Promise<JournalRecord | null> {
     const raw = await this.store.get(cmdKey(commandId));
-    return (raw ?? null) as JournalRecord | null;
+    const record = (raw ?? null) as JournalRecord | null;
+    if (record && this.poisoned.has(commandId) && record.state !== "unknown") {
+      // A lost sink write may hide a start or output: hold for reconciliation,
+      // never offer the local fallback.
+      record.state = "unknown";
+      record.fallbackSafe = false;
+    }
+    return record;
   }
 
   private async save(record: JournalRecord): Promise<void> {
@@ -254,7 +264,6 @@ export class OffloadBroker {
         terminalAt: now,
       });
       await this.store.set(countKey(principal.runId), count + 1);
-      this.known.add(request.commandId);
     });
   }
 
@@ -284,8 +293,13 @@ export class OffloadBroker {
       record.state = "unknown";
       await this.save(record);
     }
-    this.known.add(commandId);
+    this.trackLive(record);
     return record;
+  }
+
+  private trackLive(record: JournalRecord): void {
+    if (TERMINAL.has(record.state) || record.state === "unknown") this.known.delete(record.commandId);
+    else this.known.add(record.commandId);
   }
 
   async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<BrokerResponse> {
@@ -300,7 +314,7 @@ export class OffloadBroker {
         if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
           return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: request.commandId }) };
         }
-        this.known.add(request.commandId);
+        this.trackLive(existing);
         return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };
       }
       const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
@@ -382,10 +396,12 @@ export class OffloadBroker {
   }
 
   async heartbeat(commandId: string, principal: BrokerAuth): Promise<BrokerResponse> {
-    const at = this.now();
     // Worker-owned expiry rides on client heartbeats (every 5 s while any
     // client is alive); the sweep stays the slower crash backstop.
-    await this.sweepExcept(commandId, at);
+    await this.sweepExcept(commandId, this.now());
+    // Renew from a fresh clock: a slow sweep must not hand back a deadline
+    // that is already stale.
+    const at = this.now();
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
@@ -479,7 +495,10 @@ export class OffloadBroker {
       if (commandId === exceptId) continue;
       await this.chain(`cmd:${commandId}`, async () => {
         const record = await this.load(commandId);
-        if (!record || TERMINAL.has(record.state) || record.state === "unknown") return;
+        if (!record || TERMINAL.has(record.state) || record.state === "unknown") {
+          this.known.delete(commandId);
+          return;
+        }
         const timedOut = now >= record.commandDeadline;
         if (now < record.heartbeatDeadline && !timedOut) return;
         await this.expireLoaded(record, now, timedOut);
@@ -499,11 +518,33 @@ export class OffloadBroker {
   private sinkFor(commandId: string): OffloadOutputSink {
     const mutate = (fn: (record: JournalRecord) => { save: boolean; after?: () => void }): void => {
       void this.chain(`cmd:${commandId}`, async () => {
-        const record = await this.load(commandId);
-        if (!record || TERMINAL.has(record.state)) return;
-        const { save, after } = fn(record);
-        if (save) await this.save(record);
-        after?.();
+        try {
+          const record = await this.load(commandId);
+          if (!record || TERMINAL.has(record.state)) return;
+          const { save, after } = fn(record);
+          if (save) await this.save(record);
+          after?.();
+        } catch {
+          // A lost journal write must not leave a stale remoteStarted=false or
+          // a silently short output: flip to unknown (hold, never replay) and
+          // stop the command so it cannot run unobserved.
+          this.poisoned.add(commandId);
+          this.known.delete(commandId);
+          const handle = this.handles.get(commandId);
+          this.handles.delete(commandId);
+          if (handle) await handle.cancel().catch(() => undefined);
+          try {
+            const raw = (await this.store.get(cmdKey(commandId))) as JournalRecord | null;
+            if (raw && !TERMINAL.has(raw.state)) {
+              raw.state = "unknown";
+              raw.fallbackSafe = false;
+              await this.save(raw);
+            }
+          } catch {
+            // The in-memory poison mark still holds the line until restart,
+            // when the missing handle yields the same unknown hold.
+          }
+        }
       });
     };
     return {

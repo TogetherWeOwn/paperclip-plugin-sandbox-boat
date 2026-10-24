@@ -10,6 +10,25 @@ import { OFFLOAD_BOUNDS, OFFLOAD_VERSION } from "./protocol.js";
 import { classifyCargo } from "./router.js";
 import { bodyTooLarge, validateSubmit } from "./validate.js";
 
+/** The refusal path must answer the same documented 409 as submit() for a reused ID. */
+async function recordRefusalOrConflict(
+  broker: OffloadBroker,
+  request: Parameters<OffloadBroker["recordRefusal"]>[0],
+  principal: BrokerPrincipal,
+  reason: string,
+): Promise<{ status: number; body: unknown } | null> {
+  try {
+    await broker.recordRefusal(request, principal, reason);
+    return null;
+  } catch (error) {
+    if ((error as { code?: string }).code !== "OFFLOAD_IDEMPOTENCY_CONFLICT") throw error;
+    return {
+      status: 409,
+      body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: request.commandId }),
+    };
+  }
+}
+
 export interface RouteActor {
   actorType: "user" | "agent";
   actorId: string;
@@ -106,7 +125,8 @@ export async function handleExec(
     };
   }
   if (workspace.path == null && workspace.cwd == null) {
-    await host.broker.recordRefusal(request, principal, "execution workspace is not locally realized; cannot snapshot source");
+    const conflict = await recordRefusalOrConflict(host.broker, request, principal, "execution workspace is not locally realized; cannot snapshot source");
+    if (conflict) return conflict;
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -114,7 +134,8 @@ export async function handleExec(
   }
   const classification = classifyCargo(request.argv, host.profile);
   if (classification.mode === "local") {
-    await host.broker.recordRefusal(request, principal, `incompatible workload: ${classification.reason}`);
+    const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
+    if (conflict) return conflict;
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", `incompatible workload: ${classification.reason}`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),

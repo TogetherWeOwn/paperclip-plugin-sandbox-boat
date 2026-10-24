@@ -53,6 +53,57 @@ function completed(exitCode = 0) {
 describe("passthrough (invoked as cargo)", () => {
   const asCargo = "/opt/boat-offload/bin/cargo";
 
+  it("never resolves itself through a non-canonical shim-dir spelling on PATH", async () => {
+    for (const shimSpelling of ["/opt/boat-offload/bin/", "/opt/boat-offload//bin", "/opt/boat-offload/./bin"]) {
+      const t = setup({ PATH: `${shimSpelling}:/usr/local/cargo/bin:/usr/bin` });
+      t.deps.findExecutable = (dir, name) => (name === "cargo" ? `${dir.replace(/\/+$/, "")}/cargo` : null);
+      await shimMain(asCargo, ["test"], t.deps);
+      const [exe, , env] = (t.deps.spawn as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      expect(exe).toBe("/usr/local/cargo/bin/cargo");
+      expect((env as Record<string, string>).PATH).toBe("/usr/local/cargo/bin:/usr/bin");
+    }
+  });
+
+  it("skips a candidate that resolves to the shim script itself (symlinked spelling)", async () => {
+    const t = setup({ PATH: "/alias/bin:/usr/local/cargo/bin" });
+    t.deps.findExecutable = (dir, name) => (name === "cargo" ? `${dir}/cargo` : null);
+    t.deps.realpath = (p) => (p === "/alias/bin/cargo" ? asCargo : p);
+    await shimMain(asCargo, ["test"], t.deps);
+    expect((t.deps.spawn as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toBe("/usr/local/cargo/bin/cargo");
+  });
+
+  it("forwards a pid-directed signal to the local child and exits 128+N instead of 0", async () => {
+    const t = setup();
+    let handler: ((signal: "SIGINT" | "SIGTERM") => void) | undefined;
+    t.deps.onSignal = (h) => {
+      handler = h;
+    };
+    const killed: string[] = [];
+    t.deps.spawn = vi.fn(async (_exe, _argv, _env, options) => {
+      options?.onSpawn?.((signal: string) => killed.push(signal));
+      handler?.("SIGTERM");
+      return { code: 0, signal: null };
+    });
+    expect(await shimMain(asCargo, ["build"], t.deps)).toBe(143);
+    expect(killed).toEqual(["SIGTERM"]);
+  });
+
+  it("delivers a signal that arrives before the child handle exists", async () => {
+    const t = setup();
+    let handler: ((signal: "SIGINT" | "SIGTERM") => void) | undefined;
+    t.deps.onSignal = (h) => {
+      handler = h;
+    };
+    const killed: string[] = [];
+    t.deps.spawn = vi.fn(async (_exe, _argv, _env, options) => {
+      handler?.("SIGINT");
+      options?.onSpawn?.((signal: string) => killed.push(signal));
+      return { code: 130, signal: null };
+    });
+    expect(await shimMain(asCargo, ["build"], t.deps)).toBe(130);
+    expect(killed).toEqual(["SIGINT"]);
+  });
+
   it("runs local with no broker calls when BOAT_OFFLOAD is unset", async () => {
     const t = setup();
     const exit = await shimMain(asCargo, ["test"], t.deps);

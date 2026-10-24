@@ -46,6 +46,17 @@ describe("classifyCargo", () => {
     expect(classifyCargo(argv, PROFILE).mode).toBe("local");
   });
 
+  it("keeps the --config=value spelling local too, before and after the subcommand", () => {
+    for (const argv of [
+      ["build", "--config=build.rustflags=[\"-C\",\"link-arg=-foo\"]"],
+      ["--config=net.offline=true", "build"],
+    ]) {
+      const result = classifyCargo(argv, PROFILE);
+      expect(result.mode).toBe("local");
+      expect(result.reason).toMatch(/config/i);
+    }
+  });
+
   it("keeps unrecognized --config overrides local", () => {
     const result = classifyCargo(["--config", "net.offline=true", "build"], PROFILE);
     expect(result.mode).toBe("local");

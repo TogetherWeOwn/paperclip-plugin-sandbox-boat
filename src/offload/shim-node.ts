@@ -3,7 +3,7 @@
 // token travels in the Authorization header only, never in a request body.
 
 import { spawn as nodeSpawn, execFileSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, realpathSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PLUGIN_ID } from "../manifest.js";
@@ -40,9 +40,12 @@ export function createFetchHttp(baseUrl: string, token: string): BrokerHttp {
 }
 
 export function createSpawn(): ShimDeps["spawn"] {
-  return (exe, argv, env) =>
+  return (exe, argv, env, options) =>
     new Promise<SpawnResult>((resolve) => {
       const child = nodeSpawn(exe, argv, { env, stdio: "inherit" });
+      options?.onSpawn?.((signal) => {
+        child.kill(signal);
+      });
       child.on("error", () => resolve({ code: 127, signal: null }));
       child.on("close", (code, signal) => resolve({ code, signal }));
     });
@@ -107,6 +110,13 @@ export function createShimDeps(env: Record<string, string | undefined>): ShimDep
     },
     randomId: () => randomUUID(),
     findExecutable: createFindExecutable(),
+    realpath: (p) => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return p;
+      }
+    },
     readToolchains: createReadToolchains(),
     spawn: createSpawn(),
   };

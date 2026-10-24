@@ -112,6 +112,17 @@ describe("handleExec", () => {
     expect(view.body).toMatchObject({ state: "not_started" });
   });
 
+  it("answers the documented 409 when a refusal reuses an ID with a different payload", async () => {
+    const t = setup();
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+    const refusal = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv: ["fmt"] }) }, t.host);
+    expect(refusal.status).toBe(409);
+    expect(refusal.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+    t.workspaces.set(WS, { repoUrl: null, projectId: "p", projectWorkspaceId: null, path: null, cwd: null });
+    const unrealized = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv: ["check"] }) }, t.host);
+    expect(unrealized.status).toBe(409);
+  });
+
   it("rejects invalid bodies and oversized raw bodies", async () => {
     const t = setup();
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ shell: true }) }, t.host)).status).toBe(400);

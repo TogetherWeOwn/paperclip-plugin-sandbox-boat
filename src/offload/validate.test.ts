@@ -34,7 +34,7 @@ describe("validateSubmit", () => {
     expect(validateSubmit({ ...BASE, executionWorkspaceId: "x" }).ok).toBe(false);
   });
 
-  it.each([["../.."], [["/abs/path"]], [["a/../../b"]], [[""]]])("rejects escaping cwd %s", (cwdRelative) => {
+  it.each([["../.."], ["/abs/path"], ["a/../../b"], [""], ["C:\\win"]])("rejects escaping cwd %s", (cwdRelative) => {
     expect(validateSubmit({ ...BASE, cwdRelative }).ok).toBe(false);
   });
 

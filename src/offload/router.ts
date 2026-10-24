@@ -43,7 +43,7 @@ export function classifyCargo(argv: string[], profile: CargoProfile): CargoClass
   // Only cargo-side args count: after a bare `--`, args belong to the test binary.
   const dashDash = argv.indexOf("--");
   const cargoSide = dashDash >= 0 ? argv.slice(0, dashDash) : argv;
-  if (cargoSide.some((arg) => arg === "--config")) {
+  if (cargoSide.some((arg) => arg === "--config" || arg.startsWith("--config="))) {
     return local(profile, "unrecognized --config override stays local");
   }
   if (cargoSide.some((arg) => arg === "-Z" || arg.startsWith("-Z"))) {

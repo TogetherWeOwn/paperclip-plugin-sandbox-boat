@@ -26,7 +26,14 @@ export interface ShimDeps {
   randomId: () => string;
   findExecutable: (dir: string, name: string) => string | null;
   readToolchains: () => string[];
-  spawn: (exe: string, argv: string[], env: Record<string, string>) => Promise<SpawnResult>;
+  /** Optional: resolve symlinks so a candidate that is the shim itself is never used as the real cargo. */
+  realpath?: (p: string) => string;
+  /** `onSpawn` hands the caller a way to signal the child so termination is forwarded, not dropped. */
+  spawn: (exe: string, argv: string[], env: Record<string, string>, options?: SpawnOptions) => Promise<SpawnResult>;
+}
+
+export interface SpawnOptions {
+  onSpawn?: (kill: (signal: "SIGINT" | "SIGTERM") => void) => void;
 }
 
 const SIGNAL_EXIT: Record<string, number> = {
@@ -73,11 +80,23 @@ function parseCommandTimeoutMs(raw: string | undefined): number {
   return Math.min(n, 1_800_000);
 }
 
-function resolveRealCargo(shimDir: string, pathEnv: string, find: ShimDeps["findExecutable"]): string | null {
+/** Spelling-insensitive directory key: trailing/double slashes and `.` segments collapse. */
+function dirKey(dir: string): string {
+  return path.resolve(dir);
+}
+
+function resolveRealCargo(shimDir: string, scriptPath: string, pathEnv: string, deps: Pick<ShimDeps, "findExecutable" | "realpath">): string | null {
+  const real = deps.realpath ?? ((p: string) => p);
+  const shimKey = dirKey(shimDir);
+  const selfKey = real(path.resolve(scriptPath));
   for (const dir of pathEnv.split(":")) {
-    if (dir === "" || dir === shimDir) continue;
-    const hit = find(dir, "cargo");
-    if (hit) return hit;
+    if (dir === "" || dirKey(dir) === shimKey) continue;
+    const hit = deps.findExecutable(dir, "cargo");
+    if (!hit) continue;
+    // A symlinked spelling of the shim dir (or a link to the shim) must not
+    // become its own fallback target.
+    if (real(path.resolve(hit)) === selfKey) continue;
+    return hit;
   }
   return null;
 }
@@ -87,7 +106,8 @@ function fallbackEnv(env: ShimDeps["env"], shimDir: string): Record<string, stri
   for (const [key, value] of Object.entries(env)) {
     if (value !== undefined) out[key] = value;
   }
-  out.PATH = (env.PATH ?? "").split(":").filter((dir) => dir !== "" && dir !== shimDir).join(":");
+  const shimKey = dirKey(shimDir);
+  out.PATH = (env.PATH ?? "").split(":").filter((dir) => dir !== "" && dirKey(dir) !== shimKey).join(":");
   out.BOAT_OFFLOAD_SHIM_ACTIVE = "1";
   return out;
 }
@@ -130,7 +150,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     // Explicit diagnostic invocation bypasses BOAT_OFFLOAD, but re-entry still
     // short-circuits: a fallbacked cargo must never route back into the shim.
     if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) {
-      const real = resolveRealCargo(shimDir, deps.env.PATH ?? "", deps.findExecutable);
+      const real = resolveRealCargo(shimDir, scriptPath, deps.env.PATH ?? "", deps);
       if (!real) {
         writeStderr("boat-offload-cargo: no real cargo on PATH\n");
         return 127;
@@ -141,13 +161,32 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     cargoArgv = args;
   }
 
-  const realCargo = resolveRealCargo(shimDir, deps.env.PATH ?? "", deps.findExecutable);
+  const realCargo = resolveRealCargo(shimDir, scriptPath, deps.env.PATH ?? "", deps);
   if (!realCargo) {
     writeStderr("boat-offload-cargo: no real cargo on PATH\n");
     return 127;
   }
   const localEnv = fallbackEnv(deps.env, shimDir);
-  const runLocal = async (argv: string[]): Promise<number> => spawnExit(await deps.spawn(realCargo, argv, localEnv));
+  // A pid-directed SIGINT/SIGTERM must reach the local child and end the shim
+  // with 128+N; recording it for later would let the build finish and exit 0.
+  let pendingSignal: "SIGINT" | "SIGTERM" | null = null;
+  let killChild: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+  deps.onSignal((signal) => {
+    pendingSignal ??= signal;
+    killChild?.(signal);
+  });
+  const spawnLocal = async (exe: string, argv: string[], env: Record<string, string>): Promise<number> => {
+    const result = await deps.spawn(exe, argv, env, {
+      onSpawn: (kill) => {
+        killChild = kill;
+        if (pendingSignal) kill(pendingSignal);
+      },
+    });
+    killChild = null;
+    if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
+    return spawnExit(result);
+  };
+  const runLocal = async (argv: string[]): Promise<number> => spawnLocal(realCargo, argv, localEnv);
 
   const workspaceId = deps.env.PAPERCLIP_WORKSPACE_ID;
   if (!diagnostic) {

@@ -295,6 +295,93 @@ describe("heartbeat", () => {
   });
 });
 
+describe("journal write failures and sweep cost", () => {
+  it("holds a started command as unknown when the started() write is lost, never fallback-safe", async () => {
+    const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
+    const store = new MapStore();
+    const backend = new FakeBackend();
+    const broker = new OffloadBroker({ store, backend, now: () => clock.t });
+    await broker.submit(submitFor(), PRINCIPAL);
+    const realSet = store.set.bind(store);
+    store.set = async () => {
+      store.set = realSet;
+      throw new Error("transient write loss");
+    };
+    backend.starts[0]!.sink.started();
+    const cancelled = readBody(await broker.cancel(CMD, PRINCIPAL, "client_signal"));
+    expect(cancelled.state).toBe("unknown");
+    expect(cancelled.fallbackSafe).toBe(false);
+    expect(readBody(await broker.read(CMD, PRINCIPAL, 0)).fallbackSafe).toBe(false);
+  });
+
+  it("does not serve a complete result after an output write was lost", async () => {
+    const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
+    const store = new MapStore();
+    const backend = new FakeBackend();
+    const broker = new OffloadBroker({ store, backend, now: () => clock.t });
+    await broker.submit(submitFor(), PRINCIPAL);
+    const sink = backend.starts[0]!.sink;
+    sink.started();
+    await broker.read(CMD, PRINCIPAL, 0);
+    const realSet = store.set.bind(store);
+    store.set = async () => {
+      store.set = realSet;
+      throw new Error("transient write loss");
+    };
+    sink.write("stdout", new TextEncoder().encode("lost line\n"));
+    sink.complete({ exitCode: 0, signal: null, timedOut: false, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null } });
+    const view = readBody(await broker.read(CMD, PRINCIPAL, 0));
+    expect(view.state).toBe("unknown");
+    expect(view.fallbackSafe).toBe(false);
+  });
+
+  it("stops scanning terminal commands: a heartbeat reads only live work", async () => {
+    const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
+    const store = new MapStore();
+    const backend = new FakeBackend();
+    const broker = new OffloadBroker({ store, backend, now: () => clock.t });
+    const ids = Array.from({ length: 12 }, (_, i) => `00000000-0000-4000-8000-0000000001${String(i).padStart(2, "0")}`);
+    for (const id of ids) await broker.submit(submitFor(id), PRINCIPAL);
+    for (const call of backend.starts) {
+      call.sink.started();
+      call.sink.complete({ exitCode: 0, signal: null, timedOut: false, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null } });
+    }
+    await broker.submit(submitFor(), PRINCIPAL);
+    backend.starts[12]!.sink.started();
+    await broker.heartbeat(CMD, PRINCIPAL); // prunes the terminal commands it sees
+    let gets = 0;
+    const realGet = store.get.bind(store);
+    store.get = async (key: string) => {
+      gets += 1;
+      return realGet(key);
+    };
+    await broker.heartbeat(CMD, PRINCIPAL);
+    expect(gets).toBeLessThanOrEqual(2);
+  });
+
+  it("renews from a fresh clock when the sweep is slow", async () => {
+    const clock = { t: Date.parse("2026-10-23T10:00:00Z") };
+    const store = new MapStore();
+    const backend = new FakeBackend();
+    const broker = new OffloadBroker({ store, backend, now: () => clock.t });
+    const other = "00000000-0000-4000-8000-000000000007";
+    await broker.submit(submitFor(), PRINCIPAL);
+    await broker.submit(submitFor(other), PRINCIPAL);
+    backend.starts[0]!.sink.started();
+    backend.starts[1]!.sink.started();
+    await broker.read(CMD, PRINCIPAL, 0);
+    const realGet = store.get.bind(store);
+    store.get = async (key: string) => {
+      clock.t += 20_000;
+      return realGet(key);
+    };
+    await broker.heartbeat(CMD, PRINCIPAL);
+    store.get = realGet;
+    await broker.checkExpirations();
+    expect(readBody(await broker.read(CMD, PRINCIPAL, 0)).state).toBe("running");
+  });
+});
+
 describe("cancel", () => {
   it("cancels a queued command as never started and fallback-safe", async () => {
     const { broker, backend } = setup();
