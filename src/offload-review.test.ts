@@ -3,6 +3,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { OffloadExecutor } from "./offload.js";
 import type { OffloadCommand, OffloadDeps, OffloadResult } from "./offload.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
+import { JsonState, reconcile, usage } from "./test-support/account-admission.fixture.js";
 
 const SECRET_CANARY = "sk-offload-review-secret-canary";
 const EPOCH = Date.parse("2026-10-23T10:00:00Z");
@@ -49,10 +50,13 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
 
+let nextAccount = 0;
+
 function setup(
   runCommand: OffloadDeps["runCommand"] = async () => completed(),
   config: Partial<OffloadDeps["config"]> = {},
 ) {
+  const account = { state: new JsonState(), accountId: `legacy-review-account-${++nextAccount}`, poolId: "legacy-review" };
   const clock = { t: EPOCH };
   const now = () => clock.t;
   const fake = new FakeBoat({ now });
@@ -86,6 +90,7 @@ function setup(
   const logger = { info: log("info"), warn: log("warn"), error: log("error") };
   const starts: Array<{ sandboxId: string; commandId: string }> = [];
   const executor = new OffloadExecutor({
+    ...account,
     boat: fake as unknown as BoatApiLike,
     logger,
     now,
@@ -351,16 +356,25 @@ describe("offload review: uncertain remote execution", () => {
     expect(s.fake.boxes.get(id)?.state).toBe("ready");
   });
 
-  it("retains elapsed usage and cost for unknown execution without logging argv or transport secrets", async () => {
+  it("retains pending usage and estimated cost for unknown execution without logging argv or transport secrets", async () => {
     const s = uncertain();
-    await s.execute();
-    const rows = s.executor.getUsage();
+    s.fake.usage = async () => { throw new Error("synthetic meter unavailable"); };
+    const receipt = await s.execute();
+    const rows = usage(s.executor);
     expect.soft(rows).toHaveLength(1);
     expect.soft(rows[0]).toMatchObject({
-      commandId: "uncertain", outcome: "unknown", seconds: 7, dollars: 0.00007,
+      commandId: "uncertain", outcome: "unknown", kind: "command",
+      usageRecordId: expect.any(String), meterProvenance: "pending",
       queueWaitMs: 0, exitCode: 75, sandboxId: s.starts[0]!.sandboxId,
+      intervals: [{ since: new Date(EPOCH).toISOString(), until: new Date(EPOCH + 7_000).toISOString(), phase: "command" }],
     });
-    expect.soft(s.logs.some((entry) => entry.message.includes("expected-cost"))).toBe(true);
+    expect.soft(rows[0]?.usageRecordId).toEqual(expect.stringMatching(/\S/));
+    // Elapsed/estimated cost remains observable, but is not a final provider bill.
+    const costRows = s.logs.filter((entry) => entry.message.includes("expected-cost")).map(expectedCostPayload);
+    expect.soft(costRows).toHaveLength(1);
+    expect.soft(costRows[0]).toMatchObject({ commandId: "uncertain", seconds: 7, dollars: 0.00007 });
+    expect.soft(await s.execute()).toEqual(receipt);
+    expect.soft(usage(s.executor)).toMatchObject([{ usageRecordId: rows[0]?.usageRecordId, meterProvenance: "pending" }]);
     expect(JSON.stringify(s.logs)).not.toContain(SECRET_CANARY);
   });
 });
@@ -470,9 +484,14 @@ describe("offload review: bounded queue and exact accounting", () => {
     expect(s.fake.callsOf("create")).toHaveLength(1);
   });
 
-  it("records exact 63s/default-rate dollars and 1375ms queue wait in usage, receipt, and cost JSON", async () => {
+  it("records exact 63s/default-rate estimates and 1375ms queue wait without fabricating a final usage bill", async () => {
     const gate = deferred<ReturnType<typeof completed>>();
-    const s = setup(async (_vm, cmd) => cmd.commandId === "holder" ? gate.promise : completed(63));
+    const s = setup(async (_vm, cmd) => {
+      if (cmd.commandId === "holder") return gate.promise;
+      s.clock.t += 63_000;
+      return completed(63);
+    });
+    s.fake.usage = async () => { throw new Error("synthetic meter unavailable"); };
     const holder = s.executor.execute(command("holder"));
     await flush();
     const pending = s.executor.execute(command("accounted", {
@@ -483,19 +502,36 @@ describe("offload review: bounded queue and exact accounting", () => {
     gate.resolve(completed());
     await holder;
     const receipt = await pending;
-    // Hand-derived: 63 seconds at $0.036/hour = $0.000630.
+    // Hand-derived estimate: 63 seconds at $0.036/hour = $0.000630.
     const expected = {
       commandId: "accounted", seconds: 63, dollars: 0.00063, queueWaitMs: 1_375,
       warm: "warm", sandboxId: s.starts[0]!.sandboxId,
     };
     expect.soft(receipt).toMatchObject({ status: "completed", exitCode: 0, ...expected });
-    const usage = s.executor.getUsage().filter((row) => row.commandId === "accounted");
-    expect(usage).toHaveLength(1);
-    expect.soft(usage[0]).toMatchObject({ ...expected, exitCode: 0, runId: "run-9", cardId: "card-9", repoId: "repo-1" });
+    const rows = usage(s.executor).filter((row) => row.commandId === "accounted");
+    expect(rows).toHaveLength(1);
+    expect.soft(rows[0]).toMatchObject({
+      commandId: "accounted", kind: "command", usageRecordId: expect.any(String), meterProvenance: "pending",
+      exitCode: 0, runId: "run-9", cardId: "card-9", repoId: "repo-1", queueWaitMs: 1_375,
+      warm: "warm", sandboxId: s.starts[0]!.sandboxId,
+      intervals: [{ since: new Date(EPOCH + 1_375).toISOString(), until: new Date(EPOCH + 64_375).toISOString(), phase: "command" }],
+    });
+    expect.soft(rows[0]?.usageRecordId).toEqual(expect.stringMatching(/\S/));
     const costRows = s.logs.filter((entry) => entry.level === "info" && entry.message.includes("expected-cost"))
       .map(expectedCostPayload).filter((payload) => payload.commandId === "accounted");
     expect.soft(costRows).toHaveLength(1);
     expect.soft(costRows[0]).toMatchObject(expected);
     expect(JSON.stringify(s.logs)).not.toContain(SECRET_CANARY);
+    await s.advance(15_000);
+    await reconcile(s.executor);
+    const settled = usage(s.executor).filter((row) => row.commandId === "accounted");
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({
+      usageRecordId: rows[0]!.usageRecordId, meterProvenance: "pending",
+      intervals: [
+        { since: new Date(EPOCH + 1_375).toISOString(), until: new Date(EPOCH + 64_375).toISOString(), phase: "command" },
+        { since: new Date(EPOCH + 64_375).toISOString(), until: new Date(EPOCH + 79_375).toISOString(), phase: "idle_tail" },
+      ],
+    });
   });
 });
