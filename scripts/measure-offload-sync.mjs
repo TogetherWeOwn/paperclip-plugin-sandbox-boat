@@ -35,7 +35,9 @@ const conditions = {
 // Fresh command-scoped snapshot dirs, matching production: the copy, chmod,
 // utimes and rehash of every file are part of the measured cost.
 const coldSnap = mkdtempSync(path.join(tmpdir(), "offload-sync-snap-cold-"));
+const coldStart = Date.now();
 const cold = await captureSnapshot(dir, coldSnap);
+const coldSnapshotMs = Date.now() - coldStart;
 const warmSnap = mkdtempSync(path.join(tmpdir(), "offload-sync-snap-warm-"));
 const warmStart = Date.now();
 const warm = await captureSnapshot(dir, warmSnap);
@@ -54,7 +56,7 @@ const report = {
   sourceDir: dir,
   files: warm.stats.files,
   bytes: warm.stats.bytes,
-  coldSnapshotMs: cold.stats.elapsedMs,
+  coldSnapshotMs,
   warmSnapshotMs,
   planMs,
   planToSend: plan.toSend.length,

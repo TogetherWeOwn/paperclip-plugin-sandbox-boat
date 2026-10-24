@@ -890,6 +890,45 @@ describe("captureSnapshot reuse", () => {
       if (f.symlink === undefined) expect(sha256File(path.join(snap, f.path))).toBe(f.sha256);
     }
   });
+
+  it("creates a missing snapshot dir, including nested parents", async () => {
+    const root = makeTemp();
+    writeTree(root, { "sub/a.txt": "A\n" });
+    const snap = path.join(makeTemp(), "missing", "nested");
+    const { manifest } = await captureSnapshot(root, snap);
+    expect(readFileSync(path.join(snap, "sub/a.txt"), "utf8")).toBe("A\n");
+    expect(manifest.files.map((f) => f.path)).toEqual(["sub/a.txt"]);
+  });
+
+  it("recapturing into a reused dir replaces a stale symlink parent with a real dir", async () => {
+    const root = makeTemp();
+    const snap = makeTemp();
+    writeTree(root, { "tgt.txt": "T\n" });
+    symlinkSync("tgt.txt", path.join(root, "lnk"));
+    await captureSnapshot(root, snap);
+    expect(lstatSync(path.join(snap, "lnk")).isSymbolicLink()).toBe(true);
+    // symlink -> dir with content: the stale link parent must be replaced, not refused.
+    rmSync(path.join(root, "lnk"));
+    mkdirSync(path.join(root, "lnk"));
+    writeFileSync(path.join(root, "lnk/deep.txt"), "D\n");
+    const { manifest } = await captureSnapshot(root, snap);
+    expect(lstatSync(path.join(snap, "lnk")).isDirectory()).toBe(true);
+    expect(readFileSync(path.join(snap, "lnk/deep.txt"), "utf8")).toBe("D\n");
+    expect(manifest.files.find((f) => f.path === "lnk/deep.txt")!.sha256).toBe(sha256File(path.join(snap, "lnk/deep.txt")));
+  });
+
+  it("recapturing into a reused dir handles dot-dot-prefixed names as ordinary paths", async () => {
+    const root = makeTemp();
+    const snap = makeTemp();
+    writeTree(root, { "..foo": "F1\n" });
+    await captureSnapshot(root, snap);
+    rmSync(path.join(root, "..foo"));
+    mkdirSync(path.join(root, "..foo"));
+    writeFileSync(path.join(root, "..foo/k.txt"), "K\n");
+    const { manifest } = await captureSnapshot(root, snap);
+    expect(readFileSync(path.join(snap, "..foo/k.txt"), "utf8")).toBe("K\n");
+    expect(manifest.files.find((f) => f.path === "..foo/k.txt")!.sha256).toBe(sha256File(path.join(snap, "..foo/k.txt")));
+  });
 });
 
 describe("planPush metadata changes", () => {

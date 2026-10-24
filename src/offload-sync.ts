@@ -313,8 +313,9 @@ async function raceToRetry<T>(op: () => Promise<T>): Promise<T> {
  * freeze. Callers may pass a fresh dir or reuse one across captures.
  */
 async function ensureSnapDir(io: ManifestFs, snap: string, dir: string): Promise<void> {
+  await io.mkdir(snap, { recursive: true });
   const rel = path.relative(snap, dir);
-  if (rel === "" || rel.startsWith("..")) {
+  if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`)) {
     await io.mkdir(dir, { recursive: true });
     return;
   }
@@ -357,8 +358,12 @@ async function freezeAndVerify(root: string, snapshotDir: string, manifest: Sour
   const snap = path.resolve(snapshotDir);
   for (const entry of manifest.files) {
     const src = resolveWithin(base, entry.path);
-    const dest = await resolveContained(snap, entry.path);
+    const dest = resolveWithin(snap, entry.path);
+    // Parents first: a reused dir may hold a stale link where a directory
+    // must be, which is replaced (never followed); the containment check
+    // then verifies no symlinked parent survived.
     await ensureSnapDir(io, snap, path.dirname(dest));
+    await resolveContained(snap, entry.path);
     if (entry.symlink !== undefined) {
       // Recreate the captured link; copying would follow the live path instead.
       // Recursive: a reused dir may hold a stale directory at this path.
