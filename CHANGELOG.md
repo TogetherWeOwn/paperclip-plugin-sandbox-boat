@@ -10,6 +10,7 @@
 
 ### Fixed
 
+* Detached command-expiry cancellation uses proactive, explicit-company state access through executor cleanup and the final broker receipt write, so an ended heartbeat invocation cannot let an expired sync-in command start.
 * Full offload pools stop and retire idle incompatible VMs before admitting replacements, including stopped or legacy slots. Busy, quarantined and pending-stop ownership stays fenced; regression tests also pin unknown-workspace rejection and immediate quarantine refusal with queueing enabled.
 * Warm selection, stopped-VM resume and queued dispatch cannot borrow across company, repository, profile or trust-domain pool boundaries. Persisted bindings preserve isolation after worker restart; uncertain workspace holds remain exclusive even when a spare VM exists.
 * Cancellation during collection or staging retains execution evidence, staged changes and an exit-130 cancellation result rather than reporting success or safe local fallback. Post-exit journal transitions share the cancellation fence so a pending state write cannot erase the durable cancellation request.

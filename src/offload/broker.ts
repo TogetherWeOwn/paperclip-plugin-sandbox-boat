@@ -9,6 +9,7 @@
 // local: after a restart a live command reads as `unknown` (a hold, never
 // permission to replay) until the executor follow-up reconciles the guest.
 
+import { runOutsideInvocation } from "../proactive.js";
 import { offloadError } from "./errors.js";
 import {
   OFFLOAD_BOUNDS,
@@ -515,7 +516,11 @@ export class OffloadBroker {
       if (expired) {
         let cancellation = this.expiryCancellations.get(commandId);
         if (!cancellation) {
-          cancellation = this.cancelCommand(commandId, expired, now, now >= expired.commandDeadline)
+          // The heartbeat may return before cancellation I/O settles. Detach
+          // the whole operation, including its final broker journal update,
+          // from that invocation; stores still bind the explicit company.
+          cancellation = runOutsideInvocation(() =>
+            this.cancelCommand(commandId, expired, now, now >= expired.commandDeadline))
             .then(() => undefined).finally(() => { this.expiryCancellations.delete(commandId); });
           this.expiryCancellations.set(commandId, cancellation);
           // Heartbeats must not join another command's sync/cleanup. Observe
