@@ -611,8 +611,15 @@ export class OffloadExecutor {
     const retiring = this.pool.find((vm) => !vm.busy && !vm.quarantined && !vm.stopping && !compatible(vm));
     if (retiring) {
       this.clearIdleTimer(retiring);
-      if (!retiring.stopped) await this.stopVm(retiring);
-      if (!retiring.stopped) {
+      if (retiring.stopped && retiring.stopObservedAt == null) {
+        // Replay release permits admission, not proof of provider termination.
+        // Fence uncertain ownership so stop observation/retries retain coverage.
+        retiring.stopped = false;
+        retiring.stopping = true;
+        if (await this.observeStop(retiring)) await this.stopVm(retiring, true);
+      } else if (!retiring.stopped) await this.stopVm(retiring);
+      if (this.pool.includes(retiring) && (!retiring.stopped || retiring.stopObservedAt == null)) {
+        await this.persistPool();
         this.scheduleIdleStop(retiring, retiring.generation, 1000);
         return { kind: "unavailable", reason: "incompatible pool retirement pending; reconciliation required" };
       }
