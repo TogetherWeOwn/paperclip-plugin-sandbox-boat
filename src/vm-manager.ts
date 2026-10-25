@@ -1692,7 +1692,10 @@ export class BoatVmManager {
     if (!sandboxId) throw new Error("No provider lease ID available for native sync.");
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
-    this.beginActivity(config, sandboxId);
+    // Like Execute, wait for a sweep already scrubbing/stopping this card.
+    await this.withCardLock(params.companyId, sandboxId, params.lease.metadata, async () => {
+      this.beginActivity(config, sandboxId);
+    });
     const startedAt = this.now();
     try {
       let session = await this.liveSession(config, params.companyId, sandboxId);
@@ -1754,7 +1757,12 @@ export class BoatVmManager {
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
     const cwd = params.cwd ?? str(params.lease.metadata?.remoteCwd) ?? undefined;
 
-    this.beginActivity(config, sandboxId);
+    // Admit work under the sweep's card lock, but release it before running:
+    // a sweep already scrubbing/stopping must finish first; a later sweep
+    // sees inflight and leaves this command alone. Commands can still overlap.
+    await this.withCardLock(params.companyId, sandboxId, params.lease.metadata, async () => {
+      this.beginActivity(config, sandboxId);
+    });
     try {
       let session: SshSession;
       try {
