@@ -93,6 +93,10 @@ export interface OffloadCommandView {
 }
 
 const DAY = 86_400_000;
+// Per-command retained bytes, not the much smaller read-page limit. The runner
+// must propagate output rejection so lifecycle cleanup can stop a flooding guest.
+const OUTPUT_LIMIT_BYTES = 1_048_576;
+const OUTPUT_LIMIT_EVENTS = 16_384;
 const TERMINAL = new Set<OffloadState>(["completed", "not_started", "cancelled", "failed"]);
 const PRE_START = new Set<OffloadState>(["accepted", "queued", "syncing_in"]);
 const STATES = new Set<OffloadState>([...TERMINAL, ...PRE_START, "starting", "running", "syncing_out", "unknown"]);
@@ -124,7 +128,7 @@ export function validGuestIdentity(value: unknown): value is GuestIdentity {
     && Number.isSafeInteger(value.journalGeneration) && (value.journalGeneration as number) > 0
     && Number.isSafeInteger(value.processGroupId) && (value.processGroupId as number) > 0
     && typeof value.cgroupPath === "string" && value.cgroupPath.startsWith("/") && value.cgroupPath !== "/"
-    && !value.cgroupPath.includes("\0") && !value.cgroupPath.split("/").some((part) => part === "." || part === "..")
+    && !value.cgroupPath.includes("\0") && value.cgroupPath.split("/").slice(1).every((part) => part !== "" && part !== "." && part !== "..")
     && Number.isSafeInteger(value.heartbeatDeadline) && Number.isSafeInteger(value.guestDeadline);
 }
 export function validIdentity(value: unknown): value is OffloadIdentity {
@@ -169,6 +173,7 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
 
 export interface JournalLifecycle {
   prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<OffloadIdentity>;
+  discard(identity: OffloadIdentity): void;
   cancel(identity: OffloadIdentity, reason: string): Promise<void>;
   heartbeat(identity: OffloadIdentity): void;
 }
@@ -360,7 +365,14 @@ export class OffloadJournal {
     const base: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
       digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
     const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
-    await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
+    try {
+      await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
+    } catch (error) {
+      // A failed commit or pre-start cancellation must not retain an entry
+      // registered by prepare(); neither watchdog nor transport was invoked.
+      this.lifecycle?.discard(identity);
+      throw error;
+    }
     const result = await transport(sandboxId, command, identity);
     // The legacy transport resolves at exit, not at spawn. Do not claim a
     // running acknowledgement until it actually returns evidence of execution.
@@ -430,6 +442,14 @@ export class OffloadJournal {
       return result;
     }
     await this.hold(record);
+    if (this.lifecycle) {
+      // A leader's result/never-started receipt does not certify descendant
+      // cleanup or revoke an armed watchdog. Lifecycle reconciliation is a
+      // separate slice; until then even a matching receipt must retain the VM.
+      const result = this.unknown(record);
+      await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
+      return result;
+    }
     let answer: unknown = null;
     try { if (record.identity) answer = await this.deps.guestReceipts.read(record.identity); } catch { /* Hold on transport loss. */ }
     if (record.identity && matchingReceipt(answer, record.identity)) {
@@ -463,14 +483,19 @@ export class OffloadJournal {
 
   async appendOutput(command: OffloadCommand, stream: "stdout" | "stderr", bytes: Uint8Array): Promise<void> {
     if (!["stdout", "stderr"].includes(stream) || !(bytes instanceof Uint8Array)) throw offloadError("OFFLOAD_INVALID_OUTPUT");
+    if (bytes.byteLength > OUTPUT_LIMIT_BYTES) throw offloadError("OFFLOAD_OUTPUT_LIMIT");
     const data = Buffer.from(bytes); // Snapshot before awaiting the record fence.
     const record = this.active.get(commandKey(command));
     if (!record) throw offloadError("OFFLOAD_COMMAND_NOT_RUNNING");
     await this.transition(record, async () => {
       if (!["starting", "running"].includes(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_RUNNING");
       const output = [...(record.output ?? [])];
-      // Small immutable events permit bounded event-cursor reads even when a
-      // transport supplies a single multi-megabyte write or invalid UTF-8.
+      const retained = output.reduce((total, event) => total + Buffer.byteLength(event.dataBase64, "base64"), 0);
+      if (retained + data.length > OUTPUT_LIMIT_BYTES
+        || output.length + Math.ceil(data.length / 1024) > OUTPUT_LIMIT_EVENTS) throw offloadError("OFFLOAD_OUTPUT_LIMIT");
+      // Bound metadata too: tiny writes must not create millions of immutable
+      // events underneath the byte limit. Event cursors never change afterward.
+      // Small events permit bounded reads even for large writes or invalid UTF-8.
       for (let at = 0; at < data.length; at += 1024) {
         output.push({ seq: output.length + 1, stream, dataBase64: data.subarray(at, at + 1024).toString("base64") });
       }
@@ -544,6 +569,7 @@ export class OffloadJournal {
   }
 
   async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number): Promise<OffloadCommandView> {
+    if (typeof reason !== "string" || !reason.trim() || reason.length > 256) throw offloadError("OFFLOAD_INVALID_REQUEST");
     await this.checkRun(companyId, runId);
     await this.recover();
     const key = commandKey({ companyId, runId, commandId });

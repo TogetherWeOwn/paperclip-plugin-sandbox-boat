@@ -31,20 +31,31 @@ a `GuestController`, and a runner receiving `{ identity, output }`.
 * Preflight requires positive delegated-cgroup-v2 and independent-watchdog
   evidence. The full boot/process-group/cgroup/generation identity and both
   deadlines are committed before arming the watchdog and invoking the runner.
-* Guest controller operations must atomically fence their effects against the
-  supplied boot and ownership identity, not merely trust the host's earlier
-  inspection. Preparation must allocate a fresh delegated subtree; it must not
-  recycle a path still targeted by a previous absolute watchdog.
+* Guest controller operations and transport admission must atomically fence
+  their effects against the supplied boot/ownership identity and deadlines,
+  not merely trust the host's earlier inspection. A cancelled reservation must
+  reject delayed transport delivery, including after worker death. Preparation
+  must allocate a fresh, canonical, non-root delegated subtree. This worker
+  never recycles a prepared path in the same VM boot: elapsed time alone does
+  not prove a previous watchdog callback ran or was revoked. Guest replies
+  cannot replace host-authored command, company or sandbox bindings.
 * Cancellation inspects ownership, sends TERM, allows five seconds, rechecks
   ownership, kills the cgroup and verifies it empty before reuse. Descendants
   that escaped the leader's process group still belong to that subtree.
-  Unknown ownership or failed cleanup quarantines capacity; it never permits
-  local replay of possibly started work.
+  Cleanup also runs when transport or its output consumer rejects, and worker
+  timers are removed on every exit. Unknown ownership or failed cleanup
+  quarantines capacity; it never permits local replay of possibly started work.
+  Nonterminal lifecycle records stay quarantined even with a matching leader
+  result receipt: receipt-only replay cannot attest descendant cleanup. Full
+  lifecycle reconciliation remains slice b.
 * `start(command)` acknowledges durable admission without waiting for exit.
   `execute(command)` waits for the same execution. `heartbeatCommand` renews
   thirty-second client interest; clients should call it every five seconds.
-  Reads do not renew interest. The independent guest watchdog retains the
-  absolute execution deadline after worker death. Timeouts return exit 124;
+  Reads do not renew interest. Expiry is checked synchronously before transport,
+  including after asynchronous watchdog arming; cancellation cannot be lost
+  between the durable starting commit and transport registration. The independent
+  guest watchdog retains the absolute execution deadline after worker death.
+  Timeouts return exit 124;
   confirmed cancellation returns exit 130, always with unsafe local fallback
   after possible execution.
 * `readOutput(companyId, runId, commandId, after, limitBytes)` returns immutable
@@ -52,9 +63,15 @@ a `GuestController`, and a runner receiving `{ identity, output }`.
   are at most 1 KiB and each page contains at most 64 KiB of decoded bytes.
   `nextCursor` is the last included event number. If a requested limit is
   smaller than the next event, `OFFLOAD_OUTPUT_READ_TOO_SMALL` leaves the cursor
-  and retained bytes unchanged. Output expires with the journal's 24-hour
-  result retention. `cancelCommand` and `heartbeatCommand` accept an optional
-  journal generation; stale generations cannot signal or renew current work.
+  and retained bytes unchanged. Retention is capped at **1 MiB and 16,384 events
+  per command** (tiny writes also consume metadata). A write exceeding either
+  total rejects with `OFFLOAD_OUTPUT_LIMIT`, without silently dropping bytes.
+  Runners must await/propagate output errors; rejection
+  triggers guest cleanup and leaves execution uncertain, never safe to replay.
+  Output expires with the journal's 24-hour result retention. `cancelCommand`
+  requires a nonblank reason of at most 256 characters. It and `heartbeatCommand`
+  accept an optional journal generation; stale generations cannot signal or renew
+  current work.
 * ID-only `read`, `cancel` and `heartbeat` helpers apply only to commands this
   executor admitted and reject ambiguous IDs. External routes must use the
   run/company-scoped methods and supply authenticated bindings.

@@ -41,15 +41,17 @@ interface ActiveGuest {
   interestTimer: unknown | null;
   deadlineTimer: unknown | null;
   reason: string | null;
+  transportStarted: boolean;
   cleanup: Promise<void> | null;
 }
 const OWNERSHIP = ["guestBootId", "processGroupId", "cgroupPath", "journalGeneration"] as const;
 
 export class OffloadLifecycle {
   private readonly active = new Map<string, ActiveGuest>();
-  // An outside watchdog outlives a completed leader. Never recycle its cgroup
-  // path for another command while that old deadline can still fire.
-  private readonly watchdogPaths = new Map<string, number>();
+  // An outside watchdog outlives a completed leader, and its callback can be
+  // delayed past its nominal deadline. Without explicit revocation evidence,
+  // never recycle a prepared path in the same VM boot for this worker lifetime.
+  private readonly watchdogPaths = new Set<string>();
   constructor(private readonly guest: GuestController, private readonly now: () => number,
     private readonly timers: OffloadTimers) {}
 
@@ -65,35 +67,69 @@ export class OffloadLifecycle {
       || identity.guestDeadline <= this.now() || identity.guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
       throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
     }
-    for (const [path, deadline] of this.watchdogPaths) if (deadline <= this.now()) this.watchdogPaths.delete(path);
     const path = JSON.stringify([sandboxId, identity.guestBootId, identity.cgroupPath]);
     if (this.watchdogPaths.has(path)) throw offloadError("OFFLOAD_GUEST_CGROUP_REUSED");
-    this.watchdogPaths.set(path, identity.guestDeadline);
-    return { ...base, ...identity };
+    this.watchdogPaths.add(path);
+    // Guest replies may contain extra fields at runtime. Only the six guest
+    // fields can cross this boundary; host command and VM bindings cannot.
+    const full: ExecutionIdentity = { ...base, guestBootId: identity.guestBootId,
+      processGroupId: identity.processGroupId, cgroupPath: identity.cgroupPath,
+      journalGeneration: identity.journalGeneration, heartbeatDeadline: identity.heartbeatDeadline,
+      guestDeadline: identity.guestDeadline };
+    // Register before the journal awaits its starting commit, so a cancellation
+    // winning that commit/run gap cannot disappear before run() registers it.
+    this.active.set(commandKey(full), { identity: structuredClone(full), interestTimer: null,
+      deadlineTimer: null, reason: null, transportStarted: false, cleanup: null });
+    return full;
+  }
+
+  discard(identity: OffloadIdentity): void {
+    const key = commandKey(identity);
+    const entry = this.active.get(key);
+    if (!entry || !this.matches(entry, identity as GuestIdentity)) return;
+    this.clearTimers(entry);
+    this.active.delete(key);
+  }
+
+  private expire(entry: ActiveGuest): void {
+    if (this.now() >= entry.identity.guestDeadline) entry.reason ??= "execution_timeout";
+    else if (this.now() >= entry.identity.heartbeatDeadline) entry.reason ??= "interest_expired";
   }
 
   async run(identity: ExecutionIdentity, command: OffloadCommand,
     transport: (sandboxId: string, command: OffloadCommand, context: OffloadRunContext) => Promise<CommandExit>,
     output: OffloadRunContext["output"]): Promise<CommandExit> {
-    // The journal has already durably committed the full identity and both
-    // deadlines before this independent watchdog is armed or transport is used.
-    const entry: ActiveGuest = { identity: structuredClone(identity), interestTimer: null,
-      deadlineTimer: null, reason: null, cleanup: null };
-    this.active.set(commandKey(identity), entry);
-    const armed = await this.guest.armDeadline(identity.sandboxId, structuredClone(identity));
-    if (armed.verified !== true || armed.outsideCommandCgroup !== true) throw offloadError("OFFLOAD_WATCHDOG_UNVERIFIED");
-    this.scheduleInterest(entry);
-    entry.deadlineTimer = this.timers.set(() => {
-      void this.cancel(identity, "execution_timeout").catch(() => {});
-    }, Math.max(0, identity.guestDeadline - this.now()));
-    const raw = entry.reason ? { exitCode: 130, seconds: 0 }
-      : await transport(identity.sandboxId, command, { identity: structuredClone(identity), output });
-    await this.clean(entry);
-    this.clearTimers(entry);
-    this.active.delete(commandKey(identity));
-    const timedOut = entry.reason === "execution_timeout" || this.now() >= identity.guestDeadline;
-    return { ...raw, exitCode: timedOut ? 124 : entry.reason ? 130 : raw.exitCode,
-      ...(entry.reason ? { cancelled: !timedOut } : {}), ...(timedOut ? { timedOut: true } : {}) };
+    const entry = this.active.get(commandKey(identity));
+    if (!entry || !this.matches(entry, identity)) throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
+    try {
+      // Persistence and watchdog RPCs can outlast either deadline. A timer
+      // scheduled for zero milliseconds is not a synchronous spawn fence.
+      this.expire(entry);
+      if (entry.reason === null) {
+        const armed = await this.guest.armDeadline(identity.sandboxId, structuredClone(identity));
+        if (armed.verified !== true || armed.outsideCommandCgroup !== true) throw offloadError("OFFLOAD_WATCHDOG_UNVERIFIED");
+        this.expire(entry);
+      }
+      let raw: CommandExit = { exitCode: 130, seconds: 0 };
+      if (entry.reason === null) {
+        this.scheduleInterest(entry);
+        entry.deadlineTimer = this.timers.set(() => {
+          void this.cancel(identity, "execution_timeout").catch(() => {});
+        }, Math.max(0, identity.guestDeadline - this.now()));
+        entry.transportStarted = true;
+        // Rejecting transport (including output-consumer errors) does not prove
+        // the guest exited. Always join subtree cleanup before unwinding it.
+        try { raw = await transport(identity.sandboxId, command, { identity: structuredClone(identity), output }); }
+        finally { await this.clean(entry); }
+      } else {
+        await this.clean(entry);
+      }
+      const timedOut = entry.reason === "execution_timeout" || this.now() >= identity.guestDeadline;
+      return { ...raw, exitCode: timedOut ? 124 : entry.reason !== null ? 130 : raw.exitCode,
+        ...(entry.reason !== null ? { cancelled: !timedOut } : {}), ...(timedOut ? { timedOut: true } : {}) };
+    } finally {
+      this.discard(identity);
+    }
   }
 
   heartbeat(identity: OffloadIdentity): void {
@@ -145,7 +181,9 @@ export class OffloadLifecycle {
     const identity = entry.identity;
     const inspect = async () => {
       const observed = await this.guest.inspect(identity.sandboxId, structuredClone(identity));
-      if (!this.matches(entry, observed.identity) || !["running", "completed"].includes(observed.receipt)) {
+      const neverStarted = !entry.transportStarted && observed.receipt === "never_started" && observed.populated === false;
+      if (!this.matches(entry, observed.identity) || typeof observed.populated !== "boolean"
+        || (!neverStarted && !["running", "completed"].includes(observed.receipt))) {
         throw offloadError("OFFLOAD_GUEST_OWNERSHIP_UNKNOWN");
       }
       return observed;
