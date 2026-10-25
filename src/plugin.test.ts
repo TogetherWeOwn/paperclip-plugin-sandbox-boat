@@ -131,9 +131,10 @@ describe("ValidateConfig", () => {
     const result = await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { apiKey: "boat_x" } });
     expect(result.ok).toBe(true);
     expect(result.normalizedConfig).toMatchObject({
-      size: "default",
+      size: "small",
       autoStopMinutes: 120,
-      idleStopMinutes: 15,
+      idleStopMinutes: 5,
+      staleLeaseMinutes: 20,
       maxActive: 2,
       maxStartsPerDay: 70,
       minComputeHoursLeft: 1,
@@ -157,14 +158,14 @@ describe("ValidateConfig", () => {
 });
 
 describe("AcquireLease", () => {
-  it("creates a VM for a new card with monitoring off, noEnv, fail-fast, an idempotency key and the trial TTL", async () => {
+  it("creates a VM for a new card with monitoring on, noEnv, fail-fast, an idempotency key and the trial TTL", async () => {
     const lease = await acquire("run-1");
     const create = fake.callsOf("create");
     expect(create).toHaveLength(1);
     expect(create[0].args).toMatchObject({
-      type: "default",
+      type: "small",
       ttlSeconds: 7200,
-      monitoring: false,
+      monitoring: true,
       noEnv: true,
       failFast: true,
     });
@@ -1358,7 +1359,9 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
     const unverified = harness.logs.find((entry) => entry.message.includes("could not verify") && entry.meta?.sandboxId === sandboxId);
     expect(unverified).toMatchObject({ level: "error", meta: { before: "template capture" } });
-    expect(String(unverified?.meta?.detail)).toContain("Permission denied");
+    expect(unverified?.meta?.detail).toBe("walk incomplete (diagnostics withheld)");
+    expect(JSON.stringify(harness.logs)).not.toContain("Permission denied");
+    expect(JSON.stringify(harness.logs)).not.toContain("/home/user/locked");
 
     await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
     expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
@@ -1665,10 +1668,10 @@ describe("idle sweep", () => {
         return doc;
       })(),
     );
-    clock.t += 10 * 60 * 1000;
+    clock.t += 4 * 60 * 1000;
     let report = await currentManager().sweep("test", { force: true });
     expect(report.stopped).toEqual([]);
-    clock.t += 6 * 60 * 1000;
+    clock.t += 2 * 60 * 1000;
     report = await currentManager().sweep("test", { force: true });
     expect(report.stopped).toEqual([lease.providerLeaseId]);
     expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("archived");
@@ -1676,9 +1679,9 @@ describe("idle sweep", () => {
 
   it("stops a VM whose lease is still held but idle beyond staleLeaseMinutes", async () => {
     const lease = await acquire("run-1");
-    clock.t += 30 * 60 * 1000;
+    clock.t += 10 * 60 * 1000;
     expect((await currentManager().sweep("test", { force: true })).stopped).toEqual([]);
-    clock.t += 31 * 60 * 1000;
+    clock.t += 11 * 60 * 1000;
     expect((await currentManager().sweep("test", { force: true })).stopped).toEqual([lease.providerLeaseId]);
   });
 
