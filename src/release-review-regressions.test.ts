@@ -39,7 +39,9 @@ beforeEach(async () => {
   clock = { t: Date.parse("2026-10-22T18:00:00Z"), now: () => clock.t };
   fake = new FakeBoat(clock);
   ssh = new FakeSsh();
-  harness = createFakeContext();
+  harness = createFakeContext({
+    issues: new Map([[ISSUE, { status: "in_progress", executionWorkspaceSettings: {} }]]),
+  });
   sleeps = [];
   spawnMock.mockReset();
   spawnMock.mockImplementation(ssh.spawn);

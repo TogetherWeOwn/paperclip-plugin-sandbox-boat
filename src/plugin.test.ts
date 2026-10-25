@@ -46,7 +46,11 @@ let sleeps: number[];
 async function setup(
   options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
 ) {
-  harness = createFakeContext(options);
+  // An authoritative issue with no native network policy, not a missing issue.
+  harness = createFakeContext({
+    ...options,
+    issues: options.issues ?? new Map([[ISSUE, { status: "in_progress", executionWorkspaceSettings: {} }]]),
+  });
   await plugin.definition.setup(harness.ctx as never);
 }
 
