@@ -5,7 +5,8 @@
 // after C with generation-guarded timers, start/compute budget fallback to
 // OFFLOAD_UNAVAILABLE, per-command usage + expected-cost log, idempotency by
 // commandId. Durable journal/receipt recovery and account admission are both
-// wired here; sync adapter and cancel/read routes remain separate slices.
+// wired here. Guest lifecycle and incremental output are opt-in; persisted
+// pool recovery, sync-inclusive reservations and HTTP routing are separate.
 import { createHash } from "node:crypto";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
@@ -14,8 +15,11 @@ import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import type { AccountReservation, AccountUsageRow } from "./account-ledger.js";
 import { OffloadJournal, commandDigest, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
 import type { StateClientLike } from "./state.js";
+import { OffloadLifecycle, type CommandExit, type ExecutionIdentity, type GuestController, type OffloadRunContext } from "./offload-lifecycle.js";
+export type { GuestIdentity, GuestController, OffloadRunContext } from "./offload-lifecycle.js";
 export { OffloadGuestRunner } from "./offload-guest.js";
-export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
+export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadReadView,
+  OffloadOutputEvent, OffloadDurableDeps } from "./offload-journal.js";
 
 export interface OffloadCommand {
   commandId: string;
@@ -44,6 +48,10 @@ export type OffloadResult =
       exitCode: number;
       seconds: number;
       dollars: number;
+      remoteStarted?: true;
+      fallbackSafe?: false;
+      cancelled?: boolean;
+      timedOut?: boolean;
     }
   | {
       status: "unknown";
@@ -103,7 +111,15 @@ export interface OffloadDeps extends Partial<OffloadDurableDeps> {
   now: () => number;
   timers?: OffloadTimers;
   config: OffloadExecutorConfig;
-  runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<{ exitCode: number; seconds: number }>;
+  guest?: undefined;
+  runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>;
+}
+
+// A separate transport shape keeps the landed identity-only runner compatible.
+// Lifecycle-enabled callers must supply the complete durable journal ports.
+export interface OffloadLifecycleDeps extends Omit<OffloadDeps, "guest" | "runCommand" | keyof OffloadDurableDeps>, OffloadDurableDeps {
+  guest: GuestController;
+  runCommand(sandboxId: string, command: OffloadCommand, context?: OffloadRunContext): Promise<CommandExit>;
 }
 
 interface PoolVm {
@@ -165,16 +181,18 @@ export class OffloadExecutor {
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
   private readonly runCommand: OffloadDeps["runCommand"];
   private readonly durable: OffloadJournal | null;
+  private readonly lifecycle: OffloadLifecycle | null;
   private readonly pool: PoolVm[] = [];
   private readonly queue: Queued[] = [];
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
   private readonly stopFailures = new Set<string>();
+  private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
   private shutdownTask: Promise<void> | null = null;
 
-  constructor(deps: OffloadDeps) {
+  constructor(deps: OffloadDeps | OffloadLifecycleDeps) {
     this.boat = deps.boat;
     this.logger = deps.logger;
     this.now = deps.now;
@@ -189,18 +207,23 @@ export class OffloadExecutor {
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
     };
-    const hasDurableDeps = deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
+    const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
       throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
     }
-    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDeps & OffloadDurableDeps, this.now, {
+    this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers) : null;
+    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDurableDeps, this.now, {
       hold: (identity) => this.restoreHold(identity),
       release: (identity) => this.releaseHold(identity),
       cancel: (command, result) => this.cancelQueued(command, result),
-    }) : null;
-    this.runCommand = this.durable
-      ? (vm, command) => this.durable!.run(vm, command, deps.runCommand)
+    }, this.lifecycle ?? undefined) : null;
+    const transport: OffloadDeps["runCommand"] = deps.guest
+      ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand,
+        (stream, bytes) => this.requireDurable().appendOutput(command, stream, bytes))
       : deps.runCommand;
+    this.runCommand = this.durable
+      ? (vm, command) => this.durable!.run(vm, command, transport)
+      : transport;
     if (!(deps.state && deps.accountId && deps.poolId)) throw new Error("account admission requires durable state, accountId and poolId");
     this.poolId = deps.poolId;
     this.ledger = new AccountLedger(deps.state, deps.accountId, this.now);
@@ -211,8 +234,38 @@ export class OffloadExecutor {
   async readCommand(companyId: string, runId: string, commandId: string) {
     return await this.requireDurable().readCommand(companyId, runId, commandId);
   }
-  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string) {
-    return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason);
+  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number) {
+    return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason, generation);
+  }
+  // ID-only convenience calls are restricted to commands admitted by this
+  // executor. Ambiguous IDs fail closed; external routes must use scoped calls.
+  private knownCommand(commandId: string): OffloadCommand {
+    const command = this.knownCommands.get(commandId);
+    if (!command) throw new Error("OFFLOAD_COMMAND_SCOPE_REQUIRED");
+    return command;
+  }
+  async cancel(commandId: string, reason: string, generation?: number) {
+    const command = this.knownCommand(commandId);
+    return await this.cancelCommand(command.companyId, command.runId, commandId, reason, generation);
+  }
+  async heartbeatCommand(companyId: string, runId: string, commandId: string, generation?: number) {
+    return await this.requireDurable().heartbeatCommand(companyId, runId, commandId, generation);
+  }
+  async heartbeat(commandId: string, generation?: number) {
+    const command = this.knownCommand(commandId);
+    return await this.heartbeatCommand(command.companyId, command.runId, commandId, generation);
+  }
+  async readOutput(companyId: string, runId: string, commandId: string, after = 0, limitBytes = 65_536) {
+    return await this.requireDurable().readOutput(companyId, runId, commandId, after, limitBytes);
+  }
+  async read(commandId: string, after = 0, limitBytes = 65_536) {
+    const command = this.knownCommand(commandId);
+    return await this.readOutput(command.companyId, command.runId, commandId, after, limitBytes);
+  }
+  async start(command: OffloadCommand) {
+    const snapshot = this.trackCommand(command);
+    const view = await this.requireDurable().start(snapshot, () => this.executeVolatile(snapshot));
+    return { ...view, events: [], nextCursor: 0 };
   }
   private requireDurable(): OffloadJournal {
     if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
@@ -296,10 +349,18 @@ export class OffloadExecutor {
     return await next;
   }
 
-  async execute(command: OffloadCommand): Promise<OffloadResult> {
+  private trackCommand(command: OffloadCommand): OffloadCommand {
     // Snapshot caller-owned objects before any await; mutating argv or env must
     // never change the payload after its durable digest was accepted.
     const snapshot = structuredClone(command);
+    const known = this.knownCommands.get(snapshot.commandId);
+    if (!this.knownCommands.has(snapshot.commandId)) this.knownCommands.set(snapshot.commandId, snapshot);
+    else if (known && commandKey(known) !== commandKey(snapshot)) this.knownCommands.set(snapshot.commandId, null);
+    return snapshot;
+  }
+
+  async execute(command: OffloadCommand): Promise<OffloadResult> {
+    const snapshot = this.trackCommand(command);
     return this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
   }
 
@@ -387,6 +448,10 @@ export class OffloadExecutor {
     }
     if (stopped) return this.accountClaim(command, stopped, "resume");
     if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
+    // An uncertain slot has no live release event to queue behind. Refuse
+    // rather than strand callers waiting for a nonexistent safe handoff.
+    if (this.pool.every((vm) => vm.quarantined)) return { kind: "unavailable", reason: "pool quarantined; guest reconciliation required" };
+    if ((command.queueTimeoutMs ?? this.config.queueTimeoutMs) <= 0) return { kind: "unavailable", reason: "queue wait disabled" };
     if (this.queue.length >= this.config.queueLimit) {
       return { kind: "unavailable", reason: `queue full (${this.config.queueLimit} pending)` };
     }
@@ -502,9 +567,12 @@ export class OffloadExecutor {
     const startedAt = this.now();
     let result: OffloadResult;
     try {
-      const { exitCode, seconds } = await this.runCommand(vm.sandboxId, command);
+      const raw = await this.runCommand(vm.sandboxId, command);
+      const { exitCode, seconds } = raw;
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
-      result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars };
+      result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars,
+        ...(this.lifecycle ? { remoteStarted: true as const, fallbackSafe: false as const,
+          cancelled: raw.cancelled === true, timedOut: raw.timedOut === true } : {}) };
     } catch {
       const seconds = Math.max(0, (this.now() - startedAt) / 1000);
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
