@@ -63,6 +63,9 @@ export class JsonState implements StateClientLike {
     this.rows.set(this.key(input), JSON.stringify(value));
     this.writes += 1;
   }
+  async delete(input: Parameters<StateClientLike["delete"]>[0]): Promise<void> {
+    this.rows.delete(this.key(input));
+  }
   snapshot(): Array<[string, string]> { return [...this.rows]; }
 }
 
