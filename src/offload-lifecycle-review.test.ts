@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OffloadLifecycle, type GuestController, type GuestIdentity } from "./offload-lifecycle.js";
 import { commandDigest, commandKey, OffloadJournal, validGuestIdentity,
   type OffloadIdentity, type OffloadRecord } from "./offload-journal.js";
-import { Clock, command, deferred, fixture, until, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { Clock, command, deferred, EPOCH, fixture, until, type Fixture } from "./test-support/offload-lifecycle-contract.js";
 
 function lifecycleHarness() {
   const clock = new Clock();
@@ -28,6 +28,47 @@ describe("review: guest boundary and asynchronous admission", () => {
   it.each(["//", "///", "/delegated//review", "/delegated/review/"])("rejects noncanonical cgroup path %s", (path) => {
     const { identity } = lifecycleHarness();
     expect(validGuestIdentity({ ...identity, cgroupPath: path })).toBe(false);
+  });
+
+  it.each([
+    ["another boot", { guestBootId: "boot-b" }],
+    ["another journal generation", { journalGeneration: 2 }],
+    ["past heartbeat deadline", { heartbeatDeadline: EPOCH - 1 }],
+    ["heartbeat deadline at now", { heartbeatDeadline: EPOCH }],
+    ["heartbeat deadline beyond interest window", { heartbeatDeadline: EPOCH + 30_001 }],
+    ["past guest deadline", { guestDeadline: EPOCH - 1 }],
+    ["guest deadline at now", { guestDeadline: EPOCH }],
+    ["guest deadline beyond command timeout", { guestDeadline: EPOCH + 120_001 }],
+  ] satisfies Array<[string, Partial<GuestIdentity>]>)("rejects prepared identity with %s before spawning", async (_label, patch) => {
+    const s = lifecycleHarness();
+    s.guest.prepare.mockResolvedValue({ ...s.identity, ...patch });
+    const execution = s.lifecycle.prepare(s.base.sandboxId, s.cmd, s.base)
+      .then((identity) => s.lifecycle.run(identity, s.cmd, s.transport, async () => {}));
+    await expect(execution).rejects.toMatchObject({ code: "OFFLOAD_GUEST_IDENTITY_INVALID" });
+    expect(s.guest.armDeadline).not.toHaveBeenCalled();
+    expect(s.transport).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unverified prepared boot even when it matches the host binding", async () => {
+    const s = lifecycleHarness();
+    s.base.guestBootId = "unverified:boot-a";
+    s.guest.prepare.mockResolvedValue({ ...s.identity, guestBootId: s.base.guestBootId });
+    const execution = s.lifecycle.prepare(s.base.sandboxId, s.cmd, s.base)
+      .then((identity) => s.lifecycle.run(identity, s.cmd, s.transport, async () => {}));
+    await expect(execution).rejects.toMatchObject({ code: "OFFLOAD_GUEST_IDENTITY_INVALID" });
+    expect(s.guest.armDeadline).not.toHaveBeenCalled();
+    expect(s.transport).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 10_000])("bounds the prepared guest deadline with timeoutMs=%s", async (timeoutMs) => {
+    const s = lifecycleHarness();
+    s.cmd.timeoutMs = timeoutMs;
+    s.guest.prepare.mockResolvedValue({ ...s.identity, guestDeadline: EPOCH + (timeoutMs ?? 120_000) + 1 });
+    const execution = s.lifecycle.prepare(s.base.sandboxId, s.cmd, s.base)
+      .then((identity) => s.lifecycle.run(identity, s.cmd, s.transport, async () => {}));
+    await expect(execution).rejects.toMatchObject({ code: "OFFLOAD_GUEST_IDENTITY_INVALID" });
+    expect(s.guest.armDeadline).not.toHaveBeenCalled();
+    expect(s.transport).not.toHaveBeenCalled();
   });
 
   it("does not let guest-supplied extra fields replace host command bindings", async () => {
