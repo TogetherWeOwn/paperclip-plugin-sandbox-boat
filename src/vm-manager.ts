@@ -465,8 +465,23 @@ export class BoatVmManager {
     });
     let noMachine = 0;
     let transient = 0;
+    // Any attempt whose effect is unknown poisons later certainty: a refusal of
+    // attempt two is not proof that attempt one never happened. Once set, the
+    // hold is retained until an authoritative receipt reconciles the effect.
+    let uncertainEffect = false;
     for (;;) {
-      if (noMachine > 0 || transient > 0) await this.account.revalidate(api, reservation, request);
+      if (noMachine > 0 || transient > 0) {
+        try {
+          await this.account.revalidate(api, reservation, request);
+        } catch (error) {
+          // The retry cannot continue. A no_ready_machine-only history proves
+          // no start occurred; anything else retains the hold. Without this the
+          // intent stays unsettled, active and unreconciliable forever.
+          const definitive = noMachine > 0 && transient === 0 && !uncertainEffect;
+          await this.account.failed(reservation, definitive);
+          throw error;
+        }
+      }
       let response: T;
       try {
         response = await call();
@@ -480,6 +495,7 @@ export class BoatVmManager {
         }
         if (info.status === 409 && info.code === "idempotency_in_progress" && transient < 5) {
           transient += 1;
+          uncertainEffect = true;
           await this.sleep(2000);
           continue;
         }
@@ -494,10 +510,11 @@ export class BoatVmManager {
             return null;
           }
           transient += 1;
+          uncertainEffect = true;
           await this.sleep(1500 * transient);
           continue;
         }
-        await this.account.failed(reservation, await definitiveStartRejection(error));
+        await this.account.failed(reservation, !uncertainEffect && await definitiveStartRejection(error));
         throw this.mapStartError(op, info, config);
       }
       const id = toView((response as { sandbox?: unknown } | null)?.sandbox)?.id ?? accountContext.sandboxId;
@@ -1375,7 +1392,14 @@ export class BoatVmManager {
       return { accepted: true, gone: false };
     } catch (error) {
       const info = await describeBoatError(error);
-      if (info.status === 404) return { accepted: true, gone: true };
+      if (info.status === 404) {
+        // Definitive: the provider has no such sandbox, so nothing is billing.
+        // Record it now instead of holding capacity until the next reconcile.
+        await this.account.stopped(sandboxId).catch(() => {
+          this.logger.warn("boat: stop-404 ledger write failed; reconcile will converge", { sandboxId });
+        });
+        return { accepted: true, gone: true };
+      }
       if (info.status === 409 && ["sandbox_stopping", "sandbox_not_ready", "machine_not_running"].includes(info.code ?? "")) {
         return { accepted: true, gone: false };
       }
@@ -2223,6 +2247,7 @@ export class BoatVmManager {
     }
 
     const now = this.now();
+    let reconciledLedger = false;
     for (const cachedList of accounts.values()) {
       const primary = cachedList[0];
       const prefixes = new Set(cachedList.map((c) => c.config.namePrefix));
@@ -2236,9 +2261,23 @@ export class BoatVmManager {
       }
       // Reuse the sweep's authoritative inventory rather than issue duplicate
       // per-VM reads. Missing identities still require an explicit receipt.
-      await this.account.reconcile(this.opsApi(primary.config), sandboxes, true).catch(() => {
-        report.errors.push("account reservation reconciliation failed");
-      });
+      // One ledger tracks one provider account: reconciling it through a
+      // second account's client would let that account's 404s and limits
+      // release the holds that pay for the first account's VMs. Reconcile once
+      // through the first credential group; other groups still sweep their VMs.
+      // One ledger tracks one provider account: reconciling it through a
+      // second account's client would let that account's 404s and limits
+      // release the holds that pay for the first account's VMs. Reconcile once
+      // through the first credential group; other groups still sweep their VMs.
+      if (!reconciledLedger) {
+        reconciledLedger = true;
+        if (accounts.size > 1) {
+          this.logger.warn("boat: multiple provider credentials share one account ledger; reconciling through the first only", {});
+        }
+        await this.account.reconcile(this.opsApi(primary.config), sandboxes, true).catch(() => {
+          report.errors.push("account reservation reconciliation failed");
+        });
+      }
       const seen = new Set(sandboxes.map((s) => s.id));
       const unknownOwner = ownershipUnknown(cachedList);
       const leftAlone: string[] = [];

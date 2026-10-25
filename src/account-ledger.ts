@@ -230,8 +230,11 @@ export class AccountLedger {
       ? Math.max(300, req.tailSeconds) : req.tailSeconds;
   }
   private pendingStart(intent: Intent, window: Window, at: number): boolean {
+    // An unsettled (ambiguous or in-flight) start holds its window only until
+    // the window resets: provider counters roll, so holding past expiresAt is
+    // a permanent leak, not conservatism. Active/compute holds stay retained.
     return intent.operation !== "warm" && intent.status !== "rejected" && !intent.starts[window].reflected &&
-      (intent.settledAt == null || intent.starts[window].expiresAt > at);
+      intent.starts[window].expiresAt > at;
   }
   private check(doc: AccountDoc, limits: Limits, req: AdmissionRequest, tailSeconds: number, ignore?: string): void {
     for (const value of [req.jobSeconds, tailSeconds, req.maxActive, req.maxStartsPerDay, req.minComputeHoursLeft]) number(value);
@@ -272,10 +275,13 @@ export class AccountLedger {
       const doc = await this.read();
       let limits = await this.observe(api, doc, req.allowCachedLimits, req);
       const tailSeconds = this.tail(doc, limits, req);
-      // A warm handoff truncates the previous tail, but only on a committed new
-      // reservation. A refusal must leave the original tail and timer intact.
+      // A warm handoff or a new resume reservation truncates the previous tail,
+      // but only on a committed new reservation. A refusal must leave the
+      // original tail and timer intact. A resume starts a new command on the
+      // same VM: without this the predecessor's tail would run until the later
+      // terminal receipt and the overlapping seconds would be billed twice.
       const candidate = structuredClone(doc);
-      if (req.sandboxId && req.operation === "warm") {
+      if (req.sandboxId && (req.operation === "warm" || req.operation === "resume")) {
         this.closeTail(candidate, req.sandboxId, this.now());
         if (!req.poolId) {
           // Concurrent leases share one machine, not N overlapping TTL bills.
@@ -355,9 +361,12 @@ export class AccountLedger {
               intent.compute += extra; intent.tailSeconds = 300;
             }
           }
-        } catch (error) {
+        } catch {
+          // The resume has already taken effect: the VM is running and the
+          // command must proceed. Keep the shorter funded tail (already
+          // persisted above) rather than failing a live start after the fact.
           await this.write(doc);
-          throw error;
+          return intent.tailSeconds;
         }
       }
       await this.write(doc);
@@ -409,6 +418,11 @@ export class AccountLedger {
     this.closeTail(doc, sandboxId, at);
     for (const intent of doc.intents) {
       if (intent.sandboxId !== sandboxId || intent.status === "stopped" || intent.status === "rejected") continue;
+      // An intent whose external effect has not settled (no started/failed yet)
+      // is owned by its in-flight transition, not by inventory evidence: a
+      // stale archived listing must never retire a pending resume's capacity.
+      // Only started() / failed() settle such intents.
+      if (intent.status === "intent" && intent.settledAt == null) continue;
       if (intent.status === "ambiguous" || intent.status === "intent") {
         const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
         if (row && at > intent.at) row.intervals = [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }];
@@ -432,9 +446,18 @@ export class AccountLedger {
       const ids = [...active, ...history.slice(cursor), ...history.slice(0, cursor)].slice(0, 100);
       doc.reconcileCursor = (cursor + Math.max(0, ids.length - active.size)) % Math.max(1, history.length);
       for (const id of ids) {
+        // A listing is a point-in-time snapshot: when this ledger still holds
+        // a live (non-terminal) reservation for the sandbox, a listed terminal
+        // state may predate a concurrent resume. Re-check terminal evidence
+        // with a fresh read before retiring a live hold. A listed non-terminal
+        // state needs no re-check: it cannot retire anything.
+        const liveHold = doc.intents.some((i) => i.sandboxId === id && i.status !== "stopped" && i.status !== "rejected");
         try {
           const listed = inventory?.find((vm) => vm.id === id);
-          const box = listed ?? (await bounded(() => api.get({ sandboxId: id }))).sandbox;
+          const listedTerminal = listed && ["archived", "cancelled", "deleted"].includes(listed.state ?? "");
+          const box = listed && (!liveHold || !listedTerminal)
+            ? listed
+            : (await bounded(() => api.get({ sandboxId: id }))).sandbox;
           if (box && ["archived", "cancelled", "deleted"].includes(box.state ?? "")) this.terminal(doc, id, this.now());
         } catch (error) {
           // A definitive 404 for an already-known identity is not an empty list

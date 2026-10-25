@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OffloadExecutor, type OffloadDeps } from "./offload.js";
 import {
-  FileStore, cargoResult, command, flush, harness, hostKey, settled,
+  FileStore, cargoResult, command, flush, harness, hostKey, settled, testAccount,
   type Command, type Executor, type RecordV1,
 } from "./test-support/durable-offload.js";
 
@@ -307,6 +307,7 @@ describe("legacy constructor complete-payload idempotency", () => {
     const effects: string[] = [];
     let serial = 0;
     const deps: OffloadDeps = {
+      ...testAccount("legacy-conflict-pool"),
       boat: h.boat as unknown as OffloadDeps["boat"], logger: { info() {}, warn() {}, error() {} }, now: () => h.clock.t,
       timers: { set(cb, ms) { const id = ++serial; h.timers.set(id, { at: h.clock.t + ms, cb }); return id; }, clear(id) { h.timers.delete(id as number); } },
       config: queueConfig,

@@ -3,8 +3,28 @@ import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises
 import { join } from "node:path";
 import type { OffloadCommand, OffloadDeps } from "../offload.js";
 import type { BoatApiLike } from "../boat-client.js";
+import type { StateClientLike } from "../state.js";
 import { OffloadExecutor } from "../offload.js";
 import { FakeBoat } from "./fake-boat.js";
+
+// In-memory account-admission state: the merged executor always requires
+// durable ledger deps (state, accountId, poolId) alongside durable journal deps.
+export class MemAccountState implements StateClientLike {
+  private readonly rows = new Map<string, unknown>();
+  private key(input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) {
+    return JSON.stringify([input.scopeKind, input.scopeId ?? null, input.namespace ?? null, input.stateKey]);
+  }
+  async get(input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string }): Promise<unknown> {
+    return structuredClone(this.rows.get(this.key(input)) ?? null);
+  }
+  async set(input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string }, value: unknown): Promise<void> {
+    this.rows.set(this.key(input), structuredClone(value));
+  }
+}
+let nextTestAccount = 0;
+export function testAccount(poolId = "durable-test-pool") {
+  return { state: new MemAccountState(), accountId: `durable-test-account-${++nextTestAccount}`, poolId };
+}
 
 // Test-owned storage/transport fixtures. No lifecycle, recovery, deduplication,
 // retention or quarantine policy is implemented here: all belongs to the SUT.
@@ -171,9 +191,11 @@ export function harness(root: string) {
   const receiptReads: Identity[] = [];
   const hostDirectory = join(root, "host");
   const guestDirectory = join(root, "guest");
+  const account = testAccount();
   const openExecutor = (override: Partial<DurableDeps> = {}) => {
     const store = new FileStore(hostDirectory);
     const deps: DurableDeps = {
+      ...account,
       boat: boat as unknown as BoatApiLike, logger: { info() {}, warn() {}, error() {} }, now: () => clock.t,
       timers: {
         set(cb, ms) { const id = ++serial; timers.set(id, { at: clock.t + ms, cb }); return id; },

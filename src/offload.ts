@@ -132,6 +132,11 @@ interface Queued {
   refusal: Promise<void> | null;
 }
 
+function digestOf(command: OffloadCommand): string {
+  // Internal payload identity; never included in logs or usage.
+  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId, argv: command.argv });
+}
+
 function sandboxIdOf(response: unknown): string | null {
   if (!response || typeof response !== "object") return null;
   const root = response as Record<string, unknown>;
@@ -437,10 +442,14 @@ export class OffloadExecutor {
 
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
+    // Fund the provider-enforced TTL envelope, not the raw timeout: create,
+    // resume and warm update all clamp the deadline to whole seconds with a
+    // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
+    const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
     let reservation: AccountReservation;
     try {
       reservation = await ledger.reserve(this.boat, { ...this.config, operation, sandboxId: existing?.sandboxId, poolId: this.poolId,
-        jobSeconds: (command.timeoutMs ?? 120_000) / 1000, tailSeconds: this.config.offloadIdleStopSeconds,
+        jobSeconds, tailSeconds: this.config.offloadIdleStopSeconds,
         command: { commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId,
           companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") } });
     } catch {
@@ -451,18 +460,21 @@ export class OffloadExecutor {
     vm.accountReservation = reservation;
     vm.tailSeconds = reservation.tailSeconds;
     if (!existing) this.pool.push(vm);
+    // Funded whole seconds at or above the enforced minimum, so the enforced
+    // deadline below equals the funded envelope exactly.
+    const ttlSeconds = Math.max(60, Math.ceil(jobSeconds + reservation.tailSeconds));
     let effectConfirmed = operation === "warm";
     try {
       if (operation === "create") {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds: Math.max(60, Math.ceil((command.timeoutMs ?? 120_000) / 1000 + reservation.tailSeconds)), monitoring: false, failFast: true, noEnv: true });
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: false, failFast: true, noEnv: true });
         const id = sandboxIdOf(response);
         if (!id) throw new Error("create returned no sandbox id");
         vm.sandboxId = id;
       } else if (operation === "resume") {
-        await this.boat.resume({ sandboxId: vm.sandboxId, ttlSeconds: Math.max(60, Math.ceil((command.timeoutMs ?? 120_000) / 1000 + reservation.tailSeconds)) });
+        await this.boat.resume({ sandboxId: vm.sandboxId, ttlSeconds });
       } else {
         // Warm activity also needs a newly funded provider-enforced deadline.
-        await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds: Math.max(60, Math.ceil((command.timeoutMs ?? 120_000) / 1000 + reservation.tailSeconds)) });
+        await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds });
       }
       effectConfirmed = true;
       vm.stopped = false;
@@ -470,7 +482,7 @@ export class OffloadExecutor {
       // A metered resume may select C=300. Keep provider auto-stop aligned with
       // the longer, already-funded reservation before starting the command.
       if (vm.tailSeconds > reservation.tailSeconds) await this.boat.update({ sandboxId: vm.sandboxId,
-        ttlSeconds: Math.max(60, Math.ceil((command.timeoutMs ?? 120_000) / 1000 + vm.tailSeconds)) });
+        ttlSeconds: Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds)) });
       return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold" };
     } catch (error) {
       const definitive = !effectConfirmed && await definitiveStartRejection(error);
@@ -604,16 +616,23 @@ export class OffloadExecutor {
 
   private async stopVm(vm: PoolVm): Promise<boolean> {
     vm.stopAttempts += 1;
+    // The provider stop alone decides success. A ledger failure afterwards must
+    // not read as a failed stop: the VM is already stopped, and retrying the
+    // stop (or treating the VM as warm) would bill or quarantine wrongly.
+    // Unrecorded receipts converge on the next reconcile().
+    let response: unknown;
     try {
-      const response = await this.boat.stop({ sandboxId: vm.sandboxId });
-      if (this.ledger) {
-        const state = (response as { sandbox?: { state?: string } }).sandbox?.state;
-        if (state === "archived" || state === "cancelled") await this.ledger.stopped(vm.sandboxId);
-      }
+      response = await this.boat.stop({ sandboxId: vm.sandboxId });
     } catch {
       this.stopFailures.add(vm.sandboxId);
       this.logger.warn("boat offload idle stop failed; retry required", { sandboxId: vm.sandboxId, attempt: vm.stopAttempts });
       return false;
+    }
+    try {
+      const state = (response as { sandbox?: { state?: string } } | null)?.sandbox?.state;
+      if (state === "archived" || state === "cancelled") await this.ledger.stopped(vm.sandboxId);
+    } catch {
+      this.logger.error("boat offload stop receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
     }
     this.stopFailures.delete(vm.sandboxId);
     vm.stopped = true;
