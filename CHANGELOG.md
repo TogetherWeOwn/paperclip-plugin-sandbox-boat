@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* Opt-in command offload now keeps a company-scoped workspace and its VM reserved through asynchronous push, execution, collection, staging and durable settlement, including cancellation. Independent workspaces can progress without waiting for an unrelated workspace's reservation.
+* Collected adapter data reaches staging intact. Staged/conflict receipts survive durable result reads and replay without applying returned files to the live workspace. Existing void-returning sync adapters remain compatible.
+
+### Fixed
+
+* Warm selection, stopped-VM resume and queued dispatch cannot borrow across company, repository, profile or trust-domain pool boundaries. Persisted bindings preserve isolation after worker restart; uncertain workspace holds remain exclusive even when a spare VM exists.
+* Cancellation during collection or staging retains execution evidence, staged changes and an exit-130 cancellation result rather than reporting success or safe local fallback. Post-exit journal transitions share the cancellation fence so a pending state write cannot erase the durable cancellation request.
+
 ## 0.2.1
 
 ### Fixed

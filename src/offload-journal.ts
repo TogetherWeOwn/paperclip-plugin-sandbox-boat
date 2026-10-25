@@ -381,8 +381,10 @@ export class OffloadJournal {
     const result = await transport(sandboxId, command, identity);
     // The legacy transport resolves at exit, not at spawn. Do not claim a
     // running acknowledgement until it actually returns evidence of execution.
-    await this.commit(record, { state: "running", remoteStarted: true });
-    await this.commit(record, { state: "syncing_out" });
+    await this.transition(record, async () => {
+      await this.commit(record, { state: "running", remoteStarted: true });
+      await this.commit(record, { state: "syncing_out" });
+    });
     const syncBack = await this.syncOut(sandboxId, command);
     return { ...result, ...(syncBack ? { syncBack } : {}) };
   }
@@ -397,6 +399,11 @@ export class OffloadJournal {
     const record = this.active.get(commandKey(command))!;
     const committed = await this.transition(record, async () => {
       if (TERMINAL.has(record.state)) return record.result!;
+      // Cancellation after guest exit still cancels the command lifecycle, but
+      // cannot erase execution or drop staged changes. A timeout keeps exit 124.
+      if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
+        result = { ...result, cancelled: true, exitCode: 130 };
+      }
       // No transport is invoked before the starting commit. A sync/boot-ID
       // failure is therefore a known non-start, not identity-less uncertainty.
       if (PRE_START.has(record.state) && result.status === "unknown") {

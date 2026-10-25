@@ -99,10 +99,37 @@ stop does not prevent stopping a known-empty VM, but missing telemetry stays
 pending until durable evidence converges. One authoritative worker is required;
 these records do not fence simultaneous workers or external account writers.
 
-Collected-data staging, workspace reservations, cancellation during asynchronous
-sync and pool compatibility remain **slice c**. The acceptance tests model
-process trees and timer ownership; they are not proof of a real guest's cgroup
-enforcement. No live VM use or deployment is part of this change.
+Sync-inclusive reservations and staged results are part of this opt-in executor:
+
+* `sync.collect(sandboxId, command)` returns adapter-owned collected data;
+  `sync.stage(sandboxId, command, collected)` receives that same payload and
+  returns `{state: "clean"|"staged"|"conflict", changedPaths, conflictPaths,
+  artifactId}`. The staging receipt is snapshotted into the durable result and
+  returned by execution, reads and replay. Existing void-returning sync adapters
+  remain supported. Staging must preserve returned changes separately for review,
+  never write them into the live workspace; the executor does not apply files.
+* A company-scoped execution workspace holds one reservation from before push
+  through execution, collection, staging and durable settlement. Cancellation
+  cannot release it or its VM while an asynchronous phase is still pending.
+  Lifecycle callers without `executionWorkspaceId` conservatively reserve their
+  card; legacy identity-only callers without a workspace retain their old behavior.
+  Eligible waiters remain FIFO, while an unrelated permitted workspace can progress
+  past a waiter blocked on another workspace.
+* Every warm selection, stopped-VM resume and queued dispatch requires matching
+  company, repository, profile and trust-domain bindings. An omitted trust domain
+  does not match an explicit one. These bindings and workspace holds survive
+  worker restart. Old VMs without compatibility bindings cannot authorize reuse;
+  uncertain recovered reservations without workspace ownership fail closed.
+* Push failure or pre-start cancellation is durably never-started and permits
+  local fallback only after the pending push settles. Collection/staging failure
+  retains execution as unknown and quarantines both the VM and workspace, even
+  if another VM is free. Cancellation after execution retains unsafe fallback
+  and staged changes, returning exit 130 unless an execution timeout already won.
+
+The acceptance tests model process trees, transfers and timer ownership; they
+are not proof of a real guest's cgroup enforcement or a real sync adapter's path
+confinement. Real adapters, HTTP route activation and native job scheduling are
+separate integration work. No live VM use or deployment is part of this change.
 
 ### Native workspace transfers
 
