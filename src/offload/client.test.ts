@@ -177,6 +177,54 @@ describe("output and polling", () => {
   });
 });
 
+describe("terminal page draining", () => {
+  it.each([
+    { state: "completed", exitCode: 101, signal: null, terminalError: null, expected: 101 },
+    { state: "cancelled", exitCode: 130, signal: 2, terminalError: null, expected: 130 },
+    { state: "failed", exitCode: null, signal: null, terminalError: null, expected: 75 },
+    { state: "unknown", exitCode: null, signal: null, terminalError: null, expected: 75 },
+    { state: "cancelled", exitCode: 143, signal: 15, terminalError: "OFFLOAD_OUTPUT_LIMIT", expected: 74 },
+  ])("preserves $state exit $expected after all retained pages", async (scenario) => {
+    const t = setup();
+    t.http.post.mockResolvedValue({ ok: true, status: 202, json: {} });
+    t.http.get.mockImplementation(async (path: string) => {
+      const after = Number(new URL(path, "http://broker.invalid").searchParams.get("after"));
+      const events = after < 2 ? [{ seq: after, stream: "stdout", dataBase64: Buffer.from(after === 0 ? "head" : "tail").toString("base64") }] : [];
+      return { ok: true, status: 200, json: readView({
+        state: scenario.state, events, nextCursor: Math.min(after + 1, 2), terminalError: scenario.terminalError,
+        result: scenario.exitCode === null ? null : {
+          exitCode: scenario.exitCode, signal: scenario.signal, timedOut: false, cancelled: scenario.state === "cancelled",
+          syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
+        },
+      }) };
+    });
+    expect(await runOffload(t.request, t.deps)).toBe(scenario.expected);
+    expect(Buffer.concat(t.out).toString()).toBe("headtail");
+    expect(t.http.get).toHaveBeenCalledTimes(3);
+    expect(t.sleeps).toEqual([]);
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+  });
+
+  it("does not spin or duplicate bytes when a terminal page stops advancing its cursor", async () => {
+    const t = setup();
+    t.http.post.mockResolvedValue({ ok: true, status: 202, json: {} });
+    let reads = 0;
+    t.http.get.mockImplementation(async () => {
+      if (++reads > 3) return { ok: true, status: 410, json: {} };
+      return { ok: true, status: 200, json: readView({
+        state: "completed", nextCursor: 1,
+        events: [{ seq: 0, stream: "stdout", dataBase64: Buffer.from("once").toString("base64") }],
+        result: { exitCode: 0, signal: null, timedOut: false, cancelled: false,
+          syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null },
+      }) };
+    });
+    expect(await runOffload(t.request, t.deps)).toBe(75);
+    expect(Buffer.concat(t.out).toString()).toBe("once");
+    expect(t.sleeps).toEqual([500, 500]);
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+  });
+});
+
 describe("cancel", () => {
   it("posts cancel on a local signal and exits 128+N", async () => {
     const t = setup();
@@ -233,13 +281,14 @@ describe("fallback and errors", () => {
     const t = setup();
     t.http.post.mockImplementation(async () => ({ ok: true, status: 202, json: { version: 1, commandId: CMD, state: "queued", remoteStarted: false, fallbackSafe: false, eventsCursor: 0 } }));
     const e = { seq: 0, stream: "stdout", dataBase64: Buffer.from("kept").toString("base64") };
-    t.http.get.mockImplementation(async () => ({
+    t.http.get.mockImplementation(async (path: string) => ({
       ok: true,
       status: 200,
-      json: readView({ state: "cancelled", events: [e], nextCursor: 1, terminalError: "OFFLOAD_OUTPUT_LIMIT", result: { exitCode: 143, signal: 15, timedOut: false, cancelled: true, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null } }),
+      json: readView({ state: "cancelled", events: path.endsWith("after=0") ? [e] : [], nextCursor: 1, terminalError: "OFFLOAD_OUTPUT_LIMIT", result: { exitCode: 143, signal: 15, timedOut: false, cancelled: true, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null } }),
     }));
     expect(await runOffload(t.request, t.deps)).toBe(74);
     expect(Buffer.concat(t.out).toString()).toBe("kept");
+    expect(t.http.get).toHaveBeenCalledTimes(2);
   });
 });
 

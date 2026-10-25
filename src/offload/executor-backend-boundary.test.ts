@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OffloadBroker, type BackendCommand, type OffloadBackendHandle } from "./broker.js";
 import { ExecutorBackend } from "./executor-backend.js";
+import { runOffload, type ClientDeps, type HttpResult } from "./client.js";
+import type { OffloadReadResponse } from "./protocol.js";
 import { command, fixture, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
 
 let f: Fixture;
@@ -52,6 +54,57 @@ function bridge() {
   }, input);
   return { executor, broker, cmd, submit };
 }
+
+describe("executor-to-broker-to-shim terminal output", () => {
+  it.each(["accepted", "duplicate", "ambiguous"] as const)("drains completed output across broker pages after an %s submit", async (mode) => {
+    const { broker, cmd, submit } = bridge();
+    const input = cmd("paged-output", "workspace-output");
+    const stdout = Buffer.alloc(102_400);
+    for (let n = 0; n < stdout.length; n += 1) stdout[n] = n % 256;
+    const stderr = Buffer.alloc(7000, 0xfe);
+    f.output([["stdout", stdout], ["stderr", stderr]]);
+    const accepted = await submit(input);
+    await handles[0]!.done;
+    expect((await broker.read(input.commandId, input, 0)).body).toMatchObject({ state: "completed" });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    const reads: OffloadReadResponse[] = [];
+    const local = vi.fn(async () => 99);
+    const staged = vi.fn();
+    const deps: ClientDeps = {
+      now: f.clock.now, sleep: (ms) => f.clock.advance(ms),
+      randomId: () => input.commandId, onSignal() {}, runLocal: local,
+      stdout: (bytes) => { out.push(Buffer.from(bytes)); },
+      stderr: (bytes) => { err.push(Buffer.from(bytes)); },
+      reportStaged: staged, reportUnknown: vi.fn(),
+      http: {
+        post: async (path): Promise<HttpResult> => {
+          expect(path).toBe("/offload/exec");
+          const response = mode === "accepted" ? accepted : await submit(input);
+          if (mode === "ambiguous") return { ok: false, error: "lost submit acknowledgement" };
+          return { ok: true, status: response.status, json: response.body };
+        },
+        get: async (path): Promise<HttpResult> => {
+          const after = Number(new URL(path, "http://broker.invalid").searchParams.get("after"));
+          const response = await broker.read(input.commandId, input, after);
+          reads.push(response.body as OffloadReadResponse);
+          return { ok: true, status: response.status, json: response.body };
+        },
+      },
+    };
+    expect(await runOffload({
+      argv: input.argv, cwdRelative: input.cwdRelative, executionWorkspaceId: input.executionWorkspaceId,
+      queueTimeoutMs: input.queueTimeoutMs, timeoutMs: input.timeoutMs, processEnv: {},
+    }, deps)).toBe(74); // The real fixture returns a staged sync receipt.
+    expect(Buffer.concat(out)).toEqual(stdout);
+    expect(Buffer.concat(err)).toEqual(stderr);
+    expect(reads.length).toBeGreaterThan(1);
+    expect(reads.at(-1)?.events).toEqual([]);
+    expect(staged).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ artifactId: `artifact-${input.commandId}` }));
+    expect(local).not.toHaveBeenCalled();
+    expect(handles).toHaveLength(1);
+  });
+});
 
 describe("executor-to-broker cancellation isolation", () => {
   it("renews a healthy guest while an unrelated expired sync-in is still settling", async () => {
