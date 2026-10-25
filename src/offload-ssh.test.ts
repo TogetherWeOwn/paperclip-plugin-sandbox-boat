@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { access, mkdir, readFile, rmdir } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, readlink, rmdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { userInfo } from "node:os";
@@ -137,6 +137,41 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       .rejects.toMatchObject({ code: "OFFLOAD_OUTPUT_LIMIT" });
     expect(await guest.verifyEmpty(ssh.session.sandboxId, full)).toBe(true);
     expect(await guest.receipt(full)).toBe(null);
+  }, 15_000);
+
+  it("records timeout when the outside watchdog kills before the supervisor observes expiry", async () => {
+    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+    guest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
+      stateRoot: ssh.root, workspace: async () => ssh.root, executable: "python3",
+      args: () => ["-c", "import os,time; os.close(1); os.close(2); time.sleep(60)"] });
+    const command = cmd(2_000);
+    const { full } = await identity(command);
+    await guest.armDeadline(ssh.session.sandboxId, full);
+    const state = JSON.parse(await readFile(path.join(ssh.root, path.basename(full.cgroupPath), "state"), "utf8"));
+    const pending = guest.runCommand(ssh.session.sandboxId, command, { identity: full, output: async () => {} });
+    let paused = false;
+    try {
+      // Pause only this fixture's owned supervisor in its output wait, after
+      // the loop's expiry check. The independent watchdog must enforce expiry
+      // and the resumed supervisor must preserve that timeout in its receipt.
+      await expect.poll(async () => {
+        const saved = JSON.parse(await readFile(path.join(ssh.root, path.basename(full.cgroupPath), "state"), "utf8"));
+        const wait = await readFile(`/proc/${state.supervisorPid}/wchan`, "utf8");
+        const fdRoot = `/proc/${state.supervisorPid}/fd`;
+        const descriptors = await Promise.all((await readdir(fdRoot)).map((fd) => readlink(`${fdRoot}/${fd}`).catch(() => "")));
+        if (!saved.started || !/ep_?poll/.test(wait) || descriptors.some((fd) => fd.startsWith("pipe:"))) return false;
+        process.kill(state.supervisorPid, "SIGSTOP");
+        paused = true;
+        return true;
+      }).toBe(true);
+      await expect.poll(() => guest.verifyEmpty(ssh.session.sandboxId, full), { timeout: 5_000 }).toBe(true);
+      await expect.poll(async () => (await readFile(`/proc/${full.processGroupId}/stat`, "utf8")).includes(") Z"))
+        .toBe(true);
+    } finally {
+      if (paused) process.kill(state.supervisorPid, "SIGCONT");
+    }
+    expect(await pending).toMatchObject({ exitCode: 124 });
+    expect(await guest.receipt(full)).toMatchObject({ result: { exitCode: 124 } });
   }, 15_000);
 
   it("guest watchdog kills detached descendants without a host cancellation timer", async () => {

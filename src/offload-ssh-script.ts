@@ -217,6 +217,10 @@ def supervise(root):
         child.wait()
     with locked(root):
         value = load(root)
+        # The independent watchdog may win while select/poll is in progress.
+        # Recheck expiry at the receipt boundary instead of reporting its KILL
+        # as an ordinary payload signal when the loop never iterates again.
+        cancelled = cancelled or time.monotonic() >= fixed_deadline or int(time.time() * 1000) >= value['identity']['heartbeatDeadline']
         value['outputLimitExceeded'] = overflow
         value['result'] = {'exitCode': 124 if cancelled else code if code >= 0 else 128 - code,
                            'seconds': max(0, time.monotonic() - started)}
