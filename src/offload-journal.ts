@@ -1,6 +1,7 @@
 // Durable command evidence, independent of provider and transport implementations.
 import { createHash, randomUUID } from "node:crypto";
 import type { OffloadCommand, OffloadResult, OffloadWarm } from "./offload.js";
+import type { CommandExit, GuestIdentity } from "./offload-lifecycle.js";
 
 export interface OffloadStore {
   get(key: string): Promise<unknown>;
@@ -10,7 +11,7 @@ export interface OffloadStore {
   list(prefix: string): Promise<string[]>;
 }
 
-export interface OffloadIdentity {
+export interface OffloadIdentity extends Partial<GuestIdentity> {
   companyId: string;
   runId: string;
   commandId: string;
@@ -37,6 +38,7 @@ export interface OffloadRecord {
   result: OffloadResult | null;
   remoteStarted: boolean | null;
   fallbackSafe: boolean;
+  cancelRequested?: string;
   tombstone?: boolean;
 }
 
@@ -144,6 +146,8 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
 
 export interface JournalLifecycle {
   prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<OffloadIdentity>;
+  cancel(identity: OffloadIdentity, reason: string): Promise<void>;
+  heartbeat(identity: OffloadIdentity): void;
 }
 
 interface JournalPool {
@@ -294,7 +298,7 @@ export class OffloadJournal {
   }
 
   async run(sandboxId: string, command: OffloadCommand,
-    transport: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<{ exitCode: number; seconds: number }>) {
+    transport: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>) {
     const record = this.active.get(commandKey(command))!;
     await this.beforeStart(record, { state: "syncing_in" });
     // Start the sync in the same continuation as the state check. A subsequent
@@ -332,7 +336,7 @@ export class OffloadJournal {
       } else if (result.status === "unknown") {
         await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
       } else {
-        await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
+        await this.commit(record, { state: result.cancelled ? "cancelled" : "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
       }
       return result;
     });
@@ -416,15 +420,34 @@ export class OffloadJournal {
   }
 
   private view(record: OffloadRecord): OffloadCommandView {
-    const result = record.state === "completed" && record.result && "exitCode" in record.result ? {
-      exitCode: record.result.exitCode, signal: null, timedOut: false, cancelled: false,
+    const result = (record.state === "completed" || record.state === "cancelled") && record.result && "exitCode" in record.result ? {
+      exitCode: record.result.exitCode, signal: null,
+      timedOut: record.result.status === "completed" && record.result.timedOut === true,
+      cancelled: record.state === "cancelled",
       syncBack: { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
     } : null;
     return { version: 1, commandId: record.commandId, state: record.state,
       remoteStarted: record.remoteStarted, fallbackSafe: record.fallbackSafe, result };
   }
 
-  async cancelCommand(companyId: string, runId: string, commandId: string, _reason: string): Promise<OffloadCommandView> {
+  async heartbeatCommand(companyId: string, runId: string, commandId: string, generation?: number): Promise<OffloadCommandView> {
+    await this.checkRun(companyId, runId);
+    const key = commandKey({ companyId, runId, commandId });
+    const record = this.active.get(key) ?? parseRecord(await this.deps.journalStore.get(key), key);
+    await this.transition(record, async () => {
+      await this.refresh(record);
+      const identity = record.identity;
+      if (!this.lifecycle || record.cancelRequested || !identity?.heartbeatDeadline || !["starting", "running"].includes(record.state)
+        || (generation !== undefined && generation !== identity.journalGeneration)
+        || this.now() >= identity.heartbeatDeadline || this.now() >= identity.guestDeadline!) return;
+      const renewed = { ...identity, heartbeatDeadline: this.now() + 30_000 };
+      await this.commit(record, { identity: renewed });
+      this.lifecycle.heartbeat(renewed);
+    });
+    return this.view(record);
+  }
+
+  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number): Promise<OffloadCommandView> {
     await this.checkRun(companyId, runId);
     await this.recover();
     const key = commandKey({ companyId, runId, commandId });
@@ -438,15 +461,21 @@ export class OffloadJournal {
       // ever moves a record forward from a pre-start state to not_started.
       const record = this.active.get(key) ?? snapshot;
       if (record === snapshot) await this.refresh(record);
-      if (PRE_START.has(record.state)) {
+      const current = generation === undefined || generation === (record.identity?.journalGeneration ?? 1);
+      if (current && PRE_START.has(record.state)) {
         const result = this.unavailable(record, "cancelled before durable starting intent");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
       }
-      return { view: this.view(record), command: record.command, result: record.result };
+      if (current && this.lifecycle && record.identity && !TERMINAL.has(record.state) && !record.cancelRequested) {
+        await this.commit(record, { cancelRequested: reason });
+      }
+      return { view: this.view(record), command: record.command, result: record.result,
+        identity: current && !TERMINAL.has(record.state) ? record.identity : null };
     });
     // Queue capacity/VM ownership is released only after the refusal commit,
     // outside the record fence so pool and journal locks cannot invert.
     if (outcome.view.state === "not_started" && outcome.command && outcome.result) await this.pool.cancel(outcome.command, outcome.result);
+    if (outcome.identity) await this.lifecycle?.cancel(outcome.identity, reason);
     return outcome.view;
   }
 

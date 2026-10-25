@@ -46,6 +46,10 @@ export type OffloadResult =
       exitCode: number;
       seconds: number;
       dollars: number;
+      remoteStarted?: true;
+      fallbackSafe?: false;
+      cancelled?: boolean;
+      timedOut?: boolean;
     }
   | {
       status: "unknown";
@@ -181,6 +185,7 @@ export class OffloadExecutor {
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
   private readonly stopFailures = new Set<string>();
+  private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
   private shutdownTask: Promise<void> | null = null;
@@ -226,8 +231,27 @@ export class OffloadExecutor {
   async readCommand(companyId: string, runId: string, commandId: string) {
     return await this.requireDurable().readCommand(companyId, runId, commandId);
   }
-  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string) {
-    return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason);
+  async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number) {
+    return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason, generation);
+  }
+  // ID-only convenience calls are restricted to commands admitted by this
+  // executor. Ambiguous IDs fail closed; external routes must use scoped calls.
+  private knownCommand(commandId: string): OffloadCommand {
+    const command = this.knownCommands.get(commandId);
+    if (!command) throw new Error("OFFLOAD_COMMAND_SCOPE_REQUIRED");
+    return command;
+  }
+  async cancel(commandId: string, reason: string, generation?: number) {
+    const command = this.knownCommand(commandId);
+    return await this.cancelCommand(command.companyId, command.runId, commandId, reason, generation);
+  }
+  async heartbeat(commandId: string, generation?: number) {
+    const command = this.knownCommand(commandId);
+    return await this.requireDurable().heartbeatCommand(command.companyId, command.runId, commandId, generation);
+  }
+  async read(commandId: string, _after = 0, _limitBytes = 65_536) {
+    const command = this.knownCommand(commandId);
+    return await this.readCommand(command.companyId, command.runId, commandId);
   }
   private requireDurable(): OffloadJournal {
     if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
@@ -315,6 +339,9 @@ export class OffloadExecutor {
     // Snapshot caller-owned objects before any await; mutating argv or env must
     // never change the payload after its durable digest was accepted.
     const snapshot = structuredClone(command);
+    const known = this.knownCommands.get(snapshot.commandId);
+    if (!this.knownCommands.has(snapshot.commandId)) this.knownCommands.set(snapshot.commandId, snapshot);
+    else if (known && commandKey(known) !== commandKey(snapshot)) this.knownCommands.set(snapshot.commandId, null);
     return this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
   }
 
@@ -402,6 +429,10 @@ export class OffloadExecutor {
     }
     if (stopped) return this.accountClaim(command, stopped, "resume");
     if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
+    // An uncertain slot has no live release event to queue behind. Refuse
+    // rather than strand callers waiting for a nonexistent safe handoff.
+    if (this.pool.every((vm) => vm.quarantined)) return { kind: "unavailable", reason: "pool quarantined; guest reconciliation required" };
+    if ((command.queueTimeoutMs ?? this.config.queueTimeoutMs) <= 0) return { kind: "unavailable", reason: "queue wait disabled" };
     if (this.queue.length >= this.config.queueLimit) {
       return { kind: "unavailable", reason: `queue full (${this.config.queueLimit} pending)` };
     }
@@ -517,9 +548,12 @@ export class OffloadExecutor {
     const startedAt = this.now();
     let result: OffloadResult;
     try {
-      const { exitCode, seconds } = await this.runCommand(vm.sandboxId, command);
+      const raw = await this.runCommand(vm.sandboxId, command);
+      const { exitCode, seconds } = raw;
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
-      result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars };
+      result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars,
+        ...(this.lifecycle ? { remoteStarted: true as const, fallbackSafe: false as const,
+          cancelled: raw.cancelled === true, timedOut: raw.timedOut === true } : {}) };
     } catch {
       const seconds = Math.max(0, (this.now() - startedAt) / 1000);
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
