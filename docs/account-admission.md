@@ -8,6 +8,8 @@ This implements the account-budget portion of the [offload ADR](adr/0001-heavy-c
 
 `OffloadExecutor` requires `state`, `accountId` and `poolId`. There is no in-memory/no-state admission fallback. Reconstructing a ledger loads persisted reservations; a module-local cache is not a recovery mechanism. A future live adapter must supply the same account identity to its pools and `BoatVmManager`. The manager's default identity conservatively groups this worker's existing provider clients; it is not a way to discover provider account membership from API keys.
 
+Within that shared journal, the manager persists an opaque credential-group digest on each intent and keeps observations and reconciliation cursors per group. Inventory, fresh GETs (including 404s), counter deltas and stop receipts affect only that group's intents. The shared admission ceilings remain conservative across groups; credentials are not used to manufacture independent capacity. Unscoped callers still promise that their explicit `accountId` identifies the supplied provider client. Legacy unscoped holds can be reconciled by a manager with one credential group, but remain held if multiple groups make their ownership unknowable. Key rotation does not automatically transfer old holds to a new group.
+
 The state client must be durable and have one authoritative worker writer. Its get/set API supplies no cross-process compare-and-swap, so the mutex does not fence another worker or unrelated provider account consumers. Provider counters remain authoritative; ambiguous effects are held rather than interpreted as spare capacity.
 
 ## Admission

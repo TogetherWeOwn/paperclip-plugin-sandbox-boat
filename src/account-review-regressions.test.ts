@@ -99,7 +99,7 @@ describe("reconciliation evidence", () => {
     expect(intent!.compute as number).toBeGreaterThan(0);
   });
 
-  it("reconciles the ledger through one credential group only", async () => {
+  it("preserves both groups' holds while sweeping each credential group", async () => {
     const manager = f.manager();
     const base = { driverKey: "boat", companyId: COMPANY, agentId: "synthetic-principal", config: {} };
     await manager.acquire({ ...base, environmentId: "env-recon-a", issueId: "issue-a",
@@ -107,12 +107,12 @@ describe("reconciliation evidence", () => {
     await manager.acquire({ ...base, environmentId: "env-recon-b", issueId: "issue-b",
       executionWorkspaceId: "workspace-b", runId: "recon-b", config: { apiKey: "key-recon-b", cliproxyTunnel: false } } as never);
     const sandboxesBefore = f.boat.callsOf("sandboxes").length;
-    const spy = vi.spyOn(AccountLedger.prototype, "reconcile");
-    try {
-      await manager.sweep("review-reconcile-partition", { force: true });
-      expect(spy).toHaveBeenCalledTimes(1);
-    } finally {
-      spy.mockRestore();
+    await manager.sweep("review-reconcile-partition", { force: true });
+    const intents = ledgerIntents(f);
+    expect(intents).toHaveLength(2);
+    for (const intent of intents) {
+      expect(intent).toMatchObject({ status: "running", active: true });
+      expect(intent.compute as number).toBeGreaterThan(0);
     }
     // Both credential groups still sweep their own VMs.
     expect(f.boat.callsOf("sandboxes").length - sandboxesBefore).toBe(2);
