@@ -47,6 +47,15 @@ describe("validateSubmit", () => {
     expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
   });
 
+  it.each(["\ud800", "\udfff", "a\ud83dz", "\ude00b"])("rejects argv with a lone surrogate %#", (arg) => {
+    const result = validateSubmit({ ...BASE, argv: ["test", arg] });
+    expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
+  });
+
+  it("accepts well-formed surrogate pairs (emoji) in argv", () => {
+    expect(validateSubmit({ ...BASE, argv: ["test", "ok-\ud83d\ude00"] }).ok).toBe(true);
+  });
+
   it("accepts printable Unicode and spaces in test arguments", () => {
     expect(validateSubmit({ ...BASE, argv: ["test", "--", "a test", "café", "日本語"] }).ok).toBe(true);
   });

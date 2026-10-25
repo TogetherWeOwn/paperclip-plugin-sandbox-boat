@@ -156,7 +156,7 @@ export class SshOffloadRuntime {
       || command.cwdRelative.split("/").some((part) => part === ".." || part === "")) return false;
     // V1 refuses all path-bearing Cargo overrides rather than guessing which
     // belong to the host or silently rewriting arguments. Relative cwd is enough.
-    return !command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg)
+    return !command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(arg)
       || /^(--(manifest-path|target-dir|out-dir|artifact-dir|lockfile-path)|-C)(=|$)/.test(arg));
   }
 
