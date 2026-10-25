@@ -93,8 +93,12 @@ with `stoppedAt` and `stopLagMs` set to `null`. A terminal observation fills tho
 fields; earlier durable evidence bound to the exact reservation can correct a
 later reconciliation timestamp. `stopLagMs` measures observation time minus the
 original idle deadline, including worker outage and sweep delay, not just provider
-RPC time. Unreadable pending stops keep bounded observation retries, and retrying
-shutdown reconciles pending stops before deciding whether another stop is safe.
+RPC time. Accepted asynchronous stops are observed automatically by the idle
+worker. Unreadable pending stops and pool-state write failures keep
+generation-fenced observation retries with exponential backoff capped at thirty
+seconds; detached callback failures are handled without dropping ownership or
+claiming termination. Retrying shutdown reconciles pending stops before deciding
+whether another stop is safe.
 The existing five-minute native sweep cadence is the intended crash backstop,
 **not a fifteen-second stop guarantee after worker death**. A healthy worker
 still uses the short generation-fenced idle timer. Storage loss during an idle

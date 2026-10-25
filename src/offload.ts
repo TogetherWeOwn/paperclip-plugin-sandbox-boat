@@ -812,12 +812,22 @@ export class OffloadExecutor {
         } else {
           pending = !await this.stopVm(vm, vm.stopping) || vm.stopping;
         }
-        if (pending) {
-          const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(vm.stopAttempts - 1, 5));
-          this.scheduleIdleStop(vm, generation, retryMs);
-        }
+        if (pending) this.scheduleStopRetry(vm, generation);
+      }).catch(() => {
+        // The detached promise returned by withAdmission needs its own handler.
+        // A failed pool write must not consume the only pending-stop retry.
+        this.logger.error("boat offload idle stop observation failed; retry required", { sandboxId: vm.sandboxId });
+        this.scheduleStopRetry(vm, generation);
       });
     }, delayMs);
+  }
+
+  private scheduleStopRetry(vm: PoolVm, generation: number): void {
+    // Recheck after awaits/rejection: retirement, reuse or shutdown may have
+    // superseded this callback. Never overwrite a newer generation's timer.
+    if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || vm.quarantined || this.closed || vm.idleHandle != null) return;
+    const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(Math.max(0, vm.stopAttempts - 1), 5));
+    this.scheduleIdleStop(vm, generation, retryMs);
   }
 
   private async stopVm(vm: PoolVm, retryPending = false): Promise<boolean> {
