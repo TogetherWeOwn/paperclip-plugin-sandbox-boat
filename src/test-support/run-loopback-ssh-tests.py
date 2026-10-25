@@ -1,6 +1,7 @@
 """Run real loopback-SSH tests without installing packages or host services.
 
-Usage: python3 src/test-support/run-loopback-ssh-tests.py [vitest run arguments]
+Usage: python3 src/test-support/run-loopback-ssh-tests.py [vitest run arguments | --check]
+--check runs the repository's full npm check under the same reaping boundary.
 Requires node_modules and PAPERCLIP_RUN_SCRATCH_DIR (or PAPERCLIP_SCRATCH_DIR).
 On Debian, absent sshd is obtained with apt-get download + dpkg-deb -x ONLY.
 No sudo, package scripts, service management, real keys, Boat calls or VM spend.
@@ -97,9 +98,10 @@ with tempfile.TemporaryDirectory(prefix='loopback-prerequisites-', dir=scratch) 
                          if directory.is_dir() and any(directory.glob('*.so*'))]
             env['LD_LIBRARY_PATH'] = ':'.join(libraries + ([env['LD_LIBRARY_PATH']] if env.get('LD_LIBRARY_PATH') else []))
     args = sys.argv[1:] or ['src/native-sync-multiplexed-ssh.test.ts', '--reporter=verbose']
+    command = ['npm', 'run', 'check'] if args == ['--check'] else [str(repo / 'node_modules/.bin/vitest'), 'run', *args]
     reaped = 0
     try:
-        result = subprocess.Popen([str(repo / 'node_modules/.bin/vitest'), 'run', *args], cwd=repo, env=env)
+        result = subprocess.Popen(command, cwd=repo, env=env)
         while result.poll() is None:
             # Reap DURING assertions too: keeping dead adopted group members as
             # zombies would artificially delay production kill(group, 0) loops.

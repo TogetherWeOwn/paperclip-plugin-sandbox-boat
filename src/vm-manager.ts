@@ -68,6 +68,7 @@ import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
+import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
 import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
 import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
@@ -145,6 +146,8 @@ export interface ManagerDeps {
   /** Optional host integration: resolve a lifecycle-enabled, workspace-confined
    * executor without dispatching. Unavailable/unsupported bindings return null. */
   offloadExecutor?: (command: BackendCommand) => Promise<ExecutorPort | null>;
+  /** Boundary seams for transport acceptance tests; never sourced from API input. */
+  offloadTransport?: Pick<SshOffloadRuntimeDeps, "session" | "guestOptions">;
   ssh?: SshManager;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -232,6 +235,7 @@ export class BoatVmManager {
   private readonly offloadState: StateClientLike;
   private readonly offloadBrokers = new Map<string, OffloadBroker>();
   private readonly offloadBackend: ExecutorBackend;
+  private readonly nativeOffload: SshOffloadRuntime;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly locks = new Map<string, Promise<unknown>>();
@@ -264,7 +268,7 @@ export class BoatVmManager {
         // Strict boolean opt-in, checked for each new command. Toggling the
         // setting never discards a broker, its live handles or old receipts.
         if (config?.offloadExecutorEnabled !== true) return null;
-        return await deps.offloadExecutor?.(command) ?? null;
+        return deps.offloadExecutor ? await deps.offloadExecutor(command) : await this.nativeOffload.resolve(command, config);
       },
     });
     this.now = deps.now ?? (() => Date.now());
@@ -274,6 +278,8 @@ export class BoatVmManager {
     // this worker's provider clients. Never persist a key or partition by company.
     this.accountState = deps.state;
     this.accountId = deps.accountId ?? "boat-default-account";
+    this.nativeOffload = new SshOffloadRuntime({ state: deps.state, logger: deps.logger, ssh: this.ssh,
+      accountId: this.accountId, ...deps.offloadTransport });
   }
 
   // ---------------------------------------------------------------- offload
@@ -1881,6 +1887,7 @@ export class BoatVmManager {
   }
 
   async realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
+    this.nativeOffload.remember(params);
     const config = parseDriverConfig(params.config);
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
@@ -2364,6 +2371,8 @@ export class BoatVmManager {
 
   private async doSweep(reason: string): Promise<SweepReport> {
     const report: SweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
+    // Existing native job owns stop retry/reconciliation; no host pacer.
+    await this.nativeOffload.sweep().catch(() => report.errors.push("offload pool sweep unverified"));
     if (this.configs.size === 0) {
       report.skipped = "no_config_seen";
       return report;
@@ -2731,6 +2740,7 @@ export class BoatVmManager {
 
   async shutdown(): Promise<void> {
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
+    await this.nativeOffload.shutdown();
     await this.ssh.closeAll();
   }
 }
