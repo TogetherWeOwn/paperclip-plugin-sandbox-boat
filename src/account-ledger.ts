@@ -465,11 +465,13 @@ export class AccountLedger {
   }
   private terminal(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false, reservationId?: string): void {
     for (const row of doc.usage) {
-      // A warm handoff cancels the predecessor's stop obligation. Only the
-      // still-open tail owns this observation, never an earlier failed stop.
+      // A warm handoff cancels the predecessor's stop obligation. An exact
+      // reservation can repair its closed tail with earlier durable evidence,
+      // but must never stamp an older caller's cancelled tail.
       if (this.owns(row, includeUnscoped) && row.sandboxId === sandboxId
         && (row.tailSince != null || row.usageRecordId === reservationId)
-        && row.stopDueAt != null && row.stoppedAt == null) {
+        && row.stopDueAt != null
+        && (row.stoppedAt == null || row.usageRecordId === reservationId && at < row.stoppedAt)) {
         row.stoppedAt = at;
         row.stopLagMs = Math.max(0, at - row.stopDueAt);
       }

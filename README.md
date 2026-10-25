@@ -89,9 +89,12 @@ or schedule that job or enable command-level HTTP routes.
 
 Stop acceptance and termination are distinct. While Boat is archiving, capacity
 remains unavailable for reuse, and usage has integer epoch-ms `stopRequestedAt`
-with `stoppedAt` and `stopLagMs` set to `null`. A later terminal observation fills
-those fields once. `stopLagMs` measures observation time minus the original idle
-deadline, including worker outage and sweep delay, not just provider RPC time.
+with `stoppedAt` and `stopLagMs` set to `null`. A terminal observation fills those
+fields; earlier durable evidence bound to the exact reservation can correct a
+later reconciliation timestamp. `stopLagMs` measures observation time minus the
+original idle deadline, including worker outage and sweep delay, not just provider
+RPC time. Unreadable pending stops keep bounded observation retries, and retrying
+shutdown reconciles pending stops before deciding whether another stop is safe.
 The existing five-minute native sweep cadence is the intended crash backstop,
 **not a fifteen-second stop guarantee after worker death**. A healthy worker
 still uses the short generation-fenced idle timer. Storage loss during an idle
