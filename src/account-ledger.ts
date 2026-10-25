@@ -452,7 +452,7 @@ export class AccountLedger {
   }
 
   async reconcile(api: BoatApiLike, inventory?: ReadonlyArray<{ id: string; state: string }>, allowCachedLimits = false, includeUnscoped = false): Promise<void> {
-    await this.locked(async () => {
+    const ids = await this.locked(async () => {
       const doc = await this.read();
       try { await this.observe(api, doc, allowCachedLimits); } catch { /* Never free a reservation on unreadable limits. */ }
       const owned = doc.intents.filter((i) => this.owns(i, includeUnscoped));
@@ -486,15 +486,36 @@ export class AccountLedger {
           // or an unknown create. Unreadable/ambiguous answers retain the hold.
           if ((await describeBoatError(error)).status === 404) this.terminal(doc, id, this.now(), includeUnscoped);
         }
-        await this.meter(api, doc, id, includeUnscoped);
       }
       await this.write(doc);
+      return ids;
+    });
+    // Interval IO grows with command history. It must never own admission's
+    // mutex: calculate a detached projection, then merge only if its source
+    // rows (including open tails and concurrent commands) are still current.
+    for (const id of ids) await this.reconcileUsage(api, id, includeUnscoped);
+  }
+  private async reconcileUsage(api: BoatApiLike, sandboxId: string, includeUnscoped: boolean): Promise<void> {
+    const snapshot = await this.locked(() => this.read());
+    const rowsForVm = (doc: AccountDoc) => doc.usage.filter((r) => r.sandboxId === sandboxId);
+    const before = JSON.stringify(rowsForVm(snapshot));
+    if (!await this.meter(api, snapshot, sandboxId, includeUnscoped)) return;
+    await this.locked(async () => {
+      const current = await this.read();
+      if (JSON.stringify(rowsForVm(current)) !== before) return; // Explicitly pending until a later pass.
+      const projection = new Map(rowsForVm(snapshot).map((r) => [r.usageRecordId, r]));
+      current.usage = current.usage.map((row) => {
+        const replacement = projection.get(row.usageRecordId);
+        projection.delete(row.usageRecordId);
+        return replacement ?? row;
+      });
+      current.usage.push(...projection.values());
+      await this.write(current);
     });
   }
-  private async meter(api: BoatApiLike, doc: AccountDoc, sandboxId: string, includeUnscoped = false): Promise<void> {
-    const snapshot = structuredClone(doc.usage);
+  private async meter(api: BoatApiLike, doc: AccountDoc, sandboxId: string, includeUnscoped = false): Promise<boolean> {
     const rows = doc.usage.filter((r) => this.owns(r, includeUnscoped) && r.sandboxId === sandboxId && r.kind !== "overhead");
-    if (!rows.length) return;
+    if (!rows.length) return false;
     try {
       const full = await bounded(() => api.usage({ sandboxId }));
       if (!full.ok) throw new Error("usage unavailable");
@@ -544,10 +565,11 @@ export class AccountLedger {
       // not a missing bill. Larger disagreements remain pending for a later read.
       if (Math.abs(allocated - number(full.seconds)) > tolerance ||
         Math.abs(allocatedDollars - number(full.dollars)) > (covered.length + gaps.length + 1) * 0.000001) throw new Error("provider usage has not converged");
+      return true;
     } catch {
-      // Interval reads are one accounting transaction. A partial correction or
-      // transient outage must not erase a previously converged provider bill.
-      doc.usage = snapshot;
+      // Interval reads are one detached accounting transaction. Never commit a
+      // partial correction or erase a previously converged provider bill.
+      return false;
     }
   }
 }
