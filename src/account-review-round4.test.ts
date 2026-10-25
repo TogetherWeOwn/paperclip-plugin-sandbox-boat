@@ -28,7 +28,7 @@ async function foreignLease() {
   const lease = await manager.acquire({
     driverKey: "boat", companyId: COMPANY, agentId: "synthetic-principal",
     environmentId: "env-b", issueId: "issue-b", executionWorkspaceId: "workspace-b", runId: "run-b",
-    config: { apiKey: "synthetic-key-b", cliproxyTunnel: false },
+    config: { apiKey: "synthetic-key-b", cliproxyTunnel: false, size: "default" },
   } as never);
   const id = lease.providerLeaseId!;
   expect(journal().intents.find((i) => i.sandboxId === id)).toMatchObject({ status: "running", active: true, compute: 7200 });
