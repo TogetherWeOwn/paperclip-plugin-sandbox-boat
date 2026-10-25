@@ -6,6 +6,7 @@ import { createFakeContext, inHostInvocation } from "../test-support/harness.js"
 import type { ExecutorPort } from "./executor-backend.js";
 import type { OffloadReadView } from "../offload-journal.js";
 import { until } from "../test-support/offload-lifecycle-contract.js";
+import { nativeWorkspaceParams } from "../test-support/native-workspace.js";
 
 const companyId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const runId = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
@@ -16,11 +17,8 @@ const body = { version: 1, commandId, executionWorkspaceId: workspaceId, cwdRela
   argv: ["test", "--locked"], env: { CARGO_TERM_COLOR: "never" }, queueTimeoutMs: 30_000, timeoutMs: 120_000, dryRun: false };
 const terminal: OffloadReadView = { version: 1, commandId, state: "not_started", remoteStarted: false,
   fallbackSafe: true, result: null, events: [], nextCursor: 0 };
-function setup(config: Record<string, unknown> = {}) {
-  const harness = createFakeContext({ workspaces: new Map([[workspaceId, {
-    repoUrl: "https://github.com/example/public-rust", projectId: "project-a", projectWorkspaceId: "pws-a",
-    path: "/work/public-rust", cwd: "/work/public-rust",
-  }]]) });
+async function setup(config: Record<string, unknown> = {}) {
+  const harness = createFakeContext();
   const executor: ExecutorPort = {
     start: vi.fn().mockResolvedValue(terminal), readOutput: vi.fn().mockResolvedValue(terminal),
     heartbeatCommand: vi.fn().mockResolvedValue(terminal), cancelCommand: vi.fn().mockResolvedValue(terminal),
@@ -28,7 +26,8 @@ function setup(config: Record<string, unknown> = {}) {
   const resolveExecutor = vi.fn<NonNullable<ConstructorParameters<typeof BoatVmManager>[0]["offloadExecutor"]>>(async () => executor);
   const readConfig = vi.fn(async () => config);
   const manager = new BoatVmManager({ state: harness.ctx.state, logger: harness.ctx.logger,
-    executionWorkspaces: harness.ctx.executionWorkspaces, offloadConfig: readConfig, offloadExecutor: resolveExecutor });
+    offloadConfig: readConfig, offloadExecutor: resolveExecutor });
+  await manager.rememberOffloadWorkspace(nativeWorkspaceParams(companyId, runId, workspaceId));
   return { manager, resolveExecutor, executor, harness, readConfig };
 }
 afterEach(async () => { await plugin.definition.onShutdown?.(); setManagerOverridesForTests({}); });
@@ -39,7 +38,7 @@ describe("executor opt-in wiring", () => {
   });
 
   it.each([undefined, false, "true", 1])("does not resolve or start an executor for flag %s", async (enabled) => {
-    const t = setup(enabled === undefined ? {} : { offloadExecutorEnabled: enabled });
+    const t = await setup(enabled === undefined ? {} : { offloadExecutorEnabled: enabled });
     await t.manager.offloadExec(companyId, actor, body);
     await until(() => t.readConfig.mock.calls.length === 1);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -50,7 +49,7 @@ describe("executor opt-in wiring", () => {
   });
 
   it("opts in only with true and forwards the authenticated workspace-bound payload", async () => {
-    const t = setup({ offloadExecutorEnabled: true });
+    const t = await setup({ offloadExecutorEnabled: true });
     await t.manager.offloadExec(companyId, actor, body);
     await until(() => vi.mocked(t.executor.start).mock.calls.length === 1);
     expect(t.readConfig).toHaveBeenCalledWith(companyId);
@@ -60,7 +59,7 @@ describe("executor opt-in wiring", () => {
   });
 
   it("refuses before dispatch when company config cannot be read", async () => {
-    const t = setup({ offloadExecutorEnabled: true });
+    const t = await setup({ offloadExecutorEnabled: true });
     t.readConfig.mockRejectedValue(new Error("config unavailable"));
     await t.manager.offloadExec(companyId, actor, body);
     await expect.poll(async () => (await t.manager.offloadRead(companyId, actor, { commandId }, {})).body)
@@ -70,7 +69,7 @@ describe("executor opt-in wiring", () => {
   });
 
   it("keeps safe local fallback when opt-in has no installed lifecycle executor", async () => {
-    const t = setup({ offloadExecutorEnabled: true });
+    const t = await setup({ offloadExecutorEnabled: true });
     t.resolveExecutor.mockResolvedValueOnce(null);
     await t.manager.offloadExec(companyId, actor, body);
     await until(() => t.resolveExecutor.mock.calls.length === 1);
@@ -82,7 +81,7 @@ describe("executor opt-in wiring", () => {
 
   it("re-reads config for new commands without dropping an earlier broker receipt", async () => {
     const config = { offloadExecutorEnabled: true };
-    const t = setup(config);
+    const t = await setup(config);
     await t.manager.offloadExec(companyId, actor, body);
     await until(() => vi.mocked(t.executor.start).mock.calls.length === 1);
     config.offloadExecutorEnabled = false;
@@ -103,8 +102,8 @@ describe("executor opt-in wiring", () => {
       heartbeatCommand: async () => terminal, cancelCommand: async () => terminal,
     };
     const manager = new BoatVmManager({ state: harness.ctx.state, logger: harness.ctx.logger,
-      offloadConfig: async () => ({ offloadExecutorEnabled: true }), offloadExecutor: async () => executor,
-      executionWorkspaces: { get: async () => ({ repoUrl: null, projectId: "p", projectWorkspaceId: null, path: "/work", cwd: "/work" }) } });
+      offloadConfig: async () => ({ offloadExecutorEnabled: true }), offloadExecutor: async () => executor });
+    await inHostInvocation(companyId, () => manager.rememberOffloadWorkspace(nativeWorkspaceParams(companyId, runId, workspaceId)));
     await inHostInvocation(companyId, () => manager.offloadExec(companyId, actor, body));
     finish(terminal);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -114,7 +113,7 @@ describe("executor opt-in wiring", () => {
   });
 
   it("uses the SDK company config port from plugin setup", async () => {
-    const t = setup();
+    const t = await setup();
     const get = vi.fn(async () => ({ offloadExecutorEnabled: true }));
     setManagerOverridesForTests({ offloadExecutor: t.resolveExecutor });
     await plugin.definition.setup({ ...t.harness.ctx, config: { get } } as never);

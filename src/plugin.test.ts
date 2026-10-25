@@ -19,6 +19,7 @@ import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.j
 import { FakeSsh, createFakeContext, inHostInvocation, scriptOfShDashC } from "./test-support/harness.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatProviderError } from "./errors.js";
+import { nativeWorkspaceParams } from "./test-support/native-workspace.js";
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const ENV = "22222222-2222-4222-8222-222222222222";
@@ -103,7 +104,7 @@ describe("manifest", () => {
       supportsTemplateDelete: true,
     });
     expect(manifest.capabilities).toEqual(
-      expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read", "execution.workspaces.read"]),
+      expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read"]),
     );
     expect(manifest.jobs?.[0]).toMatchObject({ jobKey: SWEEP_JOB_KEY, schedule: "*/5 * * * *" });
     expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]);
@@ -1998,14 +1999,8 @@ describe("offload API routes", () => {
   const RUN_ID = "run-offload-1";
   const CMD_ID = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
 
-  function seedWorkspace(): void {
-    harness.workspaces.set(WORKSPACE, {
-      repoUrl: "https://github.com/TogetherWeOwn/two-bot-next",
-      projectId: "proj-1",
-      projectWorkspaceId: null,
-      path: "/work/two-bot-next",
-      cwd: "/work/two-bot-next",
-    });
+  async function seedWorkspace(): Promise<void> {
+    await currentManager().rememberOffloadWorkspace(nativeWorkspaceParams(COMPANY, RUN_ID, WORKSPACE));
   }
 
   function apiInput(routeKey: string, extra: Record<string, unknown> = {}) {
@@ -2038,7 +2033,7 @@ describe("offload API routes", () => {
     };
   }
 
-  it("declares agent-authenticated offload routes and the workspace capability", () => {
+  it("declares agent-authenticated offload routes without a workspace capability", () => {
     const routes = manifest.apiRoutes ?? [];
     expect(routes.map((route) => route.routeKey)).toEqual(
       expect.arrayContaining(["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]),
@@ -2046,11 +2041,11 @@ describe("offload API routes", () => {
     for (const key of ["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]) {
       expect(routes.find((route) => route.routeKey === key)).toMatchObject({ auth: "agent", capability: "api.routes.register" });
     }
-    expect(manifest.capabilities).toContain("execution.workspaces.read");
+    expect(manifest.capabilities).not.toContain("execution.workspaces.read");
   });
 
   it("submits, reads, heartbeats and cancels through the plugin dispatch", async () => {
-    seedWorkspace();
+    await seedWorkspace();
     const submit = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody() }) as never);
     expect(submit.status).toBe(202);
     // Until the executor wires in, every submit journals not_started and the
@@ -2066,7 +2061,7 @@ describe("offload API routes", () => {
   });
 
   it("denies user actors and unknown workspaces at the dispatch", async () => {
-    seedWorkspace();
+    await seedWorkspace();
     const userActor = await plugin.definition.onApiRequest!(
       apiInput("offload_exec", { body: submitBody(), actor: { actorType: "user", actorId: "u1" } }) as never,
     );
@@ -2078,7 +2073,7 @@ describe("offload API routes", () => {
   });
 
   it("dry-runs through the dispatch with no journal effect", async () => {
-    seedWorkspace();
+    await seedWorkspace();
     const dry = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody({ dryRun: true }) }) as never);
     expect(dry.status).toBe(200);
     expect(dry.body).toMatchObject({ mode: "remote_candidate", profileId: "rust-public-1" });
