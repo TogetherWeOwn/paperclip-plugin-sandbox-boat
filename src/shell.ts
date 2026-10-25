@@ -518,19 +518,29 @@ finally:
         record.close()
 
 
+# Signals forwarded so far (the handler only appends). The main loop below
+# gives the payload a bounded grace period to run its own signal cleanup
+# before we exit: restoring defaults and exiting at once lets a second
+# signal from the same teardown burst kill us first, and our death SIGKILLs
+# the payload through the parent-death binding before it finishes (for
+# example, before a sync receiver unlinks its staging scratch).
+signalled = []
+SUPERVISOR_SIGNAL_GRACE_SEC = 2
+
+
 def forward(signum, _frame):
-    # Forward, then exit at once with 128+n. Never wait() here: a wait inside
-    # the handler races the main wait for the child's exit status and can hang
-    # instead of reaping. The payload group already got the signal; a caller
-    # that needs the group gone escalates itself (see cancelRemoteCommand).
-    # Restore defaults first so a second signal kills us immediately.
-    for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(caught, signal.SIG_DFL)
+    # Forward to the payload group and record the signal. Never restore
+    # defaults or exit here: repeated signals from one teardown (a
+    # multiplexed-timeout abort sends several) must only refresh the
+    # forwarding, never preempt the payload's cleanup. Never wait() here
+    # either: a wait inside the handler races the main wait for the child's
+    # exit status and can hang instead of reaping. A caller that needs the
+    # group gone escalates itself (see cancelRemoteCommand).
     try:
         os.killpg(child.pid, signum)
     except ProcessLookupError:
         pass
-    raise SystemExit(128 + signum)
+    signalled.append(signum)
 
 
 for caught in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -543,7 +553,23 @@ sys.stderr.flush()
 # payload's diagnostics share it, and our exit closes it promptly because we
 # never outlive the payload except to reap it.
 os.close(1)
-code = child.wait()
+deadline = None
+code = None
+while code is None:
+    if signalled and deadline is None:
+        deadline = time.monotonic() + SUPERVISOR_SIGNAL_GRACE_SEC
+    try:
+        code = child.wait(timeout=0.05)
+    except subprocess.TimeoutExpired:
+        pass
+    if code is None and deadline is not None and time.monotonic() >= deadline:
+        break
+if signalled:
+    # A signal was forwarded: keep the 128+n contract, now that the payload
+    # has been reaped or the grace period has expired. Exiting here SIGKILLs
+    # only a hung payload through the parent-death binding; a cleaning one
+    # has already unlinked its scratch and exited on its own.
+    sys.exit(128 + signalled[0])
 sys.exit(code if code >= 0 else 128 - code)
 `;
 

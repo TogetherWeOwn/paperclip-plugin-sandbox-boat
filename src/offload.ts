@@ -304,7 +304,7 @@ export class OffloadExecutor {
   }
 
   async reconcile(): Promise<void> {
-    await this.ledger.reconcile(this.boat);
+    await this.ledger.reconcile(this.boat, undefined, false, false, this.poolId);
   }
 
   async shutdown(): Promise<void> {

@@ -103,10 +103,10 @@ describe("manifest", () => {
       supportsTemplateDelete: true,
     });
     expect(manifest.capabilities).toEqual(
-      expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read"]),
+      expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read", "execution.workspaces.read"]),
     );
     expect(manifest.jobs?.[0]).toMatchObject({ jobKey: SWEEP_JOB_KEY, schedule: "*/5 * * * *" });
-    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep"]);
+    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]);
     expect(harness.jobs.has(SWEEP_JOB_KEY)).toBe(true);
   });
 
@@ -192,7 +192,7 @@ describe("AcquireLease", () => {
     const sshKey = fake.callsOf("sshKey");
     expect(sshKey[0].args).toMatchObject({ sandboxId, key: "ssh-ed25519 AAAATESTPUBLICKEY paperclip-boat" });
     const master = ssh.masters()[0];
-    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes"]));
+    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes", "ForwardAgent=no"]));
     expect(master.args.at(-1)).toBe("user@203.0.113.10");
     const knownHosts = master.args.find((arg) => arg.startsWith("UserKnownHostsFile="))!.slice("UserKnownHostsFile=".length);
     expect(readFileSync(knownHosts, "utf8")).toBe(`${sandboxId} ssh-ed25519 AAAAHOSTKEY${sandboxId}\n`);
@@ -1988,5 +1988,98 @@ describe("Probe", () => {
     fake.limitsResponse = trialLimits({ activeSandboxes: 2 });
     const result = await plugin.definition.onEnvironmentProbe!({ ...base({ cliproxyTunnel: false }) } as never);
     expect(result.diagnostics?.map((entry) => entry.code)).toContain("budget_maxActive");
+  });
+});
+
+describe("offload API routes", () => {
+  const RUN_ID = "run-offload-1";
+  const CMD_ID = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
+
+  function seedWorkspace(): void {
+    harness.workspaces.set(WORKSPACE, {
+      repoUrl: "https://github.com/TogetherWeOwn/two-bot-next",
+      projectId: "proj-1",
+      projectWorkspaceId: null,
+      path: "/work/two-bot-next",
+      cwd: "/work/two-bot-next",
+    });
+  }
+
+  function apiInput(routeKey: string, extra: Record<string, unknown> = {}) {
+    return {
+      routeKey,
+      method: "POST",
+      path: "/",
+      params: {},
+      query: {},
+      body: null,
+      actor: { actorType: "agent", actorId: "agent-1", runId: RUN_ID },
+      companyId: COMPANY,
+      headers: {},
+      ...extra,
+    };
+  }
+
+  function submitBody(over: Record<string, unknown> = {}) {
+    return {
+      version: 1,
+      commandId: CMD_ID,
+      executionWorkspaceId: WORKSPACE,
+      cwdRelative: ".",
+      argv: ["test", "--locked"],
+      env: { CARGO_TERM_COLOR: "never" },
+      queueTimeoutMs: 30000,
+      timeoutMs: 1200000,
+      dryRun: false,
+      ...over,
+    };
+  }
+
+  it("declares agent-authenticated offload routes and the workspace capability", () => {
+    const routes = manifest.apiRoutes ?? [];
+    expect(routes.map((route) => route.routeKey)).toEqual(
+      expect.arrayContaining(["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]),
+    );
+    for (const key of ["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]) {
+      expect(routes.find((route) => route.routeKey === key)).toMatchObject({ auth: "agent", capability: "api.routes.register" });
+    }
+    expect(manifest.capabilities).toContain("execution.workspaces.read");
+  });
+
+  it("submits, reads, heartbeats and cancels through the plugin dispatch", async () => {
+    seedWorkspace();
+    const submit = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody() }) as never);
+    expect(submit.status).toBe(202);
+    // Until the executor wires in, every submit journals not_started and the
+    // shim falls back locally: safe by construction.
+    const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never);
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({ state: "not_started", remoteStarted: false, fallbackSafe: true });
+    const beat = await plugin.definition.onApiRequest!(apiInput("offload_heartbeat", { params: { commandId: CMD_ID } }) as never);
+    expect(beat.status).toBe(200);
+    const cancel = await plugin.definition.onApiRequest!(apiInput("offload_cancel", { params: { commandId: CMD_ID }, body: { reason: "client_signal" } }) as never);
+    expect(cancel.status).toBe(200);
+    expect(cancel.body).toMatchObject({ state: "not_started" });
+  });
+
+  it("denies user actors and unknown workspaces at the dispatch", async () => {
+    seedWorkspace();
+    const userActor = await plugin.definition.onApiRequest!(
+      apiInput("offload_exec", { body: submitBody(), actor: { actorType: "user", actorId: "u1" } }) as never,
+    );
+    expect(userActor.status).toBe(401);
+    const unknownWs = await plugin.definition.onApiRequest!(
+      apiInput("offload_exec", { body: submitBody({ executionWorkspaceId: "00000000-0000-4000-8000-000000000099" }) }) as never,
+    );
+    expect(unknownWs.status).toBe(403);
+  });
+
+  it("dry-runs through the dispatch with no journal effect", async () => {
+    seedWorkspace();
+    const dry = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody({ dryRun: true }) }) as never);
+    expect(dry.status).toBe(200);
+    expect(dry.body).toMatchObject({ mode: "remote_candidate", profileId: "rust-public-1" });
+    const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never);
+    expect(read.status).toBe(400);
   });
 });
