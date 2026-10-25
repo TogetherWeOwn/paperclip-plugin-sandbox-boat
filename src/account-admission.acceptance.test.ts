@@ -121,7 +121,7 @@ describe("shared admission: effective caps and unreflected reservations", () => 
     const a = f.pool("a", {}, run), b = f.pool("b", {}, run);
     const manager = f.manager();
     const pa = a.execute(command("mixed-a")), pb = b.execute(command("mixed-b"));
-    const lease = f.acquire(manager, "mixed-whole", { autoStopMinutes: 1 }).then(() => true, () => false);
+    const lease = f.acquire(manager, "mixed-whole", { autoStopMinutes: 1, size: "default" }).then(() => true, () => false);
     await flush(); await advance(2); g.resolve();
     const results = await Promise.all([pa, pb]);
     const whole = await lease;

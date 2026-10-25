@@ -20,6 +20,8 @@ export interface BoatDriverConfig {
   templateSnapshot: string | null;
   boatEnvironment: string | null;
   noEnv: boolean;
+  /** Retain provider command/process telemetry for newly created VMs. */
+  monitoring: boolean;
   autoStopMinutes: number;
   idleStopMinutes: number;
   staleLeaseMinutes: number;
@@ -57,11 +59,12 @@ export interface BoatDriverConfig {
 
 export const CONFIG_DEFAULTS = {
   apiBase: DEFAULT_API_BASE,
-  size: "default" as BoatSize,
+  size: "small" as BoatSize,
   noEnv: true,
+  monitoring: true,
   autoStopMinutes: 120,
-  idleStopMinutes: 15,
-  staleLeaseMinutes: 60,
+  idleStopMinutes: 5,
+  staleLeaseMinutes: 20,
   deleteAfterDays: 7,
   maxActive: 2,
   maxStartsPerDay: 70,
@@ -127,6 +130,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     templateSnapshot: str(raw.templateSnapshot),
     boatEnvironment: str(raw.boatEnvironment),
     noEnv: bool(raw.noEnv, CONFIG_DEFAULTS.noEnv),
+    monitoring: bool(raw.monitoring, CONFIG_DEFAULTS.monitoring),
     autoStopMinutes: Math.trunc(num(raw.autoStopMinutes, CONFIG_DEFAULTS.autoStopMinutes)),
     idleStopMinutes: num(raw.idleStopMinutes, CONFIG_DEFAULTS.idleStopMinutes),
     staleLeaseMinutes: num(raw.staleLeaseMinutes, CONFIG_DEFAULTS.staleLeaseMinutes),

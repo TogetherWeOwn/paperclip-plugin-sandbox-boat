@@ -114,8 +114,8 @@ const manifest: PaperclipPluginManifestV1 = {
           size: {
             type: "string",
             enum: ["small", "default", "large", "xlarge"],
-            default: "default",
-            description: "Fallback size when the task class has no measured data (default: default). Otherwise sizeCostTable selects the lowest cost per job. Plan limits still apply.",
+            default: "small",
+            description: "Fallback size when the task class has no measured data (default: small). Otherwise sizeCostTable selects the lowest cost per job. Plan limits still apply.",
           },
           taskClass: {
             type: "string",
@@ -126,7 +126,7 @@ const manifest: PaperclipPluginManifestV1 = {
           sizeCostTable: {
             type: "object",
             default: {},
-            description: "Measured completed jobs by task class and size; refresh weekly from the pilot JSONL log. Expected cost = hourlyRate * durationSeconds / 3600. No data: configured size (default). Equal cost: faster wins.",
+            description: "Measured completed jobs by task class and size; refresh weekly from the pilot JSONL log. Expected cost = hourlyRate * durationSeconds / 3600. No data: configured size (small unless overridden). Equal cost: faster wins.",
             additionalProperties: {
               type: "object",
               additionalProperties: false,
@@ -157,7 +157,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           idleStopMinutes: {
             type: "number",
-            default: 15,
+            default: 5,
             description: "The sweep stops a VM with no active run after this many idle minutes.",
           },
           maxOffloadVms: {
@@ -192,7 +192,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           staleLeaseMinutes: {
             type: "number",
-            default: 60,
+            default: 20,
             description: "The sweep also stops a VM whose run still holds the lease but sent no command for this many minutes.",
             ...advanced("Budget guard"),
           },
@@ -244,6 +244,12 @@ const manifest: PaperclipPluginManifestV1 = {
             items: { type: "string" },
             description:
               "Run env names that may reach the VM: exact names (ANTHROPIC_AUTH_TOKEN) and NAME_* prefixes (CARGO_*). Everything else Paperclip passes (project and routine env, its own process env) is dropped and logged by name. Secret-looking names (TOKEN, SECRET, PASSWORD, API_KEY, ..._KEY, SIGNING, HMAC, SALT, _AUTH, _PAT...) need an exact entry; PLANETSCALE_, CLOUDFLARE_, CF_, DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_ names, values with a JWT in them and database URLs that leave the VM are never sent. Unset: the built-in list, which covers a Claude Code run through the model-proxy tunnel and Paperclip's sandbox bridge (see the README). A list you set replaces the built-in one; an empty list sends nothing.",
+          },
+          monitoring: {
+            type: "boolean",
+            default: true,
+            description: "Retain boat command/process telemetry for new VMs. Set false to opt out for credential-bearing workloads; the plugin never changes the account-wide Monitoring off policy. Existing VMs retain their creation policy.",
+            ...advanced("VM"),
           },
           noEnv: {
             type: "boolean",
