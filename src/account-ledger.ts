@@ -457,11 +457,15 @@ export class AccountLedger {
     }
   }
 
-  async reconcile(api: BoatApiLike, inventory?: ReadonlyArray<{ id: string; state: string }>, allowCachedLimits = false, includeUnscoped = false): Promise<void> {
+  async reconcile(api: BoatApiLike, inventory?: ReadonlyArray<{ id: string; state: string }>, allowCachedLimits = false, includeUnscoped = false,
+    poolId?: string): Promise<void> {
     const ids = await this.locked(async () => {
       const doc = await this.read();
       try { await this.observe(api, doc, allowCachedLimits); } catch { /* Never free a reservation on unreadable limits. */ }
-      const owned = doc.intents.filter((i) => this.owns(i, includeUnscoped));
+      // A pool client has no credential-group inventory for the rest of the
+      // shared journal. Limit both receipt checks and subsequent metering to
+      // its durably known VM identities, including after pool reconstruction.
+      const owned = doc.intents.filter((i) => this.owns(i, includeUnscoped) && (poolId == null || i.poolId === poolId));
       const all = [...new Set(owned.map((i) => i.sandboxId).filter((id): id is string => id != null))];
       const active = new Set(owned.filter((i) => i.active && i.sandboxId != null).map((i) => i.sandboxId!));
       const history = all.filter((id) => !active.has(id));
