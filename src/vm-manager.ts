@@ -960,7 +960,7 @@ export class BoatVmManager {
                 idempotencyKey,
                 type: config.size,
                 ttlSeconds,
-                monitoring: false,
+                monitoring: true,
                 failFast: config.failFast,
                 env: { PAPERCLIP_BOAT_VM: name },
                 ...(config.noEnv ? { noEnv: true } : {}),

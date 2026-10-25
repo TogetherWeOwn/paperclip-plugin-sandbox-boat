@@ -57,11 +57,11 @@ export interface BoatDriverConfig {
 
 export const CONFIG_DEFAULTS = {
   apiBase: DEFAULT_API_BASE,
-  size: "default" as BoatSize,
+  size: "small" as BoatSize,
   noEnv: true,
   autoStopMinutes: 120,
-  idleStopMinutes: 15,
-  staleLeaseMinutes: 60,
+  idleStopMinutes: 5,
+  staleLeaseMinutes: 20,
   deleteAfterDays: 7,
   maxActive: 2,
   maxStartsPerDay: 70,

@@ -85,8 +85,8 @@ const manifest: PaperclipPluginManifestV1 = {
           size: {
             type: "string",
             enum: ["small", "default", "large", "xlarge"],
-            default: "default",
-            description: "Fallback size when the task class has no measured data (default: default). Otherwise sizeCostTable selects the lowest cost per job. Plan limits still apply.",
+            default: "small",
+            description: "Fallback size when the task class has no measured data (default: small). Otherwise sizeCostTable selects the lowest cost per job. Plan limits still apply.",
           },
           taskClass: {
             type: "string",
@@ -97,7 +97,7 @@ const manifest: PaperclipPluginManifestV1 = {
           sizeCostTable: {
             type: "object",
             default: {},
-            description: "Measured completed jobs by task class and size; refresh weekly from the pilot JSONL log. Expected cost = hourlyRate * durationSeconds / 3600. No data: configured size (default). Equal cost: faster wins.",
+            description: "Measured completed jobs by task class and size; refresh weekly from the pilot JSONL log. Expected cost = hourlyRate * durationSeconds / 3600. No data: configured size (small unless overridden). Equal cost: faster wins.",
             additionalProperties: {
               type: "object",
               additionalProperties: false,
@@ -128,7 +128,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           idleStopMinutes: {
             type: "number",
-            default: 15,
+            default: 5,
             description: "The sweep stops a VM with no active run after this many idle minutes.",
           },
           maxOffloadVms: {
@@ -163,7 +163,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           staleLeaseMinutes: {
             type: "number",
-            default: 60,
+            default: 20,
             description: "The sweep also stops a VM whose run still holds the lease but sent no command for this many minutes.",
             ...advanced("Budget guard"),
           },
