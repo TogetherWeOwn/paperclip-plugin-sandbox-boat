@@ -237,13 +237,22 @@ function hostScopeCheck(
   throw deny("company context is required");
 }
 
+export interface FakeWorkspaceMeta {
+  repoUrl: string | null;
+  projectId: string;
+  projectWorkspaceId: string | null;
+  path: string | null;
+  cwd: string | null;
+}
+
 export function createFakeContext(
-  options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
+  options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta> } = {},
 ) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
   const issues = options.issues ?? new Map<string, { status: string }>();
+  const workspaces = options.workspaces ?? new Map<string, FakeWorkspaceMeta>();
   const keyOf = (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
     `${input.scopeKind}|${input.scopeId ?? ""}|${input.namespace ?? "default"}|${input.stateKey}`;
   const log = (level: FakeLogEntry["level"]) => (message: string, meta?: Record<string, unknown>) => {
@@ -276,6 +285,9 @@ export function createFakeContext(
         jobs.set(key, fn);
       },
     },
+    executionWorkspaces: {
+      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+    },
   };
-  return { ctx, state, logs, jobs, issues };
+  return { ctx, state, logs, jobs, issues, workspaces };
 }
