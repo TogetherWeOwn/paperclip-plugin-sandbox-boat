@@ -34,6 +34,8 @@ export interface GuestController {
   term(sandboxId: string, identity: GuestIdentity): Promise<void>;
   kill(sandboxId: string, identity: GuestIdentity): Promise<void>;
   verifyEmpty(sandboxId: string, identity: GuestIdentity): Promise<boolean>;
+  /** Renew the independent guest watchdog too, not only the host timer. */
+  heartbeat?(sandboxId: string, identity: GuestIdentity): Promise<void>;
 }
 
 interface ActiveGuest {
@@ -151,10 +153,13 @@ export class OffloadLifecycle {
     }
   }
 
-  heartbeat(identity: OffloadIdentity): void {
+  async heartbeat(identity: OffloadIdentity): Promise<void> {
     const entry = this.active.get(commandKey(identity));
     if (!entry || entry.reason || entry.cleanup || this.now() >= entry.identity.heartbeatDeadline
       || !this.matches(entry, identity as GuestIdentity)) return;
+    if (this.guest.heartbeat) await this.guest.heartbeat(identity.sandboxId, identity as GuestIdentity);
+    // A cancellation/timeout can win while the renewal crosses SSH.
+    if (entry.reason || entry.cleanup || this.now() >= entry.identity.heartbeatDeadline) return;
     entry.identity.heartbeatDeadline = (identity as GuestIdentity).heartbeatDeadline;
     this.scheduleInterest(entry);
   }
