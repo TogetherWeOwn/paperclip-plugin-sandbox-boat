@@ -55,6 +55,20 @@ describe("credential-bound reconciliation", () => {
     expect(other.callsOf("get").filter((call) => call.args.sandboxId === a)).toEqual([]);
   });
 
+  it("retains a legacy unbound hold when the only available credential returns a foreign 404", async () => {
+    const ledger = new AccountLedger(f.state, f.accountId, () => Date.now());
+    const other = new FakeBoat({ now: () => Date.now() });
+    const reservation = await ledger.reserve(other as unknown as BoatApiLike, { operation: "create", size: "default",
+      jobSeconds: 60, tailSeconds: 0, maxActive: 2, maxStartsPerDay: 70, minComputeHoursLeft: 0 });
+    other.addSandbox({ id: "legacy-foreign-vm", state: "ready" });
+    await ledger.started(other as unknown as BoatApiLike, reservation, "legacy-foreign-vm");
+    const manager = f.manager();
+    manager.rememberConfig(COMPANY, "sole-available-environment", parseDriverConfig({ apiKey: "synthetic-key-a", cliproxyTunnel: false }));
+    await manager.sweep("legacy-unknown-owner", { force: true });
+    expect(journal().intents[0]).toMatchObject({ status: "running", active: true, compute: 60 });
+    expect(other.boxes.get("legacy-foreign-vm")!.state).toBe("ready");
+  });
+
   it("keeps persisted ownership when a reconstructed manager discovers groups in reverse order", async () => {
     const { other, a, b } = await twoAccounts();
     const recovered = f.manager();
@@ -71,6 +85,9 @@ describe("credential-bound reconciliation", () => {
     const { other, manager, b } = await twoAccounts();
     await advance(6_000);
     f.boat.limitsResponse = limits({ activeSandboxes: 1, creditUsedSeconds: 6 });
+    // Different keys may alias the same provider account. Identical cumulative
+    // deltas must never refund two separate holds for the same six paid seconds.
+    other.limitsResponse = limits({ activeSandboxes: 1, creditUsedSeconds: 6 });
     await manager.sweep("credential-counters", { force: true });
     expect(other.boxes.get(b)?.state).toBe("ready");
     expect(journal().intents.find((i) => i.sandboxId === b)).toMatchObject({ active: true, activeReflected: false, computeReflected: 0 });

@@ -89,6 +89,7 @@ interface AccountDoc {
   reconcileCursor?: number;
   providerObservations?: Record<string, Limits>;
   providerCursors?: Record<string, number>;
+  observationOwner?: string;
 }
 export interface AdmissionRequest {
   operation: Intent["operation"];
@@ -217,11 +218,16 @@ export class AccountLedger {
       if (error instanceof BoatBudgetError) throw error;
       throw new BoatProviderError("BOAT_LIMITS_UNAVAILABLE", "could not read fresh, complete boat limits; no new operation dispatched");
     }
-    if (prior) {
+    // Two credential groups may alias one provider account. Never refund the
+    // same cumulative counter delta through multiple credential snapshots.
+    // Pin one owner durably; other groups retain conservative unreflected holds.
+    const scope = this.providerScope ?? "unscoped";
+    doc.observationOwner ??= doc.observation ? "unscoped" : scope;
+    if (prior && doc.observationOwner === scope) {
       let activeDelta = Math.max(0, current.active - prior.active);
       let computeDelta = Math.max(0, current.used - prior.used, prior.available - current.available);
       for (const intent of doc.intents) {
-        if (!this.owns(intent) || intent.status === "rejected" || intent.settledAt == null) continue;
+        if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.settledAt == null) continue;
         if (activeDelta > 0 && intent.active && !intent.activeReflected) { intent.activeReflected = true; activeDelta--; }
         const consumed = Math.min(intent.compute, Math.max(0, ((intent.endedAt ?? this.now()) - intent.at) / 1000) * WEIGHT[intent.size]);
         const credit = Math.min(computeDelta, Math.max(0, consumed - intent.computeReflected));
@@ -230,7 +236,7 @@ export class AccountLedger {
       for (const name of Object.keys(WINDOWS) as Window[]) {
         let delta = Math.max(0, (current.windows[name]?.used ?? 0) - (prior.windows[name]?.used ?? 0));
         for (const intent of doc.intents) {
-          if (!this.owns(intent) || intent.status === "rejected" || intent.operation === "warm" || intent.settledAt == null) continue;
+          if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.operation === "warm" || intent.settledAt == null) continue;
           const start = intent.starts[name];
           if (delta > 0 && !start.reflected && start.expiresAt > current.at) { start.reflected = true; delta--; }
         }
@@ -482,9 +488,11 @@ export class AccountLedger {
             : (await bounded(() => api.get({ sandboxId: id }))).sandbox;
           if (box && ["archived", "cancelled", "deleted"].includes(box.state ?? "")) this.terminal(doc, id, this.now(), includeUnscoped);
         } catch (error) {
-          // A definitive 404 for an already-known identity is not an empty list
-          // or an unknown create. Unreadable/ambiguous answers retain the hold.
-          if ((await describeBoatError(error)).status === 404) this.terminal(doc, id, this.now(), includeUnscoped);
+          // A 404 is terminal only for identities bound to this credential.
+          // A legacy unbound hold may belong to an unavailable account even
+          // when just one group is configured now. Require positive terminal
+          // evidence for it, never infer ownership from a foreign 404.
+          if ((await describeBoatError(error)).status === 404) this.terminal(doc, id, this.now());
         }
       }
       await this.write(doc);
