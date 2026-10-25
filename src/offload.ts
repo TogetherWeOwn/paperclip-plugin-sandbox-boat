@@ -14,6 +14,8 @@ import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import type { AccountReservation, AccountUsageRow } from "./account-ledger.js";
 import { OffloadJournal, commandDigest, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
 import type { StateClientLike } from "./state.js";
+import { OffloadLifecycle, type CommandExit, type ExecutionIdentity, type GuestController, type OffloadRunContext } from "./offload-lifecycle.js";
+export type { GuestIdentity, GuestController, OffloadRunContext } from "./offload-lifecycle.js";
 export { OffloadGuestRunner } from "./offload-guest.js";
 export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
 
@@ -103,7 +105,15 @@ export interface OffloadDeps extends Partial<OffloadDurableDeps> {
   now: () => number;
   timers?: OffloadTimers;
   config: OffloadExecutorConfig;
-  runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<{ exitCode: number; seconds: number }>;
+  guest?: undefined;
+  runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>;
+}
+
+// A separate transport shape keeps the landed identity-only runner compatible.
+// Lifecycle-enabled callers must supply the complete durable journal ports.
+export interface OffloadLifecycleDeps extends Omit<OffloadDeps, "guest" | "runCommand" | keyof OffloadDurableDeps>, OffloadDurableDeps {
+  guest: GuestController;
+  runCommand(sandboxId: string, command: OffloadCommand, context?: OffloadRunContext): Promise<CommandExit>;
 }
 
 interface PoolVm {
@@ -165,6 +175,7 @@ export class OffloadExecutor {
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
   private readonly runCommand: OffloadDeps["runCommand"];
   private readonly durable: OffloadJournal | null;
+  private readonly lifecycle: OffloadLifecycle | null;
   private readonly pool: PoolVm[] = [];
   private readonly queue: Queued[] = [];
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
@@ -174,7 +185,7 @@ export class OffloadExecutor {
   private closed = false;
   private shutdownTask: Promise<void> | null = null;
 
-  constructor(deps: OffloadDeps) {
+  constructor(deps: OffloadDeps | OffloadLifecycleDeps) {
     this.boat = deps.boat;
     this.logger = deps.logger;
     this.now = deps.now;
@@ -189,18 +200,22 @@ export class OffloadExecutor {
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
     };
-    const hasDurableDeps = deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
+    const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
       throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
     }
-    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDeps & OffloadDurableDeps, this.now, {
+    this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers) : null;
+    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDurableDeps, this.now, {
       hold: (identity) => this.restoreHold(identity),
       release: (identity) => this.releaseHold(identity),
       cancel: (command, result) => this.cancelQueued(command, result),
-    }) : null;
-    this.runCommand = this.durable
-      ? (vm, command) => this.durable!.run(vm, command, deps.runCommand)
+    }, this.lifecycle ?? undefined) : null;
+    const transport: OffloadDeps["runCommand"] = deps.guest
+      ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand, async () => {})
       : deps.runCommand;
+    this.runCommand = this.durable
+      ? (vm, command) => this.durable!.run(vm, command, transport)
+      : transport;
     if (!(deps.state && deps.accountId && deps.poolId)) throw new Error("account admission requires durable state, accountId and poolId");
     this.poolId = deps.poolId;
     this.ledger = new AccountLedger(deps.state, deps.accountId, this.now);

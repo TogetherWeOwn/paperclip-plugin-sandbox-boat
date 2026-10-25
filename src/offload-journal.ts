@@ -142,6 +142,10 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
   return record;
 }
 
+export interface JournalLifecycle {
+  prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<OffloadIdentity>;
+}
+
 interface JournalPool {
   hold(identity: OffloadIdentity): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
@@ -193,7 +197,8 @@ export class OffloadJournal {
     });
   }
 
-  constructor(private readonly deps: OffloadDurableDeps, private readonly now: () => number, private readonly pool: JournalPool) {}
+  constructor(private readonly deps: OffloadDurableDeps, private readonly now: () => number,
+    private readonly pool: JournalPool, private readonly lifecycle?: JournalLifecycle) {}
 
   private serialize<T>(fn: () => Promise<T>): Promise<T> {
     const task = this.chain.then(fn, fn);
@@ -298,8 +303,9 @@ export class OffloadJournal {
     await this.deps.sync.push(sandboxId, command);
     const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
     if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
-    const identity: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
+    const base: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
       digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
+    const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
     await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
     const result = await transport(sandboxId, command, identity);
     // The legacy transport resolves at exit, not at spawn. Do not claim a
