@@ -166,6 +166,66 @@ describe("cross-manager activity", () => {
     }
   });
 
+  it("rechecks a heartbeat published by another manager between stale selection and the sweep lock", async () => {
+    const executingManager = manager();
+    const sweepingManager = manager();
+    const lease = await acquire(executingManager);
+    sweepingManager.rememberConfig(companyId, environmentId, parseDriverConfig(config));
+    clock += 21 * 60_000;
+
+    let selected!: () => void;
+    const selectionReached = new Promise<void>((resolve) => { selected = resolve; });
+    let continueSweep!: () => void;
+    const selectionHeld = new Promise<void>((resolve) => { continueSweep = resolve; });
+    const get = harness.ctx.state.get;
+    let holdSelection = true;
+    vi.spyOn(harness.ctx.state, "get").mockImplementation(async (input) => {
+      const value = await get(input);
+      if (holdSelection && input.stateKey === `activity:${lease.providerLeaseId}`) {
+        holdSelection = false;
+        // Preserve the stale selection read while a different manager admits
+        // real work. Only the under-lock shared-state recheck can see it.
+        selected();
+        await selectionHeld;
+      }
+      return value;
+    });
+
+    const payload = new MockChild();
+    let started!: () => void;
+    const commandStarted = new Promise<void>((resolve) => { started = resolve; });
+    spawnMock.mockImplementation((command: string, args: string[], options?: { stdio?: unknown[] }) => {
+      if (command === "ssh" && args.at(-1)?.includes("admitted-during-sweep-command")) {
+        started();
+        return payload;
+      }
+      return ssh.spawn(command, args, options);
+    });
+    const scrubsBefore = ssh.scrubs().length;
+    const sweeping = sweepingManager.sweep("admit-during-sweep", { force: true });
+    let executing: ReturnType<BoatVmManager["execute"]> | undefined;
+    try {
+      await selectionReached;
+      executing = executingManager.execute({ companyId, environmentId, driverKey: "boat", config, lease,
+        command: "admitted-during-sweep-command", args: [], env: {}, timeoutMs: 3_600_000 });
+      await commandStarted;
+      continueSweep();
+      expect((await sweeping).stopped).toEqual([]);
+      expect(fake.callsOf("stop")).toHaveLength(0);
+      expect(ssh.scrubs()).toHaveLength(scrubsBefore);
+      expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("ready");
+      expect(payload.exitCode).toBeNull();
+    } finally {
+      continueSweep();
+      payload.finish(0);
+      await executing;
+      await sweeping;
+    }
+    // A fresh heartbeat postpones cleanup, rather than disabling it forever.
+    clock += 21 * 60_000;
+    expect((await sweepingManager.sweep("idle-after-interleaved-command", { force: true })).stopped).toEqual([lease.providerLeaseId]);
+  });
+
   it("protects a silent 21-minute command from another manager and reclaims it after heartbeats stop", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     const executingManager = manager();
