@@ -196,3 +196,34 @@ describe("funding and accounting", () => {
     expect(f.boat.callsOf("create")).toHaveLength(1);
   });
 });
+
+describe("stop receipt persistence", () => {
+  it("confirms a provider-accepted stop when the ledger write fails", async () => {
+    const manager = f.manager();
+    const lease = await f.acquire(manager, "stop-ledger-sweep");
+    const id = lease.providerLeaseId!;
+    await advance(61 * 60_000);
+    // Fail only the account-journal writes; the VM store keeps working.
+    const realSet = f.state.set.bind(f.state);
+    type SetInput = Parameters<typeof f.state.set>[0];
+    f.state.set = async (input: SetInput, value: unknown) => {
+      if ((input as { namespace?: string }).namespace === "boat-account") throw new Error("synthetic ledger unavailable");
+      return realSet(input, value);
+    };
+    try {
+      const report = await manager.sweep("stop-ledger-sweep", { force: true });
+      // The provider archived the VM: the sweep must report the stop even
+      // though the receipt could not be persisted. Only the pre-stop ledger
+      // reconcile (which cannot write either) may report an error.
+      expect(report.stopped).toEqual([id]);
+      expect(report.errors).toEqual(["account reservation reconciliation failed"]);
+      expect(JSON.stringify(f.logs)).not.toContain("boat: stop call failed");
+    } finally {
+      f.state.set = realSet;
+    }
+    // The hold is retained fail-closed; the next reconcile converges it.
+    expect(ledgerIntents(f).some((i) => i.sandboxId === id && i.active)).toBe(true);
+    await new AccountLedger(f.state, f.accountId, () => Date.now()).reconcile(boatApi(f));
+    expect(ledgerIntents(f).filter((i) => i.sandboxId === id).every((i) => !i.active)).toBe(true);
+  });
+});

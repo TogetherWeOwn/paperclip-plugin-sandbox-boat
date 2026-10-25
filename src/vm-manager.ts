@@ -1426,12 +1426,23 @@ export class BoatVmManager {
     }
   }
 
+  /** The provider confirmation alone decides a stop. A ledger failure afterwards
+   * must not read as a failed stop: the VM is already stopped, and the next
+   * reconcile converges the unrecorded receipt. */
+  private async recordStopReceipt(sandboxId: string): Promise<void> {
+    try {
+      await this.account.stopped(sandboxId);
+    } catch {
+      this.logger.warn("boat: stop receipt persistence failed; reconcile will converge", { sandboxId });
+    }
+  }
+
   /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
   private async stopAndConfirm(api: BoatApiLike, sandboxId: string, timeoutMs: number): Promise<boolean> {
     try {
       const response = await api.stop({ sandboxId });
       const view = toView((response as { sandbox?: unknown }).sandbox);
-      if (view && (view.state === "archived" || view.state === "cancelled")) await this.account.stopped(sandboxId);
+      if (view && (view.state === "archived" || view.state === "cancelled")) await this.recordStopReceipt(sandboxId);
     } catch (error) {
       const info = await describeBoatError(error);
       if (info.status === 404) return true;
@@ -1443,7 +1454,7 @@ export class BoatVmManager {
     for (;;) {
       const sandbox = await this.getSandbox(api, sandboxId).catch(() => undefined);
       if (sandbox === null || (sandbox && (sandbox.state === "archived" || sandbox.state === "cancelled"))) {
-        await this.account.stopped(sandboxId);
+        await this.recordStopReceipt(sandboxId);
         return true;
       }
       if (sandbox?.stopStatus === "failing") {
@@ -2261,10 +2272,6 @@ export class BoatVmManager {
       }
       // Reuse the sweep's authoritative inventory rather than issue duplicate
       // per-VM reads. Missing identities still require an explicit receipt.
-      // One ledger tracks one provider account: reconciling it through a
-      // second account's client would let that account's 404s and limits
-      // release the holds that pay for the first account's VMs. Reconcile once
-      // through the first credential group; other groups still sweep their VMs.
       // One ledger tracks one provider account: reconciling it through a
       // second account's client would let that account's 404s and limits
       // release the holds that pay for the first account's VMs. Reconcile once
