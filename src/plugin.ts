@@ -44,7 +44,11 @@ const plugin = definePlugin({
       issues: {
         get: async (issueId, companyId) => {
           const issue = await ctx.issues.get(issueId, companyId);
-          return issue ? { status: issue.status } : null;
+          return issue ? {
+            status: issue.status,
+            ...(Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings")
+              ? { executionWorkspaceSettings: issue.executionWorkspaceSettings } : {}),
+          } : null;
         },
       },
       offloadConfig: async (companyId) => ctx.config.get(companyId),
