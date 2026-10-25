@@ -388,13 +388,19 @@ export async function runStreamProcess(command: string, args: string[], options:
   let timedOut = false;
   let closed = false;
   let killTimer: NodeJS.Timeout | undefined;
+  let signalled = false;
   const abort = (error: Error) => {
     failure ??= error;
     options.stdin?.destroy(error);
     child.stdin.destroy(error);
     child.stdout.destroy(error);
     options.stdout?.destroy(error);
-    if (!closed) {
+    // Signal the child exactly once: the timer plus one failing pipe per
+    // stdio endpoint can invoke abort several times in the same tick, and a
+    // burst of SIGTERMs down the relay/supervisor chain kills the remote
+    // payload before its own SIGTERM cleanup (staging-scratch unlink) runs.
+    if (!closed && !signalled) {
+      signalled = true;
       child.kill("SIGTERM");
       killTimer ??= setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
     }
