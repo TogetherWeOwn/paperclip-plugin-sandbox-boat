@@ -335,6 +335,11 @@ def rpc(action, data):
             if filename.exists():
                 with filename.open() as output:
                     for index, line in enumerate(output):
+                        # The supervisor appends outside this lock and a large
+                        # JSON record can span writes. Do not parse or consume
+                        # its unfinished tail; the next poll retries this index.
+                        if not line.endswith('\n'):
+                            break
                         if index < data['after']:
                             continue
                         if len(events) >= 4:

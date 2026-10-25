@@ -12,6 +12,7 @@
 
 ### Fixed
 
+* Guest output polling defers an incomplete JSON-line tail until the next read, avoiding spurious uncertain-execution quarantines when a healthy command's output spans multiple writes. Complete malformed records still fail closed.
 * Upgrades retain the installed 0.2.2 capability set instead of requesting `execution.workspaces.read`. Offload workspace authority now uses the host-authored native realization payload, persisted per company/run/workspace. Command dispatch stays default-off, unknown bindings fail closed, and whole-run realization does not depend on optional offload state availability. Otherwise-local executor integrations must register the same native binding before admission.
 * Detached command-expiry cancellation uses proactive, explicit-company state access through executor cleanup and the final broker receipt write, so an ended heartbeat invocation cannot let an expired sync-in command start.
 * Full offload pools stop and retire idle incompatible VMs before admitting replacements, including stopped or legacy slots. Busy, quarantined and pending-stop ownership stays fenced; regression tests also pin unknown-workspace rejection and immediate quarantine refusal with queueing enabled.
