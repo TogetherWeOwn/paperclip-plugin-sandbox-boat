@@ -73,6 +73,8 @@ import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type
 const UP_STATES = new Set(["init", "provisioning", "provisioned", "cloning", "ready", "idle", "running"]);
 const EXTEND_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
+// Below the minimum idle-stop threshold (one minute), including silent syncs.
+const ACTIVITY_HEARTBEAT_INTERVAL_MS = 15_000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
 const STOP_POLL_INTERVAL_MS = 2000;
 // After an accepted stop, release waits at most this long for the VM to leave
@@ -237,6 +239,7 @@ export class BoatVmManager {
   private readonly lastActivity = new Map<string, number>();
   private readonly lastPersistedActivity = new Map<string, number>();
   private readonly extendTimers = new Map<string, NodeJS.Timeout>();
+  private readonly heartbeatTimers = new Map<string, NodeJS.Timeout>();
   private readonly deadlines = new Map<string, number>();
   private readonly hardDeadlines = new Map<string, number>();
   private readonly sandboxCompany = new Map<string, string>();
@@ -530,6 +533,12 @@ export class BoatVmManager {
     if (info.status === 503 && code === "out_of_capacity") {
       return new BoatProviderError("BOAT_OUT_OF_CAPACITY", `boat is out of machines for a short time. ${nothing} Retry in about 2 minutes.`);
     }
+    if (info.status === 409 && code === "monitoring_off_for_account") {
+      return new BoatProviderError(
+        "BOAT_MONITORING_OFF_FOR_ACCOUNT",
+        `boat refused the ${op}: the account disables monitoring. Set monitoring=false for new VMs or ask the account administrator to review that policy. The plugin will not change account settings or retry with a different monitoring policy. ${nothing}`,
+      );
+    }
     if (info.status === 409 && code === "snapshot_data_expired") {
       return new BoatProviderError("BOAT_SNAPSHOT_EXPIRED", "the stopped VM's disk is older than 14 days and boat deleted it.");
     }
@@ -744,15 +753,15 @@ export class BoatVmManager {
       }
       try {
         session = await this.openSsh(input.api, input.config, sandboxId);
-      } catch (error) {
-        return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+      } catch {
+        return this.reportScrub(input, { status: "failed", removed: 0, detail: "SSH connection failed (diagnostics withheld)" });
       }
     }
     let result: Awaited<ReturnType<SshManager["run"]>>;
     try {
       result = await this.ssh.run(session, `sh -c ${shellQuote(scrubRuntimeSecretsScript(input.roots))}`, { timeoutMs: SCRUB_TIMEOUT_MS });
-    } catch (error) {
-      return this.reportScrub(input, { status: "failed", removed: 0, detail: errorText(error).slice(0, 300) });
+    } catch {
+      return this.reportScrub(input, { status: "failed", removed: 0, detail: "scrub command failed (diagnostics withheld)" });
     }
     const counts = RUNTIME_SECRET_SCRUB_RESULT_RE.exec(result.stdout);
     if (!result.timedOut && counts && counts[2] === "0") {
@@ -762,7 +771,7 @@ export class BoatVmManager {
       }
       if (result.exitCode === RUNTIME_SECRET_SCRUB_INCOMPLETE_EXIT && counts[3] === "incomplete") {
         // Nothing left that it could see, but a directory it had to search was unreadable: not verified.
-        return this.reportScrub(input, { status: "incomplete", removed, detail: (result.stderr || "").trim().slice(0, 300) || "walk incomplete" });
+        return this.reportScrub(input, { status: "incomplete", removed, detail: "walk incomplete (diagnostics withheld)" });
       }
     }
     if (result.exitCode === 255) {
@@ -773,7 +782,7 @@ export class BoatVmManager {
     }
     const detail = result.timedOut
       ? `timed out after ${SCRUB_TIMEOUT_MS / 1000} s`
-      : `exit ${result.exitCode}${counts ? `, ${counts[2]} left` : ""}: ${(result.stderr || "").trim().slice(0, 300)}`;
+      : `exit ${result.exitCode}${counts ? `, ${counts[2]} left` : ""} (diagnostics withheld)`;
     return this.reportScrub(input, { status: "failed", removed: counts ? Number(counts[1]) : 0, detail });
   }
 
@@ -970,9 +979,21 @@ export class BoatVmManager {
     }
   }
 
-  private beginActivity(config: BoatDriverConfig, sandboxId: string): void {
+  private async beginActivity(config: BoatDriverConfig, companyId: string, sandboxId: string): Promise<void> {
+    // Publish before admitting work. A failed write must not launch a command
+    // that another manager cannot see. Heartbeats expire naturally after a
+    // worker dies; do not persist a permanent busy bit.
+    await this.store.touchActivity(companyId, sandboxId, this.now());
     this.inflight.set(sandboxId, (this.inflight.get(sandboxId) ?? 0) + 1);
     this.lastActivity.set(sandboxId, this.now());
+    if (!this.heartbeatTimers.has(sandboxId)) {
+      const timer = setInterval(() => {
+        void runOutsideInvocation(() => this.store.touchActivity(companyId, sandboxId, this.now()))
+          .catch(() => this.logger.warn("boat: could not persist command activity heartbeat", { sandboxId }));
+      }, ACTIVITY_HEARTBEAT_INTERVAL_MS);
+      timer.unref?.();
+      this.heartbeatTimers.set(sandboxId, timer);
+    }
     if (!this.extendTimers.has(sandboxId)) {
       const timer = setInterval(() => {
         void this.maybeExtend(config, sandboxId);
@@ -992,6 +1013,10 @@ export class BoatVmManager {
     }
     const now = this.now();
     this.lastActivity.set(sandboxId, now);
+    // Always publish completion, even for short commands; do not clear a
+    // shared heartbeat while a command in another manager may still run.
+    await this.store.touchActivity(companyId, sandboxId, now)
+      .catch(() => this.logger.warn("boat: could not persist command completion activity", { sandboxId }));
     const persisted = this.lastPersistedActivity.get(sandboxId) ?? 0;
     if (now - persisted >= ACTIVITY_PERSIST_INTERVAL_MS) {
       this.lastPersistedActivity.set(sandboxId, now);
@@ -1005,9 +1030,21 @@ export class BoatVmManager {
   }
 
   private clearExtendTimer(sandboxId: string): void {
+    const heartbeat = this.heartbeatTimers.get(sandboxId);
+    if (heartbeat) clearInterval(heartbeat);
+    this.heartbeatTimers.delete(sandboxId);
     const timer = this.extendTimers.get(sandboxId);
     if (timer) clearInterval(timer);
     this.extendTimers.delete(sandboxId);
+  }
+
+  private warnUnmeasuredSmall(choice: ReturnType<typeof selectSize>): void {
+    if (choice.source === "fallback" && choice.size === "small") {
+      this.logger.warn(
+        "boat: unmeasured task class falls back to small; use size=default for heavy builds (small failed the Rust benchmark), or supply successful sizeCostTable measurements",
+        { taskClass: choice.taskClass, size: choice.size },
+      );
+    }
   }
 
   // --------------------------------------------------------------- lifecycle
@@ -1043,6 +1080,7 @@ export class BoatVmManager {
       config.size = sizeChoice.size;
       const context = { vmKey: key, runId: params.runId, issueId: params.issueId ?? null };
       this.logger.info("boat: size choice for lease", { ...context, ...sizeChoice });
+      this.warnUnmeasuredSmall(sizeChoice);
       let sandboxId = "";
       let startKind: StartKind;
       let startedNew = false;
@@ -1092,7 +1130,7 @@ export class BoatVmManager {
                 idempotencyKey,
                 type: config.size,
                 ttlSeconds,
-                monitoring: false,
+                monitoring: config.monitoring,
                 failFast: config.failFast,
                 env: { PAPERCLIP_BOAT_VM: name },
                 ...(config.noEnv ? { noEnv: true } : {}),
@@ -1340,6 +1378,7 @@ export class BoatVmManager {
     const sizeChoice = selectSize(config, taskClass, runningSize);
     config.size = sizeChoice.size;
     this.logger.info("boat: size choice for lease", { sandboxId, ...sizeChoice });
+    this.warnUnmeasuredSmall(sizeChoice);
     const session = await this.liveSession(config, params.companyId, sandboxId, true);
     const remote = await this.prepareRemote(config, session);
     const remoteCwd = str(params.leaseMetadata?.remoteCwd) ?? remote.remoteCwd;
@@ -1852,7 +1891,10 @@ export class BoatVmManager {
     if (!sandboxId) throw new Error("No provider lease ID available for native sync.");
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
-    this.beginActivity(config, sandboxId);
+    // Like Execute, wait for a sweep already scrubbing/stopping this card.
+    await this.withCardLock(params.companyId, sandboxId, params.lease.metadata, async () => {
+      await this.beginActivity(config, params.companyId, sandboxId);
+    });
     const startedAt = this.now();
     try {
       let session = await this.liveSession(config, params.companyId, sandboxId);
@@ -1914,7 +1956,12 @@ export class BoatVmManager {
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
     const cwd = params.cwd ?? str(params.lease.metadata?.remoteCwd) ?? undefined;
 
-    this.beginActivity(config, sandboxId);
+    // Admit work under the sweep's card lock, but release it before running:
+    // a sweep already scrubbing/stopping must finish first; a later sweep
+    // sees inflight and leaves this command alone. Commands can still overlap.
+    await this.withCardLock(params.companyId, sandboxId, params.lease.metadata, async () => {
+      await this.beginActivity(config, params.companyId, sandboxId);
+    });
     try {
       let session: SshSession;
       try {
@@ -2390,6 +2437,7 @@ export class BoatVmManager {
             if ((this.inflight.get(sandbox.id) ?? 0) > 0) continue;
             const lastActivity = Math.max(
               this.lastActivity.get(sandbox.id) ?? 0,
+              await this.store.activityAt(companyId, sandbox.id),
               Date.parse(record?.lastActivityAt ?? "") || 0,
               Date.parse(record?.lastStartedAt ?? "") || 0,
               record ? 0 : Date.parse(sandbox.updatedAt ?? sandbox.createdAt ?? "") || 0,
@@ -2409,7 +2457,11 @@ export class BoatVmManager {
               if (record) {
                 const fresh = findBySandboxId(await this.store.read(companyId), sandbox.id);
                 if (confirmingRelease && fresh?.status !== "stopping") return null;
-                const freshActivity = Math.max(this.lastActivity.get(sandbox.id) ?? 0, Date.parse(fresh?.lastActivityAt ?? "") || 0);
+                const freshActivity = Math.max(
+                  this.lastActivity.get(sandbox.id) ?? 0,
+                  await this.store.activityAt(companyId, sandbox.id),
+                  Date.parse(fresh?.lastActivityAt ?? "") || 0,
+                );
                 if ((this.inflight.get(sandbox.id) ?? 0) > 0 || freshActivity > lastActivity) return null;
                 if ((fresh?.activeRunIds.length ?? 0) > (record.activeRunIds.length ?? 0)) return null;
                 held = runHoldsVm(fresh ?? record);

@@ -85,9 +85,10 @@ describe("readBudget", () => {
 describe("config", () => {
   it("defaults match the boat trial and the owner's cost rules", () => {
     expect(parseDriverConfig({})).toMatchObject({
-      size: "default",
+      size: "small",
       autoStopMinutes: 120,
-      idleStopMinutes: 15,
+      idleStopMinutes: 5,
+      staleLeaseMinutes: 20,
       maxActive: 2,
       maxStartsPerDay: 70,
       minComputeHoursLeft: 1,

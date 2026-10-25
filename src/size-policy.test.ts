@@ -114,14 +114,20 @@ describe("size selection per lease", () => {
     expect(lease.metadata).toMatchObject({ taskClass: "rust", size: "default" });
   });
 
-  it.each([{}, { taskClass: "unknown", sizeCostTable: { rust } }, { taskClass: "empty", sizeCostTable: { empty: {} } }])("falls back to default with no class measurements", async (raw) => {
+  it.each([{}, { taskClass: "unknown", sizeCostTable: { rust } }, { taskClass: "empty", sizeCostTable: { empty: {} } }])("falls back to small with no class measurements", async (raw) => {
     const lease = await acquire("fallback", { ...baseConfig, ...raw });
-    expect(lease.metadata).toMatchObject({ size: "default", sizeChoice: { source: "fallback", expectedCostDollars: null } });
+    expect(lease.metadata).toMatchObject({ size: "small", sizeChoice: { source: "fallback", expectedCostDollars: null } });
   });
 
   it("preserves an explicit configured fallback size for existing environments", async () => {
     const lease = await acquire("fallback-small", { ...baseConfig, size: "small" });
     expect(lease.metadata).toMatchObject({ size: "small", sizeChoice: { source: "fallback" } });
+  });
+
+  it("keeps an explicit default size for heavy builds despite the small plugin default", async () => {
+    const lease = await acquire("fallback-heavy", { ...baseConfig, size: "default" });
+    expect(lease.metadata).toMatchObject({ size: "default", sizeChoice: { source: "fallback" } });
+    expect(fake.callsOf("create")[0].args.type).toBe("default");
   });
 
   it("prefers faster measured work when expected job costs are equal", async () => {
