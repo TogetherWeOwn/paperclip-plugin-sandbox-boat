@@ -46,8 +46,9 @@ a `GuestController`, and a runner receiving `{ identity, output }`.
   timers are removed on every exit. Unknown ownership or failed cleanup
   quarantines capacity; it never permits local replay of possibly started work.
   Nonterminal lifecycle records stay quarantined even with a matching leader
-  result receipt: receipt-only replay cannot attest descendant cleanup. Full
-  lifecycle reconciliation remains slice b.
+  result receipt: receipt-only replay cannot attest descendant cleanup. Recovery
+  inspects the pinned guest identity without replaying or signaling the command;
+  it does not release a nonterminal hold just because the original call settled.
 * `start(command)` acknowledges durable admission without waiting for exit.
   `execute(command)` waits for the same execution. `heartbeatCommand` renews
   thirty-second client interest; clients should call it every five seconds.
@@ -76,11 +77,32 @@ a `GuestController`, and a runner receiving `{ identity, output }`.
   executor admitted and reject ambiguous IDs. External routes must use the
   run/company-scoped methods and supply authenticated bindings.
 
-Persisted pool reconciliation, worker-death idle sweeping and observed stop-lag
-telemetry remain **slice b**. Collected-data staging, workspace reservations and
-pool compatibility remain **slice c**. The acceptance tests model process trees
-and timer ownership; they are not proof of a real guest's cgroup enforcement.
-No live VM use or deployment is part of this change.
+Lifecycle-enabled executors persist pool ownership, funded idle tails, absolute
+stop deadlines, stop requests and guest identities in instance-scoped plugin
+state, keyed by account and pool. Call `recover()` before reconciliation (new
+submissions do this automatically) and `sweep()` from the native plugin job
+integration. Recovery loads saved idle settings/deadlines, remembers journaled
+watchdog paths and quarantines busy, unobservable or mismatched ownership. An
+idle VM is stopped only after its durable deadline; sweep never creates a
+replacement. The API is ready for job integration, but this slice does not wire
+or schedule that job or enable command-level HTTP routes.
+
+Stop acceptance and termination are distinct. While Boat is archiving, capacity
+remains unavailable for reuse, and usage has integer epoch-ms `stopRequestedAt`
+with `stoppedAt` and `stopLagMs` set to `null`. A later terminal observation fills
+those fields once. `stopLagMs` measures observation time minus the original idle
+deadline, including worker outage and sweep delay, not just provider RPC time.
+The existing five-minute native sweep cadence is the intended crash backstop,
+**not a fifteen-second stop guarantee after worker death**. A healthy worker
+still uses the short generation-fenced idle timer. Storage loss during an idle
+stop does not prevent stopping a known-empty VM, but missing telemetry stays
+pending until durable evidence converges. One authoritative worker is required;
+these records do not fence simultaneous workers or external account writers.
+
+Collected-data staging, workspace reservations, cancellation during asynchronous
+sync and pool compatibility remain **slice c**. The acceptance tests model
+process trees and timer ownership; they are not proof of a real guest's cgroup
+enforcement. No live VM use or deployment is part of this change.
 
 ### Native workspace transfers
 

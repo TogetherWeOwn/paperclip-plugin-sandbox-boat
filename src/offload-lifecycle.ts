@@ -83,6 +83,25 @@ export class OffloadLifecycle {
     return full;
   }
 
+  remember(identity: OffloadIdentity): void {
+    if (!validGuestIdentity(identity)) throw offloadError("OFFLOAD_GUEST_OWNERSHIP_UNKNOWN");
+    this.watchdogPaths.add(JSON.stringify([identity.sandboxId, identity.guestBootId, identity.cgroupPath]));
+  }
+
+  // Recovery is observational: a running receipt is not authority to replay,
+  // signal or release a command. Remember its watchdog path across restarts too.
+  async observe(identity: OffloadIdentity): Promise<{ populated: boolean; receipt: string }> {
+    this.remember(identity);
+    if (!validGuestIdentity(identity)) throw offloadError("OFFLOAD_GUEST_OWNERSHIP_UNKNOWN");
+    const observed = await this.guest.inspect(identity.sandboxId, structuredClone(identity));
+    if (!observed.identity || !OWNERSHIP.every((key) => observed.identity[key] === identity[key])
+      || typeof observed.populated !== "boolean" || !["running", "completed", "never_started"].includes(observed.receipt)
+      || observed.receipt === "never_started" && observed.populated) {
+      throw offloadError("OFFLOAD_GUEST_OWNERSHIP_UNKNOWN");
+    }
+    return observed;
+  }
+
   discard(identity: OffloadIdentity): void {
     const key = commandKey(identity);
     const entry = this.active.get(key);

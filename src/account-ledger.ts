@@ -45,6 +45,11 @@ export interface AccountUsageRow {
   intervals: PaidInterval[];
   // Open tails are finalized at the next reservation or a terminal receipt.
   tailSince: number | null;
+  stopRequestedAt?: number | null;
+  stoppedAt?: number | null;
+  stopLagMs?: number | null;
+  // Persist the intended deadline: crash/scheduling delay is part of stop lag.
+  stopDueAt?: number | null;
 }
 interface StartWindow { used: number; limit: number; remaining: number; resetAt: number | null }
 interface Limits {
@@ -179,6 +184,9 @@ export class AccountLedger {
     await this.state.set(this.key, doc);
     this.rows = structuredClone(doc.usage);
   }
+  async load(): Promise<void> {
+    await this.locked(async () => { this.rows = structuredClone((await this.read()).usage); });
+  }
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
 
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
@@ -308,7 +316,8 @@ export class AccountLedger {
       if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
         companyId: req.command.companyId, profileId: req.command.profileId, payloadDigest: req.command.payloadDigest,
-        sandboxId: req.sandboxId ?? null, seconds: 0, dollars: 0, meterProvenance: "pending", observedStartsDelta: null, intervals: [], tailSince: null });
+        sandboxId: req.sandboxId ?? null, seconds: 0, dollars: 0, meterProvenance: "pending", observedStartsDelta: null, intervals: [], tailSince: null,
+        stopRequestedAt: null, stoppedAt: null, stopLagMs: null, stopDueAt: null });
       await this.write(candidate);
       // Persistence may itself have waited for the store. Revalidate the exact
       // intent before any external effect if its observation aged out.
@@ -407,6 +416,19 @@ export class AccountLedger {
     });
   }
 
+  async stopRequested(sandboxId: string, dueAt: number, requestedAt: number): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read();
+      for (const row of doc.usage) {
+        if (row.sandboxId !== sandboxId || row.tailSince === null || row.stopRequestedAt != null) continue;
+        row.stopDueAt = dueAt;
+        row.stopRequestedAt = requestedAt;
+        row.stoppedAt = row.stopLagMs = null;
+      }
+      await this.write(doc);
+    });
+  }
+
   async stopped(sandboxId: string): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
@@ -415,6 +437,14 @@ export class AccountLedger {
     });
   }
   private terminal(doc: AccountDoc, sandboxId: string, at: number): void {
+    for (const row of doc.usage) {
+      // A warm handoff cancels the predecessor's stop obligation. Only the
+      // still-open tail owns this observation, never an earlier failed stop.
+      if (row.sandboxId === sandboxId && row.tailSince != null && row.stopDueAt != null && row.stoppedAt == null) {
+        row.stoppedAt = at;
+        row.stopLagMs = Math.max(0, at - row.stopDueAt);
+      }
+    }
     this.closeTail(doc, sandboxId, at);
     for (const intent of doc.intents) {
       if (intent.sandboxId !== sandboxId || intent.status === "stopped" || intent.status === "rejected") continue;

@@ -172,6 +172,7 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
 }
 
 export interface JournalLifecycle {
+  remember?(identity: OffloadIdentity): void;
   prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<OffloadIdentity>;
   discard(identity: OffloadIdentity): void;
   cancel(identity: OffloadIdentity, reason: string): Promise<void>;
@@ -179,6 +180,7 @@ export interface JournalLifecycle {
 }
 
 interface JournalPool {
+  bind?(identity: OffloadIdentity): Promise<void>;
   hold(identity: OffloadIdentity): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
   cancel(command: OffloadCommand, result: OffloadResult): Promise<void>;
@@ -250,6 +252,7 @@ export class OffloadJournal {
       this.startup = this.serialize(async () => {
         for (const key of await this.deps.journalStore.list("command/")) {
           const record = parseRecord(await this.deps.journalStore.get(key), key);
+          if (record.identity) this.lifecycle?.remember?.(record.identity);
           if (!TERMINAL.has(record.state) && record.identity) await this.hold(record);
           if (!TERMINAL.has(record.state) && !PRE_START.has(record.state) && !record.identity) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         }
@@ -367,6 +370,7 @@ export class OffloadJournal {
     const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
     try {
       await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
+      await this.pool.bind?.(identity);
     } catch (error) {
       // A failed commit or pre-start cancellation must not retain an entry
       // registered by prepare(); neither watchdog nor transport was invoked.
@@ -443,10 +447,9 @@ export class OffloadJournal {
     }
     await this.hold(record);
     if (this.lifecycle) {
-      // A leader's result/never-started receipt does not certify descendant
-      // cleanup or revoke an armed watchdog. Lifecycle reconciliation is a
-      // separate slice; until then even a matching receipt must retain the VM.
-      const result = this.unknown(record);
+      // Observation cannot certify cleanup or revoke a watchdog. Preserve an
+      // existing ambiguous reply byte-for-byte; never synthesize a new execution.
+      const result = record.result?.status === "unknown" ? record.result : this.unknown(record);
       await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
       return result;
     }
