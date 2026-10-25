@@ -192,7 +192,7 @@ describe("AcquireLease", () => {
     const sshKey = fake.callsOf("sshKey");
     expect(sshKey[0].args).toMatchObject({ sandboxId, key: "ssh-ed25519 AAAATESTPUBLICKEY paperclip-boat" });
     const master = ssh.masters()[0];
-    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes"]));
+    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes", "ForwardAgent=no"]));
     expect(master.args.at(-1)).toBe("user@203.0.113.10");
     const knownHosts = master.args.find((arg) => arg.startsWith("UserKnownHostsFile="))!.slice("UserKnownHostsFile=".length);
     expect(readFileSync(knownHosts, "utf8")).toBe(`${sandboxId} ssh-ed25519 AAAAHOSTKEY${sandboxId}\n`);

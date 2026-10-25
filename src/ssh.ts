@@ -320,6 +320,8 @@ function commonSshOptions(session: SshSession, privateKeyPath: string): string[]
     "-o",
     "BatchMode=yes",
     "-o",
+    "ForwardAgent=no",
+    "-o",
     "StrictHostKeyChecking=yes",
     "-o",
     `UserKnownHostsFile=${session.knownHostsPath}`,
