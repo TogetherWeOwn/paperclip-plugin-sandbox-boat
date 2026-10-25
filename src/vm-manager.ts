@@ -69,6 +69,7 @@ import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, Vm
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
+import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
 const UP_STATES = new Set(["init", "provisioning", "provisioned", "cloning", "ready", "idle", "running"]);
@@ -134,19 +135,11 @@ export interface IssueReader {
   get(issueId: string, companyId: string): Promise<{ status?: string | null } | null>;
 }
 
-export interface ExecutionWorkspaceReader {
-  get(
-    workspaceId: string,
-    companyId: string,
-  ): Promise<{ repoUrl: string | null; projectId: string; projectWorkspaceId: string | null; path: string | null; cwd: string | null } | null>;
-}
-
 export interface ManagerDeps {
   state: StateClientLike;
   accountId?: string;
   logger: ManagerLogger;
   issues?: IssueReader | null;
-  executionWorkspaces?: ExecutionWorkspaceReader | null;
   /** Company plugin config, not sandbox environment/driver config. */
   offloadConfig?: (companyId: string) => Promise<Record<string, unknown>>;
   /** Optional host integration: resolve a lifecycle-enabled, workspace-confined
@@ -235,7 +228,7 @@ export class BoatVmManager {
   private readonly ssh: SshManager;
   private readonly logger: ManagerLogger;
   private readonly issues: IssueReader | null;
-  private readonly executionWorkspaces: ExecutionWorkspaceReader | null;
+  private readonly offloadWorkspaces: NativeOffloadWorkspaces;
   private readonly offloadState: StateClientLike;
   private readonly offloadBrokers = new Map<string, OffloadBroker>();
   private readonly offloadBackend: ExecutorBackend;
@@ -263,7 +256,7 @@ export class BoatVmManager {
     this.store = new VmStateStore(deps.state);
     this.logger = deps.logger;
     this.issues = deps.issues ?? null;
-    this.executionWorkspaces = deps.executionWorkspaces ?? null;
+    this.offloadWorkspaces = new NativeOffloadWorkspaces(deps.state);
     this.offloadState = deps.state;
     this.offloadBackend = new ExecutorBackend({
       resolveExecutor: async (command) => {
@@ -308,13 +301,16 @@ export class BoatVmManager {
     return broker;
   }
 
+  /** Trusted integrations for otherwise-local runs may supply the same native
+   * realization payload before admitting offload commands. No provider work. */
+  async rememberOffloadWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<void> {
+    await this.offloadWorkspaces.remember(params);
+  }
+
   private offloadRouteHost(companyId: string) {
-    const workspaces = this.executionWorkspaces;
     return {
       broker: this.offloadBroker(companyId),
-      workspaces: {
-        get: async (workspaceId: string, company: string) => (workspaces ? workspaces.get(workspaceId, company) : null),
-      },
+      workspaces: this.offloadWorkspaces,
       profile: V1_PROFILE,
     };
   }
@@ -1889,15 +1885,20 @@ export class BoatVmManager {
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
     const sandboxId = params.lease.providerLeaseId;
+    const metadata: Record<string, unknown> = { provider: "boat", remoteCwd };
     if (sandboxId) {
       const session = await this.liveSession(config, params.companyId, sandboxId);
       // mkdir -p the workspace and its .paperclip-runtime (kept when acquire already made it), left out of snapshots by ~/.boatignore, before Paperclip syncs into it.
-      const runtimeDir = await this.prepareRuntimeDir(session, remoteCwd);
+      metadata.runtimeDir = await this.prepareRuntimeDir(session, remoteCwd);
       // Paperclip puts its runtime assets (the run MCP config among them) under this root.
       await this.rememberRemoteRoot(params.companyId, sandboxId, remoteCwd);
-      return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd, runtimeDir } };
     }
-    return { cwd: remoteCwd, metadata: { provider: "boat", remoteCwd } };
+    // Optional command offload must not break a whole-run lease. A missing
+    // binding still fails closed at the offload route, before any dispatch.
+    await this.rememberOffloadWorkspace(params).catch((error) => {
+      this.logger.warn("boat: could not retain the native offload workspace binding", { error: errorText(error) });
+    });
+    return { cwd: remoteCwd, metadata };
   }
 
   async sync(params: PluginEnvironmentSyncInParams | PluginEnvironmentSyncOutParams, direction: "in" | "out"): Promise<PluginEnvironmentSyncResult> {

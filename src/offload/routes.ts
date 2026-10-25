@@ -52,7 +52,7 @@ export interface ServerProfile {
 export interface OffloadRouteHost {
   broker: OffloadBroker;
   workspaces: {
-    get(workspaceId: string, companyId: string): Promise<OffloadWorkspaceMeta | null>;
+    get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null>;
   };
   profile: ServerProfile;
 }
@@ -110,7 +110,7 @@ export async function handleExec(
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
   const request = validated.value;
-  const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId);
+  const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: request.commandId }) };
   }

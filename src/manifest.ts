@@ -24,7 +24,6 @@ const manifest: PaperclipPluginManifestV1 = {
     "jobs.schedule",
     "api.routes.register",
     "issues.read",
-    "execution.workspaces.read",
   ],
   entrypoints: {
     worker: "./dist/worker.js",

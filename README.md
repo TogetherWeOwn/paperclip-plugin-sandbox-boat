@@ -379,6 +379,28 @@ There are three independent gates; none enables another automatically:
 3. **Client shim:** opt in the selected run with `BOAT_OFFLOAD=1`, as above.
    Keep secret-bearing/private-service commands on the existing local path.
 
+Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
+payload, not `ctx.executionWorkspaces` or the offload request body. Paperclip's
+`server/src/services/environment-run-orchestrator.ts` supplies
+`workspace.metadata.workspaceRealizationRequest`, built by
+`server/src/services/workspace-realization.ts`: its `heartbeatRunId`,
+`executionWorkspaceId` and `source` identify the run, repository and **local**
+source root. The provider persists only the required source fields in its
+existing company-scoped plugin state, keyed by run and execution workspace;
+the VM's remote cwd and runtime-overlay commands are not source authority.
+Bindings survive worker restart and cannot authorize another run or company.
+The manifest retains exactly the six capabilities installed with 0.2.2.
+
+For otherwise-local runs, the trusted executor integration must call
+`BoatVmManager.rememberOffloadWorkspace(params)` with that same host-authored
+`PluginEnvironmentRealizeWorkspaceParams` payload before submitting commands.
+It performs no provider work and is not exposed as an agent route. An unbound
+run/workspace is rejected with 403 before dispatch; older hosts without the
+native realization metadata must keep the shim off, not supply a root in the
+request body. This binding does not replace the executor resolver's source
+confinement or enable dispatch. Failed optional binding persistence does not
+break whole-run workspace realization.
+
 `src/offload/executor-backend.ts` adapts `start`, scoped `readOutput`,
 `heartbeatCommand` and `cancelCommand`. Output is polled incrementally (250 ms
 by default), preserving bytes and stream order, including all terminal pages.

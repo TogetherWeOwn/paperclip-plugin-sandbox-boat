@@ -47,9 +47,6 @@ const plugin = definePlugin({
           return issue ? { status: issue.status } : null;
         },
       },
-      executionWorkspaces: {
-        get: async (workspaceId, companyId) => ctx.executionWorkspaces.get(workspaceId, companyId),
-      },
       offloadConfig: async (companyId) => ctx.config.get(companyId),
       ...managerOverrides,
     });
