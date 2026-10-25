@@ -1351,7 +1351,9 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
     const unverified = harness.logs.find((entry) => entry.message.includes("could not verify") && entry.meta?.sandboxId === sandboxId);
     expect(unverified).toMatchObject({ level: "error", meta: { before: "template capture" } });
-    expect(String(unverified?.meta?.detail)).toContain("Permission denied");
+    expect(unverified?.meta?.detail).toBe("walk incomplete (diagnostics withheld)");
+    expect(JSON.stringify(harness.logs)).not.toContain("Permission denied");
+    expect(JSON.stringify(harness.logs)).not.toContain("/home/user/locked");
 
     await expect(release(lease)).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
     expect(fake.callsOf("deleteSandbox")).toHaveLength(0);

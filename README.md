@@ -66,9 +66,15 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 * `refresh=0` skips the live re-read. By default, run windows read right at a stop are read again, because the meter can lag.
 * `POST .../api/sweep` runs the sweep now.
 
-### Security
+#### Worker topology and command activity
 
-* VMs are created with `noEnv: true` and `monitoring: true`. Use a boat environment marked *safe for third parties*.
+Run **one lifecycle worker per plugin state/account**. Card/name locks and company-document updates are serialized in that worker, not distributed compare-and-swap locks; active-active acquire/release/destroy is not supported. Use the native plugin job for sweeps, not independent host sweep scripts.
+
+Execute and native sync publish a separate per-VM activity timestamp before admission, every 15 seconds while in flight, and on completion. A replacement/overlapping manager's sweep reads that shared heartbeat both before selecting an idle stop and again under its card lock. A silent command therefore remains active past the 20-minute stale threshold; after a crash, heartbeats cease and normal idle/stale reclamation resumes. Heartbeats contain **only timestamps**, never command text, env values or output. An unreadable/invalid heartbeat skips the stop, and a failed initial write refuses command admission. These heartbeats protect overlapping sweeps; they do not turn the lifecycle store into an active-active coordinator. Boat's auto-stop remains the independent deadline safety net.
+
+## Security
+
+* VMs are created with `noEnv: true` and, by default, `monitoring: true`. Monitoring stays **ON by owner decision**; deployments can explicitly set `monitoring: false` for new credential-bearing VMs. Use a boat environment marked *safe for third parties*. See [monitoring retention](#monitoring-retention-and-privacy).
 * **Default-deny run env.** Paperclip passes a sandbox provider the whole run env, with every secret resolved, and filters nothing for sandboxes. The plugin sends the VM only what the [env allowlist](#run-env-allowlist) names and drops the rest.
 * The VM gets nothing of the account except boat's own `BOAT_ID` and `ASCII_TOKEN` (see [boat account settings](#boat-account-settings)). The plugin removes both from every command's environment, starts the shell above the command through `env -u` so no parent keeps them in its `/proc/<pid>/environ`, and deletes the `export ASCII_TOKEN=...` line from `~/.bashrc`, so the agent cannot casually publish a port on a public URL.
 * Besides the allowlisted run env, one more secret reaches the VM, as a file that Paperclip writes itself: the [run MCP config](#the-run-mcp-config-exception) with the run JWT. The plugin cannot keep it out of the VM. It keeps it out of boat's snapshots: `~/.boatignore` leaves the directory it lands in out of every snapshot, and it is deleted before every stop, delete and template capture as well.
@@ -148,6 +154,7 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `tunnelTargetPort` | 8317 | |
 | `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](#run-env-allowlist). A list you set replaces the built-in one; an empty list (`[]`) sends nothing. |
 | `noEnv` | true | |
+| `monitoring` | true | Explicit opt-out: `false` for **new** VMs. Existing VMs keep their creation policy. Never changes an account-wide switch; see [monitoring privacy](#monitoring-retention-and-privacy). |
 | `boatEnvironment` | account default | |
 | `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | A plain absolute path below `/home/user`, used as typed (no `~` or `$HOME`). Anything else is a config error (`BOAT_CONFIG_INVALID` at acquire, before any start): the home `.boatignore` applies only there. |
 | `namePrefix` | `paperclip` | |
@@ -176,7 +183,7 @@ These are the reported 2026-10-23 Rust benchmark totals (build all test binaries
 
 Class names are 1–64 letters, digits, dots, underscores or hyphens, starting with a letter or digit. Durations and hourly rates must be positive finite numbers, `measuredAt` an ISO timestamp with timezone, and `sampleCount` a positive integer (omitted: 1). Invalid policy config is refused with `BOAT_SIZE_POLICY_INVALID` before any VM starts; config validation returns the error to the caller.
 
-- **No measurements for the class:** use `size`, which defaults to `default`; expected cost is `null`, never a fabricated zero. The plugin does not guess the class from an issue title, command or adapter type. Use environment `taskClass` or workspace setting `boatTaskClass`. The class is retained in lease metadata for reusable resumes.
+- **No measurements for the class:** use `size`, which defaults to `small`; expected cost is `null`, never a fabricated zero. Small is the light-work fallback (model-wait, editing and modest scripts), **not** a safe default for unmeasured heavy builds. Pin `"size": "default"` for Rust compilation/test/clippy and similarly memory-intensive builds, or supply successful measurements for that class. The benchmark above failed on small twice: its lower hourly price is not evidence of lower completed-job cost. The plugin warns when an unmeasured class falls back to small; it does not guess the class from an issue title, command or adapter type. Use environment `taskClass` or workspace setting `boatTaskClass`. The class is retained in lease metadata for reusable resumes.
 - **Already running:** share the actual VM without stopping or resizing it. Metadata and per-run usage retain its real size; an unrecognized or missing running size fails closed with `BOAT_SIZE_UNKNOWN` instead of guessing. A stopped (`archived`) card VM can change size on its next lease without losing its disk. Automatic mid-lease command reconnects retain the current size.
 - **Plan limits remain authoritative:** every create/resume still passes `GET /limits`, daily/hourly/minute start guards, active-VM and compute limits. The policy never tries a different size to bypass a failed guard. No extra benchmark VMs are launched by selection.
 - **Audit:** structured `boat: size choice for lease` logs and lease `sizeChoice` metadata contain class, size, source (`measured`, `fallback`, `running_vm`), expected cost, duration, measurement timestamp and sample count. These are predictions, not a replacement for Boat's usage meter. A shared VM without a matching measurement has `null` expected cost.
@@ -313,7 +320,7 @@ These are the settings the plugin expects, with the docs (docs.boat.dev) that ba
 * **AI credentials proxy OFF.** It costs $1 a day, and on the trial one day uses the whole 25 h allowance ([docs](https://docs.boat.dev/free-trial)).
 * **Zero data retention OFF.** It deletes a VM's data at every stop, so resume would never work ([docs](https://docs.boat.dev/data-retention/zero-data-retention)).
 * **Snapshots off: OFF.** With it on, a stop erases the VM ([docs](https://docs.boat.dev/data-retention/snapshots-and-monitoring-off)).
-* **Monitoring on: per VM.** The plugin creates every VM with `monitoring: true`, so boat keeps command output, process list and CPU/RAM samples for it, including disk-full alerts. If the account-wide *Monitoring off* switch is on, boat refuses the create (`409 monitoring_off_for_account`): keep the switch off. Turning it on is not a privacy control for these VMs ([docs](https://docs.boat.dev/data-retention/snapshots-and-monitoring-off#monitoring-off)).
+* **Monitoring on: per VM, with an explicit opt-out.** The default remains `monitoring: true` by owner decision. Set `"monitoring": false` on the sandbox environment for new VMs when retained command/process telemetry is inappropriate. If the account-wide *Monitoring off* switch is on, a monitored create is refused (`409 monitoring_off_for_account`, surfaced as `BOAT_MONITORING_OFF_FOR_ACCOUNT`). The plugin never enables monitoring account-wide, changes that switch on an account/key change, or silently retries with a different policy ([docs](https://docs.boat.dev/data-retention/snapshots-and-monitoring-off#monitoring-off)).
 * **Auto-refill OFF.** It needs a paid plan and does not work during the trial. With it off, spend stops at the balance ([docs](https://docs.boat.dev/billing#control-your-spend)).
 * **Keys:** a scoped `ci` key for the plugin and a `read-only` key for cost reads. Never use an admin key in the plugin.
 
@@ -323,6 +330,14 @@ Even with safe for third parties on, every VM gets `BOAT_ID` and `ASCII_TOKEN`. 
 * deletes the `export ASCII_TOKEN=` line from `~/.bashrc` when it sets up a VM (acquire, resumed lease) and when it resumes one for a command, so a shell the agent starts (Claude Code's Bash tool sources the user's shell rc file) does not get it back.
 
 This stops casual use, not a determined agent: `user` has passwordless `sudo` and is root in its VM. boat documents no switch to leave the token out: it stays even with safe for third parties.
+
+### Monitoring retention and privacy
+
+Monitoring is provider-side capture, not just a CPU/RAM counter. Boat SDK 1.10.0 documents command history retained for 90 days and other processes' stdout/stderr for 72 hours, readable while a VM is stopped (`docs/BoatApi.md`, `commandHistory`). An agent that prints a credential or places it in argv can expose it to that capture even over SSH. **`noEnv`, `.boatignore`, and the pre-stop/pre-template disk scrub do not redact or erase already captured provider telemetry.** The SDK exposes no monitoring-output redaction/deletion guarantee; this plugin does not promise one.
+
+The plugin deliberately does not request history, command logs or process samples, and projects lifecycle responses onto metadata-only fields: captured output is never copied into plugin state or logs. The same no-secret-output boundary applies to snapshot scrub diagnostics: only counts, status and fixed failure reasons are logged, never raw guest stdout/stderr. Existing runtime-directory exclusions and the scrub before stop/delete/template capture remain mandatory with monitoring on **or** off. These protect the disk, not the provider's telemetry store.
+
+To opt out, set `"monitoring": false` in the environment config **before creating** a VM. This does not change or purge an existing VM's monitoring history; the SDK's update/resume requests do not support changing that creation policy. Keep existing work, export it through the normal Paperclip lifecycle, then use a newly created lease with the opted-out config if required. Never auto-delete a working VM or override an account's privacy setting to make a create succeed. With the default on, do not print credentials or put them in command arguments; if that cannot be assured, use the explicit opt-out.
 
 ## Live smoke test
 
