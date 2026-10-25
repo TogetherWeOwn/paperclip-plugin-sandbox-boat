@@ -23,6 +23,9 @@ export interface OffloadIdentity extends Partial<GuestIdentity> {
 
 export type OffloadState = "accepted" | "queued" | "syncing_in" | "starting" | "running" |
   "syncing_out" | "completed" | "not_started" | "cancelled" | "failed" | "unknown";
+export interface OffloadOutputEvent { seq: number; stream: "stdout" | "stderr"; dataBase64: string }
+export interface OffloadReadView extends OffloadCommandView { events: OffloadOutputEvent[]; nextCursor: number }
+
 export interface OffloadRecord {
   version: 1;
   companyId: string;
@@ -39,6 +42,7 @@ export interface OffloadRecord {
   remoteStarted: boolean | null;
   fallbackSafe: boolean;
   cancelRequested?: string;
+  output?: OffloadOutputEvent[];
   tombstone?: boolean;
 }
 
@@ -115,15 +119,27 @@ export function guestReceiptKey(identity: OffloadIdentity, kind: OffloadReceipt[
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+export function validGuestIdentity(value: unknown): value is GuestIdentity {
+  return object(value) && typeof value.guestBootId === "string" && value.guestBootId.length > 0
+    && Number.isSafeInteger(value.journalGeneration) && (value.journalGeneration as number) > 0
+    && Number.isSafeInteger(value.processGroupId) && (value.processGroupId as number) > 0
+    && typeof value.cgroupPath === "string" && value.cgroupPath.startsWith("/") && value.cgroupPath !== "/"
+    && !value.cgroupPath.includes("\0") && !value.cgroupPath.split("/").some((part) => part === "." || part === "..")
+    && Number.isSafeInteger(value.heartbeatDeadline) && Number.isSafeInteger(value.guestDeadline);
+}
 export function validIdentity(value: unknown): value is OffloadIdentity {
   return object(value) && ["companyId", "runId", "commandId", "digest", "sandboxId", "guestBootId"]
     .every((key) => typeof value[key] === "string" && value[key].length > 0)
-    && Number.isSafeInteger(value.journalGeneration) && (value.journalGeneration as number) > 0;
+    && Number.isSafeInteger(value.journalGeneration) && (value.journalGeneration as number) > 0
+    && (!["processGroupId", "cgroupPath", "heartbeatDeadline", "guestDeadline"].some((key) => key in value) || validGuestIdentity(value));
 }
 export function matchingReceipt(value: unknown, identity: OffloadIdentity): value is OffloadReceipt {
   if (!object(value) || value.version !== 1 || !validIdentity(value.identity)) return false;
   const actual = value.identity;
-  if (!(Object.keys(identity) as Array<keyof OffloadIdentity>).every((key) => actual[key] === identity[key])) return false;
+  // Interest renewal changes a deadline, not the owned process/subtree. Guest
+  // result receipts retain the original heartbeat deadline from spawn.
+  if (!(Object.keys(identity) as Array<keyof OffloadIdentity>)
+    .filter((key) => key !== "heartbeatDeadline").every((key) => actual[key] === identity[key])) return false;
   if (!["marker", "started", "result", "not_started"].includes(String(value.kind))) return false;
   return value.kind !== "result" || (object(value.result) && Number.isInteger(value.result.exitCode)
     && Number.isFinite(value.result.seconds) && (value.result.seconds as number) >= 0);
@@ -136,6 +152,13 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
     || (value.resultAt !== null && !Number.isFinite(value.resultAt))
     || ![null, false, true].includes(value.remoteStarted as null | boolean) || typeof value.fallbackSafe !== "boolean"
     || (value.identity !== null && !validIdentity(value.identity))) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+  if (value.output !== undefined && (!Array.isArray(value.output) || !value.output.every((event, index) =>
+    object(event) && event.seq === index + 1 && ["stdout", "stderr"].includes(String(event.stream))
+    && typeof event.dataBase64 === "string" && event.dataBase64.length > 0 && event.dataBase64.length <= 1368
+    && Buffer.from(event.dataBase64, "base64").length <= 1024
+    && Buffer.from(event.dataBase64, "base64").toString("base64") === event.dataBase64))) {
+    throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+  }
   const record = value as unknown as OffloadRecord;
   if (commandKey(record) !== key || (record.command && (commandKey(record.command) !== key || commandDigest(record.command) !== record.digest))
     || (!record.command && !record.tombstone) || (record.tombstone && !TERMINAL.has(record.state))) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
@@ -161,7 +184,7 @@ interface JournalPool {
 export class OffloadJournal {
   private chain: Promise<unknown> = Promise.resolve();
   private startup: Promise<void> | null = null;
-  private readonly inFlight = new Map<string, { digest: string; task: Promise<OffloadResult> }>();
+  private readonly inFlight = new Map<string, { digest: string; task: Promise<OffloadResult>; ready: Promise<OffloadCommandView> }>();
   private readonly active = new Map<string, OffloadRecord>();
   private readonly held = new Map<string, OffloadIdentity>();
   private readonly transitions = new Map<string, Promise<unknown>>();
@@ -235,6 +258,14 @@ export class OffloadJournal {
   }
 
   async execute(command: OffloadCommand, launch: () => Promise<OffloadResult>): Promise<OffloadResult> {
+    return await (await this.begin(command, launch)).task;
+  }
+
+  async start(command: OffloadCommand, launch: () => Promise<OffloadResult>): Promise<OffloadCommandView> {
+    return await (await this.begin(command, launch)).ready;
+  }
+
+  private async begin(command: OffloadCommand, launch: () => Promise<OffloadResult>) {
     // This must precede startup scanning, journal reads and even cached replies.
     await this.checkRun(command.companyId, command.runId);
     const key = commandKey(command);
@@ -242,14 +273,28 @@ export class OffloadJournal {
     const pending = this.inFlight.get(key);
     if (pending) {
       if (pending.digest !== digest) throw offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT");
-      return await pending.task;
+      return pending;
     }
-    const task = this.executeOnce(command, digest, launch);
-    this.inFlight.set(key, { digest, task });
-    try { return await task; } finally { this.inFlight.delete(key); }
+    let accepted!: (view: OffloadCommandView) => void;
+    let rejected!: (error: unknown) => void;
+    const ready = new Promise<OffloadCommandView>((resolve, reject) => { accepted = resolve; rejected = reject; });
+    // execute-only callers need not observe the separate start acknowledgement.
+    void ready.catch(() => {});
+    const task = this.executeOnce(command, digest, launch, accepted);
+    const entry = { digest, task, ready };
+    this.inFlight.set(key, entry);
+    void task.then((result) => {
+      // The existing bounded-ID admission can refuse without allocating a
+      // record; start must settle too, without suggesting a remote effect.
+      if (result.status === "unavailable") accepted({ version: 1, commandId: command.commandId,
+        state: "not_started", remoteStarted: false, fallbackSafe: true, result: null });
+    }, rejected);
+    void task.finally(() => { if (this.inFlight.get(key) === entry) this.inFlight.delete(key); }).catch(() => {});
+    return entry;
   }
 
-  private async executeOnce(command: OffloadCommand, digest: string, launch: () => Promise<OffloadResult>): Promise<OffloadResult> {
+  private async executeOnce(command: OffloadCommand, digest: string, launch: () => Promise<OffloadResult>,
+    accepted: (view: OffloadCommandView) => void): Promise<OffloadResult> {
     await this.recover();
     const key = commandKey(command);
     const admission = await this.serialize(async () => {
@@ -274,7 +319,11 @@ export class OffloadJournal {
     });
     if (!admission) return this.unavailable(command, "run command-ID capacity exhausted");
     const { record, fresh } = admission;
-    if (!fresh) return await this.replay(record);
+    if (!fresh) {
+      this.checkExpiry(record);
+      accepted(this.view(record));
+      return await this.replay(record);
+    }
     this.active.set(key, record);
     try {
       await this.transition(record, async () => {
@@ -283,6 +332,7 @@ export class OffloadJournal {
         await this.refresh(record);
         if (PRE_START.has(record.state)) await this.commit(record, { state: "queued" });
       });
+      accepted(this.view(record));
       if (record.state === "not_started") return record.result!;
       const result = await launch();
       return result.status === "unavailable" ? await this.finish(command, result) : result;
@@ -411,11 +461,57 @@ export class OffloadJournal {
     return result;
   }
 
+  async appendOutput(command: OffloadCommand, stream: "stdout" | "stderr", bytes: Uint8Array): Promise<void> {
+    if (!["stdout", "stderr"].includes(stream) || !(bytes instanceof Uint8Array)) throw offloadError("OFFLOAD_INVALID_OUTPUT");
+    const data = Buffer.from(bytes); // Snapshot before awaiting the record fence.
+    const record = this.active.get(commandKey(command));
+    if (!record) throw offloadError("OFFLOAD_COMMAND_NOT_RUNNING");
+    await this.transition(record, async () => {
+      if (!["starting", "running"].includes(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_RUNNING");
+      const output = [...(record.output ?? [])];
+      // Small immutable events permit bounded event-cursor reads even when a
+      // transport supplies a single multi-megabyte write or invalid UTF-8.
+      for (let at = 0; at < data.length; at += 1024) {
+        output.push({ seq: output.length + 1, stream, dataBase64: data.subarray(at, at + 1024).toString("base64") });
+      }
+      await this.commit(record, { output });
+    });
+  }
+
+  async readOutput(companyId: string, runId: string, commandId: string, after = 0, limitBytes = 65_536): Promise<OffloadReadView> {
+    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limitBytes) || limitBytes <= 0) {
+      throw offloadError("OFFLOAD_INVALID_REQUEST");
+    }
+    await this.checkRun(companyId, runId);
+    const key = commandKey({ companyId, runId, commandId });
+    const record = parseRecord(await this.deps.journalStore.get(key), key);
+    this.checkExpiry(record);
+    const events: OffloadOutputEvent[] = [];
+    let remaining = Math.min(limitBytes, 65_536);
+    for (const event of record.output ?? []) {
+      if (event.seq <= after) continue;
+      const size = Buffer.from(event.dataBase64, "base64").length;
+      if (size > remaining) {
+        if (!events.length) throw offloadError("OFFLOAD_OUTPUT_READ_TOO_SMALL");
+        break;
+      }
+      events.push(structuredClone(event));
+      remaining -= size;
+    }
+    return { ...this.view(record), events, nextCursor: events.at(-1)?.seq ?? after };
+  }
+
+  private checkExpiry(record: OffloadRecord): void {
+    if (record.tombstone || (TERMINAL.has(record.state) && record.resultAt !== null && this.now() - record.resultAt >= DAY)) {
+      throw offloadError("OFFLOAD_RESULT_EXPIRED");
+    }
+  }
+
   async readCommand(companyId: string, runId: string, commandId: string): Promise<OffloadCommandView> {
     await this.checkRun(companyId, runId);
     const key = commandKey({ companyId, runId, commandId });
     const record = parseRecord(await this.deps.journalStore.get(key), key);
-    if (record.tombstone || (TERMINAL.has(record.state) && record.resultAt !== null && this.now() - record.resultAt >= DAY)) throw offloadError("OFFLOAD_RESULT_EXPIRED");
+    this.checkExpiry(record);
     return this.view(record);
   }
 
@@ -490,7 +586,7 @@ export class OffloadJournal {
           && this.now() >= run.terminatedAt + 30 * DAY && this.now() >= run.tokenExpiresAt) {
           await this.deps.journalStore.delete(key);
         } else if (!record.tombstone && record.resultAt !== null && this.now() - record.resultAt >= DAY) {
-          const { command: _command, ...compact } = record;
+          const { command: _command, output: _output, ...compact } = record;
           await this.deps.journalStore.set(key, { ...compact, result: null, tombstone: true });
         }
       }

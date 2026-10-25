@@ -1,7 +1,7 @@
 // Guest enforcement is an opt-in transport port, not a claim that a profile
 // name or a host timer proves cgroup delegation / an independent watchdog.
 import type { OffloadCommand, OffloadTimers } from "./offload.js";
-import { commandKey, offloadError, type OffloadIdentity } from "./offload-journal.js";
+import { commandKey, offloadError, validGuestIdentity, type OffloadIdentity } from "./offload-journal.js";
 
 export interface GuestIdentity {
   guestBootId: string;
@@ -47,6 +47,9 @@ const OWNERSHIP = ["guestBootId", "processGroupId", "cgroupPath", "journalGenera
 
 export class OffloadLifecycle {
   private readonly active = new Map<string, ActiveGuest>();
+  // An outside watchdog outlives a completed leader. Never recycle its cgroup
+  // path for another command while that old deadline can still fire.
+  private readonly watchdogPaths = new Map<string, number>();
   constructor(private readonly guest: GuestController, private readonly now: () => number,
     private readonly timers: OffloadTimers) {}
 
@@ -56,18 +59,16 @@ export class OffloadLifecycle {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
     }
     const identity = await this.guest.prepare(sandboxId, command);
-    if (!identity.guestBootId || identity.guestBootId.startsWith("unverified:")
+    if (!validGuestIdentity(identity) || identity.guestBootId.startsWith("unverified:")
       || identity.guestBootId !== base.guestBootId || identity.journalGeneration !== base.journalGeneration
-      || !Number.isSafeInteger(identity.processGroupId) || identity.processGroupId <= 0
-      || !identity.cgroupPath.startsWith("/") || identity.cgroupPath === "/"
-      || identity.cgroupPath.split("/").some((part) => part === ".." || part === ".")
-      || identity.cgroupPath.includes("\0")
-      || !Number.isSafeInteger(identity.heartbeatDeadline) || identity.heartbeatDeadline <= this.now()
-      || identity.heartbeatDeadline > this.now() + 30_000
-      || !Number.isSafeInteger(identity.guestDeadline) || identity.guestDeadline <= this.now()
-      || identity.guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
+      || identity.heartbeatDeadline <= this.now() || identity.heartbeatDeadline > this.now() + 30_000
+      || identity.guestDeadline <= this.now() || identity.guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
       throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
     }
+    for (const [path, deadline] of this.watchdogPaths) if (deadline <= this.now()) this.watchdogPaths.delete(path);
+    const path = JSON.stringify([sandboxId, identity.guestBootId, identity.cgroupPath]);
+    if (this.watchdogPaths.has(path)) throw offloadError("OFFLOAD_GUEST_CGROUP_REUSED");
+    this.watchdogPaths.set(path, identity.guestDeadline);
     return { ...base, ...identity };
   }
 
@@ -91,7 +92,8 @@ export class OffloadLifecycle {
     this.clearTimers(entry);
     this.active.delete(commandKey(identity));
     const timedOut = entry.reason === "execution_timeout" || this.now() >= identity.guestDeadline;
-    return { ...raw, ...(entry.reason ? { cancelled: !timedOut } : {}), ...(timedOut ? { timedOut: true } : {}) };
+    return { ...raw, exitCode: timedOut ? 124 : entry.reason ? 130 : raw.exitCode,
+      ...(entry.reason ? { cancelled: !timedOut } : {}), ...(timedOut ? { timedOut: true } : {}) };
   }
 
   heartbeat(identity: OffloadIdentity): void {

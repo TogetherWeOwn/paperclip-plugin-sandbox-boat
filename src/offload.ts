@@ -5,7 +5,8 @@
 // after C with generation-guarded timers, start/compute budget fallback to
 // OFFLOAD_UNAVAILABLE, per-command usage + expected-cost log, idempotency by
 // commandId. Durable journal/receipt recovery and account admission are both
-// wired here; sync adapter and cancel/read routes remain separate slices.
+// wired here. Guest lifecycle and incremental output are opt-in; persisted
+// pool recovery, sync-inclusive reservations and HTTP routing are separate.
 import { createHash } from "node:crypto";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
@@ -17,7 +18,8 @@ import type { StateClientLike } from "./state.js";
 import { OffloadLifecycle, type CommandExit, type ExecutionIdentity, type GuestController, type OffloadRunContext } from "./offload-lifecycle.js";
 export type { GuestIdentity, GuestController, OffloadRunContext } from "./offload-lifecycle.js";
 export { OffloadGuestRunner } from "./offload-guest.js";
-export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
+export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadReadView,
+  OffloadOutputEvent, OffloadDurableDeps } from "./offload-journal.js";
 
 export interface OffloadCommand {
   commandId: string;
@@ -216,7 +218,8 @@ export class OffloadExecutor {
       cancel: (command, result) => this.cancelQueued(command, result),
     }, this.lifecycle ?? undefined) : null;
     const transport: OffloadDeps["runCommand"] = deps.guest
-      ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand, async () => {})
+      ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand,
+        (stream, bytes) => this.requireDurable().appendOutput(command, stream, bytes))
       : deps.runCommand;
     this.runCommand = this.durable
       ? (vm, command) => this.durable!.run(vm, command, transport)
@@ -245,13 +248,24 @@ export class OffloadExecutor {
     const command = this.knownCommand(commandId);
     return await this.cancelCommand(command.companyId, command.runId, commandId, reason, generation);
   }
+  async heartbeatCommand(companyId: string, runId: string, commandId: string, generation?: number) {
+    return await this.requireDurable().heartbeatCommand(companyId, runId, commandId, generation);
+  }
   async heartbeat(commandId: string, generation?: number) {
     const command = this.knownCommand(commandId);
-    return await this.requireDurable().heartbeatCommand(command.companyId, command.runId, commandId, generation);
+    return await this.heartbeatCommand(command.companyId, command.runId, commandId, generation);
   }
-  async read(commandId: string, _after = 0, _limitBytes = 65_536) {
+  async readOutput(companyId: string, runId: string, commandId: string, after = 0, limitBytes = 65_536) {
+    return await this.requireDurable().readOutput(companyId, runId, commandId, after, limitBytes);
+  }
+  async read(commandId: string, after = 0, limitBytes = 65_536) {
     const command = this.knownCommand(commandId);
-    return await this.readCommand(command.companyId, command.runId, commandId);
+    return await this.readOutput(command.companyId, command.runId, commandId, after, limitBytes);
+  }
+  async start(command: OffloadCommand) {
+    const snapshot = this.trackCommand(command);
+    const view = await this.requireDurable().start(snapshot, () => this.executeVolatile(snapshot));
+    return { ...view, events: [], nextCursor: 0 };
   }
   private requireDurable(): OffloadJournal {
     if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
@@ -335,13 +349,18 @@ export class OffloadExecutor {
     return await next;
   }
 
-  async execute(command: OffloadCommand): Promise<OffloadResult> {
+  private trackCommand(command: OffloadCommand): OffloadCommand {
     // Snapshot caller-owned objects before any await; mutating argv or env must
     // never change the payload after its durable digest was accepted.
     const snapshot = structuredClone(command);
     const known = this.knownCommands.get(snapshot.commandId);
     if (!this.knownCommands.has(snapshot.commandId)) this.knownCommands.set(snapshot.commandId, snapshot);
     else if (known && commandKey(known) !== commandKey(snapshot)) this.knownCommands.set(snapshot.commandId, null);
+    return snapshot;
+  }
+
+  async execute(command: OffloadCommand): Promise<OffloadResult> {
+    const snapshot = this.trackCommand(command);
     return this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
   }
 
