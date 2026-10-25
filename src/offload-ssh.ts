@@ -80,7 +80,13 @@ export class SshOffloadGuest implements GuestController {
   }
   async term(sandboxId: string, identity: GuestIdentity): Promise<void> { await this.call(sandboxId, "term", identity); }
   async kill(sandboxId: string, identity: GuestIdentity): Promise<void> { await this.call(sandboxId, "kill", identity); }
-  async verifyEmpty(sandboxId: string, identity: GuestIdentity): Promise<boolean> { return this.call(sandboxId, "empty", identity); }
+  async verifyEmpty(sandboxId: string, identity: GuestIdentity): Promise<boolean> {
+    const empty = await this.call<boolean>(sandboxId, "empty", identity);
+    // Verified-empty subtrees no longer need shutdown signalling. Keep
+    // uncertain/failed verifications tracked; receipts remain readable by ID.
+    if (empty === true) this.prepared.delete(identity.cgroupPath);
+    return empty;
+  }
   async heartbeat(sandboxId: string, identity: GuestIdentity): Promise<void> { await this.call(sandboxId, "heartbeat", identity); }
   async receipt(identity: OffloadIdentity): Promise<unknown> { return this.call(identity.sandboxId, "receipt", identity as GuestIdentity); }
 
