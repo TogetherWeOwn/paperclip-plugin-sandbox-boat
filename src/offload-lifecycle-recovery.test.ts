@@ -22,7 +22,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 
   // slice b: persisted pool recovery and sweep.
-  it.todo("restart after an ambiguous running reply neither replays nor releases its VM", async () => {
+  it("restart after an ambiguous running reply neither replays nor releases its VM", async () => {
     s.fail.add("exec:uncertain");
     const cmd = command("uncertain");
     const original = await s.execute(cmd);
@@ -42,7 +42,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 
   // slice b: persisted pool recovery and sweep.
-  it.todo("restart reconciles a healthy active receipt without stopping it or admitting a second command", async () => {
+  it("restart reconciles a healthy active receipt without stopping it or admitting a second command", async () => {
     const gate = s.hold("exec:healthy");
     const active = s.execute(command("healthy"));
     await until(() => s.trace.includes("exec:healthy"));
@@ -60,7 +60,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 
   // slice b: persisted pool recovery and sweep.
-  it.todo("recovered unobservable ownership remains quarantined after the original call settles", async () => {
+  it("recovered unobservable ownership remains quarantined after the original call settles", async () => {
     const gate = s.hold("exec:unobservable");
     const active = s.execute(command("unobservable"));
     await until(() => s.trace.includes("exec:unobservable"));
@@ -78,7 +78,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 
   // slice b: persisted pool recovery and sweep.
-  it.todo("restart loads the persisted idle pool and stops it through sweep without creating a replacement", async () => {
+  it("restart loads the persisted idle pool and stops it through sweep without creating a replacement", async () => {
     await s.execute(command("idle"));
     s.clock.crashWorker();
     await s.clock.advance(300_000);
@@ -91,7 +91,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 
   // slice b: persisted pool recovery and sweep.
-  it.todo("sweep uses persisted pool config rather than silently resetting its idle deadline", async () => {
+  it("sweep uses persisted pool config rather than silently resetting its idle deadline", async () => {
     const original = s.make({ offloadIdleStopSeconds: 60 });
     await s.execute(command("longer-tail"), original);
     s.clock.crashWorker();
@@ -107,7 +107,7 @@ describe("offload lifecycle: persisted reconciliation", () => {
 });
 
 // slice b: persisted stop-observation telemetry and worker-death sweep.
-describe.skip("offload lifecycle: stop acceptance is not measured termination", () => {
+describe("offload lifecycle: stop acceptance is not measured termination", () => {
   it("keeps stoppedAt and actual stop lag pending while the provider is still archiving", async () => {
     s.boat.stopMode = "never";
     await s.execute(command("slow-stop"));

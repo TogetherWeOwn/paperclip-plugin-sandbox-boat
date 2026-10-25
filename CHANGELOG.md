@@ -4,6 +4,7 @@
 
 ### Fixed
 
+* Lifecycle recovery keeps distinct unresolved create reservations readable, prevents retired stop retries from losing replacement ownership, retries pending idle/shutdown stops after transient outages, and repairs stop telemetry from the earliest reservation-bound durable observation without attributing it to cancelled tails.
 * Long-running commands and native sync publish timestamp-only shared activity heartbeats, so an overlapping manager's idle sweep does not mistake silent work for a stale lease. Single lifecycle-worker topology remains required.
 * Monitoring remains on by default, with an explicit `monitoring: false` opt-out for new VMs. An account monitoring refusal has an actionable error and never changes account policy. Snapshot scrub diagnostics no longer echo arbitrary guest output into logs or capture errors; provider-side telemetry retention is documented separately from disk cleanup.
 * The size-policy guide now consistently documents the `small` light-work fallback, recommends explicit `default` for heavy builds, and warns on an unmeasured small fallback.

@@ -312,8 +312,11 @@ export async function fixture() {
         start.persisted = await disk.all();
         guest.spawn(cmd, context);
         for (const [stream, bytes] of output) await context?.output(stream, bytes);
-        await phase("exec", cmd.commandId);
-        guest.exit(cmd.commandId, keepDescendants);
+        // An injected exec failure models a lost reply after guest exit, not a
+        // child still running without any test advancing the TERM grace clock.
+        // Descendant-fencing cases opt into surviving children explicitly.
+        try { await phase("exec", cmd.commandId); }
+        finally { guest.exit(cmd.commandId, keepDescendants); }
         return completed();
       },
     };

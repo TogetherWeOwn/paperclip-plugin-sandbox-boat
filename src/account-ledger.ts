@@ -47,6 +47,11 @@ export interface AccountUsageRow {
   intervals: PaidInterval[];
   // Open tails are finalized at the next reservation or a terminal receipt.
   tailSince: number | null;
+  stopRequestedAt?: number | null;
+  stoppedAt?: number | null;
+  stopLagMs?: number | null;
+  // Persist the intended deadline: crash/scheduling delay is part of stop lag.
+  stopDueAt?: number | null;
 }
 interface StartWindow { used: number; limit: number; remaining: number; resetAt: number | null }
 interface Limits {
@@ -197,6 +202,9 @@ export class AccountLedger {
     await this.state.set(this.key, doc);
     this.rows = structuredClone(doc.usage);
   }
+  async load(): Promise<void> {
+    await this.locked(async () => { this.rows = structuredClone((await this.read()).usage); });
+  }
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
 
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
@@ -332,7 +340,8 @@ export class AccountLedger {
       if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, providerScope: this.providerScope, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
         companyId: req.command.companyId, profileId: req.command.profileId, payloadDigest: req.command.payloadDigest,
-        sandboxId: req.sandboxId ?? null, seconds: 0, dollars: 0, meterProvenance: "pending", observedStartsDelta: null, intervals: [], tailSince: null });
+        sandboxId: req.sandboxId ?? null, seconds: 0, dollars: 0, meterProvenance: "pending", observedStartsDelta: null, intervals: [], tailSince: null,
+        stopRequestedAt: null, stoppedAt: null, stopLagMs: null, stopDueAt: null });
       await this.write(candidate);
       // Persistence may itself have waited for the store. Revalidate the exact
       // intent before any external effect if its observation aged out.
@@ -431,14 +440,42 @@ export class AccountLedger {
     });
   }
 
-  async stopped(sandboxId: string): Promise<void> {
+  async stopRequested(sandboxId: string, dueAt: number, requestedAt: number, reservationId?: string): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
-      this.terminal(doc, sandboxId, this.now());
+      for (const row of doc.usage) {
+        // Exact reservation binding also repairs a missed intent write after
+        // terminal reconciliation closed its tail, without stamping old callers.
+        if (!this.owns(row) || row.sandboxId !== sandboxId || row.stopRequestedAt != null
+          || (reservationId ? row.usageRecordId !== reservationId : row.tailSince === null)) continue;
+        row.stopDueAt = dueAt;
+        row.stopRequestedAt = requestedAt;
+        row.stoppedAt = row.stopLagMs = null;
+      }
       await this.write(doc);
     });
   }
-  private terminal(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
+
+  async stopped(sandboxId: string, at = this.now(), reservationId?: string): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read();
+      this.terminal(doc, sandboxId, at, false, reservationId);
+      await this.write(doc);
+    });
+  }
+  private terminal(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false, reservationId?: string): void {
+    for (const row of doc.usage) {
+      // A warm handoff cancels the predecessor's stop obligation. An exact
+      // reservation can repair its closed tail with earlier durable evidence,
+      // but must never stamp an older caller's cancelled tail.
+      if (this.owns(row, includeUnscoped) && row.sandboxId === sandboxId
+        && (row.tailSince != null || row.usageRecordId === reservationId)
+        && row.stopDueAt != null
+        && (row.stoppedAt == null || row.usageRecordId === reservationId && at < row.stoppedAt)) {
+        row.stoppedAt = at;
+        row.stopLagMs = Math.max(0, at - row.stopDueAt);
+      }
+    }
     this.closeTail(doc, sandboxId, at, includeUnscoped);
     for (const intent of doc.intents) {
       if (!this.owns(intent, includeUnscoped) || intent.sandboxId !== sandboxId || intent.status === "stopped" || intent.status === "rejected") continue;
