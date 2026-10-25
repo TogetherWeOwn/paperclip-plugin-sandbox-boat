@@ -605,6 +605,23 @@ export class OffloadExecutor {
     }
     if (stopped) return this.accountClaim(command, stopped, "resume");
     if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
+    // An idle incompatible cache must not permanently consume a bounded slot.
+    // Preserve its ownership until stop and telemetry are both confirmed; never
+    // reclaim busy, quarantined or asynchronously stopping allocations.
+    const retiring = this.pool.find((vm) => !vm.busy && !vm.quarantined && !vm.stopping && !compatible(vm));
+    if (retiring) {
+      this.clearIdleTimer(retiring);
+      if (!retiring.stopped) await this.stopVm(retiring);
+      if (!retiring.stopped) {
+        this.scheduleIdleStop(retiring, retiring.generation, 1000);
+        return { kind: "unavailable", reason: "incompatible pool retirement pending; reconciliation required" };
+      }
+      try { await this.persistStopTelemetry(retiring); }
+      catch { return { kind: "unavailable", reason: "stop accounting persistence pending" }; }
+      this.retireVm(retiring);
+      await this.persistPool();
+      return this.accountClaim(command, null, "create");
+    }
     // An uncertain slot has no live release event to queue behind. Refuse
     // rather than strand callers waiting for a nonexistent safe handoff.
     if (!this.pool.some((vm) => compatible(vm) && vm.busy && !vm.quarantined)) {
@@ -839,8 +856,9 @@ export class OffloadExecutor {
       vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
       await this.persistPool();
       if (!this.closed) await this.dispatchQueued();
-      // Dispatch has already reserved any reused VM before releasing admission.
-      if (vm.busy || vm.quarantined) return;
+      // Dispatch may reserve this VM, retire it for an incompatible waiter,
+      // or leave a stop retry installed. Never resurrect its old idle timer.
+      if (!this.pool.includes(vm) || vm.busy || vm.quarantined || vm.stopped || vm.stopping || vm.idleHandle != null) return;
       if (this.closed) {
         await this.stopVm(vm);
       } else {

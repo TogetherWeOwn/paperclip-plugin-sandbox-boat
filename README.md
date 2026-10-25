@@ -83,8 +83,10 @@ state, keyed by account and pool. Call `recover()` before reconciliation (new
 submissions do this automatically) and `sweep()` from the native plugin job
 integration. Recovery loads saved idle settings/deadlines, remembers journaled
 watchdog paths and quarantines busy, unobservable or mismatched ownership. An
-idle VM is stopped only after its durable deadline; sweep never creates a
-replacement. The API is ready for job integration, but this slice does not wire
+idle VM is swept only after its durable deadline; sweep never creates a
+replacement. Admission may stop an idle incompatible VM earlier to reclaim a
+full pool slot, but only replaces it after confirmed termination and durable
+stop accounting. The API is ready for job integration, but this slice does not wire
 or schedule that job or enable command-level HTTP routes.
 
 Stop acceptance and termination are distinct. While Boat is archiving, capacity
@@ -122,7 +124,10 @@ Sync-inclusive reservations and staged results are part of this opt-in executor:
   company, repository, profile and trust-domain bindings. An omitted trust domain
   does not match an explicit one. These bindings and workspace holds survive
   worker restart. Old VMs without compatibility bindings cannot authorize reuse;
-  uncertain recovered reservations without workspace ownership fail closed.
+  idle incompatible slots are stopped and retired before admitting replacements.
+  Busy, quarantined and pending-stop allocations are never evicted. Uncertain
+  recovered reservations without workspace ownership fail closed, and a known
+  quarantined workspace is refused immediately even when queueing is enabled.
 * Push failure or pre-start cancellation is durably never-started and permits
   local fallback only after the pending push settles. Collection/staging failure
   retains execution as unknown and quarantines both the VM and workspace, even
