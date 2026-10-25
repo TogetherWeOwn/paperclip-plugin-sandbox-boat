@@ -1,8 +1,8 @@
 // Offload command broker: journal, incremental output, heartbeat and cancel.
 // Design: docs/adr/0001-heavy-command-offload.md. Routes delegate here after
 // host authentication; the shim polls here. Remote execution itself is an
-// injected OffloadBackend (the TOG-38024 executor grows start/cancel/streaming
-// in a follow-up; until then the plugin wires a backend that never dispatches).
+// injected OffloadBackend (the executor follow-up grows start/cancel/streaming;
+// until then the plugin wires a backend that never dispatches).
 //
 // Durability: the journal lives in the injected store (plugin state in prod),
 // so a submit is never replayed after a crash. Backend handles are process
@@ -37,7 +37,7 @@ export interface BrokerAuth {
   runId: string;
 }
 
-/** Placeholder backend until the TOG-38024 executor grows start/cancel. */
+/** Placeholder backend until the executor follow-up grows start/cancel. */
 export class NeverDispatchBackend implements OffloadBackend {
   start(): OffloadBackendHandle {
     throw new Error("OFFLOAD_UNAVAILABLE: remote execution is not wired yet; the broker journals not_started and the shim falls back.");
@@ -313,6 +313,13 @@ export class OffloadBroker {
         }
         if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
           return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: request.commandId }) };
+        }
+        // Same orphan hold as resolve(): after a restart a live record has no
+        // handle, so hold for reconciliation instead of replaying live state
+        // where a sweep could expire it into a fallback-safe receipt.
+        if (!TERMINAL.has(existing.state) && existing.state !== "unknown" && !this.handles.has(existing.commandId)) {
+          existing.state = "unknown";
+          await this.save(existing);
         }
         this.trackLive(existing);
         return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };

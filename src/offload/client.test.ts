@@ -305,6 +305,33 @@ describe("ambiguous-submit recovery", () => {
     expect(t.deps.runLocal).toHaveBeenCalledTimes(1);
   });
 
+  it("does not cancel a running command while reconciling an ambiguous submit", async () => {
+    const t = setup();
+    let cancels = 0;
+    t.http.post.mockImplementation(async (path: string) => {
+      if (path === "/offload/exec") return { ok: false as const, error: "timeout" };
+      if (path.endsWith("/cancel")) {
+        cancels += 1;
+        return { ok: true, status: 200, json: readView({ state: "cancelled", result: null }) };
+      }
+      return { ok: true, status: 500, json: {} };
+    });
+    let reads = 0;
+    t.http.get.mockImplementation(async () => {
+      reads += 1;
+      if (reads < 2) return { ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST") };
+      if (reads === 2) return { ok: true, status: 200, json: readView({}) };
+      return {
+        ok: true,
+        status: 200,
+        json: readView({ state: "completed", result: { exitCode: 0, signal: null, timedOut: false, cancelled: false, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null } }),
+      };
+    });
+    expect(await runOffload(t.request, t.deps)).toBe(0);
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+    expect(cancels).toBe(0);
+  });
+
   it("exits 75 with the original ID when still unresolved after 10 s", async () => {
     const t = setup();
     t.http.post.mockImplementation(async () => ({ ok: false as const, error: "timeout" }));

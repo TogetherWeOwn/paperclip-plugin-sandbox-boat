@@ -265,7 +265,7 @@ export class BoatVmManager {
   private offloadBroker(companyId: string): OffloadBroker {
     let broker = this.offloadBrokers.get(companyId);
     if (!broker) {
-      // Until the TOG-38024 executor grows start/cancel, every submit journals
+      // Until the executor follow-up grows start/cancel, every submit journals
       // not_started and the shim falls back locally: safe by construction.
       broker = new OffloadBroker({ store: this.offloadStore(companyId), backend: new NeverDispatchBackend(), now: this.now });
       this.offloadBrokers.set(companyId, broker);

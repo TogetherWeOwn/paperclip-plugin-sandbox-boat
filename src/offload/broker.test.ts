@@ -472,6 +472,26 @@ describe("restart and failure holds", () => {
     expect(view.result).toBeNull();
   });
 
+  it("holds a resubmitted live command as unknown after a restart instead of replaying it", async () => {
+    const OTHER_CMD = "9d82278c-2ba7-4e68-96ab-a2cc10b697ae";
+    const { broker, backend, store, clock } = setup();
+    await broker.submit(submitFor(), PRINCIPAL);
+    backend.starts[0]!.sink.started();
+    await broker.read(CMD, PRINCIPAL, 0);
+    // Worker restarts: handles are gone but the journal survives.
+    const restarted = new OffloadBroker({ store, backend: new FakeBackend(), now: () => clock.t });
+    const again = await restarted.submit(submitFor(), PRINCIPAL);
+    expect(again.status).toBe(200);
+    expect(again.body).toMatchObject({ state: "unknown", fallbackSafe: false });
+    // A sibling heartbeat must not expire the orphan into a replayable receipt.
+    await restarted.submit(submitFor(OTHER_CMD), PRINCIPAL);
+    clock.t += 31_000;
+    await restarted.heartbeat(OTHER_CMD, PRINCIPAL);
+    const view = readBody(await restarted.read(CMD, PRINCIPAL, 0));
+    expect(view.state).toBe("unknown");
+    expect(view.fallbackSafe).toBe(false);
+  });
+
   it("refuses to resubmit an expired id as if known not started", async () => {
     const { broker, backend, clock } = setup();
     await broker.submit(submitFor(), PRINCIPAL);

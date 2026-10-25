@@ -230,11 +230,12 @@ async function poll(ctx: PollContext, cursor: number): Promise<number> {
  * Reconcile an ambiguous submit for at most ten seconds with the same command
  * ID. A running receipt resumes ordinary handling, a never-started receipt
  * permits exactly one bounded local fallback, and anything else exits 75.
+ * Never cancel before the first read: the submit may have landed and the
+ * command may be running, and an upfront cancel would kill it.
  */
 async function recover(ctx: PollContext): Promise<number> {
   const { deps, commandId } = ctx;
   const deadline = deps.now() + OFFLOAD_BOUNDS.recoveryBudgetMs;
-  await cancelBestEffort(ctx);
   let cursor = 0;
   for (;;) {
     const signal = ctx.pendingSignal();
