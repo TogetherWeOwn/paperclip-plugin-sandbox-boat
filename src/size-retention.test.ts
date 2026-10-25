@@ -72,7 +72,7 @@ async function restart(path: LeasePath, first: Lease, measurements: Record<strin
   // The environment says waiting, but the reusable lease's persisted class is rust.
   return await plugin.definition.onEnvironmentResumeLease!({
     ...base({ ...config, sizeCostTable: { rust: measurements } }),
-    providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
+    issueId: "issue-size-retention", providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
   });
 }
 

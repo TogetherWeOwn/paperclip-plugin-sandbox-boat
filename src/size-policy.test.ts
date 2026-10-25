@@ -51,7 +51,9 @@ beforeEach(async () => {
   spawnMock.mockImplementation(ssh.spawn);
   setBoatApiFactoryForTests(() => fake as unknown as BoatApiLike);
   setManagerOverridesForTests({ now: () => clock, sleep: async (ms) => { clock += ms; } });
-  harness = createFakeContext();
+  harness = createFakeContext({
+    issues: new Map([["issue-size-policy", { status: "in_progress", executionWorkspaceSettings: {} }]]),
+  });
   await plugin.definition.setup(harness.ctx as never);
 });
 afterEach(async () => {
@@ -164,7 +166,7 @@ describe("size selection per lease", () => {
     await release(first);
     const lease = await plugin.definition.onEnvironmentResumeLease!({
       ...base({ ...config, sizeCostTable: { rust: waiting } }),
-      providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
+      issueId: "issue-size-policy", providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
     });
     expect(fake.callsOf("resume")[0].args.type).toBe("small");
     expect(lease.metadata).toMatchObject({ size: "small", taskClass: "rust", sizeChoice: { source: "measured", expectedCostDollars: expect.closeTo(0.0015, 12) } });
@@ -194,7 +196,7 @@ describe("size selection per lease", () => {
     const first = await acquire();
     fake.boxes.get(first.providerLeaseId!)!.type = "future-type";
     await expect(plugin.definition.onEnvironmentResumeLease!({
-      ...base(), providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
+      ...base(), issueId: "issue-size-policy", providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
     })).rejects.toMatchObject({ code: "BOAT_SIZE_UNKNOWN" });
   });
 

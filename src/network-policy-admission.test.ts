@@ -16,6 +16,7 @@ const COMPANY = "11111111-1111-4111-8111-111111111111";
 const ENV = "22222222-2222-4222-8222-222222222222";
 const WORKSPACE = "33333333-3333-4333-8333-333333333333";
 const ISSUE = "44444444-4444-4444-8444-444444444444";
+const STALE_ISSUE = "55555555-5555-4555-8555-555555555555";
 const API_KEY = "boat_synthetic_admission_credential_not_real";
 const FQDN = "private-policy.example.test";
 const CIDR = "192.0.2.19/32";
@@ -64,7 +65,7 @@ function leaseParams(lease: Lease) {
   return { ...base(), issueId: ISSUE, providerLeaseId: lease.providerLeaseId!, leaseMetadata: lease.metadata };
 }
 
-function livePolicy(settings: Record<string, unknown> = {}) {
+function livePolicy(settings: Record<string, unknown> | null = {}) {
   harness.issues.set(ISSUE, { status: "in_progress", executionWorkspaceSettings: settings });
 }
 
@@ -214,9 +215,10 @@ describe.each(resumeStates)("native network policy ResumeLease: %s VM", (state) 
   });
 
   it.each([
-    { name: "omitted", settings: {} },
-    { name: "null", settings: { networkEgress: null } },
-  ])("allows an authoritative $name policy, not a stale restrictive lease hint", async ({ settings }) => {
+    { name: "omitted policy", settings: {} },
+    { name: "null policy", settings: { networkEgress: null } },
+    { name: "null settings", settings: null },
+  ])("allows authoritative $name, not a stale restrictive lease hint", async ({ settings }) => {
     const lease = await seedLease(state);
     livePolicy(settings);
     const reader = vi.spyOn(harness.ctx.issues, "get");
@@ -235,11 +237,28 @@ describe.each(resumeStates)("native network policy ResumeLease: %s VM", (state) 
     expect.soft(boat.callsOf("resume").length - resumes).toBe(state === "archived" ? 1 : 0);
   });
 
-  it.each(["missing issue", "missing settings field", "read failure", "missing reader", "missing issue client"] as const)(
+  it.each([
+    { name: "absent", issue: { status: "in_progress" } },
+    { name: "undefined", issue: { status: "in_progress", executionWorkspaceSettings: undefined } },
+    { name: "false", issue: { status: "in_progress", executionWorkspaceSettings: false } },
+    { name: "zero", issue: { status: "in_progress", executionWorkspaceSettings: 0 } },
+    { name: "empty string", issue: { status: "in_progress", executionWorkspaceSettings: "" } },
+    { name: "string", issue: { status: "in_progress", executionWorkspaceSettings: POLICY_SECRET } },
+    { name: "array", issue: { status: "in_progress", executionWorkspaceSettings: [] } },
+  ])("fails closed for $name authoritative settings before provider, state or SSH effects", async ({ issue }) => {
+    const lease = await seedLease(state);
+    harness.issues.set(ISSUE, issue as never);
+    const reader = vi.spyOn(harness.ctx.issues, "get");
+    const before = checkpoint();
+    const outcome = await settle(plugin.definition.onEnvironmentResumeLease!(leaseParams(lease) as never));
+    expect.soft(reader.mock.calls).toEqual([[ISSUE, COMPANY]]);
+    expectRefusal(outcome, before, UNAVAILABLE, true);
+  });
+
+  it.each(["missing issue", "read failure", "missing reader", "missing issue client"] as const)(
     "fails closed for %s, without treating unknown policy as unrestricted", async (missing) => {
       const lease = await seedLease(state);
       if (missing === "missing issue") harness.issues.delete(ISSUE);
-      if (missing === "missing settings field") harness.issues.set(ISSUE, { status: "in_progress" });
       if (missing === "read failure") {
         vi.spyOn(harness.ctx.issues, "get").mockRejectedValue(new Error(`lookup failed: ${FQDN} ${CIDR} ${API_KEY} ${POLICY_SECRET}`));
       }
@@ -270,15 +289,34 @@ describe.each(resumeStates)("native network policy ResumeLease: %s VM", (state) 
 });
 
 describe("authoritative issue policy is not cached at resume admission", () => {
-  it("uses issue identity retained in lease metadata when the SDK request omits issueId", async () => {
-    const lease = await seedLease("archived");
-    livePolicy({ networkEgress: {} });
-    const reader = vi.spyOn(harness.ctx.issues, "get");
-    const { issueId: _issueId, ...params } = leaseParams(lease);
-    const before = checkpoint();
-    const outcome = await settle(plugin.definition.onEnvironmentResumeLease!(params as never));
-    expect.soft(reader).toHaveBeenCalledWith(ISSUE, COMPANY);
-    expectRefusal(outcome, before, UNSUPPORTED);
+  describe.each(resumeStates)("current host issue identity: %s VM", (state) => {
+    it("refuses metadata-only issue identity when the SDK request omits issueId", async () => {
+      const lease = await seedLease(state);
+      livePolicy({ networkEgress: null });
+      const reader = vi.spyOn(harness.ctx.issues, "get");
+      const { issueId: _issueId, ...params } = leaseParams(lease);
+      const before = checkpoint();
+      const outcome = await settle(plugin.definition.onEnvironmentResumeLease!({
+        ...params, leaseMetadata: { ...lease.metadata, issueId: ISSUE },
+      } as never));
+      expect.soft(reader).not.toHaveBeenCalled();
+      expectRefusal(outcome, before, UNAVAILABLE, true);
+    });
+
+    it("queries only current issueId and refuses its restrictive policy despite a permissive metadata identity", async () => {
+      const lease = await seedLease(state);
+      harness.issues.set(STALE_ISSUE, { status: "in_progress", executionWorkspaceSettings: { networkEgress: null } });
+      livePolicy({ networkEgress: { allowFqdns: [FQDN] } });
+      const reader = vi.spyOn(harness.ctx.issues, "get");
+      const before = checkpoint();
+      const outcome = await settle(plugin.definition.onEnvironmentResumeLease!({
+        ...leaseParams(lease), leaseMetadata: {
+          ...lease.metadata, issueId: STALE_ISSUE, executionWorkspaceSettings: { networkEgress: null }, networkEgress: null,
+        },
+      } as never));
+      expect.soft(reader.mock.calls).toEqual([[ISSUE, COMPANY]]);
+      expectRefusal(outcome, before, UNSUPPORTED, true);
+    });
   });
 
   it("re-reads after a successful resume when the current policy changes", async () => {
