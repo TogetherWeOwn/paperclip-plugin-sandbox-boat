@@ -1,6 +1,6 @@
 // Durable command evidence, independent of provider and transport implementations.
 import { createHash, randomUUID } from "node:crypto";
-import type { OffloadCommand, OffloadResult, OffloadWarm } from "./offload.js";
+import type { OffloadCommand, OffloadResult, OffloadWarm, OffloadSyncBack } from "./offload.js";
 import type { CommandExit, GuestIdentity } from "./offload-lifecycle.js";
 
 export interface OffloadStore {
@@ -61,8 +61,9 @@ export interface OffloadRunState {
 
 export interface OffloadSync {
   push(sandboxId: string, command: OffloadCommand): Promise<void>;
-  collect(sandboxId: string, command: OffloadCommand): Promise<void>;
-  stage(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Collection is adapter-owned data; orchestration passes it to stage intact.
+  collect(sandboxId: string, command: OffloadCommand): Promise<unknown>;
+  stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
 }
 
 export interface OffloadDurableDeps {
@@ -87,7 +88,7 @@ export interface OffloadCommandView {
     signal: null;
     timedOut: boolean;
     cancelled: boolean;
-    syncBack: { state: "clean"; changedPaths: string[]; conflictPaths: string[]; artifactId: null };
+    syncBack: OffloadSyncBack;
     usageRecordId: null;
   } | null;
 }
@@ -181,7 +182,7 @@ export interface JournalLifecycle {
 
 interface JournalPool {
   bind?(identity: OffloadIdentity): Promise<void>;
-  hold(identity: OffloadIdentity): Promise<void>;
+  hold(identity: OffloadIdentity, command?: OffloadCommand): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
   cancel(command: OffloadCommand, result: OffloadResult): Promise<void>;
 }
@@ -382,9 +383,14 @@ export class OffloadJournal {
     // running acknowledgement until it actually returns evidence of execution.
     await this.commit(record, { state: "running", remoteStarted: true });
     await this.commit(record, { state: "syncing_out" });
-    await this.deps.sync.collect(sandboxId, command);
-    await this.deps.sync.stage(sandboxId, command);
-    return result;
+    const syncBack = await this.syncOut(sandboxId, command);
+    return { ...result, ...(syncBack ? { syncBack } : {}) };
+  }
+
+  private async syncOut(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
+    const collected = await this.deps.sync.collect(sandboxId, command);
+    const staged = await this.deps.sync.stage(sandboxId, command, collected);
+    return staged === undefined ? undefined : structuredClone(staged);
   }
 
   async finish(command: OffloadCommand, result: OffloadResult): Promise<OffloadResult> {
@@ -423,7 +429,7 @@ export class OffloadJournal {
   private async hold(record: OffloadRecord): Promise<void> {
     if (record.identity) {
       this.held.set(commandKey(record), record.identity);
-      await this.pool.hold(record.identity);
+      await this.pool.hold(record.identity, record.command);
     }
   }
   private async release(record: OffloadRecord): Promise<void> {
@@ -460,10 +466,9 @@ export class OffloadJournal {
         const raw = answer.result!;
         // Resume only output collection/staging, never command execution.
         await this.commit(record, { state: "syncing_out", remoteStarted: true });
-        await this.deps.sync.collect(record.identity.sandboxId, record.command!);
-        await this.deps.sync.stage(record.identity.sandboxId, record.command!);
+        const syncBack = await this.syncOut(record.identity.sandboxId, record.command!);
         const result: OffloadResult = { status: "completed", commandId: record.commandId, sandboxId: record.identity.sandboxId,
-          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0 };
+          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0, ...(syncBack ? { syncBack } : {}) };
         await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
         await this.release(record);
         return result;
@@ -548,7 +553,8 @@ export class OffloadJournal {
       exitCode: record.result.exitCode, signal: null,
       timedOut: record.result.status === "completed" && record.result.timedOut === true,
       cancelled: record.state === "cancelled",
-      syncBack: { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
+      syncBack: record.result.status === "completed" && record.result.syncBack
+        ? structuredClone(record.result.syncBack) : { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
     } : null;
     return { version: 1, commandId: record.commandId, state: record.state,
       remoteStarted: record.remoteStarted, fallbackSafe: record.fallbackSafe, result };

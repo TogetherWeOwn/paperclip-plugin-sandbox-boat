@@ -21,6 +21,9 @@ export interface PoolVm {
   stopObservedAt?: number | null;
   stopAttempts: number;
   identity: OffloadIdentity | null;
+  // Missing legacy bindings cannot authorize reuse or erase an uncertain hold.
+  compatibilityKey?: string;
+  workspaceKey?: string | null;
   accountReservation?: AccountReservation;
   tailSeconds?: number;
 }
@@ -50,6 +53,8 @@ export class OffloadPoolStore {
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0
         || (vm.tailSeconds !== undefined && !finite(vm.tailSeconds))
+        || (vm.compatibilityKey !== undefined && (typeof vm.compatibilityKey !== "string" || !vm.compatibilityKey))
+        || (vm.workspaceKey !== undefined && vm.workspaceKey !== null && (typeof vm.workspaceKey !== "string" || !vm.workspaceKey))
         || (vm.identity !== null && (!validIdentity(vm.identity) || vm.identity.sandboxId !== vm.sandboxId))
         || (vm.accountReservation !== undefined && (!vm.accountReservation || typeof vm.accountReservation.id !== "string"
           || !finite(vm.accountReservation.at) || !finite(vm.accountReservation.tailSeconds)))) {
