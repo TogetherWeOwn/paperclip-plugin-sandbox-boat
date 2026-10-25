@@ -46,8 +46,12 @@ describe("guest lifecycle boundary regressions", () => {
     expect(await s.executor.read("deadline")).toMatchObject({ result: { timedOut: true, exitCode: 124 } });
   });
 
-  it("never invokes transport without positive outside-watchdog arm evidence", async () => {
-    s.guest.armDeadline = async () => ({ verified: true, outsideCommandCgroup: false });
+  it.each([
+    { verified: true, outsideCommandCgroup: false },
+    { verified: false, outsideCommandCgroup: true },
+    { verified: false, outsideCommandCgroup: false },
+  ])("never invokes transport without positive outside-watchdog arm evidence: %j", async (armed) => {
+    s.guest.armDeadline = async () => armed;
     const result = await s.execute(command("unarmed"));
     expect(result).toMatchObject({ status: "unknown", fallbackSafe: false });
     expect(s.starts).toEqual([]);
