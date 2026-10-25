@@ -62,8 +62,8 @@ export class ExecutorBackend implements OffloadBackend {
       // A rejection from start is ambiguous: admission may have persisted and
       // dispatched before the acknowledgement was lost. Never retry/remint.
       dispatched = true;
-      await resolved.start(command);
-      return resolved;
+      const initial = await resolved.start(command);
+      return { executor: resolved, initial };
     });
     // The output pump outlives the API request. Host state calls must use the
     // plugin's proactive, explicit-company scope, not its expired invocation.
@@ -75,9 +75,20 @@ export class ExecutorBackend implements OffloadBackend {
           outcome = { state: "not_started", remoteStarted: false, fallbackSafe: true, result: null };
           return;
         }
+        // Capacity admission can refuse without allocating a journal row.
+        // That explicit never-started acknowledgement is already authoritative;
+        // trying to read a nonexistent row would turn safe fallback into unknown.
+        if (active.initial.state === "not_started") {
+          outcome = terminal(active.initial);
+          sink.failToStart("verified executor never-started admission receipt");
+          return;
+        }
+        sawStart = active.initial.remoteStarted === true || active.initial.state === "starting"
+          || active.initial.state === "syncing_out" || active.initial.events.length > 0;
+        if (sawStart) sink.started();
         let cursor = 0;
         for (;;) {
-          const view = await active.readOutput(command.companyId, command.runId, command.commandId, cursor);
+          const view = await active.executor.readOutput(command.companyId, command.runId, command.commandId, cursor);
           // `starting` is already a durable may-have-spawned intent, not a
           // never-started receipt. Output is also positive execution evidence.
           if (!sawStart && (view.remoteStarted === true || view.state === "starting"
@@ -123,7 +134,7 @@ export class ExecutorBackend implements OffloadBackend {
       },
       cancel: async () => {
         await ready;
-        await cancelGuest();
+        if (!outcome) await cancelGuest();
         // A cancel acknowledgement alone is not a settled workspace: sync-in
         // may still read it, or sync-out may still stage returned changes.
         await done;

@@ -365,11 +365,17 @@ There are three independent gates; none enables another automatically:
 by default), preserving bytes and stream order, including all terminal pages.
 Client heartbeats, not the output poller, renew guest interest. Cancellation
 waits for the executor's cleanup and settled sync receipt, preserving staged or
-conflicting changes; it cannot grant fallback while sync-in still reads source.
+conflicting changes and draining shutdown output before publishing the terminal
+receipt; it cannot grant fallback while sync-in still reads source. A live
+command held as `unknown` after a heartbeat failure remains cancellable and
+subject to expiry; missing handles after restart still require reconciliation.
 A rejected/lost start acknowledgement, uncertain execution, unreadable output
 or unverified cancellation becomes an `unknown` hold with **no local replay**.
-Only a durable never-started receipt (or a binding refusal before calling
-`start`) permits local fallback. No blind dispatch retries are added.
+Only an authoritative never-started receipt (or a binding refusal before calling
+`start`) permits local fallback. This includes explicit admission refusals that
+allocate no executor journal row. A starting acknowledgement is already evidence
+against fallback, even if a later read contradicts it. No blind dispatch retries
+are added.
 
 Rollback: set company `offloadExecutorEnabled` to `false` for new admissions,
 then use `BOAT_OFFLOAD=0` for future local commands. Do not re-run an already
