@@ -11,7 +11,7 @@ afterEach(async () => { await s.dispose(); });
 // Breaks caught: releasing on Cargo exit instead of stage completion; using only
 // the VM lock rather than a workspace reservation; choosing incompatible VMs.
 // slice c: sync-inclusive workspace reservations and pool compatibility.
-describe.skip("offload lifecycle: sync-inclusive reservations", () => {
+describe("offload lifecycle: sync-inclusive reservations", () => {
   it("pushes, executes, collects and stages in order without writing the live workspace", async () => {
     await writeFile(join(s.liveRoot, "Cargo.lock"), "concurrent local edit\n");
     const result = await s.execute(command("ordered"));
@@ -115,7 +115,7 @@ describe("offload lifecycle: queued cancellation and idle fencing", () => {
   });
 
   // slice c: cancellation must retain an asynchronous sync reservation.
-  describe.skip("slice c: cancellation during sync", () => {
+  describe("slice c: cancellation during sync", () => {
   it.each(["push", "collect", "stage"])("cancellation during %s cannot hand off before the asynchronous phase settles", async (phase) => {
     const gate = s.hold(`${phase}:cancelled`);
     const first = s.execute(command("cancelled"));

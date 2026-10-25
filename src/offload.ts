@@ -6,7 +6,7 @@
 // OFFLOAD_UNAVAILABLE, per-command usage + expected-cost log, idempotency by
 // commandId. Durable journal/receipt recovery and account admission are both
 // wired here. Guest lifecycle and incremental output are opt-in; persisted
-// pool recovery is opt-in too; sync-inclusive refinements and HTTP routing are separate.
+// pool recovery is opt-in too; HTTP routing and real sync adapters remain separate.
 import { createHash } from "node:crypto";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
@@ -32,6 +32,7 @@ export interface OffloadCommand {
   profileId: string;
   argv: string[];
   executionWorkspaceId?: string;
+  trustDomainId?: string;
   cwdRelative?: string;
   env?: Record<string, string>;
   queueTimeoutMs?: number;
@@ -39,6 +40,14 @@ export interface OffloadCommand {
 }
 
 export type OffloadWarm = "warm" | "cold";
+
+// Returned changes are staged for explicit review, never applied to live files.
+export interface OffloadSyncBack {
+  state: "clean" | "staged" | "conflict";
+  changedPaths: string[];
+  conflictPaths: string[];
+  artifactId: string | null;
+}
 
 export type OffloadResult =
   | {
@@ -54,6 +63,7 @@ export type OffloadResult =
       fallbackSafe?: false;
       cancelled?: boolean;
       timedOut?: boolean;
+      syncBack?: OffloadSyncBack;
     }
   | {
       status: "unknown";
@@ -126,7 +136,8 @@ export interface OffloadLifecycleDeps extends Omit<OffloadDeps, "guest" | "runCo
 
 type Reservation = { kind: "run"; vm: PoolVm; warm: OffloadWarm };
 type Dispatch = Reservation | OffloadResult;
-type Claim = Reservation | { kind: "unavailable"; reason: string } | { kind: "queued"; wait: Promise<Dispatch> };
+type Slot = Reservation | { kind: "unavailable"; reason: string } | { kind: "blocked" };
+type Claim = Exclude<Slot, { kind: "blocked" }> | { kind: "queued"; wait: Promise<Dispatch> };
 
 interface Queued {
   command: OffloadCommand;
@@ -174,7 +185,8 @@ export class OffloadExecutor {
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
-  private readonly runCommand: OffloadDeps["runCommand"];
+  private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
+    Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly durable: OffloadJournal | null;
   private readonly lifecycle: OffloadLifecycle | null;
   private readonly pool: PoolVm[] = [];
@@ -210,7 +222,7 @@ export class OffloadExecutor {
     }
     this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers) : null;
     this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDurableDeps, this.now, {
-      hold: (identity) => this.restoreHold(identity),
+      hold: (identity, command) => this.restoreHold(identity, command),
       release: (identity) => this.releaseHold(identity),
       bind: (identity) => this.bindIdentity(identity),
       cancel: (command, result) => this.cancelQueued(command, result),
@@ -366,7 +378,7 @@ export class OffloadExecutor {
     return this.durable;
   }
 
-  private async restoreHold(identity: OffloadIdentity): Promise<void> {
+  private async restoreHold(identity: OffloadIdentity, command?: OffloadCommand): Promise<void> {
     await this.withAdmission(async () => {
       let vm = this.pool.find((entry) => entry.sandboxId === identity.sandboxId);
       if (!vm) {
@@ -374,6 +386,10 @@ export class OffloadExecutor {
           lastActiveAt: this.now(), generation: identity.journalGeneration, idleHandle: null, stopDueAt: null, stopAttempts: 0,
           stopping: false, stopRequestedAt: null, identity: structuredClone(identity) };
         this.pool.push(vm);
+      }
+      if (command) {
+        vm.workspaceKey = this.workspaceKey(command);
+        vm.compatibilityKey ??= this.compatibilityKey(command);
       }
       vm.quarantined = true;
       vm.generation += 1;
@@ -393,6 +409,7 @@ export class OffloadExecutor {
     await this.withAdmission(async () => {
       vm.quarantined = false;
       vm.busy = false;
+      vm.workspaceKey = null;
       vm.stopped = true;
       vm.lastActiveAt = this.now();
       await this.persistPool();
@@ -524,8 +541,20 @@ export class OffloadExecutor {
     return await this.runOnVm(dispatch.vm, command, dispatch.warm, this.now() - enqueuedAt);
   }
 
-  private reserveVm(vm: PoolVm): Reservation {
+  private compatibilityKey(command: OffloadCommand): string {
+    return JSON.stringify([command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null]);
+  }
+
+  private workspaceKey(command: OffloadCommand): string | null {
+    // Legacy identity-only callers without a workspace keep their old contract.
+    // Lifecycle callers lacking the newer binding conservatively reserve a card.
+    const workspace = command.executionWorkspaceId ?? (this.lifecycle ? command.cardId : null);
+    return workspace === null ? null : JSON.stringify([command.companyId, workspace]);
+  }
+
+  private reserveVm(vm: PoolVm, command: OffloadCommand): Reservation {
     vm.busy = true;
+    vm.workspaceKey = this.workspaceKey(command);
     vm.generation += 1;
     this.clearIdleTimer(vm);
     vm.stopDueAt = null;
@@ -536,10 +565,21 @@ export class OffloadExecutor {
     return { kind: "run", vm, warm: "warm" };
   }
 
-  private async claimSlot(command: OffloadCommand): Promise<Claim> {
+  // Runs under admission. A blocked workspace cannot consume a second VM,
+  // and a quarantined reservation remains exclusive after its call settles.
+  private async tryClaimSlot(command: OffloadCommand): Promise<Slot> {
     if (this.closed) return { kind: "unavailable", reason: "executor shutdown" };
     const cancelled = this.durable?.preStartResult(command);
     if (cancelled?.status === "unavailable") return { kind: "unavailable", reason: cancelled.reason };
+    if (this.lifecycle && this.pool.some((vm) => vm.quarantined && vm.workspaceKey === undefined)) {
+      return { kind: "unavailable", reason: "recovered workspace ownership unknown; reconciliation required" };
+    }
+    const workspace = this.workspaceKey(command);
+    const held = workspace === null ? undefined : this.pool.find((vm) =>
+      vm.workspaceKey === workspace && (vm.busy || vm.quarantined));
+    if (held?.quarantined) return { kind: "unavailable", reason: "workspace quarantined; guest reconciliation required" };
+    if (held) return { kind: "blocked" };
+    const compatible = (vm: PoolVm) => vm.compatibilityKey === this.compatibilityKey(command);
     // A stop may have finished since its asynchronous acceptance. Observe the
     // exact allocation before resuming it; never try resume while archiving.
     for (const vm of [...this.pool]) {
@@ -553,21 +593,53 @@ export class OffloadExecutor {
     // Warmest idle first (running, not stopped or uncertain).
     let best: PoolVm | null = null;
     for (const vm of this.pool) {
-      if (vm.busy || vm.stopped || vm.stopping || vm.quarantined) continue;
+      if (vm.busy || vm.stopped || vm.stopping || vm.quarantined || !compatible(vm)) continue;
       if (!best || vm.lastActiveAt > best.lastActiveAt) best = vm;
     }
     if (best) return this.accountClaim(command, best, "warm");
     // Most recently stopped compatible VM next.
     let stopped: PoolVm | null = null;
     for (const vm of this.pool) {
-      if (vm.busy || !vm.stopped || vm.stopping || vm.quarantined) continue;
+      if (vm.busy || !vm.stopped || vm.stopping || vm.quarantined || !compatible(vm)) continue;
       if (!stopped || vm.lastActiveAt > stopped.lastActiveAt) stopped = vm;
     }
     if (stopped) return this.accountClaim(command, stopped, "resume");
     if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
+    // An idle incompatible cache must not permanently consume a bounded slot.
+    // Preserve its ownership until stop and telemetry are both confirmed; never
+    // reclaim busy, quarantined or asynchronously stopping allocations.
+    const retiring = this.pool.find((vm) => !vm.busy && !vm.quarantined && !vm.stopping && !compatible(vm));
+    if (retiring) {
+      this.clearIdleTimer(retiring);
+      if (retiring.stopped && retiring.stopObservedAt == null) {
+        // Replay release permits admission, not proof of provider termination.
+        // Fence uncertain ownership so stop observation/retries retain coverage.
+        retiring.stopped = false;
+        retiring.stopping = true;
+        if (await this.observeStop(retiring)) await this.stopVm(retiring, true);
+      } else if (!retiring.stopped) await this.stopVm(retiring);
+      if (this.pool.includes(retiring) && (!retiring.stopped || retiring.stopObservedAt == null)) {
+        await this.persistPool();
+        this.scheduleIdleStop(retiring, retiring.generation, 1000);
+        return { kind: "unavailable", reason: "incompatible pool retirement pending; reconciliation required" };
+      }
+      try { await this.persistStopTelemetry(retiring); }
+      catch { return { kind: "unavailable", reason: "stop accounting persistence pending" }; }
+      this.retireVm(retiring);
+      await this.persistPool();
+      return this.accountClaim(command, null, "create");
+    }
     // An uncertain slot has no live release event to queue behind. Refuse
     // rather than strand callers waiting for a nonexistent safe handoff.
-    if (this.pool.every((vm) => vm.quarantined || vm.stopping)) return { kind: "unavailable", reason: "pool quarantined; guest reconciliation required" };
+    if (!this.pool.some((vm) => compatible(vm) && vm.busy && !vm.quarantined)) {
+      return { kind: "unavailable", reason: "no compatible pool capacity; guest reconciliation required" };
+    }
+    return { kind: "blocked" };
+  }
+
+  private async claimSlot(command: OffloadCommand): Promise<Claim> {
+    const claim = await this.tryClaimSlot(command);
+    if (claim.kind !== "blocked") return claim;
     if ((command.queueTimeoutMs ?? this.config.queueTimeoutMs) <= 0) return { kind: "unavailable", reason: "queue wait disabled" };
     if (this.queue.length >= this.config.queueLimit) {
       return { kind: "unavailable", reason: `queue full (${this.config.queueLimit} pending)` };
@@ -638,8 +710,8 @@ export class OffloadExecutor {
       return { kind: "unavailable", reason: "account admission refused: limits, capacity or durable state unavailable" };
     }
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
-      stopping: false, stopRequestedAt: null, identity: null };
-    this.reserveVm(vm);
+      stopping: false, stopRequestedAt: null, identity: null, compatibilityKey: this.compatibilityKey(command) };
+    this.reserveVm(vm, command);
     vm.accountReservation = reservation;
     vm.tailSeconds = reservation.tailSeconds;
     if (!existing) this.pool.push(vm);
@@ -677,6 +749,7 @@ export class OffloadExecutor {
         this.logger.error("boat offload start reconciliation persistence failed; intent retained");
       });
       vm.busy = false;
+      if (definitive) vm.workspaceKey = null;
       if (!definitive) vm.quarantined = true;
       else if (!existing) this.retireVm(vm);
       await this.persistPool().catch(() => { vm.quarantined = true; });
@@ -692,6 +765,7 @@ export class OffloadExecutor {
       const { exitCode, seconds } = raw;
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
       result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars,
+        ...(raw.syncBack ? { syncBack: raw.syncBack } : {}),
         ...(this.lifecycle ? { remoteStarted: true as const, fallbackSafe: false as const,
           cancelled: raw.cancelled === true, timedOut: raw.timedOut === true } : {}) };
     } catch {
@@ -753,34 +827,49 @@ export class OffloadExecutor {
       this.clearIdleTimer(vm);
       await this.persistPool();
       this.logger.warn("boat offload VM quarantined; guest receipt reconciliation required", { commandId: command.commandId, sandboxId: vm.sandboxId });
+      if (!this.closed) await this.dispatchQueued();
     });
+  }
+
+  // Preserve FIFO among eligible waiters without blocking other workspaces
+  // behind a reserved workspace or handing an incompatible VM to the head.
+  private async dispatchQueued(): Promise<void> {
+    for (const entry of [...this.queue]) {
+      if (entry.refusal || !this.queue.includes(entry)) continue;
+      let claim: Slot;
+      try { claim = await this.tryClaimSlot(entry.command); }
+      catch (error) {
+        this.queue.splice(this.queue.indexOf(entry), 1);
+        if (entry.timerHandle != null) this.timers.clear(entry.timerHandle);
+        entry.reject(error);
+        continue;
+      }
+      if (claim.kind === "blocked") continue;
+      this.queue.splice(this.queue.indexOf(entry), 1);
+      if (entry.timerHandle != null) this.timers.clear(entry.timerHandle);
+      entry.timerHandle = null;
+      entry.resolve(claim.kind === "unavailable"
+        ? this.finish(this.cacheKey(entry.command), this.unavailable(entry.command, claim.reason)) : claim);
+    }
   }
 
   private async releaseVm(vm: PoolVm): Promise<void> {
     await this.withAdmission(async () => {
       vm.lastActiveAt = this.now();
-      if (!this.closed) {
-        const nextAt = this.queue.findIndex((entry) => !entry.refusal);
-        const next = nextAt >= 0 ? this.queue.splice(nextAt, 1)[0] : undefined;
-        if (next) {
-          if (next.timerHandle != null) this.timers.clear(next.timerHandle);
-          next.timerHandle = null;
-          // Transfer a busy reservation, not an idle VM to rediscover. A new
-          // arrival cannot steal this VM before the FIFO waiter continues.
-          const claim = await this.accountClaim(next.command, vm, "warm");
-          next.resolve(claim.kind === "unavailable" ? this.finish(next.command.commandId, this.unavailable(next.command, claim.reason)) : claim);
-          if (claim.kind === "run") return;
-        }
-      }
       vm.busy = false;
+      vm.workspaceKey = null;
       vm.generation += 1;
       vm.stopAttempts = 0;
       vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
       await this.persistPool();
+      if (!this.closed) await this.dispatchQueued();
+      // Dispatch may reserve this VM, retire it for an incompatible waiter,
+      // or leave a stop retry installed. Never resurrect its old idle timer.
+      if (!this.pool.includes(vm) || vm.busy || vm.quarantined || vm.stopped || vm.stopping || vm.idleHandle != null) return;
       if (this.closed) {
         await this.stopVm(vm);
       } else {
-        this.scheduleIdleStop(vm, vm.generation, (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
+        this.scheduleIdleStop(vm, vm.generation, Math.max(0, vm.stopDueAt! - this.now()));
       }
     });
   }

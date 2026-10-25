@@ -49,7 +49,10 @@ describe("persisted recovery review regressions", () => {
       throw new Error("create reply lost");
     };
     for (const id of ["lost-create-a", "lost-create-b"]) {
-      expect(await s.execute(command(id), ex)).toMatchObject({ status: "unavailable", remoteStarted: false });
+      // Independent workspaces permit distinct allocation attempts while each
+      // ambiguous predecessor keeps its own workspace quarantined.
+      expect(await s.execute(command(id, { executionWorkspaceId: id }), ex))
+        .toMatchObject({ status: "unavailable", remoteStarted: false });
     }
     const saved = await savedPool();
     expect(saved.vms.map((vm) => vm.sandboxId)).toEqual(["", ""]);

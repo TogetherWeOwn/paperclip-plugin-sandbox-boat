@@ -1,6 +1,6 @@
 // Durable command evidence, independent of provider and transport implementations.
 import { createHash, randomUUID } from "node:crypto";
-import type { OffloadCommand, OffloadResult, OffloadWarm } from "./offload.js";
+import type { OffloadCommand, OffloadResult, OffloadWarm, OffloadSyncBack } from "./offload.js";
 import type { CommandExit, GuestIdentity } from "./offload-lifecycle.js";
 
 export interface OffloadStore {
@@ -61,8 +61,9 @@ export interface OffloadRunState {
 
 export interface OffloadSync {
   push(sandboxId: string, command: OffloadCommand): Promise<void>;
-  collect(sandboxId: string, command: OffloadCommand): Promise<void>;
-  stage(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Collection is adapter-owned data; orchestration passes it to stage intact.
+  collect(sandboxId: string, command: OffloadCommand): Promise<unknown>;
+  stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
 }
 
 export interface OffloadDurableDeps {
@@ -87,7 +88,7 @@ export interface OffloadCommandView {
     signal: null;
     timedOut: boolean;
     cancelled: boolean;
-    syncBack: { state: "clean"; changedPaths: string[]; conflictPaths: string[]; artifactId: null };
+    syncBack: OffloadSyncBack;
     usageRecordId: null;
   } | null;
 }
@@ -181,7 +182,7 @@ export interface JournalLifecycle {
 
 interface JournalPool {
   bind?(identity: OffloadIdentity): Promise<void>;
-  hold(identity: OffloadIdentity): Promise<void>;
+  hold(identity: OffloadIdentity, command?: OffloadCommand): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
   cancel(command: OffloadCommand, result: OffloadResult): Promise<void>;
 }
@@ -226,7 +227,7 @@ export class OffloadJournal {
   private async beforeStart(record: OffloadRecord, patch: Partial<OffloadRecord>): Promise<void> {
     await this.transition(record, async () => {
       await this.refresh(record);
-      if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+      if (!PRE_START.has(record.state) || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
       await this.commit(record, patch);
     });
   }
@@ -361,7 +362,7 @@ export class OffloadJournal {
     await this.beforeStart(record, { state: "syncing_in" });
     // Start the sync in the same continuation as the state check. A subsequent
     // cancellation can fence spawn, but need not abort an already-running push.
-    if (record.state === "not_started") throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+    if (record.state === "not_started" || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
     await this.deps.sync.push(sandboxId, command);
     const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
     if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
@@ -380,17 +381,29 @@ export class OffloadJournal {
     const result = await transport(sandboxId, command, identity);
     // The legacy transport resolves at exit, not at spawn. Do not claim a
     // running acknowledgement until it actually returns evidence of execution.
-    await this.commit(record, { state: "running", remoteStarted: true });
-    await this.commit(record, { state: "syncing_out" });
-    await this.deps.sync.collect(sandboxId, command);
-    await this.deps.sync.stage(sandboxId, command);
-    return result;
+    await this.transition(record, async () => {
+      await this.commit(record, { state: "running", remoteStarted: true });
+      await this.commit(record, { state: "syncing_out" });
+    });
+    const syncBack = await this.syncOut(sandboxId, command);
+    return { ...result, ...(syncBack ? { syncBack } : {}) };
+  }
+
+  private async syncOut(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
+    const collected = await this.deps.sync.collect(sandboxId, command);
+    const staged = await this.deps.sync.stage(sandboxId, command, collected);
+    return staged === undefined ? undefined : structuredClone(staged);
   }
 
   async finish(command: OffloadCommand, result: OffloadResult): Promise<OffloadResult> {
     const record = this.active.get(commandKey(command))!;
     const committed = await this.transition(record, async () => {
       if (TERMINAL.has(record.state)) return record.result!;
+      // Cancellation after guest exit still cancels the command lifecycle, but
+      // cannot erase execution or drop staged changes. A timeout keeps exit 124.
+      if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
+        result = { ...result, cancelled: true, exitCode: 130 };
+      }
       // No transport is invoked before the starting commit. A sync/boot-ID
       // failure is therefore a known non-start, not identity-less uncertainty.
       if (PRE_START.has(record.state) && result.status === "unknown") {
@@ -423,7 +436,7 @@ export class OffloadJournal {
   private async hold(record: OffloadRecord): Promise<void> {
     if (record.identity) {
       this.held.set(commandKey(record), record.identity);
-      await this.pool.hold(record.identity);
+      await this.pool.hold(record.identity, record.command);
     }
   }
   private async release(record: OffloadRecord): Promise<void> {
@@ -460,10 +473,9 @@ export class OffloadJournal {
         const raw = answer.result!;
         // Resume only output collection/staging, never command execution.
         await this.commit(record, { state: "syncing_out", remoteStarted: true });
-        await this.deps.sync.collect(record.identity.sandboxId, record.command!);
-        await this.deps.sync.stage(record.identity.sandboxId, record.command!);
+        const syncBack = await this.syncOut(record.identity.sandboxId, record.command!);
         const result: OffloadResult = { status: "completed", commandId: record.commandId, sandboxId: record.identity.sandboxId,
-          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0 };
+          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0, ...(syncBack ? { syncBack } : {}) };
         await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
         await this.release(record);
         return result;
@@ -548,7 +560,8 @@ export class OffloadJournal {
       exitCode: record.result.exitCode, signal: null,
       timedOut: record.result.status === "completed" && record.result.timedOut === true,
       cancelled: record.state === "cancelled",
-      syncBack: { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
+      syncBack: record.result.status === "completed" && record.result.syncBack
+        ? structuredClone(record.result.syncBack) : { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
     } : null;
     return { version: 1, commandId: record.commandId, state: record.state,
       remoteStarted: record.remoteStarted, fallbackSafe: record.fallbackSafe, result };
@@ -588,8 +601,15 @@ export class OffloadJournal {
       if (record === snapshot) await this.refresh(record);
       const current = generation === undefined || generation === (record.identity?.journalGeneration ?? 1);
       if (current && PRE_START.has(record.state)) {
-        const result = this.unavailable(record, "cancelled before durable starting intent");
-        await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        if (this.lifecycle && record.state === "syncing_in" && this.active.has(key)) {
+          // Fence spawn now, but do not authorize a local fallback while push
+          // may still be reading the workspace. run()/finish() settle the
+          // never-started receipt only after the asynchronous phase unwinds.
+          await this.commit(record, { cancelRequested: record.cancelRequested ?? reason });
+        } else {
+          const result = this.unavailable(record, "cancelled before durable starting intent");
+          await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        }
       }
       if (current && this.lifecycle && record.identity && !TERMINAL.has(record.state) && !record.cancelRequested) {
         await this.commit(record, { cancelRequested: reason });

@@ -280,7 +280,7 @@ export async function fixture() {
     },
     stage: async (cmd: LifecycleCommand, _collected: unknown) => {
       await phase("stage", cmd.commandId);
-      return { state: "staged", changedPaths: ["Cargo.lock"], conflictPaths: [], artifactId: `artifact-${cmd.commandId}` };
+      return { state: "staged" as const, changedPaths: ["Cargo.lock"], conflictPaths: [], artifactId: `artifact-${cmd.commandId}` };
     },
   };
   let keepDescendants = false;
@@ -298,12 +298,12 @@ export async function fixture() {
       journalStore: disk.store(),
       guestReceipts: { bootId: async () => "boot-a", read: async () => null },
       resolveRunState: async () => ({ permanentlyTerminal: false, terminatedAt: null, tokenExpiresAt: EPOCH + 86_400_000 }),
-      // slice c will exercise collected-data/staging results; preserve the
-      // landed journal's void sync contract until that adapter slice lands.
+      // Preserve the adapter payload and staging receipt across the port.
+      // This wrapper does not implement sync or change any acceptance policy.
       sync: {
         push: sync.push,
-        collect: async (vm: string, cmd: OffloadCommand) => { await sync.collect(vm, cmd as LifecycleCommand); },
-        stage: async (_vm: string, cmd: OffloadCommand) => { await sync.stage(cmd as LifecycleCommand, undefined); },
+        collect: (vm: string, cmd: OffloadCommand) => sync.collect(vm, cmd as LifecycleCommand),
+        stage: (_vm: string, cmd: OffloadCommand, collected: unknown) => sync.stage(cmd as LifecycleCommand, collected),
       },
       runCommand: async (sandboxId: string, raw: OffloadCommand, context?: RunContext) => {
         const cmd = raw as LifecycleCommand;
