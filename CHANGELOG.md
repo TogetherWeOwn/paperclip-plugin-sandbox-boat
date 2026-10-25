@@ -4,6 +4,7 @@
 
 ### Added
 
+* Receipt-driven broker/executor adapter with incremental byte-preserving output, scoped client heartbeats and cancellation that waits for guest cleanup and staged return. The company plugin setting `offloadExecutorEnabled` defaults to false; a trusted, lifecycle-enabled executor integration and the separate Cargo shim opt-in are also required. The stock worker still cannot dispatch without that integration.
 * Opt-in command offload now keeps a company-scoped workspace and its VM reserved through asynchronous push, execution, collection, staging and durable settlement, including cancellation. Independent workspaces can progress without waiting for an unrelated workspace's reservation.
 * Collected adapter data reaches staging intact. Staged/conflict receipts survive durable result reads and replay without applying returned files to the live workspace. Existing void-returning sync adapters remain compatible.
 
