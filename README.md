@@ -21,15 +21,19 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 
 ### Command-level guest lifecycle (opt-in executor slice)
 
-The internal `OffloadExecutor` can keep the agent local and send a heavy command
-through an injected guest transport. The HTTP broker now has a receipt-driven
-`ExecutorBackend` bridge, gated by `offloadExecutorEnabled: true` in company
-plugin config **and** an installed lifecycle executor. Neither is enabled by
-this package's stock worker; it does not install a guest cgroup/watchdog
-transport. The existing identity-only runner remains compatible, but is not a
-safe HTTP offload integration. To supply the lifecycle executor, provide
-`OffloadLifecycleDeps`: the durable journal, receipt and account ports,
-a `GuestController`, and a runner receiving `{ identity, output }`.
+The stock worker now has a concrete Linux guest transport over the existing
+API-authorized, pinned-host-key Boat SSH connection. The agent/model stays on
+the server; only an eligible heavy command and a frozen, secret-free source
+snapshot go to a pool VM. **Everything remains default OFF**: both company
+flags, an explicit repository allowlist, native workspace realization metadata,
+a delegated cgroup parent and a private artifact directory are required. The
+separate Cargo shim opt-in is still required. See the enabling and smoke
+procedures below. No new Paperclip capability is needed.
+
+The existing identity-only runner remains compatible, but is not a safe HTTP
+offload integration. Custom integrations can still supply `OffloadLifecycleDeps`
+and override `ManagerDeps.offloadExecutor`; the stock worker uses
+`SshOffloadRuntime`, `SshOffloadGuest` and `SshOffloadSync` when no override exists.
 
 * Preflight requires positive delegated-cgroup-v2 and independent-watchdog
   evidence. The full boot/process-group/cgroup/generation identity and both
@@ -342,7 +346,7 @@ Heavy-command-only offload is a separate execution mode and is not implemented b
 
 ## Cargo offload shim (`bin/boat-offload-cargo`)
 
-Design: `docs/adr/0001-heavy-command-offload.md`. Status: routes, broker, shim and executor adapter are implemented. Command dispatch is **default OFF**. Without both the company opt-in and a host-installed lifecycle executor, each accepted submit journals `not_started` and the shim falls back to the existing bounded local path.
+Design: `docs/adr/0001-heavy-command-offload.md`. Status: routes, broker, shim, executor adapter and concrete SSH guest lifecycle are implemented. Command dispatch is **default OFF**. Without all company and native-binding prerequisites below, each accepted submit journals `not_started` and the shim falls back to the existing bounded local path.
 
 Install the shim as `cargo` ahead of the real executable for opted-in runs (`BOAT_OFFLOAD=1`); anything else, including unset and `0`, runs local cargo with no broker calls. Eligible subcommands are `build`, `test`, `check`, `clippy`, `nextest run` and `llvm-cov` compilation/test modes on an installed profile toolchain. Everything else (`fmt`, `add`, `update`, `metadata`, help/version, install, custom aliases, `--config`/`-Z`, compound shell text, `RUSTFLAGS` builds) stays local. Only an explicit nonsecret env (`CARGO_TERM_COLOR`, `RUST_BACKTRACE`) reaches the request; the run token travels in HTTP headers only.
 
@@ -358,26 +362,46 @@ Semantics the shim guarantees: incremental stdout/stderr with exit/signal passth
 
 ### Enabling the executor bridge
 
-There are three independent gates; none enables another automatically:
+There are independent gates; none enables another automatically:
 
-1. **Host integration:** construct an `OffloadExecutor` using `OffloadLifecycleDeps`
-   and supply it through `ManagerDeps.offloadExecutor(command)`. This trusted,
-   side-effect-free resolver must authorize the active run's workspace, bind its
-   company/repository/profile/trust domain, confine source paths and path-bearing
-   Cargo options, and select the matching pool. Return `null` for unsupported
-   confinement, secret-bearing workloads or an ineligible guest. Never use the
-   legacy identity-only runner here. The stock worker supplies no resolver:
-   enabling a flag alone therefore cannot create a VM.
-2. **Company plugin configuration:** in Paperclip's plugin configuration, set
-   `{"offloadExecutorEnabled": true}`. This is **not** an environment driver
-   setting. `plugin.setup` reads it via `ctx.config.get(companyId)`; integrations
-   constructing `BoatVmManager` directly supply `offloadConfig(companyId)` and
-   `offloadExecutor(command)`. Only the boolean `true` opts in. Unset, `false`,
-   strings, missing bindings and pre-dispatch config failures retain safe local
-   fallback. The setting is read for every new command; disabling it leaves
-   already admitted commands and their receipts intact.
+1. **Native binding:** the worker must receive a host-authored
+   `onEnvironmentRealizeWorkspace` payload containing the SDK's
+   `workspace.metadata.workspaceRealizationRequest` and matching local source.
+   Company, current run, workspace, repository and environment are bound from
+   those params, never from the offload request body or an SDK workspace lookup.
+   The driver config from that invocation supplies the scoped Boat credential
+   in memory only. After a worker restart, a fresh native realization is required
+   before new dispatch; unresolved old commands remain quarantined, never replayed.
+   A local-only run for which the host never realizes this plugin's workspace
+   remains local; a flag does not manufacture a trusted binding.
+2. **Company plugin configuration:** explicitly approve only public, secret-free
+   repositories and supply the guest delegation and host artifact root:
+
+   ```json
+   {
+     "offloadExecutorEnabled": true,
+     "offloadGuestTransportEnabled": true,
+     "offloadAllowedRepos": ["repo:https://github.com/example/public-rust"],
+     "offloadCgroupParent": "/sys/fs/cgroup/your-existing-delegated-parent",
+     "offloadArtifactRoot": "/var/lib/paperclip/boat-offload-artifacts"
+   }
+   ```
+
+   These are **company plugin** settings, not environment driver settings.
+   Both flags default to false and the allowlist defaults to empty (deny all).
+   Only literal boolean `true` opts in. Repository IDs use the route's canonical
+   form (lowercase repository URL, no trailing slash or `.git`). The guest path
+   must be an existing delegation, writable by the Boat SSH user, with functional
+   `cgroup.procs`, `cgroup.events` and recursive `cgroup.kill`. The plugin never
+   changes systemd, mounts, cgroup delegation or host services. The host artifact
+   directory must be operator-owned, private, persistent and outside live source.
+   All gates are rechecked for each new command; turning one off does not discard
+   existing handles, receipts or uncertain holds. A custom host integration can
+   still supply `ManagerDeps.offloadExecutor` instead of the stock transport.
 3. **Client shim:** opt in the selected run with `BOAT_OFFLOAD=1`, as above.
-   Keep secret-bearing/private-service commands on the existing local path.
+   Keep secret-bearing/private-service commands local. The stock transport
+   rejects all Cargo path overrides (`--manifest-path`, `--target-dir`, etc.)
+   rather than guessing how to translate host paths.
 
 Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
 payload, not `ctx.executionWorkspaces` or the offload request body. Paperclip's
@@ -422,9 +446,108 @@ Rollback: set company `offloadExecutorEnabled` to `false` for new admissions,
 then use `BOAT_OFFLOAD=0` for future local commands. Do not re-run an already
 uncertain command locally. Broker restart still holds unresolved commands for
 reconciliation; this adapter does not automatically reattach lost handles.
-The lifecycle executor's owner must retain its native sweep/recovery/shutdown
-integration. No deployment, real VM call or live enforcement claim is part of
-the mocked adapter tests.
+The stock lifecycle executor uses the existing native sweep/recovery/shutdown
+integration. Loopback SSH acceptance tests exercise actual kernel enforcement;
+no deployment, live Boat call or live Boat enforcement claim is part of them.
+
+### Concrete transport and fallback
+
+`src/offload-ssh.ts` and `src/offload-ssh-script.ts` implement preflight, prepare,
+arm, inspect, TERM, recursive KILL and empty verification over `SshManager`.
+Native binary sync and its shell supervisor are reused, including pinned host
+keys, managed channel cancellation and bounded control output. Each reservation
+refreshes the API-authorized SSH endpoint/key before transfer, including resumes.
+
+Preparation creates a fresh cgroup and a gated process group. A separate detached
+watchdog remains outside that subtree and the SSH channel. Boot ID, process
+start time, cgroup inode and generation fence controls; the one-use start gate
+follows durable host intent. The watchdog kills the subtree on execution deadline,
+expired client interest or supervisor loss. Heartbeats renew the guest watchdog
+and host timer; reads renew neither. Losing a result/output channel is uncertain,
+not permission to replay. Output is capped at 1 MiB; overflow fails closed rather
+than returning truncated success. New pool VMs keep monitoring on. The existing
+native sweep job owns stop retry/reconciliation; no host pacer is added.
+
+**Fallback:** without functional cgroup-v2 delegation and a verified outside
+watchdog, the command never starts and the existing bounded local path remains
+available. A process group cannot contain `setsid` descendants, so the stock
+transport does **not** advertise the shell supervisor as equivalent containment.
+Use an already delegated guest image; the plugin never changes systemd, mounts,
+delegation or services. This is lifecycle containment within a trusted pool,
+not a security boundary against hostile code sharing its UID/delegation authority.
+
+Source is frozen with the existing manifest/exclusion checks and sent through
+native sync. This first concrete adapter sends fresh command-scoped checkouts
+(no delta/cache preservation yet). Return inspection hashes files in bounded
+chunks and fetches at most 4 MiB into private staged artifacts, never live source.
+Only approved public, secret-free inputs belong here: exclusions are defense in
+depth, not a secret scanner. Successful collection removes the disposable guest
+checkout. Artifacts remain in the configured persistent host root for explicit
+review/removal. Failed or uncertain collection retains the reservation and files.
+A restart does not reattach old handles or reconstruct interrupted in-memory
+sync manifests; those commands remain held for inspection.
+
+### Real-SSH acceptance tests (no Boat calls)
+
+Tests use the isolated loopback `sshd` harness, throwaway keys and an unprivileged
+daemon, without host SSH/service changes. `PAPERCLIP_TEST_SSHD` selects an isolated
+OpenSSH executable if needed. Execution assertions need Linux cgroup delegation;
+without it the ordinary suite verifies real-SSH refusal/local fallback instead.
+`PAPERCLIP_TEST_CGROUP_REQUIRED=1` makes absent delegation an explicit failure,
+never a skipped execution proof. On a Linux development machine with delegation,
+this **one-shot test scope** is not an installed service, timer or automation:
+
+```sh
+scratch=$(mktemp -d)
+# From the repository root, after npm ci --ignore-scripts:
+systemd-run --user --scope --quiet --property=Delegate=yes \
+  env VITEST_MAX_WORKERS=1 PAPERCLIP_RUN_SCRATCH_DIR="$scratch" \
+  PAPERCLIP_TEST_CGROUP_REQUIRED=1 \
+  nice -n 15 python3 -I src/test-support/run-loopback-ssh-tests.py --check
+rm -rf "$scratch"
+```
+
+The launcher runs typecheck, full Vitest suite and build under one child-subreaper
+boundary, then reaps only its own descendants. `PAPERCLIP_TEST_CGROUP_PARENT` can
+select an existing test delegation. Provider calls are fake; SSH, file transfer,
+watchdogs, cgroups, cancellation and staging are real. No live Boat VM is used.
+
+### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)
+
+Run later on the **Boat Pilot Builder** agent, after the reviewed package is
+installed. This is not a deployment or fleet-enable instruction. Never use
+production data, private dependencies, production credentials or real workspaces.
+
+1. Use a disposable public Rust canary with no external dependencies and an
+   installed supported toolchain. Keep the agent/model local and release any
+   whole-run pilot VM first. The host must supply this plugin's native realization
+   binding for the canary run. If it cannot, stop: do not forge a binding through
+   the agent API or reintroduce a workspace capability.
+2. Record start time, baseline provider usage and a hard cutoff. Set native driver
+   config `maxOffloadVms: 1`, `maxActive: 1`, `offloadIdleStopSeconds: 15`; retain
+   budget admission and provider auto-stop. Use a scoped operations key, never a
+   master key. Permit **one VM total and at most 30 aggregate billed VM-minutes**,
+   including starts, idle tail and stop lag. Do not create replacement VMs.
+3. Verify an existing guest delegation and a private persistent host artifact
+   directory. Missing delegation means expected local fallback, not permission
+   for a process-group-only workaround. Leave fleet gates off and report the
+   guest-image prerequisite.
+4. Apply both company flags and an allowlist containing only this canary's repo
+   ID; set `BOAT_OFFLOAD=1` only on that run. Execute
+   `boat-offload-cargo -- test --locked`. Observe incremental streams, an exit-0
+   receipt, real boot/cgroup identity and no second VM. A changed `Cargo.lock`
+   must yield a staged artifact/exit 74, with live source unchanged.
+5. Cancel a 60-second sleeping canary test via the shim's SIGINT path. Confirm
+   exit 130 and an empty cgroup after TERM/KILL grace. Separately test a short
+   command timeout (exit 124), then stop only the canary client's heartbeats to
+   verify guest interest expiry within 30 s. Do not restart a production worker
+   for testing. Inspect uncertain receipts without local replay.
+6. Set both company flags false and future clients to `BOAT_OFFLOAD=0`. Confirm
+   the sole VM becomes stopped/archived after the idle tail; use native pool stop
+   reconciliation if it does not. Confirm billed usage stayed within 30 VM-minutes,
+   preserve receipts/staged artifacts for review, then remove the canary/artifacts
+   through normal ownership controls. Failed ownership or cleanup is a stop
+   condition, never a reason for broader rollout.
 
 ## Run env allowlist
 

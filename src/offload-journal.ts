@@ -579,7 +579,7 @@ export class OffloadJournal {
         || this.now() >= identity.heartbeatDeadline || this.now() >= identity.guestDeadline!) return;
       const renewed = { ...identity, heartbeatDeadline: this.now() + 30_000 };
       await this.commit(record, { identity: renewed });
-      this.lifecycle.heartbeat(renewed);
+      await this.lifecycle.heartbeat(renewed);
     });
     return this.view(record);
   }

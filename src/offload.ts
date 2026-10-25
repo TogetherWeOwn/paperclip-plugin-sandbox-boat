@@ -722,7 +722,7 @@ export class OffloadExecutor {
     try {
       await this.persistPool();
       if (operation === "create") {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: false, failFast: true, noEnv: true });
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
         const id = sandboxIdOf(response);
         if (!id) throw new Error("create returned no sandbox id");
         vm.sandboxId = id;

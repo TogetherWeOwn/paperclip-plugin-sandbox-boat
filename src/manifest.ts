@@ -89,7 +89,23 @@ const manifest: PaperclipPluginManifestV1 = {
       offloadExecutorEnabled: {
         type: "boolean",
         default: false,
-        description: "Opt in to command-level offload through an installed lifecycle executor. Without that integration, commands still fall back locally. Does not enable the Cargo shim or change whole-run leases.",
+        description: "Opt in to command-level offload through a lifecycle executor. The stock SSH executor also requires the guest transport opt-in and native workspace params. Does not enable the Cargo shim or change whole-run leases.",
+      },
+      offloadGuestTransportEnabled: {
+        type: "boolean", default: false,
+        description: "Enable the stock Linux SSH guest transport for explicitly approved public, secret-free workspaces. Requires offloadExecutorEnabled, native realization metadata and verified delegated cgroup v2. Never send production data.",
+      },
+      offloadCgroupParent: {
+        type: "string",
+        description: "Canonical delegated cgroup v2 parent on the guest, below /sys/fs/cgroup/. Missing or unwritable delegation keeps commands local; the plugin never changes guest services or delegation.",
+      },
+      offloadAllowedRepos: {
+        type: "array", items: { type: "string" }, default: [],
+        description: "Exact canonical repository IDs approved for public, secret-free offload (for example repo:https://github.com/example/public). Empty denies every repository, even with both flags enabled.",
+      },
+      offloadArtifactRoot: {
+        type: "string",
+        description: "Operator-owned persistent host directory for private frozen snapshots and staged returns. Required for stock command offload; no automatic application to source files.",
       },
     },
   },

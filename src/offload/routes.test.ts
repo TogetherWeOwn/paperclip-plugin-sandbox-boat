@@ -130,6 +130,25 @@ describe("handleExec", () => {
     expect(t.starts.length).toBe(0);
   });
 
+  it("rejects argv controls with 400 before workspace lookup, journaling or dispatch", async () => {
+    const t = setup();
+    let lookups = 0;
+    const workspaces = t.host.workspaces;
+    t.host.workspaces = { get: async () => { lookups++; return null; } };
+    for (const code of [...Array.from({ length: 32 }, (_, i) => i), 127]) {
+      const response = await handleExec({ actor: ACTOR, companyId: COMPANY,
+        body: submitBody({ argv: ["test", `filter${String.fromCharCode(code)}suffix`] }) }, t.host);
+      expect(response.status).toBe(400);
+      expect(response.body).toMatchObject({ code: "OFFLOAD_INVALID_REQUEST" });
+    }
+    expect(lookups).toBe(0);
+    expect(t.starts).toHaveLength(0);
+    expect(t.store.data.size).toBe(0);
+    // Rejected input never reserves the command ID.
+    t.host.workspaces = workspaces;
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+  });
+
   it("rejects secret canaries and never journals secret values", async () => {
     const t = setup();
     const canary = "canary-gh-token-9f8e7d6c5b4a";

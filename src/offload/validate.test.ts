@@ -42,6 +42,32 @@ describe("validateSubmit", () => {
     expect(validateSubmit({ ...BASE, cwdRelative: "crates/core" }).ok).toBe(true);
   });
 
+  it.each([...Array.from({ length: 32 }, (_, i) => i), 127])("rejects argv control character U+%i", (code) => {
+    const result = validateSubmit({ ...BASE, argv: ["test", `filter${String.fromCharCode(code)}suffix`] });
+    expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
+  });
+
+  it.each(["\ud800", "\udfff", "a\ud83dz", "\ude00b"])("rejects argv with a lone surrogate %#", (arg) => {
+    const result = validateSubmit({ ...BASE, argv: ["test", arg] });
+    expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
+  });
+
+  it.each(["\ud800", "crates/\udfff", "a\ud83dz/b"])("rejects cwd with a lone surrogate %#", (cwdRelative) => {
+    expect(validateSubmit({ ...BASE, cwdRelative })).toEqual({ ok: false, detail: "cwdRelative holds invalid characters" });
+  });
+
+  it("accepts well-formed surrogate pairs (emoji) in cwd", () => {
+    expect(validateSubmit({ ...BASE, cwdRelative: "crates/ok-\ud83d\ude00" }).ok).toBe(true);
+  });
+
+  it("accepts well-formed surrogate pairs (emoji) in argv", () => {
+    expect(validateSubmit({ ...BASE, argv: ["test", "ok-\ud83d\ude00"] }).ok).toBe(true);
+  });
+
+  it("accepts printable Unicode and spaces in test arguments", () => {
+    expect(validateSubmit({ ...BASE, argv: ["test", "--", "a test", "café", "日本語"] }).ok).toBe(true);
+  });
+
   it("rejects more than 256 args", () => {
     expect(validateSubmit({ ...BASE, argv: Array.from({ length: 257 }, (_, i) => `a${i}`) }).ok).toBe(false);
   });
