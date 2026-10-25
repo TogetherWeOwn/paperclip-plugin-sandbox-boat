@@ -35,6 +35,7 @@ import { boatApi, waitReady } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
+import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
@@ -141,6 +142,7 @@ export interface ExecutionWorkspaceReader {
 
 export interface ManagerDeps {
   state: StateClientLike;
+  accountId?: string;
   logger: ManagerLogger;
   issues?: IssueReader | null;
   executionWorkspaces?: ExecutionWorkspaceReader | null;
@@ -221,6 +223,9 @@ function errorText(error: unknown): string {
 
 export class BoatVmManager {
   private readonly store: VmStateStore;
+  private readonly accountState: StateClientLike;
+  private readonly accountId: string;
+  private readonly accounts = new Map<string, AccountLedger>();
   private readonly ssh: SshManager;
   private readonly logger: ManagerLogger;
   private readonly issues: IssueReader | null;
@@ -256,6 +261,10 @@ export class BoatVmManager {
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.ssh = deps.ssh ?? new SshManager(deps.logger, this.sleep);
+    // Without an explicit credential-free account identity, conservatively group
+    // this worker's provider clients. Never persist a key or partition by company.
+    this.accountState = deps.state;
+    this.accountId = deps.accountId ?? "boat-default-account";
   }
 
   // ---------------------------------------------------------------- offload
@@ -386,6 +395,18 @@ export class BoatVmManager {
     return boatApi({ apiKey: resolveApiKey(config), apiBase: config.apiBase });
   }
 
+  private account(config: BoatDriverConfig): AccountLedger {
+    // Bind provider receipts and counter deltas to the same credential group as
+    // the sweep's inventory. Persist only an opaque digest, never credentials.
+    const scope = createHash("sha256").update(`${config.apiBase}\u0000${resolveApiKey(config)}`).digest("hex");
+    let ledger = this.accounts.get(scope);
+    if (!ledger) {
+      ledger = new AccountLedger(this.accountState, this.accountId, this.now, scope);
+      this.accounts.set(scope, ledger);
+    }
+    return ledger;
+  }
+
   private costApi(config: BoatDriverConfig): BoatApiLike {
     return boatApi({ apiKey: resolveCostApiKey(config), apiBase: config.apiBase });
   }
@@ -475,19 +496,6 @@ export class BoatVmManager {
     );
   }
 
-  private async guardBudget(config: BoatDriverConfig, context: Record<string, unknown>): Promise<void> {
-    const snapshot = await this.readBudget(config);
-    const refusal = checkBudget(snapshot, config, config.size);
-    if (refusal) {
-      this.logger.warn(`boat budget guard refused a VM start: limit=${refusal.limit}`, {
-        limit: refusal.limit,
-        ...refusal.details,
-        ...context,
-      });
-      throw new BoatBudgetError(refusal);
-    }
-  }
-
   private mapStartError(op: string, info: BoatErrorInfo, config: BoatDriverConfig): BoatProviderError {
     const nothing = "Nothing was started or billed.";
     const code = info.code ?? "";
@@ -549,12 +557,37 @@ export class BoatVmManager {
     config: BoatDriverConfig,
     call: () => Promise<T>,
     settled?: () => Promise<boolean>,
+    accountContext: { sandboxId?: string; ttlSeconds?: number } = {},
   ): Promise<T | null> {
+    const api = this.opsApi(config);
+    const request = { ...config, operation: op, sandboxId: accountContext.sandboxId,
+      jobSeconds: accountContext.ttlSeconds ?? config.autoStopMinutes * 60, tailSeconds: 0 };
+    const reservation = await this.account(config).reserve(api, request).catch((error) => {
+      if (error instanceof BoatBudgetError) this.logger.warn(`boat budget guard refused a VM start: limit=${error.limit}`, { limit: error.limit });
+      throw error;
+    });
     let noMachine = 0;
     let transient = 0;
+    // Any attempt whose effect is unknown poisons later certainty: a refusal of
+    // attempt two is not proof that attempt one never happened. Once set, the
+    // hold is retained until an authoritative receipt reconciles the effect.
+    let uncertainEffect = false;
     for (;;) {
+      if (noMachine > 0 || transient > 0) {
+        try {
+          await this.account(config).revalidate(api, reservation, request);
+        } catch (error) {
+          // The retry cannot continue. A no_ready_machine-only history proves
+          // no start occurred; anything else retains the hold. Without this the
+          // intent stays unsettled, active and unreconciliable forever.
+          const definitive = noMachine > 0 && transient === 0 && !uncertainEffect;
+          await this.account(config).failed(reservation, definitive);
+          throw error;
+        }
+      }
+      let response: T;
       try {
-        return await call();
+        response = await call();
       } catch (error) {
         const info = await describeBoatError(error);
         if (info.status === 503 && info.code === "no_ready_machine" && noMachine < config.noReadyMachineRetries) {
@@ -565,21 +598,35 @@ export class BoatVmManager {
         }
         if (info.status === 409 && info.code === "idempotency_in_progress" && transient < 5) {
           transient += 1;
+          uncertainEffect = true;
           await this.sleep(2000);
           continue;
         }
         if (op === "resume" && info.status === 409 && (info.code === "sandbox_resuming" || info.code === "sandbox_securing")) {
+          await this.account(config).started(api, reservation, accountContext.sandboxId!);
           return null;
         }
         const ambiguous = info.status == null || (info.status >= 500 && info.code !== "no_ready_machine" && info.code !== "out_of_capacity");
         if (ambiguous && transient < 2) {
-          if (settled && (await settled().catch(() => false))) return null;
+          if (settled && (await settled().catch(() => false))) {
+            await this.account(config).started(api, reservation, accountContext.sandboxId!);
+            return null;
+          }
           transient += 1;
+          uncertainEffect = true;
           await this.sleep(1500 * transient);
           continue;
         }
+        await this.account(config).failed(reservation, !uncertainEffect && await definitiveStartRejection(error));
         throw this.mapStartError(op, info, config);
       }
+      const id = toView((response as { sandbox?: unknown } | null)?.sandbox)?.id ?? accountContext.sandboxId;
+      if (!id) {
+        await this.account(config).failed(reservation, false);
+        throw new BoatProviderError("BOAT_START_FAILED", "provider reply omitted the sandbox identity; account reservation retained");
+      }
+      await this.account(config).started(api, reservation, id);
+      return response;
     }
   }
 
@@ -919,7 +966,11 @@ export class BoatVmManager {
     if (hard != null) ttlSeconds = Math.min(ttlSeconds, Math.floor((hard - this.now()) / 1000));
     if (ttlSeconds < 60) return;
     try {
-      const response = await this.opsApi(config).update({ sandboxId, ttlSeconds });
+      const api = this.opsApi(config);
+      const reservation = await this.account(config).reserve(api, { ...config, operation: "warm", sandboxId, allowCachedLimits: true,
+        jobSeconds: ttlSeconds, tailSeconds: 0 });
+      const response = await api.update({ sandboxId, ttlSeconds });
+      await this.account(config).started(api, reservation, sandboxId);
       const view = toView((response as { sandbox?: unknown }).sandbox);
       this.deadlines.set(sandboxId, view?.archiveAfter ? Date.parse(view.archiveAfter) : this.now() + ttlSeconds * 1000);
       this.logger.info("boat: extended auto-stop deadline while a command runs", { sandboxId, ttlSeconds });
@@ -1041,10 +1092,12 @@ export class BoatVmManager {
           sandboxId = sandbox.id;
           startKind = "reuse_running";
           archiveAfter = sandbox.archiveAfter;
+          const reservation = await this.account(config).reserve(api, { ...config, operation: "warm", sandboxId, allowCachedLimits: true,
+            jobSeconds: ttlSeconds, tailSeconds: 0 });
+          await this.account(config).started(api, reservation, sandboxId);
         } else {
           let resumed = false;
           if (sandbox) {
-            await this.guardBudget(config, context);
             const target = sandbox;
             const sizeChange = target.state === "archived" && target.type !== config.size ? { type: config.size } : {};
             try {
@@ -1056,6 +1109,7 @@ export class BoatVmManager {
                   const now = await this.getSandbox(api, target.id);
                   return !!now && UP_STATES.has(now.state);
                 },
+                { sandboxId: target.id, ttlSeconds },
               );
               sandboxId = target.id;
               startKind = "resume";
@@ -1069,7 +1123,6 @@ export class BoatVmManager {
             }
           }
           if (!resumed) {
-            if (!sandbox) await this.guardBudget(config, context);
             // Same key + same body on a retry returns the same sandbox and does not spend a start.
             const idempotencyKey = `pcboat-${createHash("sha256").update(`${name}\u0000${params.runId}`).digest("hex").slice(0, 40)}`;
             const response = await this.startCall("create", config, () =>
@@ -1084,6 +1137,8 @@ export class BoatVmManager {
                 ...(config.boatEnvironment ? { environment: config.boatEnvironment } : {}),
                 ...(config.templateSnapshot ? { from: config.templateSnapshot } : {}),
               }),
+              undefined,
+              { ttlSeconds },
             );
             const created = toView((response as { sandbox?: unknown } | null)?.sandbox);
             if (!created) throw new BoatProviderError("BOAT_START_FAILED", "boat create returned no sandbox.");
@@ -1209,7 +1264,7 @@ export class BoatVmManager {
             deleted = await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId, runId: params.runId, trigger: "failed start", reason });
           }
           if (!deleted) {
-            await this.stopAndConfirm(this.opsApi(config), sandboxId, 30_000).catch(() => false);
+            await this.stopAndConfirm(config, sandboxId, 30_000).catch(() => false);
             await this.store
               .update(params.companyId, (state) => {
                 const record = state.vms[key];
@@ -1389,7 +1444,6 @@ export class BoatVmManager {
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
         const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
         const startConfig = { ...config, size };
-        await this.guardBudget(startConfig, { sandboxId, reason: "resume_for_execute" });
         const response = await this.startCall(
           "resume",
           startConfig,
@@ -1404,6 +1458,7 @@ export class BoatVmManager {
             const now = await this.getSandbox(api, sandboxId);
             return !!now && UP_STATES.has(now.state);
           },
+          { sandboxId, ttlSeconds: this.ttlSeconds(config, this.hardDeadlines.get(sandboxId) ?? null) },
         );
         this.noteDeadline(sandboxId, toView((response as { sandbox?: unknown } | null)?.sandbox)?.archiveAfter ?? null);
         this.logger.info("boat: resumed a stopped VM for a command", { sandboxId, previousState: sandbox.state });
@@ -1462,13 +1517,23 @@ export class BoatVmManager {
    * A slow release keeps the Paperclip lease active while its run is terminal,
    * and Paperclip's orphan-lease sweep then destroys the warm VM.
    */
-  private async requestStop(api: BoatApiLike, sandboxId: string): Promise<{ accepted: boolean; gone: boolean }> {
+  private async requestStop(config: BoatDriverConfig, sandboxId: string): Promise<{ accepted: boolean; gone: boolean }> {
+    const api = this.opsApi(config);
     try {
-      await api.stop({ sandboxId });
+      const response = await api.stop({ sandboxId });
+      const view = toView((response as { sandbox?: unknown }).sandbox);
+      if (view && (view.state === "archived" || view.state === "cancelled")) await this.account(config).stopped(sandboxId);
       return { accepted: true, gone: false };
     } catch (error) {
       const info = await describeBoatError(error);
-      if (info.status === 404) return { accepted: true, gone: true };
+      if (info.status === 404) {
+        // Definitive: the provider has no such sandbox, so nothing is billing.
+        // Record it now instead of holding capacity until the next reconcile.
+        await this.account(config).stopped(sandboxId).catch(() => {
+          this.logger.warn("boat: stop-404 ledger write failed; reconcile will converge", { sandboxId });
+        });
+        return { accepted: true, gone: true };
+      }
       if (info.status === 409 && ["sandbox_stopping", "sandbox_not_ready", "machine_not_running"].includes(info.code ?? "")) {
         return { accepted: true, gone: false };
       }
@@ -1495,10 +1560,24 @@ export class BoatVmManager {
     }
   }
 
-  /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
-  private async stopAndConfirm(api: BoatApiLike, sandboxId: string, timeoutMs: number): Promise<boolean> {
+  /** The provider confirmation alone decides a stop. A ledger failure afterwards
+   * must not read as a failed stop: the VM is already stopped, and the next
+   * reconcile converges the unrecorded receipt. */
+  private async recordStopReceipt(config: BoatDriverConfig, sandboxId: string): Promise<void> {
     try {
-      await api.stop({ sandboxId });
+      await this.account(config).stopped(sandboxId);
+    } catch {
+      this.logger.warn("boat: stop receipt persistence failed; reconcile will converge", { sandboxId });
+    }
+  }
+
+  /** Stop, then poll until boat reports `archived` (billing has stopped). Returns false when not confirmed in time. */
+  private async stopAndConfirm(config: BoatDriverConfig, sandboxId: string, timeoutMs: number): Promise<boolean> {
+    const api = this.opsApi(config);
+    try {
+      const response = await api.stop({ sandboxId });
+      const view = toView((response as { sandbox?: unknown }).sandbox);
+      if (view && (view.state === "archived" || view.state === "cancelled")) await this.recordStopReceipt(config, sandboxId);
     } catch (error) {
       const info = await describeBoatError(error);
       if (info.status === 404) return true;
@@ -1509,8 +1588,10 @@ export class BoatVmManager {
     const deadline = this.now() + timeoutMs;
     for (;;) {
       const sandbox = await this.getSandbox(api, sandboxId).catch(() => undefined);
-      if (sandbox === null) return true;
-      if (sandbox && (sandbox.state === "archived" || sandbox.state === "cancelled")) return true;
+      if (sandbox === null || (sandbox && (sandbox.state === "archived" || sandbox.state === "cancelled"))) {
+        await this.recordStopReceipt(config, sandboxId);
+        return true;
+      }
       if (sandbox?.stopStatus === "failing") {
         // boat refused the stop because the save failed; it retries by itself and
         // does not bill while the stop waits (docs.boat.dev/snapshots/stop).
@@ -1648,7 +1729,7 @@ export class BoatVmManager {
       // boat is still saving the snapshot (4-65 s). Waiting for the save here
       // keeps the Paperclip lease active past its run, and the orphan-lease
       // sweep then destroys the warm VM. The idle sweep confirms the save.
-      const stop = await this.requestStop(api, sandboxId);
+      const stop = await this.requestStop(config, sandboxId);
       let current = await this.getSandbox(api, sandboxId).catch(() => undefined);
       if (stop.accepted && !stop.gone && (current === undefined || (current && UP_STATES.has(current.state)))) {
         current = await this.waitUntilNotUp(api, sandboxId, current);
@@ -2331,6 +2412,12 @@ export class BoatVmManager {
         report.errors.push(`list: ${errorText(error)}`);
         continue;
       }
+      // Every intent is reconciled only through its persisted credential group,
+      // not whichever inventory happened to list first. Legacy unscoped holds
+      // cannot be assigned to a client when multiple groups are configured.
+      await this.account(primary.config).reconcile(this.opsApi(primary.config), sandboxes, true, accounts.size === 1).catch(() => {
+        report.errors.push("account reservation reconciliation failed");
+      });
       const seen = new Set(sandboxes.map((s) => s.id));
       const unknownOwner = ownershipUnknown(cachedList);
       const leftAlone: string[] = [];
@@ -2411,7 +2498,7 @@ export class BoatVmManager {
                   return "deleted" as const;
                 }
               }
-              const confirmed = await this.stopAndConfirm(api, sandbox.id, config.stopConfirmTimeoutMs);
+              const confirmed = await this.stopAndConfirm(config, sandbox.id, config.stopConfirmTimeoutMs);
               if (record) {
                 await this.store.update(companyId, (doc) => {
                   const current = findBySandboxId(doc, sandbox.id);

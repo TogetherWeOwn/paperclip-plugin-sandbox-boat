@@ -4,13 +4,16 @@
 // Scope: warm pick, resume/create up to maxOffloadVms, FIFO queue, idle stop
 // after C with generation-guarded timers, start/compute budget fallback to
 // OFFLOAD_UNAVAILABLE, per-command usage + expected-cost log, idempotency by
-// commandId. Durable journal/receipt recovery is injectable; live dispatch,
-// guest lifecycle enforcement, sweep wiring and adaptive policy remain unwired.
-import { checkBudget, readBudget } from "./budget.js";
+// commandId. Durable journal/receipt recovery and account admission are both
+// wired here; sync adapter and cancel/read routes remain separate slices.
+import { createHash } from "node:crypto";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { PRICE_PER_HOUR } from "./size-policy.js";
+import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
+import type { AccountReservation, AccountUsageRow } from "./account-ledger.js";
 import { OffloadJournal, commandDigest, commandKey, type OffloadDurableDeps, type OffloadIdentity } from "./offload-journal.js";
+import type { StateClientLike } from "./state.js";
 export { OffloadGuestRunner } from "./offload-guest.js";
 export type { OffloadStore, OffloadIdentity, OffloadRecord, OffloadCommandView, OffloadDurableDeps } from "./offload-journal.js";
 
@@ -66,22 +69,7 @@ export type OffloadResult =
       reason: string;
     };
 
-export interface OffloadUsageRow {
-  commandId: string;
-  runId: string;
-  cardId: string;
-  repoId: string;
-  sandboxId: string;
-  warm: OffloadWarm;
-  queueWaitMs: number;
-  seconds: number;
-  dollars: number;
-  exitCode: number;
-  outcome: "completed" | "unknown";
-  // Unknown transport outcomes retain elapsed cost as a lower bound, not a bill.
-  estimated: boolean;
-  at: string;
-}
+export type OffloadUsageRow = AccountUsageRow;
 
 export interface OffloadExecutorConfig {
   maxOffloadVms: number;
@@ -106,6 +94,10 @@ export interface OffloadLogger {
 }
 
 export interface OffloadDeps extends Partial<OffloadDurableDeps> {
+  state: StateClientLike;
+  // Stable, credential-free provider identity, shared with the whole-run manager.
+  accountId: string;
+  poolId: string;
   boat: BoatApiLike;
   logger: OffloadLogger;
   now: () => number;
@@ -124,6 +116,8 @@ interface PoolVm {
   idleHandle: unknown | null;
   stopDueAt: number | null;
   stopAttempts: number;
+  accountReservation?: AccountReservation;
+  tailSeconds?: number;
 }
 
 type Reservation = { kind: "run"; vm: PoolVm; warm: OffloadWarm };
@@ -136,6 +130,11 @@ interface Queued {
   reject: (error: unknown) => void;
   timerHandle: unknown | null;
   refusal: Promise<void> | null;
+}
+
+function digestOf(command: OffloadCommand): string {
+  // Internal payload identity; never included in logs or usage.
+  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId, argv: command.argv });
 }
 
 function sandboxIdOf(response: unknown): string | null {
@@ -157,6 +156,8 @@ const DEFAULTS = {
 
 export class OffloadExecutor {
   private readonly boat: BoatApiLike;
+  private readonly ledger: AccountLedger;
+  private readonly poolId: string;
   private readonly logger: OffloadLogger;
   private readonly now: () => number;
   private readonly timers: OffloadTimers;
@@ -168,7 +169,6 @@ export class OffloadExecutor {
   private readonly queue: Queued[] = [];
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
-  private readonly usage: OffloadUsageRow[] = [];
   private readonly stopFailures = new Set<string>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
@@ -201,6 +201,9 @@ export class OffloadExecutor {
     this.runCommand = this.durable
       ? (vm, command) => this.durable!.run(vm, command, deps.runCommand)
       : deps.runCommand;
+    if (!(deps.state && deps.accountId && deps.poolId)) throw new Error("account admission requires durable state, accountId and poolId");
+    this.poolId = deps.poolId;
+    this.ledger = new AccountLedger(deps.state, deps.accountId, this.now);
   }
 
   async recover(): Promise<void> { await this.requireDurable().recover(); }
@@ -243,8 +246,12 @@ export class OffloadExecutor {
     });
   }
 
-  getUsage(): OffloadUsageRow[] {
-    return [...this.usage];
+  getUsage(): AccountUsageRow[] {
+    return this.ledger.usage(this.poolId);
+  }
+
+  async reconcile(): Promise<void> {
+    await this.ledger.reconcile(this.boat, undefined, false, false, this.poolId);
   }
 
   async shutdown(): Promise<void> {
@@ -371,43 +378,15 @@ export class OffloadExecutor {
       if (vm.busy || vm.stopped || vm.quarantined) continue;
       if (!best || vm.lastActiveAt > best.lastActiveAt) best = vm;
     }
-    if (best) return this.reserveVm(best);
+    if (best) return this.accountClaim(command, best, "warm");
     // Most recently stopped compatible VM next.
     let stopped: PoolVm | null = null;
     for (const vm of this.pool) {
       if (vm.busy || !vm.stopped || vm.quarantined) continue;
       if (!stopped || vm.lastActiveAt > stopped.lastActiveAt) stopped = vm;
     }
-    if (stopped) {
-      const refusal = await this.budgetRefusal();
-      if (refusal) return { kind: "unavailable", reason: refusal };
-      this.reserveVm(stopped);
-      try {
-        await this.boat.resume({ sandboxId: stopped.sandboxId });
-      } catch (error) {
-        stopped.busy = false;
-        return { kind: "unavailable", reason: `resume failed: ${error instanceof Error ? error.message : String(error)}` };
-      }
-      stopped.stopped = false;
-      return { kind: "run", vm: stopped, warm: "cold" };
-    }
-    if (this.pool.length < this.config.maxOffloadVms) {
-      const refusal = await this.budgetRefusal();
-      if (refusal) return { kind: "unavailable", reason: refusal };
-      const placeholder: PoolVm = { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0 };
-      this.pool.push(placeholder);
-      try {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds: 7200, monitoring: false, failFast: true, noEnv: true });
-        const id = sandboxIdOf(response);
-        if (!id) throw new Error("boat create returned no sandbox id.");
-        placeholder.sandboxId = id;
-      } catch (error) {
-        const at = this.pool.indexOf(placeholder);
-        if (at >= 0) this.pool.splice(at, 1);
-        return { kind: "unavailable", reason: `create failed: ${error instanceof Error ? error.message : String(error)}` };
-      }
-      return { kind: "run", vm: placeholder, warm: "cold" };
-    }
+    if (stopped) return this.accountClaim(command, stopped, "resume");
+    if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
     if (this.queue.length >= this.config.queueLimit) {
       return { kind: "unavailable", reason: `queue full (${this.config.queueLimit} pending)` };
     }
@@ -461,17 +440,62 @@ export class OffloadExecutor {
     return entry.refusal;
   }
 
-  private async budgetRefusal(): Promise<string | null> {
-    let limits: unknown;
+  private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
+    const ledger = this.ledger!;
+    // Fund the provider-enforced TTL envelope, not the raw timeout: create,
+    // resume and warm update all clamp the deadline to whole seconds with a
+    // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
+    const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+    let reservation: AccountReservation;
     try {
-      limits = await this.boat.limits({});
-    } catch (error) {
-      return `limits unreadable: ${error instanceof Error ? error.message : String(error)}`;
+      reservation = await ledger.reserve(this.boat, { ...this.config, operation, sandboxId: existing?.sandboxId, poolId: this.poolId,
+        jobSeconds, tailSeconds: this.config.offloadIdleStopSeconds,
+        command: { commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId,
+          companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") } });
+    } catch {
+      return { kind: "unavailable", reason: "account admission refused: limits, capacity or durable state unavailable" };
     }
-    const snapshot = readBudget(limits);
-    const refusal = checkBudget(snapshot, { maxActive: this.config.maxActive, maxStartsPerDay: this.config.maxStartsPerDay, minComputeHoursLeft: this.config.minComputeHoursLeft } as Parameters<typeof checkBudget>[1], this.config.size);
-    if (refusal) return `${refusal.limit}: ${refusal.message}`;
-    return null;
+    const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0 };
+    this.reserveVm(vm);
+    vm.accountReservation = reservation;
+    vm.tailSeconds = reservation.tailSeconds;
+    if (!existing) this.pool.push(vm);
+    // Funded whole seconds at or above the enforced minimum, so the enforced
+    // deadline below equals the funded envelope exactly.
+    const ttlSeconds = Math.max(60, Math.ceil(jobSeconds + reservation.tailSeconds));
+    let effectConfirmed = operation === "warm";
+    try {
+      if (operation === "create") {
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: false, failFast: true, noEnv: true });
+        const id = sandboxIdOf(response);
+        if (!id) throw new Error("create returned no sandbox id");
+        vm.sandboxId = id;
+      } else if (operation === "resume") {
+        await this.boat.resume({ sandboxId: vm.sandboxId, ttlSeconds });
+      } else {
+        // Warm activity also needs a newly funded provider-enforced deadline.
+        await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds });
+      }
+      effectConfirmed = true;
+      vm.stopped = false;
+      vm.tailSeconds = await ledger.started(this.boat, reservation, vm.sandboxId);
+      // A metered resume may select C=300. Keep provider auto-stop aligned with
+      // the longer, already-funded reservation before starting the command.
+      if (vm.tailSeconds > reservation.tailSeconds) await this.boat.update({ sandboxId: vm.sandboxId,
+        ttlSeconds: Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds)) });
+      return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold" };
+    } catch (error) {
+      const definitive = !effectConfirmed && await definitiveStartRejection(error);
+      await ledger.failed(reservation, definitive).catch(() => {
+        // The original durable intent remains held. No command was dispatched;
+        // a failing follow-up write must not poison the idempotency receipt.
+        this.logger.error("boat offload start reconciliation persistence failed; intent retained");
+      });
+      vm.busy = false;
+      if (!definitive) vm.quarantined = true;
+      else if (!existing) this.pool.splice(this.pool.indexOf(vm), 1);
+      return { kind: "unavailable", reason: definitive ? "provider rejected start; no command dispatched" : "start outcome uncertain; reservation retained, no command dispatched" };
+    }
   }
 
   private async runOnVm(vm: PoolVm, command: OffloadCommand, warm: OffloadWarm, queueWaitMs: number): Promise<OffloadResult> {
@@ -494,10 +518,23 @@ export class OffloadExecutor {
     }
     this.finish(this.cacheKey(command), result);
     if (result.status === "unavailable") {
+      // A durable cancellation won the race after admission: no command ran.
+      // Close the funded reservation with a zero-length command interval.
+      await this.ledger.finished(vm.accountReservation!, false, {
+        warm, queueWaitMs, exitCode: 0, outcome: "completed", expectedSeconds: 0, expectedDollars: 0,
+      }).catch(() => {
+        this.logger.error("boat offload usage persistence failed; account reservation retained");
+      });
       await this.releaseVm(vm);
       return result;
     }
-    this.usage.push({ commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId, sandboxId: vm.sandboxId, warm, queueWaitMs, seconds: result.seconds, dollars: result.dollars, exitCode: result.exitCode, outcome: result.status, estimated: result.status === "unknown", at: new Date(this.now()).toISOString() });
+    let accountingFailed = false;
+    await this.ledger.finished(vm.accountReservation!, result.status === "unknown", {
+      warm, queueWaitMs, exitCode: result.exitCode, outcome: result.status, expectedSeconds: result.seconds, expectedDollars: result.dollars,
+    }).catch(() => {
+      accountingFailed = true;
+      this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
+    });
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
       commandId: command.commandId,
@@ -510,7 +547,7 @@ export class OffloadExecutor {
       outcome: result.status,
       estimated: result.status === "unknown",
     });
-    if (result.status === "unknown") {
+    if (result.status === "unknown" || accountingFailed) {
       await this.quarantineVm(vm, command);
     } else {
       await this.releaseVm(vm);
@@ -540,18 +577,19 @@ export class OffloadExecutor {
           next.timerHandle = null;
           // Transfer a busy reservation, not an idle VM to rediscover. A new
           // arrival cannot steal this VM before the FIFO waiter continues.
-          next.resolve(this.reserveVm(vm));
-          return;
+          const claim = await this.accountClaim(next.command, vm, "warm");
+          next.resolve(claim.kind === "unavailable" ? this.finish(next.command.commandId, this.unavailable(next.command, claim.reason)) : claim);
+          if (claim.kind === "run") return;
         }
       }
       vm.busy = false;
       vm.generation += 1;
       vm.stopAttempts = 0;
-      vm.stopDueAt = this.now() + (this.closed ? 0 : this.config.offloadIdleStopSeconds * 1000);
+      vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
       if (this.closed) {
         await this.stopVm(vm);
       } else {
-        this.scheduleIdleStop(vm, vm.generation, this.config.offloadIdleStopSeconds * 1000);
+        this.scheduleIdleStop(vm, vm.generation, (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
       }
     });
   }
@@ -578,12 +616,23 @@ export class OffloadExecutor {
 
   private async stopVm(vm: PoolVm): Promise<boolean> {
     vm.stopAttempts += 1;
+    // The provider stop alone decides success. A ledger failure afterwards must
+    // not read as a failed stop: the VM is already stopped, and retrying the
+    // stop (or treating the VM as warm) would bill or quarantine wrongly.
+    // Unrecorded receipts converge on the next reconcile().
+    let response: unknown;
     try {
-      await this.boat.stop({ sandboxId: vm.sandboxId });
+      response = await this.boat.stop({ sandboxId: vm.sandboxId });
     } catch {
       this.stopFailures.add(vm.sandboxId);
       this.logger.warn("boat offload idle stop failed; retry required", { sandboxId: vm.sandboxId, attempt: vm.stopAttempts });
       return false;
+    }
+    try {
+      const state = (response as { sandbox?: { state?: string } } | null)?.sandbox?.state;
+      if (state === "archived" || state === "cancelled") await this.ledger.stopped(vm.sandboxId);
+    } catch {
+      this.logger.error("boat offload stop receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
     }
     this.stopFailures.delete(vm.sandboxId);
     vm.stopped = true;

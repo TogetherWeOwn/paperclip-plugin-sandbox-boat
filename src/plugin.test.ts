@@ -547,11 +547,15 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
   });
 
   it("returns a stopped receipt at once when the stop is still pending; StopLease only throws when boat refuses the stop", async () => {
-    const lease = await acquire("run-1");
+    // Receipt-only scenario: the first two VMs remain archiving and must still
+    // consume account slots, even though FakeBoat's active counter lags at zero.
+    const receiptConfig = { maxActive: 3 };
+    fake.limitsResponse = trialLimits({ maxActiveSandboxes: 3 });
+    const lease = await acquire("run-1", {}, receiptConfig);
     fake.stopMode = "never";
     await expect(release(lease)).resolves.toEqual({ providerLeaseId: lease.providerLeaseId, state: "stopped" });
     // Another card: its stop is accepted too, so StopLease returns a receipt instead of waiting.
-    const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
+    const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" }, receiptConfig);
     await expect(
       plugin.definition.onEnvironmentStopLease!({
         ...base(),
@@ -560,9 +564,13 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
         resourceDisposition: "stop_and_retain",
       } as never),
     ).resolves.toEqual({ providerLeaseId: second.providerLeaseId, state: "stopped" });
+    expect(fake.boxes.get(lease.providerLeaseId!)?.state).toBe("archiving");
+    expect(fake.boxes.get(second.providerLeaseId!)?.state).toBe("archiving");
+    expect(fake.callsOf("create")).toHaveLength(2);
     // But when boat refuses the stop and the VM stays up, StopLease throws.
     fake.stopMode = "immediate";
-    const third = await acquire("run-3", { executionWorkspaceId: "66666666-6666-4666-8666-666666666666" });
+    const third = await acquire("run-3", { executionWorkspaceId: "66666666-6666-4666-8666-666666666666" }, receiptConfig);
+    expect(fake.callsOf("create")).toHaveLength(3);
     fake.failNext("stop", responseError(500, { code: "http_500" }));
     await expect(
       plugin.definition.onEnvironmentStopLease!({

@@ -3,6 +3,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { OffloadExecutor } from "./offload.js";
 import type { OffloadCommand, OffloadDeps, OffloadResult } from "./offload.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
+import { JsonState } from "./test-support/account-admission.fixture.js";
 
 const EPOCH = Date.parse("2026-10-23T10:00:00Z");
 const completed = () => ({ exitCode: 0, seconds: 1 });
@@ -29,7 +30,10 @@ function diagnostics(executor: OffloadExecutor) {
   };
 }
 
+let nextAccount = 0;
+
 function setup(runCommand: OffloadDeps["runCommand"] = async () => completed()) {
+  const account = { state: new JsonState(), accountId: `legacy-stop-account-${++nextAccount}`, poolId: "legacy-stop" };
   const clock = { t: EPOCH };
   const now = () => clock.t;
   const fake = new FakeBoat({ now });
@@ -58,6 +62,7 @@ function setup(runCommand: OffloadDeps["runCommand"] = async () => completed()) 
   };
   const starts: Array<{ sandboxId: string; commandId: string }> = [];
   const executor = new OffloadExecutor({
+    ...account,
     boat: fake as unknown as BoatApiLike,
     logger: { info() {}, warn() {}, error() {} },
     now,
