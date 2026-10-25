@@ -50,6 +50,7 @@ const plugin = definePlugin({
       executionWorkspaces: {
         get: async (workspaceId, companyId) => ctx.executionWorkspaces.get(workspaceId, companyId),
       },
+      offloadConfig: async (companyId) => ctx.config.get(companyId),
       ...managerOverrides,
     });
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {

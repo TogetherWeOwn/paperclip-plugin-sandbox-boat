@@ -79,11 +79,14 @@ function buildEnv(processEnv: ShimRequest["processEnv"]): { local: true } | { lo
   return { local: false, env };
 }
 
-function asReadView(json: unknown, commandId: string): OffloadReadResponse | null {
+function asReadView(json: unknown, commandId: string, after = 0): OffloadReadResponse | null {
   if (!json || typeof json !== "object") return null;
   const view = json as Record<string, unknown>;
   if (view.commandId !== commandId || typeof view.state !== "string") return null;
   if (!Array.isArray(view.events)) return null;
+  const cursor = view.nextCursor;
+  if (typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < after
+    || (view.events.length > 0 && cursor === after)) return null;
   return view as unknown as OffloadReadResponse;
 }
 
@@ -155,11 +158,12 @@ function render(ctx: PollContext, view: OffloadReadResponse): void {
 }
 
 /**
- * Finish a terminal view. Returns the process exit, or null while running.
+ * Finish only after an empty terminal page confirms broker output is drained.
+ * Every size-limited page carries state/result, even with more output unread.
  * Local fallback happens only on a durable never-started receipt.
  */
 async function finishIfTerminal(ctx: PollContext, view: OffloadReadResponse): Promise<number | null> {
-  if (!TERMINAL.has(view.state)) return null;
+  if (!TERMINAL.has(view.state) || view.events.length > 0) return null;
   if (view.terminalError === "OFFLOAD_OUTPUT_LIMIT") return OFFLOAD_EXIT.syncStaged;
   if (!view.result) {
     if (view.state === "not_started" && view.remoteStarted === false && view.fallbackSafe === true) {
@@ -192,12 +196,15 @@ async function poll(ctx: PollContext, cursor: number): Promise<number> {
       response = { ok: false, error: "read failed" };
     }
     if (response.ok && response.status === 200) {
-      const view = asReadView(response.json, commandId);
+      const view = asReadView(response.json, commandId, cursor);
       if (view) {
         render(ctx, view);
         cursor = view.nextCursor;
         const done = await finishIfTerminal(ctx, view);
         if (done !== null) return done;
+        // Drain terminal pages immediately, without poll sleeps/heartbeats.
+        // Cursor validation above prevents a non-advancing response loop.
+        if (TERMINAL.has(view.state) && view.events.length > 0) continue;
       }
     } else if (response.ok && response.status === 410) {
       return OFFLOAD_EXIT.executionUnknown;
@@ -250,16 +257,13 @@ async function recover(ctx: PollContext): Promise<number> {
       response = { ok: false, error: "read failed" };
     }
     if (response.ok && response.status === 200) {
-      const view = asReadView(response.json, commandId);
+      const view = asReadView(response.json, commandId, cursor);
       if (view) {
         render(ctx, view);
         cursor = view.nextCursor;
-        if (view.state === "not_started" && view.remoteStarted === false && view.fallbackSafe === true) {
-          return deps.runLocal(ctx.request.argv);
-        }
         const done = await finishIfTerminal(ctx, view);
         if (done !== null) return done;
-        if (isLive(view.state)) return poll(ctx, cursor);
+        if (isLive(view.state) || view.events.length > 0) return poll(ctx, cursor);
         // Queued/unknown: the submit may still land; keep waiting.
       }
     } else if (response.ok && response.status === 410) {

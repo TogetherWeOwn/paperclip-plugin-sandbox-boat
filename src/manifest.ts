@@ -84,6 +84,16 @@ const manifest: PaperclipPluginManifestV1 = {
       capability: "api.routes.register",
     },
   ],
+  instanceConfigSchema: {
+    type: "object",
+    properties: {
+      offloadExecutorEnabled: {
+        type: "boolean",
+        default: false,
+        description: "Opt in to command-level offload through an installed lifecycle executor. Without that integration, commands still fall back locally. Does not enable the Cargo shim or change whole-run leases.",
+      },
+    },
+  },
   environmentDrivers: [
     {
       driverKey: DRIVER_KEY,

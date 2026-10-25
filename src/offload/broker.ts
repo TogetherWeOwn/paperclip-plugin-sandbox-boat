@@ -1,14 +1,15 @@
 // Offload command broker: journal, incremental output, heartbeat and cancel.
 // Design: docs/adr/0001-heavy-command-offload.md. Routes delegate here after
 // host authentication; the shim polls here. Remote execution itself is an
-// injected OffloadBackend (the executor follow-up grows start/cancel/streaming;
-// until then the plugin wires a backend that never dispatches).
+// injected OffloadBackend; the executor adapter is explicitly opt-in. Without
+// an installed lifecycle executor, the plugin never dispatches.
 //
 // Durability: the journal lives in the injected store (plugin state in prod),
 // so a submit is never replayed after a crash. Backend handles are process
 // local: after a restart a live command reads as `unknown` (a hold, never
 // permission to replay) until the executor follow-up reconciles the guest.
 
+import { runOutsideInvocation } from "../proactive.js";
 import { offloadError } from "./errors.js";
 import {
   OFFLOAD_BOUNDS,
@@ -57,6 +58,7 @@ export interface BackendCommand {
   cardId: string;
   repoId: string;
   profileId: string;
+  executionWorkspaceId: string;
   cwdRelative: string;
   argv: string[];
   env: Record<string, string>;
@@ -68,6 +70,7 @@ export interface BackendCompletion {
   exitCode: number;
   signal: number | null;
   timedOut: boolean;
+  cancelled?: boolean;
   syncBack: OffloadSyncBack;
   usageRecordId?: string | null;
 }
@@ -80,9 +83,16 @@ export interface OffloadOutputSink {
   fail(error: Error): void;
 }
 
+/** Authoritative cancellation receipt, including sync settlement. Legacy test
+ * backends may return void; lifecycle executors must return actual evidence. */
+export type BackendCancellation =
+  | { state: "not_started"; remoteStarted: false; fallbackSafe: true; result: null }
+  | { state: "completed" | "cancelled"; remoteStarted: true; fallbackSafe: false; result: BackendCompletion };
+
 export interface OffloadBackendHandle {
   readonly done: Promise<void>;
-  cancel(): Promise<void>;
+  cancel(): Promise<void | BackendCancellation>;
+  heartbeat?(): Promise<void>;
 }
 
 export interface OffloadBackend {
@@ -155,6 +165,7 @@ export class OffloadBroker {
   /** Commands whose sink journal write failed: their persisted state is untrustworthy. */
   private readonly poisoned = new Set<string>();
   private readonly chains = new Map<string, Promise<unknown>>();
+  private readonly expiryCancellations = new Map<string, Promise<void>>();
 
   constructor(deps: OffloadBrokerDeps) {
     this.store = deps.store;
@@ -298,7 +309,7 @@ export class OffloadBroker {
   }
 
   private trackLive(record: JournalRecord): void {
-    if (TERMINAL.has(record.state) || record.state === "unknown") this.known.delete(record.commandId);
+    if (TERMINAL.has(record.state) || (record.state === "unknown" && !this.handles.has(record.commandId))) this.known.delete(record.commandId);
     else this.known.add(record.commandId);
   }
 
@@ -374,6 +385,7 @@ export class OffloadBroker {
             cardId: principal.cardId,
             repoId: principal.repoId,
             profileId: principal.profileId,
+            executionWorkspaceId: request.executionWorkspaceId,
             cwdRelative: request.cwdRelative,
             argv: request.argv,
             env: request.env,
@@ -405,112 +417,120 @@ export class OffloadBroker {
   async heartbeat(commandId: string, principal: BrokerAuth): Promise<BrokerResponse> {
     // Worker-owned expiry rides on client heartbeats (every 5 s while any
     // client is alive); the sweep stays the slower crash backstop.
-    await this.sweepExcept(commandId, this.now());
+    await this.sweepExcept(commandId, this.now(), false);
     // Renew from a fresh clock: a slow sweep must not hand back a deadline
     // that is already stale.
     const at = this.now();
-    return this.chain(`cmd:${commandId}`, async () => {
+    const response = await this.chain(`cmd:${commandId}`, async (): Promise<BrokerResponse | null> => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
       if (!TERMINAL.has(resolved.state) && resolved.state !== "unknown") {
-        if (at >= resolved.commandDeadline) {
-          await this.expireLoaded(resolved, at, true);
-        } else {
+        if (at >= resolved.commandDeadline) return null;
+        try {
+          await this.handles.get(commandId)?.heartbeat?.();
           resolved.heartbeatDeadline = at + OFFLOAD_BOUNDS.heartbeatExpiryMs;
-          await this.save(resolved);
+        } catch {
+          resolved.state = "unknown";
+          resolved.fallbackSafe = false;
         }
+        await this.save(resolved);
       }
       return { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) };
     });
+    return response ?? await this.cancelCommand(commandId, principal, at, true);
   }
 
   async cancel(commandId: string, principal: BrokerAuth, _reason: string): Promise<BrokerResponse> {
-    const at = this.now();
-    return this.chain(`cmd:${commandId}`, async () => {
+    return await this.cancelCommand(commandId, principal, this.now(), false);
+  }
+
+  private async cancelCommand(commandId: string, principal: BrokerAuth, now: number, timedOut: boolean): Promise<BrokerResponse> {
+    const pending = await this.chain<{ response: BrokerResponse } | { handle: OffloadBackendHandle }>(`cmd:${commandId}`, async () => {
+      const resolved = await this.resolve(commandId, principal);
+      if (!isRecord(resolved)) return { response: resolved };
+      const handle = this.handles.get(commandId);
+      // Unknown is a replay hold, not a reason to ignore a still-live handle.
+      // After restart, missing handles remain unknown and never grant fallback.
+      if (TERMINAL.has(resolved.state) || !handle) {
+        return { response: { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) } };
+      }
+      return { handle };
+    });
+    if ("response" in pending) return pending.response;
+
+    // Do not hold the journal chain while joining remote cancellation. The
+    // adapter drains output before done settles; its sink callbacks must commit
+    // before the cancellation receipt can make the broker record terminal.
+    let receipt: BackendCancellation | void = undefined;
+    let failed = false;
+    try { receipt = await pending.handle.cancel(); }
+    catch { failed = true; }
+
+    return await this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
-      if (TERMINAL.has(resolved.state) || resolved.state === "unknown") {
-        return { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) };
-      }
-      const handle = this.handles.get(commandId);
-      if (handle) {
-        try {
-          await handle.cancel();
-        } catch {
-          // Cancel outcome uncertain: hold for reconciliation, never replay.
+      if (!TERMINAL.has(resolved.state)) {
+        if (failed || this.poisoned.has(commandId)) {
           resolved.state = "unknown";
-          await this.save(resolved);
-          return { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) };
+          resolved.fallbackSafe = false;
+        } else {
+          this.handles.delete(commandId);
+          if (receipt) {
+            resolved.state = receipt.state;
+            resolved.remoteStarted = receipt.remoteStarted;
+            resolved.fallbackSafe = receipt.fallbackSafe;
+            resolved.result = receipt.result ? { ...receipt.result,
+              cancelled: receipt.result.cancelled === true, usageRecordId: receipt.result.usageRecordId ?? null } : null;
+          } else if (!resolved.remoteStarted) {
+            resolved.state = "not_started";
+            resolved.fallbackSafe = true;
+            resolved.result = null;
+          } else {
+            resolved.state = "cancelled";
+            resolved.result = {
+              exitCode: 143, signal: 15, timedOut, cancelled: true,
+              syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
+            };
+          }
+          resolved.terminalAt = now;
         }
-        this.handles.delete(commandId);
+        await this.save(resolved);
       }
-      if (!resolved.remoteStarted) {
-        resolved.state = "not_started";
-        resolved.fallbackSafe = true;
-        resolved.result = null;
-      } else {
-        resolved.state = "cancelled";
-        resolved.result = {
-          exitCode: 143,
-          signal: 15,
-          timedOut: false,
-          cancelled: true,
-          syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null },
-          usageRecordId: null,
-        };
-      }
-      resolved.terminalAt = at;
-      await this.save(resolved);
       return { status: 200, body: this.view(resolved, 0, OFFLOAD_BOUNDS.readLimitBytes) };
     });
   }
 
-  /** Expire one loaded live record through the cancel path. Caller holds the command chain. */
-  private async expireLoaded(record: JournalRecord, now: number, timedOut: boolean): Promise<void> {
-    const handle = this.handles.get(record.commandId);
-    if (handle) {
-      try {
-        await handle.cancel();
-      } catch {
-        record.state = "unknown";
-        await this.save(record);
-        return;
-      }
-      this.handles.delete(record.commandId);
-    }
-    if (!record.remoteStarted) {
-      record.state = "not_started";
-      record.fallbackSafe = true;
-      record.result = null;
-    } else {
-      record.state = "cancelled";
-      record.result = {
-        exitCode: 143,
-        signal: 15,
-        timedOut,
-        cancelled: true,
-        syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null },
-        usageRecordId: null,
-      };
-    }
-    record.terminalAt = now;
-    await this.save(record);
-  }
-
-  private async sweepExcept(exceptId: string | null, now: number): Promise<void> {
+  private async sweepExcept(exceptId: string | null, now: number, waitForSettlements = true): Promise<void> {
+    const pending = new Set(this.expiryCancellations.values());
     for (const commandId of [...this.known]) {
       if (commandId === exceptId) continue;
-      await this.chain(`cmd:${commandId}`, async () => {
+      const expired = await this.chain(`cmd:${commandId}`, async () => {
         const record = await this.load(commandId);
-        if (!record || TERMINAL.has(record.state) || record.state === "unknown") {
+        if (!record || TERMINAL.has(record.state) || (record.state === "unknown" && !this.handles.has(commandId))) {
           this.known.delete(commandId);
-          return;
+          return null;
         }
-        const timedOut = now >= record.commandDeadline;
-        if (now < record.heartbeatDeadline && !timedOut) return;
-        await this.expireLoaded(record, now, timedOut);
+        if (now < record.heartbeatDeadline && now < record.commandDeadline) return null;
+        return record;
       });
+      if (expired) {
+        let cancellation = this.expiryCancellations.get(commandId);
+        if (!cancellation) {
+          // The heartbeat may return before cancellation I/O settles. Detach
+          // the whole operation, including its final broker journal update,
+          // from that invocation; stores still bind the explicit company.
+          cancellation = runOutsideInvocation(() =>
+            this.cancelCommand(commandId, expired, now, now >= expired.commandDeadline))
+            .then(() => undefined).finally(() => { this.expiryCancellations.delete(commandId); });
+          this.expiryCancellations.set(commandId, cancellation);
+          // Heartbeats must not join another command's sync/cleanup. Observe
+          // detached failures; a later sweep can retry the still-owned command.
+          void cancellation.catch(() => undefined);
+        }
+        pending.add(cancellation);
+      }
     }
+    if (waitForSettlements) await Promise.all(pending);
   }
 
   /**
@@ -599,12 +619,12 @@ export class OffloadBroker {
         // chain, and fake-time tests may advance the clock in between.
         const at = this.now();
         mutate((record) => {
-          record.state = "completed";
+          record.state = result.cancelled ? "cancelled" : "completed";
           record.result = {
             exitCode: result.exitCode,
             signal: result.signal,
             timedOut: result.timedOut,
-            cancelled: false,
+            cancelled: result.cancelled === true,
             syncBack: result.syncBack,
             usageRecordId: result.usageRecordId ?? null,
           };
@@ -627,11 +647,12 @@ export class OffloadBroker {
           return { save: true };
         });
       },
-      fail: (_error) => {
+      fail: (error) => {
         const at = this.now();
         mutate((record) => {
-          record.state = "failed";
-          record.terminalAt = at;
+          record.state = (error as Error & { code?: string }).code === "OFFLOAD_EXECUTION_UNKNOWN" ? "unknown" : "failed";
+          record.fallbackSafe = false;
+          record.terminalAt = record.state === "unknown" ? null : at;
           this.handles.delete(commandId);
           return { save: true };
         });

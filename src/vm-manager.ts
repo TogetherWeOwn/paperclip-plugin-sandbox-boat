@@ -66,7 +66,8 @@ import { runOutsideInvocation } from "./proactive.js";
 import { syncFiles } from "./file-sync.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
-import { NeverDispatchBackend, OffloadBroker, type OffloadJournalStore } from "./offload/broker.js";
+import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
+import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -146,6 +147,11 @@ export interface ManagerDeps {
   logger: ManagerLogger;
   issues?: IssueReader | null;
   executionWorkspaces?: ExecutionWorkspaceReader | null;
+  /** Company plugin config, not sandbox environment/driver config. */
+  offloadConfig?: (companyId: string) => Promise<Record<string, unknown>>;
+  /** Optional host integration: resolve a lifecycle-enabled, workspace-confined
+   * executor without dispatching. Unavailable/unsupported bindings return null. */
+  offloadExecutor?: (command: BackendCommand) => Promise<ExecutorPort | null>;
   ssh?: SshManager;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -232,6 +238,7 @@ export class BoatVmManager {
   private readonly executionWorkspaces: ExecutionWorkspaceReader | null;
   private readonly offloadState: StateClientLike;
   private readonly offloadBrokers = new Map<string, OffloadBroker>();
+  private readonly offloadBackend: ExecutorBackend;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly locks = new Map<string, Promise<unknown>>();
@@ -258,6 +265,15 @@ export class BoatVmManager {
     this.issues = deps.issues ?? null;
     this.executionWorkspaces = deps.executionWorkspaces ?? null;
     this.offloadState = deps.state;
+    this.offloadBackend = new ExecutorBackend({
+      resolveExecutor: async (command) => {
+        const config = await deps.offloadConfig?.(command.companyId);
+        // Strict boolean opt-in, checked for each new command. Toggling the
+        // setting never discards a broker, its live handles or old receipts.
+        if (config?.offloadExecutorEnabled !== true) return null;
+        return await deps.offloadExecutor?.(command) ?? null;
+      },
+    });
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.ssh = deps.ssh ?? new SshManager(deps.logger, this.sleep);
@@ -286,9 +302,7 @@ export class BoatVmManager {
   private offloadBroker(companyId: string): OffloadBroker {
     let broker = this.offloadBrokers.get(companyId);
     if (!broker) {
-      // Until the executor follow-up grows start/cancel, every submit journals
-      // not_started and the shim falls back locally: safe by construction.
-      broker = new OffloadBroker({ store: this.offloadStore(companyId), backend: new NeverDispatchBackend(), now: this.now });
+      broker = new OffloadBroker({ store: this.offloadStore(companyId), backend: this.offloadBackend, now: this.now });
       this.offloadBrokers.set(companyId, broker);
     }
     return broker;

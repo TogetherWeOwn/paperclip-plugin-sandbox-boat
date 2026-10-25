@@ -22,10 +22,13 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 ### Command-level guest lifecycle (opt-in executor slice)
 
 The internal `OffloadExecutor` can keep the agent local and send a heavy command
-through an injected guest transport. This slice is **not enabled by the plugin's
-HTTP routes** and does not install a guest cgroup/watchdog adapter. The existing
-identity-only runner remains compatible. To opt into the new orchestration,
-provide `OffloadLifecycleDeps`: the durable journal, receipt and account ports,
+through an injected guest transport. The HTTP broker now has a receipt-driven
+`ExecutorBackend` bridge, gated by `offloadExecutorEnabled: true` in company
+plugin config **and** an installed lifecycle executor. Neither is enabled by
+this package's stock worker; it does not install a guest cgroup/watchdog
+transport. The existing identity-only runner remains compatible, but is not a
+safe HTTP offload integration. To supply the lifecycle executor, provide
+`OffloadLifecycleDeps`: the durable journal, receipt and account ports,
 a `GuestController`, and a runner receiving `{ identity, output }`.
 
 * Preflight requires positive delegated-cgroup-v2 and independent-watchdog
@@ -339,7 +342,7 @@ Heavy-command-only offload is a separate execution mode and is not implemented b
 
 ## Cargo offload shim (`bin/boat-offload-cargo`)
 
-Design: `docs/adr/0001-heavy-command-offload.md`. Status: routes, broker and shim are implemented; remote execution wires in when the executor grows start/cancel, so today every submit journals `not_started` and the shim falls back to the existing bounded local path.
+Design: `docs/adr/0001-heavy-command-offload.md`. Status: routes, broker, shim and executor adapter are implemented. Command dispatch is **default OFF**. Without both the company opt-in and a host-installed lifecycle executor, each accepted submit journals `not_started` and the shim falls back to the existing bounded local path.
 
 Install the shim as `cargo` ahead of the real executable for opted-in runs (`BOAT_OFFLOAD=1`); anything else, including unset and `0`, runs local cargo with no broker calls. Eligible subcommands are `build`, `test`, `check`, `clippy`, `nextest run` and `llvm-cov` compilation/test modes on an installed profile toolchain. Everything else (`fmt`, `add`, `update`, `metadata`, help/version, install, custom aliases, `--config`/`-Z`, compound shell text, `RUSTFLAGS` builds) stays local. Only an explicit nonsecret env (`CARGO_TERM_COLOR`, `RUST_BACKTRACE`) reaches the request; the run token travels in HTTP headers only.
 
@@ -352,6 +355,54 @@ boat-offload-cargo --json -- test --locked           # run; result envelope on s
 ```
 
 Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
+
+### Enabling the executor bridge
+
+There are three independent gates; none enables another automatically:
+
+1. **Host integration:** construct an `OffloadExecutor` using `OffloadLifecycleDeps`
+   and supply it through `ManagerDeps.offloadExecutor(command)`. This trusted,
+   side-effect-free resolver must authorize the active run's workspace, bind its
+   company/repository/profile/trust domain, confine source paths and path-bearing
+   Cargo options, and select the matching pool. Return `null` for unsupported
+   confinement, secret-bearing workloads or an ineligible guest. Never use the
+   legacy identity-only runner here. The stock worker supplies no resolver:
+   enabling a flag alone therefore cannot create a VM.
+2. **Company plugin configuration:** in Paperclip's plugin configuration, set
+   `{"offloadExecutorEnabled": true}`. This is **not** an environment driver
+   setting. `plugin.setup` reads it via `ctx.config.get(companyId)`; integrations
+   constructing `BoatVmManager` directly supply `offloadConfig(companyId)` and
+   `offloadExecutor(command)`. Only the boolean `true` opts in. Unset, `false`,
+   strings, missing bindings and pre-dispatch config failures retain safe local
+   fallback. The setting is read for every new command; disabling it leaves
+   already admitted commands and their receipts intact.
+3. **Client shim:** opt in the selected run with `BOAT_OFFLOAD=1`, as above.
+   Keep secret-bearing/private-service commands on the existing local path.
+
+`src/offload/executor-backend.ts` adapts `start`, scoped `readOutput`,
+`heartbeatCommand` and `cancelCommand`. Output is polled incrementally (250 ms
+by default), preserving bytes and stream order, including all terminal pages.
+Client heartbeats, not the output poller, renew guest interest. Cancellation
+waits for the executor's cleanup and settled sync receipt, preserving staged or
+conflicting changes and draining shutdown output before publishing the terminal
+receipt; it cannot grant fallback while sync-in still reads source. A live
+command held as `unknown` after a heartbeat failure remains cancellable and
+subject to expiry; missing handles after restart still require reconciliation.
+A rejected/lost start acknowledgement, uncertain execution, unreadable output
+or unverified cancellation becomes an `unknown` hold with **no local replay**.
+Only an authoritative never-started receipt (or a binding refusal before calling
+`start`) permits local fallback. This includes explicit admission refusals that
+allocate no executor journal row. A starting acknowledgement is already evidence
+against fallback, even if a later read contradicts it. No blind dispatch retries
+are added.
+
+Rollback: set company `offloadExecutorEnabled` to `false` for new admissions,
+then use `BOAT_OFFLOAD=0` for future local commands. Do not re-run an already
+uncertain command locally. Broker restart still holds unresolved commands for
+reconciliation; this adapter does not automatically reattach lost handles.
+The lifecycle executor's owner must retain its native sweep/recovery/shutdown
+integration. No deployment, real VM call or live enforcement claim is part of
+the mocked adapter tests.
 
 ## Run env allowlist
 

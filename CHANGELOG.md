@@ -4,11 +4,13 @@
 
 ### Added
 
+* Receipt-driven broker/executor adapter with incremental byte-preserving output, scoped client heartbeats and cancellation that waits for guest cleanup and staged return. The company plugin setting `offloadExecutorEnabled` defaults to false; a trusted, lifecycle-enabled executor integration and the separate Cargo shim opt-in are also required. The stock worker still cannot dispatch without that integration.
 * Opt-in command offload now keeps a company-scoped workspace and its VM reserved through asynchronous push, execution, collection, staging and durable settlement, including cancellation. Independent workspaces can progress without waiting for an unrelated workspace's reservation.
 * Collected adapter data reaches staging intact. Staged/conflict receipts survive durable result reads and replay without applying returned files to the live workspace. Existing void-returning sync adapters remain compatible.
 
 ### Fixed
 
+* Detached command-expiry cancellation uses proactive, explicit-company state access through executor cleanup and the final broker receipt write, so an ended heartbeat invocation cannot let an expired sync-in command start.
 * Full offload pools stop and retire idle incompatible VMs before admitting replacements, including stopped or legacy slots. Busy, quarantined and pending-stop ownership stays fenced; regression tests also pin unknown-workspace rejection and immediate quarantine refusal with queueing enabled.
 * Warm selection, stopped-VM resume and queued dispatch cannot borrow across company, repository, profile or trust-domain pool boundaries. Persisted bindings preserve isolation after worker restart; uncertain workspace holds remain exclusive even when a spare VM exists.
 * Cancellation during collection or staging retains execution evidence, staged changes and an exit-130 cancellation result rather than reporting success or safe local fallback. Post-exit journal transitions share the cancellation fence so a pending state write cannot erase the durable cancellation request.
