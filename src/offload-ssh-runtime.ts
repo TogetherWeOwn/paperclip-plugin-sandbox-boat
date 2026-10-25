@@ -73,6 +73,7 @@ function journalStore(state: StateClientLike, companyId: string, poolId: string)
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
   private readonly pools = new Map<string, { executor: OffloadExecutor; guest: SshOffloadGuest }>();
+  private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
 
@@ -92,7 +93,7 @@ export class SshOffloadRuntime {
   }
 
   async resolve(command: BackendCommand, settings: Record<string, unknown>) {
-    if (this.closed || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
+    if (this.closing || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
       || !plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")
       || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
       || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
@@ -102,7 +103,7 @@ export class SshOffloadRuntime {
       || !this.confined(command)) return null;
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
-    if (await realpath(binding.source).catch(() => null) !== binding.source || !resolveApiKey(binding.config)) return null;
+    if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot])).digest("hex").slice(0, 24);
     const existing = this.pools.get(poolId);
@@ -167,7 +168,9 @@ export class SshOffloadRuntime {
   }
 
   async shutdown(): Promise<void> {
-    // Keep run-state reads available until cancellation/collection has settled.
+    // Fence both new and already-awaiting resolutions before taking the pool
+    // snapshot. Keep run-state reads available while those pools drain.
+    this.closing = true;
     await Promise.all([...this.pools.values()].map(async ({ executor, guest }) => {
       await executor.shutdown();
       await guest.shutdown();

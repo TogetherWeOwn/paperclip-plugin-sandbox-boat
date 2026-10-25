@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -53,6 +53,32 @@ afterEach(async () => {
 }, 20_000);
 
 describe("stock concrete executor factory", () => {
+  it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
+    const executor = (await runtime.resolve(command(), config))!;
+    let release!: () => void;
+    const draining = new Promise<void>((resolve) => { release = resolve; });
+    const shutdown = vi.spyOn(executor, "shutdown").mockImplementation(() => draining);
+    const pending = runtime.shutdown();
+    try {
+      expect(shutdown).toHaveBeenCalledOnce();
+      const another = native();
+      another.environmentId = "another-env";
+      (another.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).environmentId = "another-env";
+      runtime.remember(another);
+      expect(await runtime.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally {
+      release();
+      await pending;
+      shutdown.mockRestore();
+    }
+  });
+  it("fences a resolution already awaiting native source validation when shutdown starts", async () => {
+    const resolving = runtime.resolve(command(), config);
+    await runtime.shutdown();
+    expect(await resolving).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("wires the stock worker from native params without injecting a lifecycle executor", async () => {
     const harness = createFakeContext({ workspaces: new Map([[executionWorkspaceId, {
       repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: source, cwd: source,
