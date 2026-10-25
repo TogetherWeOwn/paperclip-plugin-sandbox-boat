@@ -164,6 +164,7 @@ export class OffloadBroker {
   /** Commands whose sink journal write failed: their persisted state is untrustworthy. */
   private readonly poisoned = new Set<string>();
   private readonly chains = new Map<string, Promise<unknown>>();
+  private readonly expiryCancellations = new Map<string, Promise<void>>();
 
   constructor(deps: OffloadBrokerDeps) {
     this.store = deps.store;
@@ -415,7 +416,7 @@ export class OffloadBroker {
   async heartbeat(commandId: string, principal: BrokerAuth): Promise<BrokerResponse> {
     // Worker-owned expiry rides on client heartbeats (every 5 s while any
     // client is alive); the sweep stays the slower crash backstop.
-    await this.sweepExcept(commandId, this.now());
+    await this.sweepExcept(commandId, this.now(), false);
     // Renew from a fresh clock: a slow sweep must not hand back a deadline
     // that is already stale.
     const at = this.now();
@@ -498,7 +499,8 @@ export class OffloadBroker {
     });
   }
 
-  private async sweepExcept(exceptId: string | null, now: number): Promise<void> {
+  private async sweepExcept(exceptId: string | null, now: number, waitForSettlements = true): Promise<void> {
+    const pending = new Set(this.expiryCancellations.values());
     for (const commandId of [...this.known]) {
       if (commandId === exceptId) continue;
       const expired = await this.chain(`cmd:${commandId}`, async () => {
@@ -510,8 +512,20 @@ export class OffloadBroker {
         if (now < record.heartbeatDeadline && now < record.commandDeadline) return null;
         return record;
       });
-      if (expired) await this.cancelCommand(commandId, expired, now, now >= expired.commandDeadline);
+      if (expired) {
+        let cancellation = this.expiryCancellations.get(commandId);
+        if (!cancellation) {
+          cancellation = this.cancelCommand(commandId, expired, now, now >= expired.commandDeadline)
+            .then(() => undefined).finally(() => { this.expiryCancellations.delete(commandId); });
+          this.expiryCancellations.set(commandId, cancellation);
+          // Heartbeats must not join another command's sync/cleanup. Observe
+          // detached failures; a later sweep can retry the still-owned command.
+          void cancellation.catch(() => undefined);
+        }
+        pending.add(cancellation);
+      }
     }
+    if (waitForSettlements) await Promise.all(pending);
   }
 
   /**
