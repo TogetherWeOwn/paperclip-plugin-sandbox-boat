@@ -151,6 +151,12 @@ export class DiskState implements StateClientLike {
     writeFileSync(this.path, JSON.stringify(doc));
     this.writes.push(structuredClone(value));
   }
+  async delete(key: Parameters<StateClientLike["delete"]>[0]) {
+    if (this.failWrites) throw new Error("test host persistence unavailable");
+    const doc = await this.all();
+    delete doc[JSON.stringify(key)];
+    writeFileSync(this.path, JSON.stringify(doc));
+  }
 }
 
 interface ProcessTree {

@@ -21,6 +21,8 @@ export interface PaidInterval {
   phase: "command" | "idle_tail" | "overhead";
 }
 export interface AccountUsageRow {
+  /** Opaque credential-group binding within the conservatively shared account. */
+  providerScope?: string;
   usageRecordId: string;
   queueWaitMs?: number;
   warm?: "warm" | "cold";
@@ -63,6 +65,7 @@ interface Limits {
   sizes: Array<{ type: string; available: boolean }>;
 }
 interface Intent {
+  providerScope?: string;
   id: string;
   poolId: string | null;
   sandboxId: string | null;
@@ -89,6 +92,9 @@ interface AccountDoc {
   usage: AccountUsageRow[];
   countedResumeUntil: number | null;
   reconcileCursor?: number;
+  providerObservations?: Record<string, Limits>;
+  providerCursors?: Record<string, number>;
+  observationOwner?: string;
 }
 export interface AdmissionRequest {
   operation: Intent["operation"];
@@ -160,8 +166,20 @@ export async function definitiveStartRejection(error: unknown): Promise<boolean>
 export class AccountLedger {
   private readonly key: { scopeKind: "instance"; namespace: string; stateKey: string };
   private rows: AccountUsageRow[] = [];
-  constructor(private readonly state: StateClientLike, private readonly accountId: string, private readonly now: () => number) {
+  constructor(private readonly state: StateClientLike, private readonly accountId: string, private readonly now: () => number,
+    private readonly providerScope?: string) {
     this.key = { scopeKind: "instance", namespace: "boat-account", stateKey: createHash("sha256").update(accountId).digest("hex") };
+  }
+
+  // An unscoped caller explicitly supplies one provider-account identity (e.g.
+  // an offload pool). Managers additionally bind receipts/counter deltas to the
+  // credential group that dispatched the intent. Unknown legacy ownership is
+  // included only when the manager has exactly one credential group.
+  private owns(record: { providerScope?: string }, includeUnscoped = false): boolean {
+    return this.providerScope == null || record.providerScope === this.providerScope || (includeUnscoped && record.providerScope == null);
+  }
+  private observation(doc: AccountDoc): Limits | null {
+    return this.providerScope == null ? doc.observation : doc.providerObservations?.[this.providerScope] ?? null;
   }
 
   private async locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -190,8 +208,9 @@ export class AccountLedger {
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
 
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
-    const age = doc.observation ? this.now() - doc.observation.at : Infinity;
-    if (allowCached && age >= 0 && age <= 5000) return doc.observation!;
+    const prior = this.observation(doc);
+    const age = prior ? this.now() - prior.at : Infinity;
+    if (allowCached && age >= 0 && age <= 5000) return prior!;
     let current: Limits;
     try {
       const raw = await bounded(() => api.limits({}));
@@ -207,12 +226,16 @@ export class AccountLedger {
       if (error instanceof BoatBudgetError) throw error;
       throw new BoatProviderError("BOAT_LIMITS_UNAVAILABLE", "could not read fresh, complete boat limits; no new operation dispatched");
     }
-    const prior = doc.observation;
-    if (prior) {
+    // Two credential groups may alias one provider account. Never refund the
+    // same cumulative counter delta through multiple credential snapshots.
+    // Pin one owner durably; other groups retain conservative unreflected holds.
+    const scope = this.providerScope ?? "unscoped";
+    doc.observationOwner ??= doc.observation ? "unscoped" : scope;
+    if (prior && doc.observationOwner === scope) {
       let activeDelta = Math.max(0, current.active - prior.active);
       let computeDelta = Math.max(0, current.used - prior.used, prior.available - current.available);
       for (const intent of doc.intents) {
-        if (intent.status === "rejected" || intent.settledAt == null) continue;
+        if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.settledAt == null) continue;
         if (activeDelta > 0 && intent.active && !intent.activeReflected) { intent.activeReflected = true; activeDelta--; }
         const consumed = Math.min(intent.compute, Math.max(0, ((intent.endedAt ?? this.now()) - intent.at) / 1000) * WEIGHT[intent.size]);
         const credit = Math.min(computeDelta, Math.max(0, consumed - intent.computeReflected));
@@ -221,13 +244,14 @@ export class AccountLedger {
       for (const name of Object.keys(WINDOWS) as Window[]) {
         let delta = Math.max(0, (current.windows[name]?.used ?? 0) - (prior.windows[name]?.used ?? 0));
         for (const intent of doc.intents) {
-          if (intent.status === "rejected" || intent.operation === "warm" || intent.settledAt == null) continue;
+          if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.operation === "warm" || intent.settledAt == null) continue;
           const start = intent.starts[name];
           if (delta > 0 && !start.reflected && start.expiresAt > current.at) { start.reflected = true; delta--; }
         }
       }
     }
-    doc.observation = current;
+    if (this.providerScope == null) doc.observation = current;
+    else (doc.providerObservations ??= {})[this.providerScope] = current;
     return current;
   }
   private tail(doc: AccountDoc, limits: Limits, req: AdmissionRequest): number {
@@ -268,9 +292,9 @@ export class AccountLedger {
       refuse("minComputeHoursLeft", "insufficient job plus tail compute and reserve");
     }
   }
-  private closeTail(doc: AccountDoc, sandboxId: string, at: number): void {
+  private closeTail(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
     for (const row of doc.usage) {
-      if (row.sandboxId !== sandboxId || row.tailSince == null) continue;
+      if (!this.owns(row, includeUnscoped) || row.sandboxId !== sandboxId || row.tailSince == null) continue;
       if (at > row.tailSince) row.intervals.push({ since: new Date(row.tailSince).toISOString(), until: new Date(at).toISOString(), phase: "idle_tail" });
       row.tailSince = null;
       const intent = doc.intents.find((i) => i.usageId === row.usageRecordId);
@@ -296,7 +320,7 @@ export class AccountLedger {
           // Preserve any longer funded deadline while closing prior envelopes.
           let remaining = req.jobSeconds;
           for (const prior of candidate.intents) {
-            if (prior.sandboxId !== req.sandboxId || prior.endedAt != null || prior.status === "rejected") continue;
+            if (!this.owns(prior) || prior.sandboxId !== req.sandboxId || prior.endedAt != null || prior.status === "rejected") continue;
             remaining = Math.max(remaining, (prior.at + prior.jobSeconds * 1000 - this.now()) / 1000);
             prior.endedAt = this.now();
             prior.compute = Math.min(prior.compute, Math.max(0, (prior.endedAt - prior.at) / 1000) * WEIGHT[prior.size]);
@@ -308,12 +332,12 @@ export class AccountLedger {
       const at = this.now(), id = randomUUID();
       const starts = {} as Intent["starts"];
       for (const name of Object.keys(WINDOWS) as Window[]) starts[name] = { reflected: false, expiresAt: limits.windows[name]?.resetAt ?? at + WINDOWS[name] };
-      const intent: Intent = { id, poolId: req.poolId ?? null, sandboxId: req.sandboxId ?? null, operation: req.operation, at,
+      const intent: Intent = { id, providerScope: this.providerScope, poolId: req.poolId ?? null, sandboxId: req.sandboxId ?? null, operation: req.operation, at,
         settledAt: null, status: "intent", active: req.operation !== "warm", activeReflected: false, starts,
         compute: (req.jobSeconds + tailSeconds) * WEIGHT[req.size], computeReflected: 0, size: req.size, jobSeconds: req.jobSeconds,
         tailSeconds, reserveSeconds: req.minComputeHoursLeft * 3600, endedAt: null, usageId: req.command ? id : null };
       candidate.intents.push(intent);
-      if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, poolId: req.poolId, kind: "command",
+      if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, providerScope: this.providerScope, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
         companyId: req.command.companyId, profileId: req.command.profileId, payloadDigest: req.command.payloadDigest,
         sandboxId: req.sandboxId ?? null, seconds: 0, dollars: 0, meterProvenance: "pending", observedStartsDelta: null, intervals: [], tailSince: null,
@@ -356,7 +380,7 @@ export class AccountLedger {
       if (row) row.sandboxId = sandboxId;
       // Record, never assume, whether this particular resume spent a start.
       if (intent.operation === "resume" && intent.poolId) {
-        const before = doc.observation?.windows.day?.used;
+        const before = this.observation(doc)?.windows.day?.used;
         try {
           const limits = await this.observe(api, doc), after = limits.windows.day?.used;
           const delta = before != null && after != null ? Math.max(0, after - before) : null;
@@ -422,7 +446,7 @@ export class AccountLedger {
       for (const row of doc.usage) {
         // Exact reservation binding also repairs a missed intent write after
         // terminal reconciliation closed its tail, without stamping old callers.
-        if (row.sandboxId !== sandboxId || row.stopRequestedAt != null
+        if (!this.owns(row) || row.sandboxId !== sandboxId || row.stopRequestedAt != null
           || (reservationId ? row.usageRecordId !== reservationId : row.tailSince === null)) continue;
         row.stopDueAt = dueAt;
         row.stopRequestedAt = requestedAt;
@@ -435,23 +459,24 @@ export class AccountLedger {
   async stopped(sandboxId: string, at = this.now(), reservationId?: string): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
-      this.terminal(doc, sandboxId, at, reservationId);
+      this.terminal(doc, sandboxId, at, false, reservationId);
       await this.write(doc);
     });
   }
-  private terminal(doc: AccountDoc, sandboxId: string, at: number, reservationId?: string): void {
+  private terminal(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false, reservationId?: string): void {
     for (const row of doc.usage) {
       // A warm handoff cancels the predecessor's stop obligation. Only the
       // still-open tail owns this observation, never an earlier failed stop.
-      if (row.sandboxId === sandboxId && (row.tailSince != null || row.usageRecordId === reservationId)
+      if (this.owns(row, includeUnscoped) && row.sandboxId === sandboxId
+        && (row.tailSince != null || row.usageRecordId === reservationId)
         && row.stopDueAt != null && row.stoppedAt == null) {
         row.stoppedAt = at;
         row.stopLagMs = Math.max(0, at - row.stopDueAt);
       }
     }
-    this.closeTail(doc, sandboxId, at);
+    this.closeTail(doc, sandboxId, at, includeUnscoped);
     for (const intent of doc.intents) {
-      if (intent.sandboxId !== sandboxId || intent.status === "stopped" || intent.status === "rejected") continue;
+      if (!this.owns(intent, includeUnscoped) || intent.sandboxId !== sandboxId || intent.status === "stopped" || intent.status === "rejected") continue;
       // An intent whose external effect has not settled (no started/failed yet)
       // is owned by its in-flight transition, not by inventory evidence: a
       // stale archived listing must never retire a pending resume's capacity.
@@ -467,46 +492,77 @@ export class AccountLedger {
     }
   }
 
-  async reconcile(api: BoatApiLike, inventory?: ReadonlyArray<{ id: string; state: string }>, allowCachedLimits = false): Promise<void> {
-    await this.locked(async () => {
+  async reconcile(api: BoatApiLike, inventory?: ReadonlyArray<{ id: string; state: string }>, allowCachedLimits = false, includeUnscoped = false,
+    poolId?: string): Promise<void> {
+    const ids = await this.locked(async () => {
       const doc = await this.read();
       try { await this.observe(api, doc, allowCachedLimits); } catch { /* Never free a reservation on unreadable limits. */ }
-      const all = [...new Set(doc.intents.map((i) => i.sandboxId).filter((id): id is string => id != null))];
-      const active = new Set(doc.intents.filter((i) => i.active && i.sandboxId != null).map((i) => i.sandboxId!));
+      // A pool client has no credential-group inventory for the rest of the
+      // shared journal. Limit both receipt checks and subsequent metering to
+      // its durably known VM identities, including after pool reconstruction.
+      const owned = doc.intents.filter((i) => this.owns(i, includeUnscoped) && (poolId == null || i.poolId === poolId));
+      const all = [...new Set(owned.map((i) => i.sandboxId).filter((id): id is string => id != null))];
+      const active = new Set(owned.filter((i) => i.active && i.sandboxId != null).map((i) => i.sandboxId!));
       const history = all.filter((id) => !active.has(id));
-      const cursor = Number.isSafeInteger(doc.reconcileCursor) && doc.reconcileCursor! >= 0 ? doc.reconcileCursor! % Math.max(1, history.length) : 0;
+      const savedCursor = this.providerScope == null ? doc.reconcileCursor : doc.providerCursors?.[this.providerScope];
+      const cursor = Number.isSafeInteger(savedCursor) && savedCursor! >= 0 ? savedCursor! % Math.max(1, history.length) : 0;
       // Live holds always get a terminal-receipt check. Rotate historical bills
       // so an old hundred-VM prefix cannot starve new holds or late corrections.
       const ids = [...active, ...history.slice(cursor), ...history.slice(0, cursor)].slice(0, 100);
-      doc.reconcileCursor = (cursor + Math.max(0, ids.length - active.size)) % Math.max(1, history.length);
+      const nextCursor = (cursor + Math.max(0, ids.length - active.size)) % Math.max(1, history.length);
+      if (this.providerScope == null) doc.reconcileCursor = nextCursor;
+      else (doc.providerCursors ??= {})[this.providerScope] = nextCursor;
       for (const id of ids) {
         // A listing is a point-in-time snapshot: when this ledger still holds
         // a live (non-terminal) reservation for the sandbox, a listed terminal
         // state may predate a concurrent resume. Re-check terminal evidence
         // with a fresh read before retiring a live hold. A listed non-terminal
         // state needs no re-check: it cannot retire anything.
-        const liveHold = doc.intents.some((i) => i.sandboxId === id && i.status !== "stopped" && i.status !== "rejected");
+        const liveHold = owned.some((i) => i.sandboxId === id && i.status !== "stopped" && i.status !== "rejected");
         try {
           const listed = inventory?.find((vm) => vm.id === id);
           const listedTerminal = listed && ["archived", "cancelled", "deleted"].includes(listed.state ?? "");
           const box = listed && (!liveHold || !listedTerminal)
             ? listed
             : (await bounded(() => api.get({ sandboxId: id }))).sandbox;
-          if (box && ["archived", "cancelled", "deleted"].includes(box.state ?? "")) this.terminal(doc, id, this.now());
+          if (box && ["archived", "cancelled", "deleted"].includes(box.state ?? "")) this.terminal(doc, id, this.now(), includeUnscoped);
         } catch (error) {
-          // A definitive 404 for an already-known identity is not an empty list
-          // or an unknown create. Unreadable/ambiguous answers retain the hold.
+          // A 404 is terminal only for identities bound to this credential.
+          // A legacy unbound hold may belong to an unavailable account even
+          // when just one group is configured now. Require positive terminal
+          // evidence for it, never infer ownership from a foreign 404.
           if ((await describeBoatError(error)).status === 404) this.terminal(doc, id, this.now());
         }
-        await this.meter(api, doc, id);
       }
       await this.write(doc);
+      return ids;
+    });
+    // Interval IO grows with command history. It must never own admission's
+    // mutex: calculate a detached projection, then merge only if its source
+    // rows (including open tails and concurrent commands) are still current.
+    for (const id of ids) await this.reconcileUsage(api, id, includeUnscoped);
+  }
+  private async reconcileUsage(api: BoatApiLike, sandboxId: string, includeUnscoped: boolean): Promise<void> {
+    const snapshot = await this.locked(() => this.read());
+    const rowsForVm = (doc: AccountDoc) => doc.usage.filter((r) => r.sandboxId === sandboxId);
+    const before = JSON.stringify(rowsForVm(snapshot));
+    if (!await this.meter(api, snapshot, sandboxId, includeUnscoped)) return;
+    await this.locked(async () => {
+      const current = await this.read();
+      if (JSON.stringify(rowsForVm(current)) !== before) return; // Explicitly pending until a later pass.
+      const projection = new Map(rowsForVm(snapshot).map((r) => [r.usageRecordId, r]));
+      current.usage = current.usage.map((row) => {
+        const replacement = projection.get(row.usageRecordId);
+        projection.delete(row.usageRecordId);
+        return replacement ?? row;
+      });
+      current.usage.push(...projection.values());
+      await this.write(current);
     });
   }
-  private async meter(api: BoatApiLike, doc: AccountDoc, sandboxId: string): Promise<void> {
-    const snapshot = structuredClone(doc.usage);
-    const rows = doc.usage.filter((r) => r.sandboxId === sandboxId && r.kind !== "overhead");
-    if (!rows.length) return;
+  private async meter(api: BoatApiLike, doc: AccountDoc, sandboxId: string, includeUnscoped = false): Promise<boolean> {
+    const rows = doc.usage.filter((r) => this.owns(r, includeUnscoped) && r.sandboxId === sandboxId && r.kind !== "overhead");
+    if (!rows.length) return false;
     try {
       const full = await bounded(() => api.usage({ sandboxId }));
       if (!full.ok) throw new Error("usage unavailable");
@@ -545,7 +601,7 @@ export class AccountLedger {
       const overheadId = `overhead:${sandboxId}`;
       const overhead = doc.usage.find((r) => r.usageRecordId === overheadId);
       if (seconds > 0 || overhead) {
-        const row: AccountUsageRow = { usageRecordId: overheadId, poolId: rows[0].poolId, kind: "overhead", commandId: null, runId: null, cardId: null, repoId: null,
+        const row: AccountUsageRow = { usageRecordId: overheadId, providerScope: this.providerScope, poolId: rows[0].poolId, kind: "overhead", commandId: null, runId: null, cardId: null, repoId: null,
           sandboxId, seconds, dollars, intervals, tailSince: null, observedStartsDelta: null, meterProvenance: "provider" };
         if (overhead) Object.assign(overhead, row); else doc.usage.push(row);
       }
@@ -556,10 +612,11 @@ export class AccountLedger {
       // not a missing bill. Larger disagreements remain pending for a later read.
       if (Math.abs(allocated - number(full.seconds)) > tolerance ||
         Math.abs(allocatedDollars - number(full.dollars)) > (covered.length + gaps.length + 1) * 0.000001) throw new Error("provider usage has not converged");
+      return true;
     } catch {
-      // Interval reads are one accounting transaction. A partial correction or
-      // transient outage must not erase a previously converged provider bill.
-      doc.usage = snapshot;
+      // Interval reads are one detached accounting transaction. Never commit a
+      // partial correction or erase a previously converged provider bill.
+      return false;
     }
   }
 }

@@ -63,6 +63,12 @@ export class JsonState implements StateClientLike {
     this.rows.set(this.key(input), JSON.stringify(value));
     this.writes += 1;
   }
+  async delete(input: Parameters<StateClientLike["delete"]>[0]) {
+    if (this.failWrites) throw new Error("synthetic durable store unavailable");
+    await this.beforeWrite?.();
+    this.rows.delete(this.key(input));
+    this.writes += 1;
+  }
   snapshot(): Array<[string, string]> { return [...this.rows]; }
 }
 

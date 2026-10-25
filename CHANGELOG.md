@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.2
+
+### Added
+
+* **Measured VM size policy.** Lease acquisition and reuse pick the cheapest measured size per task class (`sizeCostTable`, refreshed weekly by the offline `recompute-size-cost-table` script), with actual running sizes retained for accounting and budget guards preserved.
+* **Heavy-command offload executor.** Shared pool of up to `maxOffloadVms` (default 4) guest VMs: warmest running idle first, then most recently stopped, then create, otherwise a bounded FIFO queue. Idle VMs stop `offloadIdleStopSeconds` (default 15) after the last command, never mid-command. Budget reads `GET /limits` before create/resume and falls back to local execution when starts or compute run low. Per-command usage accounting plus a sanitized expected-cost log line; idempotent by commandId.
+* **Durable offload journal and guest receipts.** Command intent is persisted with run-scoped payload identity, bounded retained IDs, restart reconciliation, and guest marker/receipt fences; pre-start cancellation and durable queue refusals are fenced so a stale read can neither clobber a later state nor misreport fallback safety. Live dispatch stays disabled and the existing pool contract is unchanged.
+
+### Fixed
+
+* **Release returns a receipt on stop-accept.** Slow stops keep warm reuse: unknown stop status is retried within the existing bound, stale stopping state resets on reconnect, and confirmation plus usage closure stay under the card lock.
+* **Native workspace sync over pinned SSH.** Paired tar-stream sync hooks over the multiplexed SSH session with bounded stream IO, sender-side exclusion matching, ACP refusal before operation payloads, runtime-member omission, VM-owned runtime directory restore after workspace replacement, and interrupted-upload cleanup with remote-job cancel on multiplexed timeout. Live timing has not run.
+* Test hygiene: the fake-ssh timeout fixture execs sleep so no grandchild outlives the kill.
+
+### Docs
+
+* Pooled heavy-command offload design proposal and acceptance record (`docs/adr/0001-heavy-command-offload.md`).
+
 ## 0.2.1
 
 ### Fixed

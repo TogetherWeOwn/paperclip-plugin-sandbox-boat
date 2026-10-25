@@ -9,6 +9,7 @@ import type {
 import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
+import type { RouteActor } from "./offload/routes.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -31,6 +32,10 @@ function requireManager(): BoatVmManager {
   return currentManager();
 }
 
+function toRouteActor(actor: PluginApiRequestInput["actor"]): RouteActor {
+  return { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId ?? null };
+}
+
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
     manager = new BoatVmManager({
@@ -41,6 +46,9 @@ const plugin = definePlugin({
           const issue = await ctx.issues.get(issueId, companyId);
           return issue ? { status: issue.status } : null;
         },
+      },
+      executionWorkspaces: {
+        get: async (workspaceId, companyId) => ctx.executionWorkspaces.get(workspaceId, companyId),
       },
       ...managerOverrides,
     });
@@ -75,6 +83,22 @@ const plugin = definePlugin({
     }
     if (input.routeKey === "sweep") {
       return { status: 200, body: await boat.sweep("api", { force: true }) };
+    }
+    if (input.routeKey === "offload_exec") {
+      const response = await boat.offloadExec(input.companyId, toRouteActor(input.actor), input.body);
+      return { status: response.status, body: response.body };
+    }
+    if (input.routeKey === "offload_read") {
+      const response = await boat.offloadRead(input.companyId, toRouteActor(input.actor), input.params, input.query);
+      return { status: response.status, body: response.body };
+    }
+    if (input.routeKey === "offload_heartbeat") {
+      const response = await boat.offloadHeartbeat(input.companyId, toRouteActor(input.actor), input.params);
+      return { status: response.status, body: response.body };
+    }
+    if (input.routeKey === "offload_cancel") {
+      const response = await boat.offloadCancel(input.companyId, toRouteActor(input.actor), input.params, input.body);
+      return { status: response.status, body: response.body };
     }
     return { status: 404, body: { error: `unknown route ${input.routeKey}` } };
   },

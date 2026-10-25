@@ -20,6 +20,9 @@ export class MemAccountState implements StateClientLike {
   async set(input: { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string }, value: unknown): Promise<void> {
     this.rows.set(this.key(input), structuredClone(value));
   }
+  async delete(input: Parameters<StateClientLike["delete"]>[0]): Promise<void> {
+    this.rows.delete(this.key(input));
+  }
 }
 let nextTestAccount = 0;
 export function testAccount(poolId = "durable-test-pool") {
