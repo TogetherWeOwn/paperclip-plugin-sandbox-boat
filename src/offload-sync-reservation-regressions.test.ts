@@ -37,6 +37,30 @@ describe("sync receipt plumbing", () => {
 });
 
 describe("sync reservations across cancellation and recovery", () => {
+  it.each([false, true])("does not authorize local fallback until a cancelled push settles (push fails: %s)", async (fails) => {
+    const cmd = command("push-cancel-read");
+    const gate = s.hold(`push:${cmd.commandId}`);
+    if (fails) s.fail.add(`push:${cmd.commandId}`);
+    const first = s.execute(cmd);
+    await until(() => s.trace.includes(`push:${cmd.commandId}`));
+
+    const cancellation = await s.executor.cancel(cmd.commandId, "client_signal", 1);
+    expect.soft(cancellation).toMatchObject({ state: "syncing_in", remoteStarted: false, fallbackSafe: false });
+    expect.soft(await s.executor.read(cmd.commandId)).toMatchObject({ state: "syncing_in", fallbackSafe: false });
+    expect.soft(await s.state.store().get(commandKey(cmd))).toMatchObject({
+      state: "syncing_in", cancelRequested: "client_signal", fallbackSafe: false,
+    });
+    // Repeated cancellation must not turn an in-progress transfer into a safe handoff.
+    expect.soft(await s.executor.cancel(cmd.commandId, "client_signal", 1)).toMatchObject({ fallbackSafe: false });
+
+    gate.resolve();
+    const result = await first;
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true });
+    expect(await s.executor.read(cmd.commandId)).toMatchObject({ state: "not_started", fallbackSafe: true });
+    expect(await s.execute(cmd)).toEqual(result);
+    expect(s.starts).toEqual([]);
+  });
+
   it.each(["push", "collect", "stage"])("retains the workspace through cancelled %s even with a spare VM", async (phase) => {
     const gate = s.hold(`${phase}:cancelled`);
     const ex = s.make({ maxOffloadVms: 2 });

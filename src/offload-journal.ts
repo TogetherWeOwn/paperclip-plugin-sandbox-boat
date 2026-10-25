@@ -227,7 +227,7 @@ export class OffloadJournal {
   private async beforeStart(record: OffloadRecord, patch: Partial<OffloadRecord>): Promise<void> {
     await this.transition(record, async () => {
       await this.refresh(record);
-      if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+      if (!PRE_START.has(record.state) || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
       await this.commit(record, patch);
     });
   }
@@ -362,7 +362,7 @@ export class OffloadJournal {
     await this.beforeStart(record, { state: "syncing_in" });
     // Start the sync in the same continuation as the state check. A subsequent
     // cancellation can fence spawn, but need not abort an already-running push.
-    if (record.state === "not_started") throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+    if (record.state === "not_started" || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
     await this.deps.sync.push(sandboxId, command);
     const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
     if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
@@ -601,8 +601,15 @@ export class OffloadJournal {
       if (record === snapshot) await this.refresh(record);
       const current = generation === undefined || generation === (record.identity?.journalGeneration ?? 1);
       if (current && PRE_START.has(record.state)) {
-        const result = this.unavailable(record, "cancelled before durable starting intent");
-        await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        if (this.lifecycle && record.state === "syncing_in" && this.active.has(key)) {
+          // Fence spawn now, but do not authorize a local fallback while push
+          // may still be reading the workspace. run()/finish() settle the
+          // never-started receipt only after the asynchronous phase unwinds.
+          await this.commit(record, { cancelRequested: record.cancelRequested ?? reason });
+        } else {
+          const result = this.unavailable(record, "cancelled before durable starting intent");
+          await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        }
       }
       if (current && this.lifecycle && record.identity && !TERMINAL.has(record.state) && !record.cancelRequested) {
         await this.commit(record, { cancelRequested: reason });
