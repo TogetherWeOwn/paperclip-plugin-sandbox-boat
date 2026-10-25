@@ -125,9 +125,13 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve({ ...command(), cwdRelative: "../escape" }, config)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
-  it("defensively refuses argv controls before resolving an executor or spending any VM starts", async () => {
+  it("defensively refuses argv controls and lone surrogates in argv or cwd before resolving an executor or spending any VM starts", async () => {
     for (const code of [...Array.from({ length: 32 }, (_, i) => i), 127]) {
       expect(await runtime.resolve({ ...command(), argv: ["test", `filter${String.fromCharCode(code)}suffix`] }, config)).toBe(null);
+    }
+    for (const lone of ["\ud800", "\udfff"]) {
+      expect(await runtime.resolve({ ...command(), argv: ["test", `a${lone}b`] }, config)).toBe(null);
+      expect(await runtime.resolve({ ...command(), cwdRelative: `crates/${lone}` }, config)).toBe(null);
     }
     expect(boat.calls).toHaveLength(0);
     expect(await runtime.resolve(command(), config)).not.toBe(null);

@@ -52,6 +52,14 @@ describe("validateSubmit", () => {
     expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
   });
 
+  it.each(["\ud800", "crates/\udfff", "a\ud83dz/b"])("rejects cwd with a lone surrogate %#", (cwdRelative) => {
+    expect(validateSubmit({ ...BASE, cwdRelative })).toEqual({ ok: false, detail: "cwdRelative holds invalid characters" });
+  });
+
+  it("accepts well-formed surrogate pairs (emoji) in cwd", () => {
+    expect(validateSubmit({ ...BASE, cwdRelative: "crates/ok-\ud83d\ude00" }).ok).toBe(true);
+  });
+
   it("accepts well-formed surrogate pairs (emoji) in argv", () => {
     expect(validateSubmit({ ...BASE, argv: ["test", "ok-\ud83d\ude00"] }).ok).toBe(true);
   });

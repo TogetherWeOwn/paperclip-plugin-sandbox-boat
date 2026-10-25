@@ -11,6 +11,7 @@ import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offl
 import type { OffloadStore } from "./offload-journal.js";
 import { canonicalRepoId, V1_PROFILE } from "./offload/routes.js";
 import { classifyCargo } from "./offload/router.js";
+import { LONE_SURROGATE } from "./offload/validate.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
@@ -152,11 +153,11 @@ export class SshOffloadRuntime {
   }
 
   private confined(command: BackendCommand): boolean {
-    if (path.posix.isAbsolute(command.cwdRelative) || command.cwdRelative.includes("\0")
+    if (path.posix.isAbsolute(command.cwdRelative) || command.cwdRelative.includes("\0") || LONE_SURROGATE.test(command.cwdRelative)
       || command.cwdRelative.split("/").some((part) => part === ".." || part === "")) return false;
     // V1 refuses all path-bearing Cargo overrides rather than guessing which
     // belong to the host or silently rewriting arguments. Relative cwd is enough.
-    return !command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(arg)
+    return !command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg)
       || /^(--(manifest-path|target-dir|out-dir|artifact-dir|lockfile-path)|-C)(=|$)/.test(arg));
   }
 

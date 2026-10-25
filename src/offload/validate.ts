@@ -23,6 +23,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TERM_COLOR = new Set(["auto", "always", "never"]);
 const BACKTRACE = new Set(["0", "1", "full"]);
 const MAX_RUSTFLAGS_BYTES = 2048;
+/** Lone UTF-16 surrogates crash the guest exec (Popen) just like control bytes do. */
+export const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 function invalid(detail: string): ValidateResult {
   return { ok: false, detail };
@@ -32,7 +34,7 @@ function invalid(detail: string): ValidateResult {
 function cwdProblem(cwd: string): string | null {
   if (cwd.length === 0 || cwd.length > 1024) return "cwdRelative must be 1..1024 chars";
   if (cwd.startsWith("/") || /^[A-Za-z]:/.test(cwd)) return "cwdRelative must be relative";
-  if (cwd.includes("\\") || /[\u0000-\u001f\u007f]/.test(cwd)) return "cwdRelative holds invalid characters";
+  if (cwd.includes("\\") || /[\u0000-\u001f\u007f]/.test(cwd) || LONE_SURROGATE.test(cwd)) return "cwdRelative holds invalid characters";
   const stack: string[] = [];
   for (const segment of cwd.split("/")) {
     if (segment === "" || segment === ".") continue;
@@ -74,7 +76,7 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
     return invalid("argv must be a non-empty array of non-empty strings");
   }
   // Control bytes and lone UTF-16 surrogates both crash the guest exec (Popen) after a VM is spent; reject them here.
-  if (argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(arg))) return invalid("argv holds invalid control characters");
+  if (argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg))) return invalid("argv holds invalid control characters");
   if (argv.length > OFFLOAD_BOUNDS.maxArgs) return invalid(`argv holds more than ${OFFLOAD_BOUNDS.maxArgs} args`);
   if (Buffer.byteLength(JSON.stringify(argv), "utf8") > OFFLOAD_BOUNDS.maxArgvBytes) {
     return invalid("argv exceeds 32 KiB encoded");
