@@ -17,6 +17,8 @@ export interface PoolVm {
   idleHandle: unknown | null;
   stopDueAt: number | null;
   stopRequestedAt: number | null;
+  // Optional for pools persisted before observed stop timestamps were stored.
+  stopObservedAt?: number | null;
   stopAttempts: number;
   identity: OffloadIdentity | null;
   accountReservation?: AccountReservation;
@@ -45,6 +47,7 @@ export class OffloadPoolStore {
       if (!vm || typeof vm.sandboxId !== "string" || ids.has(vm.sandboxId)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
+        || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0
         || (vm.tailSeconds !== undefined && !finite(vm.tailSeconds))
         || (vm.identity !== null && (!validIdentity(vm.identity) || vm.identity.sandboxId !== vm.sandboxId))

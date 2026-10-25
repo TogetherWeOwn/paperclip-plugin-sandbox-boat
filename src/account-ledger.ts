@@ -416,11 +416,14 @@ export class AccountLedger {
     });
   }
 
-  async stopRequested(sandboxId: string, dueAt: number, requestedAt: number): Promise<void> {
+  async stopRequested(sandboxId: string, dueAt: number, requestedAt: number, reservationId?: string): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
       for (const row of doc.usage) {
-        if (row.sandboxId !== sandboxId || row.tailSince === null || row.stopRequestedAt != null) continue;
+        // Exact reservation binding also repairs a missed intent write after
+        // terminal reconciliation closed its tail, without stamping old callers.
+        if (row.sandboxId !== sandboxId || row.stopRequestedAt != null
+          || (reservationId ? row.usageRecordId !== reservationId : row.tailSince === null)) continue;
         row.stopDueAt = dueAt;
         row.stopRequestedAt = requestedAt;
         row.stoppedAt = row.stopLagMs = null;
@@ -429,18 +432,19 @@ export class AccountLedger {
     });
   }
 
-  async stopped(sandboxId: string): Promise<void> {
+  async stopped(sandboxId: string, at = this.now(), reservationId?: string): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
-      this.terminal(doc, sandboxId, this.now());
+      this.terminal(doc, sandboxId, at, reservationId);
       await this.write(doc);
     });
   }
-  private terminal(doc: AccountDoc, sandboxId: string, at: number): void {
+  private terminal(doc: AccountDoc, sandboxId: string, at: number, reservationId?: string): void {
     for (const row of doc.usage) {
       // A warm handoff cancels the predecessor's stop obligation. Only the
       // still-open tail owns this observation, never an earlier failed stop.
-      if (row.sandboxId === sandboxId && row.tailSince != null && row.stopDueAt != null && row.stoppedAt == null) {
+      if (row.sandboxId === sandboxId && (row.tailSince != null || row.usageRecordId === reservationId)
+        && row.stopDueAt != null && row.stoppedAt == null) {
         row.stoppedAt = at;
         row.stopLagMs = Math.max(0, at - row.stopDueAt);
       }

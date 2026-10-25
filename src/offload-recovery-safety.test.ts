@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { command, DiskState, EPOCH, fixture, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { responseError } from "./test-support/fake-boat.js";
 
 let s: Fixture;
 beforeEach(async () => { s = await fixture(); });
@@ -55,7 +56,9 @@ describe("guest recovery safety regressions", () => {
 
   it("does not stamp an earlier caller's cancelled idle tail with a later command's stop", async () => {
     await s.execute(command("old-tail"));
-    s.boat.failNext("stop", new Error("stop failed"));
+    // Warm reuse requires a definitive refusal, not a possibly accepted stop
+    // whose transport reply was lost. Keep all attribution assertions intact.
+    s.boat.failNext("stop", responseError(429, { code: "rate_limited" }));
     await s.clock.advance(15_000);
     await s.execute(command("new-tail"));
     await s.clock.advance(15_000);
