@@ -115,6 +115,82 @@ describe("persisted recovery review regressions", () => {
     expect(s.boat.callsOf("get").length).toBeLessThan(10);
   });
 
+  it.each(["transient", "sustained"])("keeps autonomous stop retries across a %s pool-store outage without unhandled rejection", async (outage) => {
+    await s.execute(command("pool-outage"));
+    s.boat.failNext("stop", new Error("stop never reached provider"));
+    await s.clock.advance(15_000);
+    const set = s.state.set.bind(s.state);
+    const get = s.boat.get.bind(s.boat);
+    let failedWrites = 0;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      s.state.set = async (key, value) => {
+        if (key.namespace === "boat-offload-pool") {
+          failedWrites += 1;
+          throw new Error("pool-store outage");
+        }
+        await set(key, value);
+      };
+      if (outage === "sustained") {
+        s.boat.get = async (args) => {
+          s.boat.failNext("get", new Error("status temporarily unreadable"));
+          return await get(args);
+        };
+      } else s.boat.failNext("get", new Error("status temporarily unreadable"));
+      await s.clock.advance(1_000);
+      expect(failedWrites).toBe(1);
+      expect(s.executor.getUsage()).toMatchObject([{ stoppedAt: null, stopLagMs: null }]);
+      expect((await savedPool()).vms).toHaveLength(1);
+      if (outage === "sustained") {
+        // A prolonged outage must not turn observation into a hot retry loop.
+        await s.clock.advance(60_000);
+        expect(s.boat.callsOf("get").length).toBeLessThan(10);
+        expect(failedWrites).toBeGreaterThan(1);
+        expect([...s.clock.timers.values()].filter((timer) => timer.owner === "worker")
+          .map((timer) => timer.at - s.clock.t)).toEqual([30_000]);
+      }
+      s.state.set = set;
+      s.boat.get = get;
+      // No sweep, new admission or restart may rescue the detached callback.
+      await s.clock.advance(60_000);
+      expect.soft(unhandled).toEqual([]);
+      expect.soft(s.boat.callsOf("stop")).toHaveLength(2);
+      expect.soft(s.boat.boxes.get(s.starts[0]!.sandboxId)?.state).toBe("archived");
+      expect.soft(s.executor.getUsage()[0]!.stoppedAt).not.toBeNull();
+      expect.soft([...s.clock.timers.values()].filter((timer) => timer.owner === "worker")).toHaveLength(0);
+    } finally {
+      s.state.set = set;
+      s.boat.get = get;
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("automatically observes an accepted asynchronous stop without another stop RPC", async () => {
+    s.boat.stopMode = "never";
+    await s.execute(command("accepted-async-stop"));
+    const sandboxId = s.starts[0]!.sandboxId;
+    await s.clock.advance(15_000);
+    expect(s.boat.boxes.get(sandboxId)?.state).toBe("archiving");
+    expect(s.boat.callsOf("stop")).toHaveLength(1);
+    expect(s.executor.getUsage()).toMatchObject([{
+      stopRequestedAt: EPOCH + 15_000, stoppedAt: null, stopLagMs: null,
+    }]);
+    await s.clock.advance(1_000);
+    expect(s.executor.getUsage()).toMatchObject([{ stoppedAt: null, stopLagMs: null }]);
+    expect((await savedPool()).vms[0]).toMatchObject({ stopping: true, stopped: false, stopObservedAt: null });
+    s.boat.boxes.get(sandboxId)!.state = "archived";
+    // Observation is autonomous: no sweep, admission, shutdown or worker crash.
+    await s.clock.advance(2_000);
+    expect(s.boat.callsOf("stop")).toHaveLength(1);
+    expect(s.executor.getUsage()).toMatchObject([{
+      stopRequestedAt: EPOCH + 15_000, stoppedAt: EPOCH + 18_000, stopLagMs: 3_000,
+    }]);
+    expect((await savedPool()).vms[0]).toMatchObject({ stopping: false, stopped: true, stopObservedAt: EPOCH + 18_000 });
+    expect([...s.clock.timers.values()].filter((timer) => timer.owner === "worker")).toHaveLength(0);
+  });
+
   it("retains the earlier durable observation after reconciliation closes a delayed stop", async () => {
     s.boat.stopMode = "never";
     await s.execute(command("delayed-stop"));
