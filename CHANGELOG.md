@@ -12,6 +12,7 @@
 
 ### Fixed
 
+* Offload submissions reject NUL and other ASCII control characters in argv with HTTP 400 before workspace lookup, journaling or dispatch; the native SSH executor also refuses them defensively before resolving a pool.
 * Successful guest-empty verification releases host shutdown tracking for that command, so long-lived pools do not replay cleanup for every completed command. Failed or uncertain verifications remain tracked and receipts stay readable.
 * Guest output polling defers an incomplete JSON-line tail until the next read, avoiding spurious uncertain-execution quarantines when a healthy command's output spans multiple writes. Complete malformed records still fail closed.
 * Upgrades retain the installed 0.2.2 capability set instead of requesting `execution.workspaces.read`. Offload workspace authority now uses the host-authored native realization payload, persisted per company/run/workspace. Command dispatch stays default-off, unknown bindings fail closed, and whole-run realization does not depend on optional offload state availability. Otherwise-local executor integrations must register the same native binding before admission.

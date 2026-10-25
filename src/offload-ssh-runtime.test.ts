@@ -125,6 +125,14 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve({ ...command(), cwdRelative: "../escape" }, config)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("defensively refuses argv controls before resolving an executor or spending any VM starts", async () => {
+    for (const code of [...Array.from({ length: 32 }, (_, i) => i), 127]) {
+      expect(await runtime.resolve({ ...command(), argv: ["test", `filter${String.fromCharCode(code)}suffix`] }, config)).toBe(null);
+    }
+    expect(boat.calls).toHaveLength(0);
+    expect(await runtime.resolve(command(), config)).not.toBe(null);
+  });
+
   it("executes a native-bound command through the real SSH lifecycle, freezes source and stages returns without live writeback", async () => {
     const executor = await runtime.resolve(command(), config);
     expect(executor).not.toBe(null);

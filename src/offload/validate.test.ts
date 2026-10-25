@@ -42,6 +42,15 @@ describe("validateSubmit", () => {
     expect(validateSubmit({ ...BASE, cwdRelative: "crates/core" }).ok).toBe(true);
   });
 
+  it.each([...Array.from({ length: 32 }, (_, i) => i), 127])("rejects argv control character U+%i", (code) => {
+    const result = validateSubmit({ ...BASE, argv: ["test", `filter${String.fromCharCode(code)}suffix`] });
+    expect(result).toEqual({ ok: false, detail: "argv holds invalid control characters" });
+  });
+
+  it("accepts printable Unicode and spaces in test arguments", () => {
+    expect(validateSubmit({ ...BASE, argv: ["test", "--", "a test", "café", "日本語"] }).ok).toBe(true);
+  });
+
   it("rejects more than 256 args", () => {
     expect(validateSubmit({ ...BASE, argv: Array.from({ length: 257 }, (_, i) => `a${i}`) }).ok).toBe(false);
   });

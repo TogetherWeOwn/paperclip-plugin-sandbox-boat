@@ -73,6 +73,7 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
   if (!Array.isArray(argv) || argv.length === 0 || argv.some((a) => typeof a !== "string" || a.length === 0)) {
     return invalid("argv must be a non-empty array of non-empty strings");
   }
+  if (argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg))) return invalid("argv holds invalid control characters");
   if (argv.length > OFFLOAD_BOUNDS.maxArgs) return invalid(`argv holds more than ${OFFLOAD_BOUNDS.maxArgs} args`);
   if (Buffer.byteLength(JSON.stringify(argv), "utf8") > OFFLOAD_BOUNDS.maxArgvBytes) {
     return invalid("argv exceeds 32 KiB encoded");
