@@ -10,8 +10,13 @@
 
 ### Fixed
 
+* Full offload pools stop and retire idle incompatible VMs before admitting replacements, including stopped or legacy slots. Busy, quarantined and pending-stop ownership stays fenced; regression tests also pin unknown-workspace rejection and immediate quarantine refusal with queueing enabled.
 * Warm selection, stopped-VM resume and queued dispatch cannot borrow across company, repository, profile or trust-domain pool boundaries. Persisted bindings preserve isolation after worker restart; uncertain workspace holds remain exclusive even when a spare VM exists.
 * Cancellation during collection or staging retains execution evidence, staged changes and an exit-130 cancellation result rather than reporting success or safe local fallback. Post-exit journal transitions share the cancellation fence so a pending state write cannot erase the durable cancellation request.
+* Lifecycle recovery keeps distinct unresolved create reservations readable, prevents retired stop retries from losing replacement ownership, retries pending idle/shutdown stops after transient outages, and repairs stop telemetry from the earliest reservation-bound durable observation without attributing it to cancelled tails.
+* Long-running commands and native sync publish timestamp-only shared activity heartbeats, so an overlapping manager's idle sweep does not mistake silent work for a stale lease. Single lifecycle-worker topology remains required.
+* Monitoring remains on by default, with an explicit `monitoring: false` opt-out for new VMs. An account monitoring refusal has an actionable error and never changes account policy. Snapshot scrub diagnostics no longer echo arbitrary guest output into logs or capture errors; provider-side telemetry retention is documented separately from disk cleanup.
+* The size-policy guide now consistently documents the `small` light-work fallback, recommends explicit `default` for heavy builds, and warns on an unmeasured small fallback.
 
 ## 0.2.2
 

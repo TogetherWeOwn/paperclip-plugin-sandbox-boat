@@ -112,6 +112,29 @@ export class VmStateStore {
     return normalizeDoc(await this.state.get({ scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: VMS_KEY }));
   }
 
+  /**
+   * A separate per-VM heartbeat: lifecycle read-modify-writes of the company
+   * document must not erase a long command's activity from another manager.
+   * Only a timestamp crosses this boundary, never command text or output.
+   */
+  async touchActivity(companyId: string, sandboxId: string, at: number): Promise<void> {
+    await this.serialize(() => this.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: `activity:${sandboxId}` },
+      at,
+    ));
+  }
+
+  async activityAt(companyId: string, sandboxId: string): Promise<number> {
+    const at = await this.state.get({
+      scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: `activity:${sandboxId}`,
+    });
+    if (at == null) return 0; // VMs created before heartbeat support.
+    if (typeof at !== "number" || !Number.isFinite(at) || at < 0) {
+      throw new Error("boat: invalid shared activity timestamp; refusing an idle stop");
+    }
+    return at;
+  }
+
   /** Read-modify-write, serialized with every other write in this worker. */
   async update<T>(companyId: string, fn: (doc: StateDoc) => T | Promise<T>): Promise<T> {
     return this.serialize(async () => {

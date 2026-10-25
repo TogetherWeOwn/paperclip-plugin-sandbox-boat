@@ -158,17 +158,18 @@ describe("compatible pool scheduling", () => {
     expect(s.boat.callsOf("resume")).toHaveLength(1);
   });
 
-  it("refuses a full incompatible pool rather than borrowing it on release", async () => {
+  it("refuses a busy incompatible pool rather than borrowing its active VM", async () => {
     const gate = s.hold("exec:first");
     const first = s.execute(command("first"));
     await until(() => s.trace.includes("exec:first"));
-    const other = s.execute(command("other", { trustDomainId: "untrusted-fork" }));
-    for (let n = 0; n < 20; n += 1) await flush();
-    gate.resolve();
-    const refused = await other;
+    const other = command("other", { trustDomainId: "untrusted-fork", executionWorkspaceId: "workspace-b" });
+    const refused = await s.execute(other);
     expect(refused).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true });
+    expect(s.guest.alive("first")).toBe(true);
+    expect(s.boat.callsOf("stop")).toHaveLength(0);
+    gate.resolve();
     await first;
-    expect(await s.execute(command("other", { trustDomainId: "untrusted-fork" }))).toEqual(refused);
+    expect(await s.execute(other)).toEqual(refused);
     expect(s.starts.map((start) => start.commandId)).toEqual(["first"]);
   });
 

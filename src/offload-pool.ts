@@ -46,8 +46,12 @@ export class OffloadPoolStore {
       || !finite(doc.config.offloadIdleStopSeconds) || !Number.isSafeInteger(doc.config.maxOffloadVms)
       || doc.config.maxOffloadVms < 1) throw new Error("OFFLOAD_POOL_UNREADABLE");
     const ids = new Set<string>();
+    const reservations = new Set<string>();
     for (const vm of doc.vms) {
-      if (!vm || typeof vm.sandboxId !== "string" || ids.has(vm.sandboxId)
+      // A lost create reply has no provider ID yet. Its durable reservation,
+      // not the empty placeholder, uniquely owns that unresolved allocation.
+      if (!vm || typeof vm.sandboxId !== "string" || (vm.sandboxId !== "" && ids.has(vm.sandboxId))
+        || (vm.sandboxId === "" && !vm.accountReservation?.id)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
@@ -57,10 +61,12 @@ export class OffloadPoolStore {
         || (vm.workspaceKey !== undefined && vm.workspaceKey !== null && (typeof vm.workspaceKey !== "string" || !vm.workspaceKey))
         || (vm.identity !== null && (!validIdentity(vm.identity) || vm.identity.sandboxId !== vm.sandboxId))
         || (vm.accountReservation !== undefined && (!vm.accountReservation || typeof vm.accountReservation.id !== "string"
+          || !vm.accountReservation.id || reservations.has(vm.accountReservation.id)
           || !finite(vm.accountReservation.at) || !finite(vm.accountReservation.tailSeconds)))) {
         throw new Error("OFFLOAD_POOL_UNREADABLE");
       }
-      ids.add(vm.sandboxId);
+      if (vm.sandboxId) ids.add(vm.sandboxId);
+      if (vm.accountReservation) reservations.add(vm.accountReservation.id);
     }
     return structuredClone(doc.vms).map((vm) => ({ ...vm,
       // Recovery uses the funded per-VM tail or its saved pool setting, never

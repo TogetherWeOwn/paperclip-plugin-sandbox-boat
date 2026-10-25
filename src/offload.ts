@@ -298,7 +298,7 @@ export class OffloadExecutor {
     }
     this.stopFailures.delete(vm.sandboxId);
     if (state === "deleted") {
-      this.pool.splice(this.pool.indexOf(vm), 1);
+      this.retireVm(vm);
     } else {
       vm.stopping = false;
       vm.stopped = true;
@@ -442,10 +442,14 @@ export class OffloadExecutor {
   private async drain(pending: Promise<OffloadResult>[]): Promise<void> {
     const refusals = await this.withAdmission(async () => {
       const tasks = this.queue.map((entry) => this.refuseQueued(entry, "executor shutdown"));
-      for (const vm of this.pool) {
+      for (const vm of [...this.pool]) {
         this.clearIdleTimer(vm);
-        if (!vm.busy && !vm.stopped && !vm.stopping && !vm.quarantined) await this.stopVm(vm);
+        if (vm.busy || vm.quarantined) continue;
+        if (vm.stopping) {
+          if (await this.observeStop(vm)) await this.stopVm(vm, true);
+        } else if (!vm.stopped) await this.stopVm(vm);
       }
+      await this.persistPool();
       return tasks;
     });
     await Promise.allSettled(refusals);
@@ -601,6 +605,23 @@ export class OffloadExecutor {
     }
     if (stopped) return this.accountClaim(command, stopped, "resume");
     if (this.pool.length < this.config.maxOffloadVms) return this.accountClaim(command, null, "create");
+    // An idle incompatible cache must not permanently consume a bounded slot.
+    // Preserve its ownership until stop and telemetry are both confirmed; never
+    // reclaim busy, quarantined or asynchronously stopping allocations.
+    const retiring = this.pool.find((vm) => !vm.busy && !vm.quarantined && !vm.stopping && !compatible(vm));
+    if (retiring) {
+      this.clearIdleTimer(retiring);
+      if (!retiring.stopped) await this.stopVm(retiring);
+      if (!retiring.stopped) {
+        this.scheduleIdleStop(retiring, retiring.generation, 1000);
+        return { kind: "unavailable", reason: "incompatible pool retirement pending; reconciliation required" };
+      }
+      try { await this.persistStopTelemetry(retiring); }
+      catch { return { kind: "unavailable", reason: "stop accounting persistence pending" }; }
+      this.retireVm(retiring);
+      await this.persistPool();
+      return this.accountClaim(command, null, "create");
+    }
     // An uncertain slot has no live release event to queue behind. Refuse
     // rather than strand callers waiting for a nonexistent safe handoff.
     if (!this.pool.some((vm) => compatible(vm) && vm.busy && !vm.quarantined)) {
@@ -723,7 +744,7 @@ export class OffloadExecutor {
       vm.busy = false;
       if (definitive) vm.workspaceKey = null;
       if (!definitive) vm.quarantined = true;
-      else if (!existing) this.pool.splice(this.pool.indexOf(vm), 1);
+      else if (!existing) this.retireVm(vm);
       await this.persistPool().catch(() => { vm.quarantined = true; });
       return { kind: "unavailable", reason: definitive ? "provider rejected start; no command dispatched" : "start outcome uncertain; reservation retained, no command dispatched" };
     }
@@ -835,8 +856,9 @@ export class OffloadExecutor {
       vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
       await this.persistPool();
       if (!this.closed) await this.dispatchQueued();
-      // Dispatch has already reserved any reused VM before releasing admission.
-      if (vm.busy || vm.quarantined) return;
+      // Dispatch may reserve this VM, retire it for an incompatible waiter,
+      // or leave a stop retry installed. Never resurrect its old idle timer.
+      if (!this.pool.includes(vm) || vm.busy || vm.quarantined || vm.stopped || vm.stopping || vm.idleHandle != null) return;
       if (this.closed) {
         await this.stopVm(vm);
       } else {
@@ -850,18 +872,29 @@ export class OffloadExecutor {
     vm.idleHandle = null;
   }
 
+  private retireVm(vm: PoolVm): void {
+    this.clearIdleTimer(vm);
+    vm.generation += 1;
+    const at = this.pool.indexOf(vm);
+    if (at >= 0) this.pool.splice(at, 1);
+  }
+
   private scheduleIdleStop(vm: PoolVm, generation: number, delayMs: number): void {
     vm.idleHandle = this.timers.set(() => {
       void this.withAdmission(async () => {
-        if (vm.generation !== generation || vm.busy || vm.stopped || vm.quarantined || this.closed) return;
+        if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || vm.quarantined || this.closed) return;
         vm.idleHandle = null;
+        let pending: boolean;
         if (vm.stopping && !await this.observeStop(vm)) {
+          // An unreadable or archiving allocation is still owned. Only a
+          // terminal observation (or retirement) ends bounded retries.
+          pending = this.pool.includes(vm) && vm.stopping;
+          if (pending) vm.stopAttempts += 1;
           await this.persistPool();
-          return;
+        } else {
+          pending = !await this.stopVm(vm, vm.stopping) || vm.stopping;
         }
-        if (!await this.stopVm(vm, vm.stopping)) {
-          // Keep ownership after a transient stop failure. New reservations
-          // cancel this retry and invalidate its generation just like a tail.
+        if (pending) {
           const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(vm.stopAttempts - 1, 5));
           this.scheduleIdleStop(vm, generation, retryMs);
         }
