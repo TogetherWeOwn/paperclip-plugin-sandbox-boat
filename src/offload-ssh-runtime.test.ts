@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
@@ -159,4 +159,33 @@ describe("stock concrete executor factory", () => {
       expect(["completed", "not_started"]).toContain(view.state);
     }
   }, 20_000);
+  it("admits a node command when the profile is enabled and a lockfile exists", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps node local without an enabled profile, a lockfile, or a remote-candidate shape", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    expect(await runtime.resolve(node, config)).toBe(null);
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"], offloadAllowedRepos: [] })).toBe(null);
+    expect(await runtime.resolve({ ...node, argv: ["run", "dev"] }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(await runtime.resolve({ ...node, runner: "bun" }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    await rm(path.join(source, "package-lock.json"), { force: true });
+    expect(await runtime.resolve({ ...node } as BackendCommand, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
+    await writeFile(path.join(source, "requirements.txt"), "pytest\n");
+    const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
+    expect(await runtime.resolve(base, enabled)).not.toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-c", "print(1)"] }, enabled)).toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toBe(null);
+    expect(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
 });

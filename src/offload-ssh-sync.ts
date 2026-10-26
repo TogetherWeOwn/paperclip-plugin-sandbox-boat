@@ -3,6 +3,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import { syncFiles } from "./file-sync.js";
+import { planDependencies } from "./offload/deps-install.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { captureSnapshot, collectAndStage, DEFAULT_SYNC_EXCLUDES, type GuestStore, type GuestFileState, type SourceManifest } from "./offload-sync.js";
 import type { OffloadSync } from "./offload-journal.js";
@@ -102,7 +103,11 @@ export interface SshOffloadSyncDeps {
 /** Frozen inbound native sync and bounded, staged-only return collection. */
 export class SshOffloadSync implements OffloadSync {
   private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string }>();
+  /** Sandbox ids with a verified per-VM dependency cache entry (lockfile hash). */
+  private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
+  /** Guest-side content-addressed marker root for installed dependencies. */
+  depCacheDir(): string { return path.posix.join(this.deps.workRoot ?? "/tmp", "paperclip-boat-deps"); }
   private key(command: OffloadCommand): string {
     return createHash("sha256").update(JSON.stringify([command.companyId, command.runId, command.commandId])).digest("hex");
   }
@@ -126,12 +131,57 @@ export class SshOffloadSync implements OffloadSync {
       const guestDir = this.directory(command);
       await syncFiles({ ssh: this.deps.ssh, session: await this.deps.session(sandboxId), timeoutMs: 300_000, remoteRoot: guestDir }, "in",
         [{ operationId: this.key(command), files: [{ sourcePath: frozen, targetPath: guestDir, kind: "directory" }] }]);
+      await this.installDependencies(sandboxId, command, source, guestDir);
       this.uploads.set(this.key(command), { source, manifest, scratch, guestDir });
       await rm(frozen, { recursive: true, force: true });
     } catch (error) {
       await rm(scratch, { recursive: true, force: true });
       throw error;
     }
+  }
+  /**
+   * Install Node/Python dependencies on the guest from the source lockfile.
+   * Frozen sync excludes dependency dirs, so a checkout without node_modules
+   * cannot run until this installs them. The install runs once per lockfile
+   * hash per VM (guest-side marker plus an in-memory set); a warm pool VM
+   * reuses its cache across runs. Cargo checkouts skip this entirely.
+   */
+  async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
+    if ((command.tool ?? "cargo") === "cargo") return;
+    const plan = await planDependencies(source);
+    if (!plan) {
+      // resolve() keeps lockfile-less commands local before any VM is spent;
+      // reaching here means the source changed under us. Never run unlocked.
+      throw new Error("Offload node/python commands need a lockfile; refusing unlocked install");
+    }
+    const done = this.installed.get(sandboxId);
+    if (done?.has(plan.hash)) return;
+    const session = await this.deps.session(sandboxId);
+    const marker = path.posix.join(this.depCacheDir(), `${plan.hash}.ok`);
+    const check = await this.deps.ssh.runStream(session,
+      buildRemoteCommand(`exec test -f ${shellQuote(marker)}`), { timeoutMs: 15_000 });
+    if (check.exitCode === 0 && !check.timedOut && !check.signal) {
+      this.markInstalled(sandboxId, plan.hash);
+      return;
+    }
+    const steps = plan.installs
+      .map((item) => `cd ${shellQuote(guestDir)} && ${item.install.map(shellQuote).join(" ")}`)
+      .join(" && ");
+    const script = `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(marker)}`;
+    const result = await this.deps.ssh.runStream(session,
+      buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
+    if (result.exitCode !== 0 || result.timedOut || result.signal) {
+      throw new Error("Offload dependency install failed; no command ran");
+    }
+    this.markInstalled(sandboxId, plan.hash);
+  }
+  private markInstalled(sandboxId: string, hash: string): void {
+    let done = this.installed.get(sandboxId);
+    if (!done) {
+      done = new Set();
+      this.installed.set(sandboxId, done);
+    }
+    done.add(hash);
   }
   async collect(sandboxId: string, command: OffloadCommand): Promise<unknown> {
     const upload = this.uploads.get(this.key(command));

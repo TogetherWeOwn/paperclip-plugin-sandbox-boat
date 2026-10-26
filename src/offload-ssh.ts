@@ -17,6 +17,8 @@ export interface SshOffloadGuestDeps {
   stateRoot?: string;
   executable?: string;
   args?: (command: OffloadCommand) => string[];
+  /** Per-command nonsecret env allowlist; defaults to the cargo pair. */
+  allowedEnv?: (command: OffloadCommand) => string[];
   path?: string;
 }
 
@@ -58,12 +60,16 @@ export class SshOffloadGuest implements GuestController {
   }
   async prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity> {
     // Explicit nonsecret command env only; no inherited host/Boat credentials.
-    if (Object.keys(command.env ?? {}).some((key) => !["CARGO_TERM_COLOR", "RUST_BACKTRACE"].includes(key))) {
+    // Node/Python commands travel with an empty env (validateSubmit enforces
+    // it); cargo keeps its two validated keys.
+    const allowedEnv = this.deps.allowedEnv?.(command) ?? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"];
+    if (Object.keys(command.env ?? {}).some((key) => !allowedEnv.includes(key))) {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
     }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
       program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
-      cwd: await this.deps.workspace(sandboxId, command), executable: this.deps.executable ?? "cargo",
+      cwd: await this.deps.workspace(sandboxId, command),
+      executable: command.runner ?? command.executable ?? this.deps.executable ?? "cargo",
       args: this.deps.args?.(command) ?? command.argv, env: command.env ?? {}, timeoutMs: command.timeoutMs ?? 120_000,
       path: this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
       base: { companyId: command.companyId, runId: command.runId, commandId: command.commandId,

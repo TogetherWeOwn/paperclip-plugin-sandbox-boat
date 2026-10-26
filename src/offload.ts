@@ -106,6 +106,8 @@ export interface OffloadExecutorConfig {
   maxActive?: number;
   maxStartsPerDay?: number;
   minComputeHoursLeft?: number;
+  /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
+  offloadMonthlyVmHourCap?: number;
 }
 
 export interface OffloadTimers {
@@ -131,6 +133,12 @@ export interface OffloadDeps extends Partial<OffloadDurableDeps> {
   config: OffloadExecutorConfig;
   guest?: undefined;
   runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>;
+  /**
+   * Telemetry hook: completed remote command durations feed the duration
+   * gate. Failures must be swallowed by the implementation; a learning write
+   * never fails a command.
+   */
+  recordDuration?: (command: OffloadCommand, seconds: number) => Promise<void> | void;
 }
 
 // A separate transport shape keeps the landed identity-only runner compatible.
@@ -194,6 +202,7 @@ export class OffloadExecutor {
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
+  private readonly recordDuration?: OffloadDeps["recordDuration"];
   private readonly durable: OffloadJournal | null;
   private readonly lifecycle: OffloadLifecycle | null;
   private readonly pool: PoolVm[] = [];
@@ -241,6 +250,7 @@ export class OffloadExecutor {
     this.runCommand = this.durable
       ? (vm, command) => this.durable!.run(vm, command, transport)
       : transport;
+    this.recordDuration = deps.recordDuration;
     if (!(deps.state && deps.accountId && deps.poolId)) throw new Error("account admission requires durable state, accountId and poolId");
     this.poolId = deps.poolId;
     this.ledger = new AccountLedger(deps.state, deps.accountId, this.now);
@@ -805,6 +815,16 @@ export class OffloadExecutor {
       accountingFailed = true;
       this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
     });
+    if (result.status === "completed") {
+      // Feed the duration gate: completed remote runs teach the next decision.
+      // A learning write never fails the command it just measured.
+      try {
+        await this.recordDuration?.(command, result.seconds);
+      } catch (error) {
+        this.logger.warn("boat offload duration recording failed", { commandId: command.commandId });
+        void error;
+      }
+    }
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
       commandId: command.commandId,

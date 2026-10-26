@@ -364,6 +364,13 @@ describe("LocalGuestStore.pruneMirror", () => {
 });
 
 describe("isReturnEligible", () => {
+  it("returns package lockfiles at the root alongside Cargo.lock and snapshots", () => {
+    for (const lock of ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "requirements.txt", "uv.lock"]) {
+      expect(isReturnEligible(lock, DEFAULT_RETURN_POLICY)).toBe(true);
+      expect(isReturnEligible(`nested/${lock}`, DEFAULT_RETURN_POLICY)).toBe(false);
+    }
+  });
+
   it("returns Cargo.lock and snapshots with an empty generated allowlist by default", () => {
     expect(DEFAULT_RETURN_POLICY).toEqual({ generatedAllowlist: [] });
     expect(isReturnEligible("Cargo.lock", DEFAULT_RETURN_POLICY)).toBe(true);

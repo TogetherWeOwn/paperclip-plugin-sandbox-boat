@@ -9,8 +9,10 @@ import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./config.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import type { OffloadStore } from "./offload-journal.js";
-import { canonicalRepoId, V1_PROFILE } from "./offload/routes.js";
-import { classifyCargo } from "./offload/router.js";
+import { planDependencies } from "./offload/deps-install.js";
+import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
+import { canonicalRepoId, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
+import { classifyCargo, classifyNode, classifyPython } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
@@ -30,6 +32,17 @@ export interface SshOffloadRuntimeDeps {
   session?: (sandboxId: string) => Promise<SshSession>;
   guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot">;
 }
+/** Profile by id; unknown ids never resolve. */
+function profileForId(profileId: string): ServerProfile | null {
+  if (profileId === V1_PROFILE.id) return V1_PROFILE;
+  if (profileId === NODE_PROFILE.id) return NODE_PROFILE;
+  if (profileId === PYTHON_PROFILE.id) return PYTHON_PROFILE;
+  return null;
+}
+
+/** Path-bearing flags whose values must resolve inside the workspace. */
+const PATH_FLAGS = ["--config", "--rootdir", "--prefix", "--cwd", "--dir", "--cache-dir", "-C", "--target-dir", "--out-dir"];
+
 const object = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 const key = (company: string, run: string, workspace: string) => JSON.stringify([company, run, workspace]);
 const plain = (value: unknown): value is string => typeof value === "string" && value.length > 0 && !value.includes("\0");
@@ -113,9 +126,24 @@ export class SshOffloadRuntime {
       || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
       || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
     const binding = this.bindings.get(key(command.companyId, command.runId, command.executionWorkspaceId));
-    if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId
-      || command.profileId !== V1_PROFILE.id || classifyCargo(command.argv, V1_PROFILE).mode !== "remote_candidate"
-      || !this.confined(command)) return null;
+    if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
+    const profile = profileForId(command.profileId);
+    if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
+    const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
+    const runner = command.runner ?? defaultRunnerFor(tool);
+    const runners = profile.id === V1_PROFILE.id ? ["cargo"] : profile.id === NODE_PROFILE.id ? NODE_PROFILE.runners! : PYTHON_PROFILE.runners!;
+    if (!runners.includes(runner)) return null;
+    const classified = tool === "cargo" ? classifyCargo(command.argv, V1_PROFILE)
+      : tool === "node" ? classifyNode(runner, command.argv, profile)
+      : classifyPython(runner, command.argv, profile);
+    if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
+    if (!this.confined(command, tool)) return null;
+    if (tool !== "cargo") {
+      // No lockfile, no remote: the guest only installs from a lockfile and
+      // never from an unlocked manifest.
+      const plan = await planDependencies(binding.source).catch(() => null);
+      if (!plan) return null;
+    }
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
@@ -144,7 +172,9 @@ export class SshOffloadRuntime {
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, artifactRoot: settings.offloadArtifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot });
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent: settings.offloadCgroupParent,
-      workspace: (vm, cmd) => sync.cwd(vm, cmd), ...this.deps.guestOptions });
+      workspace: (vm, cmd) => sync.cwd(vm, cmd),
+      allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
+      ...this.deps.guestOptions });
     // Sync-in begins every reservation, including resumed VMs: discard stale
     // host-key/IP state and authorize via the provider before transferring.
     const executor = new OffloadExecutor({ boat: api, state: this.deps.state, accountId: this.deps.accountId, poolId,
@@ -153,6 +183,20 @@ export class SshOffloadRuntime {
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
+      recordDuration: async (cmd, seconds) => {
+        // Completed remote Node/Python runs teach the duration gate. Rust is
+        // never gated and is not recorded.
+        const tool = cmd.tool ?? "cargo";
+        if (tool === "cargo") return;
+        const scope = { scopeKind: "company" as const, scopeId: cmd.companyId, namespace: "boat-offload", stateKey: "" };
+        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv));
+        try {
+          await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
+            set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value) }, key, { seconds, at: Date.now() });
+        } catch {
+          // Telemetry only; the command already completed.
+        }
+      },
       journalStore: journalStore(this.deps.state, command.companyId, poolId),
       guestReceipts: { bootId: (vm) => guest.bootId(vm), read: (identity) => guest.receipt(identity) },
       resolveRunState: async (companyId, runId) => ({
@@ -166,13 +210,32 @@ export class SshOffloadRuntime {
     return executor;
   }
 
-  private confined(command: BackendCommand): boolean {
+  private confined(command: BackendCommand, tool: "cargo" | "node" | "python"): boolean {
     if (path.posix.isAbsolute(command.cwdRelative) || command.cwdRelative.includes("\0") || LONE_SURROGATE.test(command.cwdRelative)
       || command.cwdRelative.split("/").some((part) => part === ".." || part === "")) return false;
-    // V1 refuses all path-bearing Cargo overrides rather than guessing which
-    // belong to the host or silently rewriting arguments. Relative cwd is enough.
-    return !command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg)
-      || /^(--(manifest-path|target-dir|out-dir|artifact-dir|lockfile-path)|-C)(=|$)/.test(arg));
+    if (command.argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg))) return false;
+    if (tool === "cargo") {
+      // V1 refuses all path-bearing Cargo overrides rather than guessing which
+      // belong to the host or silently rewriting arguments. Relative cwd is enough.
+      return !command.argv.some((arg) => /^(--(manifest-path|target-dir|out-dir|artifact-dir|lockfile-path)|-C)(=|$)/.test(arg));
+    }
+    // Node/Python: arbitrary inline code never goes remote, absolute host
+    // paths are meaningless on the guest, and path-bearing flags must resolve
+    // inside the workspace. Rust semantics above are unchanged.
+    if ((command.runner === "python" || command.runner === "python3") && command.argv.includes("-c")) return false;
+    if (command.argv.some((arg) => path.posix.isAbsolute(arg) || /^[A-Za-z]:/.test(arg))) return false;
+    const cwd = command.cwdRelative;
+    for (let i = 0; i < command.argv.length; i++) {
+      const arg = command.argv[i]!;
+      const flag = PATH_FLAGS.find((name) => arg === name || arg.startsWith(`${name}=`));
+      if (!flag) continue;
+      const value = arg === flag ? (command.argv[i + 1] ?? "") : arg.slice(flag.length + 1);
+      if (value === "" || value.startsWith("-")) continue;
+      if (path.posix.isAbsolute(value) || /^[A-Za-z]:/.test(value)) return false;
+      const resolved = path.posix.normalize(path.posix.join(cwd, value));
+      if (resolved === ".." || resolved.startsWith("../")) return false;
+    }
+    return true;
   }
 
   async sweep(): Promise<void> {
