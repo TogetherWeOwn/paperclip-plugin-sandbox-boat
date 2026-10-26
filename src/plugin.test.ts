@@ -107,7 +107,7 @@ describe("manifest", () => {
       expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read"]),
     );
     expect(manifest.jobs?.[0]).toMatchObject({ jobKey: SWEEP_JOB_KEY, schedule: "*/5 * * * *" });
-    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]);
+    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_heartbeat", "offload_cancel", "offload_report"]);
     expect(harness.jobs.has(SWEEP_JOB_KEY)).toBe(true);
   });
 

@@ -69,7 +69,7 @@ import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, Vm
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
-import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
+import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, normalizeOffloadSettings, type RouteActor } from "./offload/routes.js";
 import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -255,8 +255,10 @@ export class BoatVmManager {
   private lastSweepAt = 0;
   private sweeping: Promise<SweepReport> | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
+  private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
 
   constructor(deps: ManagerDeps) {
+    this.offloadConfigFn = deps.offloadConfig ?? null;
     this.store = new VmStateStore(deps.state);
     this.logger = deps.logger;
     this.issues = deps.issues ?? null;
@@ -391,16 +393,41 @@ export class BoatVmManager {
     for (const workspaceId of live?.workspaces ?? []) await this.offloadWorkspaces.forget(companyId, workspaceId, runId);
   }
 
-  private offloadRouteHost(companyId: string) {
+  private offloadRouteHost(companyId: string, settings?: Record<string, unknown>) {
     return {
       broker: this.offloadBroker(companyId),
       workspaces: this.offloadWorkspaces,
       profile: V1_PROFILE,
+      extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],
+      settings: normalizeOffloadSettings(settings ?? {}),
+      durations: this.offloadDurations(companyId),
     };
   }
 
+  /** Bounded per-signature duration samples, company-scoped like the journal. */
+  private offloadDurations(companyId: string) {
+    const store = this.offloadStore(companyId);
+    return {
+      get: (key: string) => store.get(key),
+      set: (key: string, value: unknown) => store.set(key, value),
+    };
+  }
+
+  private async offloadCompanyConfig(companyId: string): Promise<Record<string, unknown> | undefined> {
+    if (!this.offloadConfigFn) return undefined;
+    try {
+      return await this.offloadConfigFn(companyId);
+    } catch {
+      return undefined;
+    }
+  }
+
   async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
-    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId));
+    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
+  }
+
+  async offloadReport(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
+    return handleReport({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
   }
 
   async offloadRead(

@@ -108,6 +108,8 @@ export interface AdmissionRequest {
   maxStartsPerDay: number;
   minComputeHoursLeft: number;
   command?: { commandId: string; runId: string; cardId: string; repoId: string; companyId?: string; profileId?: string; payloadDigest?: string };
+  /** Monthly offload VM-hour cap: enforced atomically with admission inside the ledger lock. */
+  monthlyCap?: { companyId: string; nowMs: number; capHours: number };
 }
 export interface AccountReservation { id: string; tailSeconds: number; at: number }
 
@@ -153,6 +155,39 @@ async function bounded<T>(fn: () => Promise<T>): Promise<T> {
       timer = setTimeout(() => reject(new Error("provider read timed out after 3 seconds")), 3000);
     })]);
   } finally { if (timer) clearTimeout(timer); }
+}
+
+/** Month-to-date tracked VM seconds for one company, clamped to the UTC month. */
+function monthUsageSeconds(doc: AccountDoc, companyId: string, nowMs: number): number {
+  const at = new Date(nowMs);
+  const monthStart = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), 1);
+  let totalMs = 0;
+  for (const row of doc.usage) {
+    if (row.companyId !== companyId) continue;
+    for (const interval of row.intervals) {
+      const since = Date.parse(interval.since);
+      const until = Date.parse(interval.until);
+      if (!Number.isFinite(since) || !Number.isFinite(until)) continue;
+      totalMs += Math.max(0, Math.min(until, nowMs) - Math.max(since, monthStart));
+    }
+    if (row.tailSince != null && Number.isFinite(row.tailSince)) {
+      totalMs += Math.max(0, nowMs - Math.max(row.tailSince, monthStart));
+    }
+  }
+  return totalMs / 1000;
+}
+
+/** Pending reservation envelopes for one company: prevents monthly-cap burst overshoot. */
+function pendingCapSeconds(doc: AccountDoc, companyId: string): number {
+  const byUsage = new Map(doc.usage.map((row) => [row.usageRecordId, row]));
+  let total = 0;
+  for (const intent of doc.intents) {
+    if (intent.status === "rejected" || intent.settledAt != null) continue;
+    const company = intent.usageId ? byUsage.get(intent.usageId)?.companyId : undefined;
+    if (company !== companyId) continue;
+    total += intent.jobSeconds + intent.tailSeconds;
+  }
+  return total;
 }
 
 /** Only explicit provider refusals prove that a mutation never took effect. */
@@ -206,6 +241,19 @@ export class AccountLedger {
     await this.locked(async () => { this.rows = structuredClone((await this.read()).usage); });
   }
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
+
+  /**
+   * Tracked VM seconds in the UTC calendar month containing nowMs, for one
+   * company. Sums paid intervals clamped to the month plus the elapsed part
+   * of still-open tails. Throws when the journal is unreadable: callers fail
+   * closed (stay local) rather than dispatching unbounded on telemetry loss.
+   */
+  async monthVmSeconds(companyId: string, nowMs: number): Promise<number> {
+    return this.locked(async () => {
+      const doc = await this.read();
+      return monthUsageSeconds(doc, companyId, nowMs);
+    });
+  }
 
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
     const prior = this.observation(doc);
@@ -305,6 +353,15 @@ export class AccountLedger {
   async reserve(api: BoatApiLike, req: AdmissionRequest): Promise<AccountReservation> {
     return await this.locked(async () => {
       const doc = await this.read();
+      if (req.monthlyCap && req.monthlyCap.capHours > 0 && req.monthlyCap.companyId) {
+        const used = monthUsageSeconds(doc, req.monthlyCap.companyId, req.monthlyCap.nowMs)
+          + pendingCapSeconds(doc, req.monthlyCap.companyId);
+        if (used / 3600 >= req.monthlyCap.capHours) {
+          throw new BoatBudgetError({ limit: "minComputeHoursLeft",
+            message: `monthly offload VM-hour cap reached (${req.monthlyCap.capHours}h); new commands run local until next month`,
+            details: {} });
+        }
+      }
       let limits = await this.observe(api, doc, req.allowCachedLimits, req);
       const tailSeconds = this.tail(doc, limits, req);
       // A warm handoff or a new resume reservation truncates the previous tail,

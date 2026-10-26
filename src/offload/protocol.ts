@@ -67,11 +67,18 @@ export interface OffloadErrorEnvelope {
   fallbackSafe: boolean;
 }
 
+/** Heavy-command tool. Absent means cargo (the original wire contract). */
+export type OffloadTool = "cargo" | "node" | "python";
+
 export interface OffloadSubmitRequest {
   version: typeof OFFLOAD_VERSION;
   commandId: string;
   executionWorkspaceId: string;
   cwdRelative: string;
+  /** Package runner / test binary, e.g. npm, yarn, pytest, python. Defaults per tool. */
+  runner?: string;
+  /** Defaults to cargo for backward compatibility. */
+  tool?: OffloadTool;
   argv: string[];
   env: Record<string, string>;
   queueTimeoutMs: number;

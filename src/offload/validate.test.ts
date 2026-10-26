@@ -130,3 +130,38 @@ describe("bodyTooLarge", () => {
     expect(bodyTooLarge("{}")).toBe(false);
   });
 });
+
+describe("validateSubmit tool/runner", () => {
+  const node = { ...BASE, tool: "node", runner: "npm", argv: ["run", "test"], env: {} };
+
+  it("accepts node/python requests with an empty env", () => {
+    expect(validateSubmit(node, { tool: "node", runners: ["npm", "pnpm", "yarn", "npx"] })).toEqual({
+      ok: true,
+      value: expect.objectContaining({ tool: "node", runner: "npm" }),
+    });
+    expect(validateSubmit(
+      { ...BASE, tool: "python", runner: "pytest", argv: ["tests/"], env: {} },
+      { tool: "python", runners: ["pytest", "python", "python3"] },
+    ).ok).toBe(true);
+  });
+
+  it("defaults to cargo when tool and runner are absent", () => {
+    expect(validateSubmit(BASE)).toEqual({ ok: true, value: expect.not.objectContaining({ tool: expect.anything() }) });
+  });
+
+  it("rejects a tool that does not match the profile", () => {
+    expect(validateSubmit({ ...BASE, tool: "node" })).toEqual({ ok: false, detail: "tool must be cargo" });
+    expect(validateSubmit(node, { tool: "python", runners: ["pytest"] }).ok).toBe(false);
+  });
+
+  it("rejects runners outside the profile allowlist", () => {
+    expect(validateSubmit({ ...node, runner: "bun" }, { tool: "node", runners: ["npm"] }).ok).toBe(false);
+    expect(validateSubmit({ ...node, runner: "npm install" }, { tool: "node", runners: ["npm"] }).ok).toBe(false);
+    expect(validateSubmit({ ...node, runner: "npm/x" }, { tool: "node", runners: ["npm"] }).ok).toBe(false);
+  });
+
+  it("rejects non-empty env for node/python", () => {
+    expect(validateSubmit({ ...node, env: { FOO: "bar" } }, { tool: "node", runners: ["npm"] }))
+      .toEqual({ ok: false, detail: "env must be empty for node/python commands" });
+  });
+});

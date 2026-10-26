@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+// boat-offload-python: a pytest/python wrapper for offload opt-in runs.
+// Install as `pytest` (or python/python3) ahead of the real executable (BOAT_OFFLOAD=1 opts in),
+// or invoke directly: boat-offload-python [--dry-run] [--json] [--runner <name>] -- <argv...>.
+// Needs the built plugin: run `npm run build` first so ../dist exists.
+import { createShimDeps } from "../dist/offload/shim-node.js";
+import { PYTHON_SHIM, shimMain } from "../dist/offload/shim-main.js";
+
+try {
+  const exit = await shimMain(
+    process.argv[1] ?? "boat-offload-python",
+    process.argv.slice(2),
+    createShimDeps(process.env),
+    PYTHON_SHIM,
+  );
+  process.exit(exit);
+} catch (error) {
+  process.stderr.write(`boat-offload-python: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+}

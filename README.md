@@ -427,6 +427,68 @@ builds the same payload from host-owned data only:
    resolved per binding and never stored; `offloadLocalEnvironmentId` and
    `offloadLocalDriverConfig` give the pool identity and settings.
 
+### Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
+
+Rust offload above extends to long Node and Python commands on two more server
+profiles: `node-public-1` (npm/pnpm/yarn scripts and test binaries such as
+`vitest run`, `jest`, `playwright test`, `next build`) and `python-public-1`
+(`pytest` and `python -m pytest|unittest` suites). Install the shim as
+`npm`/`pytest`/etc. ahead of the real executable for opted-in runs
+(`BOAT_OFFLOAD=1`); anything else runs locally. Diagnostics work the same:
+`boat-offload-node --dry-run -- run test`. Only profile `rust-public-1` is
+enabled by default; add profiles explicitly:
+
+```json
+{
+  "offloadProfiles": ["rust-public-1", "node-public-1", "python-public-1"]
+}
+```
+
+Only LONG commands go remote. The plugin keeps per company + repository +
+profile + normalized-command-signature duration history (last 20 runs,
+30-day TTL) in its existing company-scoped state. A Node/Python command is a
+remote candidate only when its recorded median meets
+`offloadMinExpectedSeconds` (default 120); unknown signatures run local first
+and record, so the second identical long run can go remote. Recordings come
+from completed remote runs (server-side) and from shim-reported local runs
+(`POST /offload/report`, agent-authed, bounded samples). Rust keeps its
+existing behaviour and is never gated by this setting.
+
+Short commands must stay local: sync plus VM overhead (~30 s) makes anything
+shorter slower remotely. Watch modes, single-file filters, lint/typecheck/
+format, install/ci, dev servers, inline `python -c`, deploy/publish/release-like
+scripts (any name containing deploy, publish, release, push, upload, prod or
+ship) and anything unrecognized stay local. Only exact `build` plus an
+allowlisted build suffix stays remote. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
+caches and build outputs; the guest installs dependencies from the lockfile
+(`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
+`requirements.txt` via `pip install --require-hashes -r`, where every
+requirement is `name[extras]==version` with `--hash=sha256:` and no pip
+option lines) into a per-VM cache keyed by lockfile hash. Global pip installs reuse the cache across runs;
+checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
+warm VM never reuses a stale checkout. Python commands from a `uv.lock` plan
+run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with
+`VIRTUAL_ENV=<checkout>/.venv` and `<checkout>/.venv/bin` prepended to the
+guest `PATH` for that command only (every other env key stays empty), so
+console scripts and bare `python` subprocesses cannot resolve the system
+interpreter. No lockfile
+(or competing lockfiles for the same tool) means the command stays local: the
+plugin never installs from an unlocked manifest, and an unpinned
+`requirements.txt` stays local.
+Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
+Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
+`.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,
+are never synced and keep commands local. Symlinked config is never followed:
+a symlinked `pyproject.toml` stays local without reading its target, and
+regular `pyproject.toml` files are read bounded at 256 KiB. Only an empty env
+travels with Node/Python requests except `VIRTUAL_ENV` for `uv.lock` venv
+commands; secret-free env policy, public allow-listed
+repositories and cwd/argv confinement apply unchanged.
+
+`offloadMonthlyVmHourCap` (default 0, disabled) caps the month's tracked
+offload VM-hours per company against the existing account-ledger usage rows;
+once reached, new commands run local until next month.
+
 The agent and the offload request body supply nothing. The started event usually
 arrives before Paperclip prepares the run's workspace, so the bind is retried when
 that run's first offload request arrives. A binding never replaces a whole-run

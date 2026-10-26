@@ -1,14 +1,14 @@
-// boat-offload-cargo entrypoint: a `cargo` wrapper for opted-in runs.
-// Installed as `cargo` ahead of the real executable (passthrough), or invoked
-// directly as `boat-offload-cargo [--dry-run] [--json] -- <cargo argv...>`
-// (diagnostic). Ordinary passthrough preserves cargo's stdout, stderr and exit
-// status; only staged/conflict/unknown outcomes add an explicit stderr report,
-// as the stage-first contract requires.
+// Shim entrypoint: a package-runner wrapper for opted-in runs.
+// Installed as the wrapped executable ahead of the real one (passthrough), or
+// invoked directly as a diagnostic binary ([--dry-run] [--json]
+// [--runner <name>] -- <argv...>) (diagnostic). Ordinary passthrough preserves
+// stdout, stderr and exit status; only staged/conflict/unknown outcomes add an
+// explicit stderr report, as the stage-first contract requires.
 
 import path from "node:path";
-import { runDryRun, runOffload, type BrokerHttp, type ClientDeps, type ShimRequest } from "./client.js";
+import { reportDuration, runDryRun, runOffload, type BrokerHttp, type ClientDeps, type ShimRequest } from "./client.js";
 import { OFFLOAD_VERSION } from "./protocol.js";
-import { classifyCargo } from "./router.js";
+import { classifyCargo, classifyNode, classifyPython } from "./router.js";
 
 export interface SpawnResult {
   code: number | null;
@@ -26,7 +26,7 @@ export interface ShimDeps {
   randomId: () => string;
   findExecutable: (dir: string, name: string) => string | null;
   readToolchains: () => string[];
-  /** Optional: resolve symlinks so a candidate that is the shim itself is never used as the real cargo. */
+  /** Optional: resolve symlinks so a candidate that is the shim itself is never used as the real executable. */
   realpath?: (p: string) => string;
   /** `onSpawn` hands the caller a way to signal the child so termination is forwarded, not dropped. */
   spawn: (exe: string, argv: string[], env: Record<string, string>, options?: SpawnOptions) => Promise<SpawnResult>;
@@ -35,6 +35,40 @@ export interface ShimDeps {
 export interface SpawnOptions {
   onSpawn?: (kill: (signal: "SIGINT" | "SIGTERM") => void) => void;
 }
+
+export interface ToolShim {
+  tool: "cargo" | "node" | "python";
+  /** Basenames the shim answers to: passthrough when installed as one of these, diagnostic otherwise. */
+  exeNames: string[];
+  /** Diagnostic binary name, for help and error text. */
+  diagnosticName: string;
+  defaultRunner: string;
+  classify(runner: string, argv: string[], toolchains: string[]): { mode: "local" | "remote_candidate"; reason: string };
+}
+
+export const CARGO_SHIM: ToolShim = {
+  tool: "cargo",
+  exeNames: ["cargo"],
+  diagnosticName: "boat-offload-cargo",
+  defaultRunner: "cargo",
+  classify: (_runner, argv, toolchains) => classifyCargo(argv, { id: "local-prefilter", toolchains }),
+};
+
+export const NODE_SHIM: ToolShim = {
+  tool: "node",
+  exeNames: ["npm", "pnpm", "yarn", "npx"],
+  diagnosticName: "boat-offload-node",
+  defaultRunner: "npm",
+  classify: (runner, argv) => classifyNode(runner, argv, { id: "local-prefilter" }),
+};
+
+export const PYTHON_SHIM: ToolShim = {
+  tool: "python",
+  exeNames: ["pytest", "python", "python3"],
+  diagnosticName: "boat-offload-python",
+  defaultRunner: "pytest",
+  classify: (runner, argv) => classifyPython(runner, argv, { id: "local-prefilter" }),
+};
 
 const SIGNAL_EXIT: Record<string, number> = {
   SIGHUP: 129,
@@ -52,21 +86,25 @@ const SIGNAL_EXIT: Record<string, number> = {
   SIGTERM: 143,
 };
 
-const HELP = `boat-offload-cargo: run eligible cargo commands on a boat.dev pool VM.
+function helpFor(tool: ToolShim): string {
+  const [first, ...rest] = tool.exeNames;
+  const example = tool.tool === "cargo" ? "test --locked" : tool.tool === "node" ? "run test" : "tests/";
+  return `${tool.diagnosticName}: run eligible ${tool.tool} commands on a boat.dev pool VM.
 
-Passthrough (installed as \`cargo\` on PATH for opted-in runs):
-  cargo test --locked            offload when BOAT_OFFLOAD=1, else local
+Passthrough (installed as \`${first}${rest.length > 0 ? `|${rest.join("|")}` : ""}\` on PATH for opted-in runs):
+  ${first} ${example}            offload when BOAT_OFFLOAD=1, else local
 
-Diagnostic (never collides with cargo flags):
-  boat-offload-cargo --dry-run -- test --locked
-  boat-offload-cargo --dry-run --json -- test --locked
-  boat-offload-cargo --json -- test --locked
+Diagnostic (never collides with ${tool.tool} flags):
+  ${tool.diagnosticName} --dry-run -- ${example}
+  ${tool.diagnosticName} --dry-run --json -- ${example}
+  ${tool.diagnosticName} --json -- ${example}
 
 Discovery: --dry-run classifies without a VM, sync or journal effect.
 Recovery: an ambiguous submit reconciles the same command ID for 10 s, then
 exits 75 with that ID; a durable never-started receipt falls back locally.
 Staged remote outputs exit 74 with an artifact to apply explicitly.
 `;
+}
 
 function parseQueueTimeoutMs(raw: string | undefined): number {
   const n = raw === undefined ? NaN : Number(raw);
@@ -85,13 +123,13 @@ function dirKey(dir: string): string {
   return path.resolve(dir);
 }
 
-function resolveRealCargo(shimDir: string, scriptPath: string, pathEnv: string, deps: Pick<ShimDeps, "findExecutable" | "realpath">): string | null {
+function resolveRealExe(shimDir: string, scriptPath: string, pathEnv: string, exeName: string, deps: Pick<ShimDeps, "findExecutable" | "realpath">): string | null {
   const real = deps.realpath ?? ((p: string) => p);
   const shimKey = dirKey(shimDir);
   const selfKey = real(path.resolve(scriptPath));
   for (const dir of pathEnv.split(":")) {
     if (dir === "" || dirKey(dir) === shimKey) continue;
-    const hit = deps.findExecutable(dir, "cargo");
+    const hit = deps.findExecutable(dir, exeName);
     if (!hit) continue;
     // A symlinked spelling of the shim dir (or a link to the shim) must not
     // become its own fallback target.
@@ -118,52 +156,64 @@ function spawnExit(result: SpawnResult): number {
   return 128;
 }
 
-export async function shimMain(scriptPath: string, args: string[], deps: ShimDeps): Promise<number> {
-  const diagnostic = path.basename(scriptPath) !== "cargo";
+export async function shimMain(scriptPath: string, args: string[], deps: ShimDeps, tool: ToolShim = CARGO_SHIM): Promise<number> {
+  const installedAs = path.basename(scriptPath);
+  const diagnostic = !tool.exeNames.includes(installedAs);
+  const diag = tool.diagnosticName;
   const shimDir = path.dirname(scriptPath);
   const writeStderr = (text: string) => deps.stderr(Buffer.from(text, "utf8"));
   const writeStdout = (text: string) => deps.stdout(Buffer.from(text, "utf8"));
 
-  let cargoArgv: string[];
+  let toolArgv: string[];
   let dryRun = false;
   let json = false;
+  let runner = diagnostic ? tool.defaultRunner : installedAs;
   if (diagnostic) {
     if (args.length > 0 && (args[0] === "--help" || args[0] === "-h")) {
-      writeStdout(HELP);
+      writeStdout(helpFor(tool));
       return 0;
     }
     const dash = args.indexOf("--");
     const flags = dash >= 0 ? args.slice(0, dash) : args;
     if (dash < 0 && flags.length > 0) {
-      writeStderr("usage: boat-offload-cargo [--dry-run] [--json] -- <cargo argv...>\n");
+      writeStderr(`usage: ${diag} [--dry-run] [--json] [--runner <name>] -- <argv...>\n`);
       return 64;
     }
-    for (const flag of flags) {
+    for (let i = 0; i < flags.length; i++) {
+      const flag = flags[i]!;
       if (flag === "--dry-run") dryRun = true;
       else if (flag === "--json") json = true;
-      else {
-        writeStderr(`unknown flag ${JSON.stringify(flag)}\nusage: boat-offload-cargo [--dry-run] [--json] -- <cargo argv...>\n`);
+      else if (flag === "--runner") {
+        const name = flags[i + 1];
+        i += 1;
+        if (!name || !tool.exeNames.includes(name)) {
+          writeStderr(`unknown runner ${JSON.stringify(name ?? "")}\nusage: ${diag} [--dry-run] [--json] [--runner <name>] -- <argv...>\n`);
+          return 64;
+        }
+        runner = name;
+      } else {
+        writeStderr(`unknown flag ${JSON.stringify(flag)}\nusage: ${diag} [--dry-run] [--json] [--runner <name>] -- <argv...>\n`);
         return 64;
       }
     }
-    cargoArgv = dash >= 0 ? args.slice(dash + 1) : [];
+    toolArgv = dash >= 0 ? args.slice(dash + 1) : [];
     // Explicit diagnostic invocation bypasses BOAT_OFFLOAD, but re-entry still
-    // short-circuits: a fallbacked cargo must never route back into the shim.
+    // short-circuits: a fallbacked command must never route back into the shim.
     if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) {
-      const real = resolveRealCargo(shimDir, scriptPath, deps.env.PATH ?? "", deps);
+      const real = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", runner, deps);
       if (!real) {
-        writeStderr("boat-offload-cargo: no real cargo on PATH\n");
+        writeStderr(`${diag}: no real ${runner} on PATH\n`);
         return 127;
       }
-      return spawnExit(await deps.spawn(real, cargoArgv, fallbackEnv(deps.env, shimDir)));
+      return spawnExit(await deps.spawn(real, toolArgv, fallbackEnv(deps.env, shimDir)));
     }
   } else {
-    cargoArgv = args;
+    toolArgv = args;
   }
 
-  const realCargo = resolveRealCargo(shimDir, scriptPath, deps.env.PATH ?? "", deps);
-  if (!realCargo) {
-    writeStderr("boat-offload-cargo: no real cargo on PATH\n");
+  const realExe = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", diagnostic ? runner : installedAs, deps);
+  if (!realExe) {
+    writeStderr(`${diag}: no real ${diagnostic ? runner : installedAs} on PATH\n`);
     return 127;
   }
   const localEnv = fallbackEnv(deps.env, shimDir);
@@ -186,24 +236,34 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     return spawnExit(result);
   };
-  const runLocal = async (argv: string[]): Promise<number> => spawnLocal(realCargo, argv, localEnv);
+  const runLocal = async (argv: string[]): Promise<number> => spawnLocal(realExe, argv, localEnv);
 
   const workspaceId = deps.env.PAPERCLIP_WORKSPACE_ID;
   if (!diagnostic) {
     // Passthrough gating: strict opt-in, re-entry guard, workspace binding.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return runLocal(cargoArgv);
-    if (deps.env.BOAT_OFFLOAD !== "1") return runLocal(cargoArgv);
-    if (!workspaceId) return runLocal(cargoArgv);
+    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return runLocal(toolArgv);
+    if (deps.env.BOAT_OFFLOAD !== "1") return runLocal(toolArgv);
+    if (!workspaceId) return runLocal(toolArgv);
   } else if (!workspaceId) {
     if (dryRun) {
       const envelope = { version: OFFLOAD_VERSION, commandId: deps.randomId(), mode: "local", reason: "no workspace binding", profileId: "" };
       writeStdout(json ? `${JSON.stringify(envelope)}\n` : "mode: local (no workspace binding)\n");
       return 0;
     }
-    return runLocal(cargoArgv);
+    return runLocal(toolArgv);
   }
 
   const commandId = deps.randomId();
+  const request: ShimRequest = {
+    tool: tool.tool,
+    runner,
+    argv: toolArgv,
+    cwdRelative: ".",
+    executionWorkspaceId: workspaceId!,
+    queueTimeoutMs: parseQueueTimeoutMs(deps.env.BOAT_OFFLOAD_QUEUE_TIMEOUT_MS),
+    timeoutMs: parseCommandTimeoutMs(deps.env.BOAT_OFFLOAD_TIMEOUT_MS),
+    processEnv: deps.env,
+  };
   const clientDeps: ClientDeps = {
     http: deps.http,
     now: deps.now,
@@ -212,7 +272,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     stderr: deps.stderr,
     onSignal: deps.onSignal,
     randomId: () => commandId,
-    runLocal,
+    runLocal: (argv) => runLocalMeasured(argv),
     reportStaged: (syncBack) => {
       writeStderr(
         `offload: remote run ${syncBack.state} ${syncBack.changedPaths.length + syncBack.conflictPaths.length} path(s); ` +
@@ -223,13 +283,17 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
       writeStderr(`offload: execution state unknown for ${info.commandId}; exit 75, no local replay.\n`);
     },
   };
-  const request: ShimRequest = {
-    argv: cargoArgv,
-    cwdRelative: ".",
-    executionWorkspaceId: workspaceId!,
-    queueTimeoutMs: parseQueueTimeoutMs(deps.env.BOAT_OFFLOAD_QUEUE_TIMEOUT_MS),
-    timeoutMs: parseCommandTimeoutMs(deps.env.BOAT_OFFLOAD_TIMEOUT_MS),
-    processEnv: deps.env,
+  // A remote-candidate command that ends up running locally teaches the
+  // server duration gate. Cargo never reports; pre-opt-in runs never report.
+  const runLocalMeasured = async (argv: string[]): Promise<number> => {
+    if (tool.tool === "cargo") return runLocal(argv);
+    const startedAt = deps.now();
+    try {
+      return await runLocal(argv);
+    } finally {
+      const seconds = Math.max(0, (deps.now() - startedAt) / 1000);
+      await reportDuration(request, clientDeps, seconds);
+    }
   };
 
   if (diagnostic && dryRun) {
@@ -248,13 +312,13 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // Syntactic pre-filter avoids a network round trip for obviously local argv.
   let toolchains: string[];
   try {
-    toolchains = deps.readToolchains();
+    toolchains = tool.tool === "cargo" ? deps.readToolchains() : [];
   } catch {
     toolchains = [];
   }
-  const prefilter = classifyCargo(cargoArgv, { id: "local-prefilter", toolchains });
+  const prefilter = tool.classify(runner, toolArgv, toolchains);
   if (prefilter.mode === "local") {
-    const exit = await runLocal(cargoArgv);
+    const exit = await runLocal(toolArgv);
     if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId: null, mode: "local", reason: prefilter.reason, exitCode: exit })}\n`, "utf8"));
     return exit;
   }
@@ -265,12 +329,12 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   try {
     const classification = await runDryRun(request, clientDeps);
     if (classification.mode === "local") {
-      const exit = await runLocal(cargoArgv);
+      const exit = await runLocalMeasured(toolArgv);
       if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "local", reason: classification.reason, exitCode: exit })}\n`, "utf8"));
       return exit;
     }
   } catch {
-    return runLocal(cargoArgv);
+    return runLocalMeasured(toolArgv);
   }
   const exit = await runOffload(request, clientDeps);
   if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "remote", exitCode: exit })}\n`, "utf8"));
