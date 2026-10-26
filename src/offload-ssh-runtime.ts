@@ -181,7 +181,8 @@ export class SshOffloadRuntime {
       logger: this.deps.logger, now: Date.now,
       config: { maxOffloadVms: binding.config.maxOffloadVms, offloadIdleStopSeconds: binding.config.offloadIdleStopSeconds,
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
-        minComputeHoursLeft: binding.config.minComputeHoursLeft },
+        minComputeHoursLeft: binding.config.minComputeHoursLeft,
+        offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is

@@ -57,6 +57,8 @@ export interface OffloadSettings {
   offloadProfiles: string[];
   /** A Node/Python signature is a remote candidate only at/above this recorded median. */
   offloadMinExpectedSeconds: number;
+  /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
+  offloadMonthlyVmHourCap: number;
 }
 
 export interface OffloadRouteHost {
@@ -107,6 +109,7 @@ export const PYTHON_PROFILE: ServerProfile = {
 export const DEFAULT_SETTINGS: OffloadSettings = {
   offloadProfiles: ["rust-public-1"],
   offloadMinExpectedSeconds: 120,
+  offloadMonthlyVmHourCap: 0,
 };
 
 const KNOWN_PROFILE_IDS = new Set(["rust-public-1", "node-public-1", "python-public-1"]);
@@ -119,9 +122,11 @@ export function normalizeOffloadSettings(raw: unknown): OffloadSettings {
     ? record.offloadProfiles.filter((id): id is string => typeof id === "string" && KNOWN_PROFILE_IDS.has(id))
     : [...DEFAULT_SETTINGS.offloadProfiles];
   const min = Number(record.offloadMinExpectedSeconds);
+  const cap = Number(record.offloadMonthlyVmHourCap);
   return {
     offloadProfiles: profiles,
     offloadMinExpectedSeconds: Number.isFinite(min) && min >= 0 ? min : DEFAULT_SETTINGS.offloadMinExpectedSeconds,
+    offloadMonthlyVmHourCap: Number.isFinite(cap) && cap > 0 ? cap : DEFAULT_SETTINGS.offloadMonthlyVmHourCap,
   };
 }
 

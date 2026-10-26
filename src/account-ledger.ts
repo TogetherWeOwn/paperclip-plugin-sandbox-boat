@@ -207,6 +207,39 @@ export class AccountLedger {
   }
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
 
+  /**
+   * Tracked VM seconds in the UTC calendar month containing nowMs, for one
+   * company. Sums paid intervals clamped to the month plus the elapsed part
+   * of still-open tails. Enforces offloadMonthlyVmHourCap; returns 0 when the
+   * journal is unreadable rather than blocking dispatch on telemetry.
+   */
+  async monthVmSeconds(companyId: string, nowMs: number): Promise<number> {
+    return this.locked(async () => {
+      let doc: AccountDoc;
+      try {
+        doc = await this.read();
+      } catch {
+        return 0;
+      }
+      const at = new Date(nowMs);
+      const monthStart = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), 1);
+      let totalMs = 0;
+      for (const row of doc.usage) {
+        if (row.companyId !== companyId) continue;
+        for (const interval of row.intervals) {
+          const since = Date.parse(interval.since);
+          const until = Date.parse(interval.until);
+          if (!Number.isFinite(since) || !Number.isFinite(until)) continue;
+          totalMs += Math.max(0, Math.min(until, nowMs) - Math.max(since, monthStart));
+        }
+        if (row.tailSince != null && Number.isFinite(row.tailSince)) {
+          totalMs += Math.max(0, nowMs - Math.max(row.tailSince, monthStart));
+        }
+      }
+      return totalMs / 1000;
+    });
+  }
+
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
     const prior = this.observation(doc);
     const age = prior ? this.now() - prior.at : Infinity;

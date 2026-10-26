@@ -199,7 +199,8 @@ export class OffloadExecutor {
   private readonly now: () => number;
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
-    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
+    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
+    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap">;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly recordDuration?: OffloadDeps["recordDuration"];
@@ -231,6 +232,7 @@ export class OffloadExecutor {
       maxActive: deps.config.maxActive ?? DEFAULTS.maxActive,
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
+      offloadMonthlyVmHourCap: deps.config.offloadMonthlyVmHourCap ?? 0,
     };
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
@@ -713,6 +715,16 @@ export class OffloadExecutor {
 
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
+    // Monthly VM-hour cap, when configured: the month's tracked offload
+    // VM-hours already reached the cap, so this command stays local. Uses the
+    // existing account-ledger usage rows; never starts or bills a VM.
+    const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+    if (monthCap > 0) {
+      const usedSeconds = await ledger.monthVmSeconds(command.companyId, this.now()).catch(() => 0);
+      if (usedSeconds / 3600 >= monthCap) {
+        return { kind: "unavailable", reason: `monthly offload VM-hour cap reached (${monthCap}h); new commands run local until next month` };
+      }
+    }
     // Fund the provider-enforced TTL envelope, not the raw timeout: create,
     // resume and warm update all clamp the deadline to whole seconds with a
     // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
