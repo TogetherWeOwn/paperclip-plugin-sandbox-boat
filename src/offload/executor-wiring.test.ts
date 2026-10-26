@@ -40,7 +40,9 @@ describe("executor opt-in wiring", () => {
   it.each([undefined, false, "true", 1])("does not resolve or start an executor for flag %s", async (enabled) => {
     const t = await setup(enabled === undefined ? {} : { offloadExecutorEnabled: enabled });
     await t.manager.offloadExec(companyId, actor, body);
-    await until(() => t.readConfig.mock.calls.length === 1);
+    // Company config is read at request time (profiles/threshold) and
+    // re-read at dispatch; the dispatch re-check refuses here.
+    await until(() => t.readConfig.mock.calls.length === 2);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(t.resolveExecutor).not.toHaveBeenCalled();
     const read = await t.manager.offloadRead(companyId, actor, { commandId }, {});
@@ -86,7 +88,7 @@ describe("executor opt-in wiring", () => {
     await until(() => vi.mocked(t.executor.start).mock.calls.length === 1);
     config.offloadExecutorEnabled = false;
     await t.manager.offloadExec(companyId, actor, { ...body, commandId: "00000000-0000-4000-8000-000000000002" });
-    await until(() => t.readConfig.mock.calls.length === 2);
+    await until(() => t.readConfig.mock.calls.length === 4);
     expect(t.executor.start).toHaveBeenCalledTimes(1);
     expect((await t.manager.offloadRead(companyId, actor, { commandId }, {})).status).toBe(200);
     await t.manager.shutdown();

@@ -67,13 +67,13 @@ function setup(backend: OffloadBackend = new NeverDispatchBackend(), settings?: 
 
 describe("normalizeOffloadSettings", () => {
   it("defaults to rust-only with a 120s threshold", () => {
-    expect(normalizeOffloadSettings({})).toEqual({ offloadProfiles: ["rust-public-1"], offloadMinExpectedSeconds: 120 });
-    expect(normalizeOffloadSettings(null)).toEqual({ offloadProfiles: ["rust-public-1"], offloadMinExpectedSeconds: 120 });
+    expect(normalizeOffloadSettings({})).toEqual({ offloadProfiles: ["rust-public-1"], offloadMinExpectedSeconds: 120, offloadMonthlyVmHourCap: 0 });
+    expect(normalizeOffloadSettings(null)).toEqual({ offloadProfiles: ["rust-public-1"], offloadMinExpectedSeconds: 120, offloadMonthlyVmHourCap: 0 });
   });
 
   it("keeps known profiles and drops unknown ones and bad thresholds", () => {
     expect(normalizeOffloadSettings({ offloadProfiles: ["node-public-1", "nope"], offloadMinExpectedSeconds: -5 }))
-      .toEqual({ offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 120 });
+      .toEqual({ offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 120, offloadMonthlyVmHourCap: 0 });
     expect(normalizeOffloadSettings({ offloadMinExpectedSeconds: 60 }).offloadMinExpectedSeconds).toBe(60);
   });
 });
