@@ -88,7 +88,9 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
           // without touching its target (link size must not stand in for the
           // target, and the target must not be buffered unbounded).
           if (info.isSymbolicLink()) return true;
-          if (!info.isFile()) continue;
+          // A FIFO/socket/dir here would only fail later in captureSnapshot
+          // (SYNC_SPECIAL_FILE) after a VM was reserved, so stay local now.
+          if (!info.isFile()) return true;
           if (info.size > MAX_PYPROJECT_BYTES) return true;
           const handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
           try {
