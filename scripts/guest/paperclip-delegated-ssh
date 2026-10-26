@@ -1,0 +1,18 @@
+#!/bin/sh
+# Paperclip offload template: run each SSH command for this user inside a
+# delegated systemd user scope (systemd-run --user --scope -p Delegate=yes),
+# so the boat offload guest supervisor can move its own children into
+# cgroups below user@<uid>.service. Session scopes cannot be delegated.
+# stdio and the exit status pass through unchanged (a scope runs in place).
+uid=$(id -u)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+shell="${SHELL:-/bin/bash}"
+if command -v systemd-run >/dev/null 2>&1 && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  if [ -n "$SSH_ORIGINAL_COMMAND" ]; then
+    exec systemd-run --user --scope --quiet --collect -p Delegate=yes -- "$shell" -c "$SSH_ORIGINAL_COMMAND"
+  fi
+  exec systemd-run --user --scope --quiet --collect -p Delegate=yes -- "$shell" -l
+fi
+# No user manager bus yet: behave exactly like plain sshd.
+if [ -n "$SSH_ORIGINAL_COMMAND" ]; then exec "$shell" -c "$SSH_ORIGINAL_COMMAND"; fi
+exec "$shell" -l

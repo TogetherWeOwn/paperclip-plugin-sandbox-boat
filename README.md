@@ -596,6 +596,33 @@ boundary, then reaps only its own descendants. `PAPERCLIP_TEST_CGROUP_PARENT` ca
 select an existing test delegation. Provider calls are fake; SSH, file transfer,
 watchdogs, cgroups, cancellation and staging are real. No live Boat VM is used.
 
+### Delegated guest template (required for remote offload)
+
+The stock boat image has no cgroup v2 delegation for SSH sessions: session
+scopes sit under `user-1000.slice`, systemd ignores `Delegate=` on slices,
+and the guest preflight therefore returns false. Build a template once, on one
+default VM:
+
+1. Add `/etc/systemd/system/user@.service.d/10-delegate.conf` containing
+   `[Service]` and `Delegate=cpu memory pids`, then run `daemon-reload` and
+   `loginctl enable-linger user`.
+2. Install `scripts/guest/paperclip-delegated-ssh` as
+   `/usr/local/sbin/paperclip-delegated-ssh`. Add
+   `/etc/ssh/sshd_config.d/60-paperclip-delegated.conf` with
+   `Match User user` and `ForceCommand /usr/local/sbin/paperclip-delegated-ssh`.
+   Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
+   with stdio and exit status unchanged.
+3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
+   guest PATH is fixed and has no `RUSTUP_HOME`.
+4. Reboot, then run the preflight with `offloadCgroupParent`
+   `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
+   `true`.
+5. Save the VM as a named snapshot (not available during the boat free trial)
+   and set the driver `templateSnapshot` to that name. Offload pool VMs then
+   boot from it, as whole-run leases do; a missing snapshot is a refused start
+   and the command stays local. The snapshot name is part of the pool identity,
+   so changing it never reuses VMs that booted from the old image.
+
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)
 
 Run later on the **Boat Pilot Builder** agent, after the reviewed package is

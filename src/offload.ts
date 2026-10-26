@@ -108,6 +108,8 @@ export interface OffloadExecutorConfig {
   minComputeHoursLeft?: number;
   /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
   offloadMonthlyVmHourCap?: number;
+  /** Named boat snapshot new pool VMs boot from (driver `templateSnapshot`); null = stock image. */
+  templateSnapshot?: string | null;
 }
 
 export interface OffloadTimers {
@@ -200,7 +202,7 @@ export class OffloadExecutor {
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
-    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap">;
+    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot">;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly recordDuration?: OffloadDeps["recordDuration"];
@@ -233,6 +235,7 @@ export class OffloadExecutor {
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
       offloadMonthlyVmHourCap: deps.config.offloadMonthlyVmHourCap ?? 0,
+      templateSnapshot: deps.config.templateSnapshot ?? null,
     };
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
@@ -749,7 +752,11 @@ export class OffloadExecutor {
     try {
       await this.persistPool();
       if (operation === "create") {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+        // Same semantics as whole-run leases (vm-manager): a configured named
+        // snapshot is the guest image; a missing one is a refused start, so the
+        // command stays local.
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+          ...(this.config.templateSnapshot ? { from: this.config.templateSnapshot } : {}) });
         const id = sandboxIdOf(response);
         if (!id) throw new Error("create returned no sandbox id");
         vm.sandboxId = id;

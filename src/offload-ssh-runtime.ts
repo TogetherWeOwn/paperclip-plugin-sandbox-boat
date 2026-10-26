@@ -244,7 +244,8 @@ export class SshOffloadRuntime {
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
-      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot])).digest("hex").slice(0, 24);
+      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot,
+      binding.config.templateSnapshot ?? null])).digest("hex").slice(0, 24);
     const existing = this.pools.get(poolId);
     if (existing) return existing.executor;
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
@@ -287,7 +288,8 @@ export class SshOffloadRuntime {
       config: { maxOffloadVms: binding.config.maxOffloadVms, offloadIdleStopSeconds: binding.config.offloadIdleStopSeconds,
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
-        offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap },
+        offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
+        templateSnapshot: binding.config.templateSnapshot ?? null },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is
