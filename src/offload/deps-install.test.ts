@@ -40,20 +40,43 @@ describe("planDependencies", () => {
   });
 
   it("plans pip and uv installs", async () => {
-    expect((await planDependencies(root({ "requirements.txt": "pytest\n" })))?.installs)
-      .toEqual([{ lockfile: "requirements.txt", install: ["pip", "install", "-r", "requirements.txt"] }]);
+    const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    expect((await planDependencies(root({ "requirements.txt": pinned })))?.installs)
+      .toEqual([{ lockfile: "requirements.txt", install: ["pip", "install", "--require-hashes", "-r", "requirements.txt"] }]);
     expect((await planDependencies(root({ "uv.lock": "x" })))?.installs)
       .toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen"] }]);
   });
 
+  it("stays local on unpinned requirements.txt", async () => {
+    expect(await planDependencies(root({ "requirements.txt": "pytest\n" }))).toBe(null);
+    expect(await planDependencies(root({ "requirements.txt": "pytest>=7\n" }))).toBe(null);
+    expect(await planDependencies(root({ "requirements.txt": "pytest==7.4.2\n" }))).toBe(null);
+  });
+
+  it("scopes ambiguity to the requested tool", async () => {
+    const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    const both = root({ "package-lock.json": "x", "yarn.lock": "y", "requirements.txt": pinned });
+    expect(await planDependencies(both, "python")).not.toBe(null);
+    expect(await planDependencies(both, "node")).toBe(null);
+    const bothPy = root({ "package-lock.json": "x", "requirements.txt": pinned });
+    expect((await planDependencies(bothPy, "python"))?.installs).toHaveLength(1);
+  });
+
   it("plans both ecosystems in a mixed repo", async () => {
-    const plan = await planDependencies(root({ "package-lock.json": "x", "requirements.txt": "y\n" }));
+    const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    const plan = await planDependencies(root({ "package-lock.json": "x", "requirements.txt": pinned }));
     expect(plan?.installs).toHaveLength(2);
+  });
+
+  it("ignores unpinned requirements beside uv.lock", async () => {
+    const plan = await planDependencies(root({ "uv.lock": "x", "requirements.txt": "pytest\n" }));
+    expect(plan?.installs).toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen"] }]);
   });
 
   it("returns null on ambiguous competing lockfiles", async () => {
     expect(await planDependencies(root({ "package-lock.json": "x", "yarn.lock": "y" }))).toBe(null);
-    expect(await planDependencies(root({ "uv.lock": "x", "requirements.txt": "y" }))).toBe(null);
+    const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    expect(await planDependencies(root({ "uv.lock": "x", "requirements.txt": pinned }))).toBe(null);
   });
 
   it("keys the hash on lockfile contents", async () => {

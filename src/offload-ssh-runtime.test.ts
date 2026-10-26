@@ -178,7 +178,7 @@ describe("stock concrete executor factory", () => {
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
-    await writeFile(path.join(source, "requirements.txt"), "pytest\n");
+    await writeFile(path.join(source, "requirements.txt"), "pytest==7.4.2 \\\n    --hash=sha256:abc123\n");
     const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
     expect(await runtime.resolve(base, enabled)).not.toBe(null);

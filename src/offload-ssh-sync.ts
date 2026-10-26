@@ -148,7 +148,7 @@ export class SshOffloadSync implements OffloadSync {
    */
   async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
     if ((command.tool ?? "cargo") === "cargo") return;
-    const plan = await planDependencies(source);
+    const plan = await planDependencies(source, command.tool);
     if (!plan) {
       // resolve() keeps lockfile-less commands local before any VM is spent;
       // reaching here means the source changed under us. Never run unlocked.

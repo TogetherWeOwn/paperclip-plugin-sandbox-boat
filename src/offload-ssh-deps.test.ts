@@ -83,7 +83,7 @@ describe("installDependencies", () => {
   });
 
   it("fails the push when the install fails", async () => {
-    const root = source({ "requirements.txt": "pytest\n" });
+    const root = source({ "requirements.txt": "pytest==7.4.2 \\\n    --hash=sha256:abc123\n" });
     const ssh = {
       runStream: vi.fn(async (_s: unknown, cmd: string) => {
         if (String(cmd).includes("test -f")) return { exitCode: 1, timedOut: false, signal: null, stdout: "" };

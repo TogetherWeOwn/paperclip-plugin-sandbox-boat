@@ -141,7 +141,7 @@ export class SshOffloadRuntime {
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest.
-      const plan = await planDependencies(binding.source).catch(() => null);
+      const plan = await planDependencies(binding.source, tool).catch(() => null);
       if (!plan) return null;
     }
     // Source and credentials only from host-authored native params. An API
