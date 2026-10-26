@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
@@ -11,6 +11,7 @@ import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
+import { DEFAULT_API_BASE } from "./config.js";
 
 let ssh: LoopbackSsh;
 let runtime: SshOffloadRuntime;
@@ -216,6 +217,48 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toBe(null);
     expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toBe(null);
     expect(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("templateSnapshot pool wiring", () => {
+  // Pool identity before templateSnapshot existed. Existing pools persist their
+  // VMs under this id, so an unset template must keep it byte-for-byte.
+  function legacyPoolId(profileId = "rust-public-1") {
+    return createHash("sha256").update(JSON.stringify([companyId, "env", "repo:https://github.com/example/public", profileId,
+      DEFAULT_API_BASE, "small", config.offloadCgroupParent, config.offloadArtifactRoot])).digest("hex").slice(0, 24);
+  }
+  function withTemplate(name: string): PluginEnvironmentRealizeWorkspaceParams {
+    const params = native();
+    params.config = { ...params.config, templateSnapshot: name };
+    return params;
+  }
+
+  it("keeps the legacy pool identity when no template is configured", async () => {
+    const executor = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    expect(executor.poolId).toBe(legacyPoolId());
+    expect(executor.config.templateSnapshot).toBe(null);
+  });
+
+  it("updates a cached executor when a later binding selects another template", async () => {
+    const first = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    runtime.remember(withTemplate("tmpl-a"));
+    const a = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(a).toBe(first);
+    expect(a.config.templateSnapshot).toBe("tmpl-a");
+    runtime.remember(withTemplate("tmpl-b"));
+    const b = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(b).toBe(first);
+    expect(b.config.templateSnapshot).toBe("tmpl-b");
+    runtime.remember(native());
+    expect(((await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } }).config.templateSnapshot).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("forwards the configured template and keeps the pool identity, so recorded VMs stay owned", async () => {
+    runtime.remember(withTemplate("tmpl-a"));
+    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    expect(a.config.templateSnapshot).toBe("tmpl-a");
+    expect(a.poolId).toBe(legacyPoolId());
     expect(boat.calls).toHaveLength(0);
   });
 });
