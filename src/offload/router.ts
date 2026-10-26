@@ -51,6 +51,28 @@ const NODE_BIN_RUNNERS = new Set(["npx", "pnpm", "yarn", "npm"]);
 const NODE_TEST_SCRIPT_RE = /^(test|tests|e2e|integration|spec|specs|build)([:\-]|$)/i;
 /** Watch-mode npm scripts never go remote: a killed watch burns VM-hours. */
 const NODE_WATCH_SCRIPT_RE = /:watch|watch$/i;
+/** Deploy/publish/release-like script names never go remote. */
+const NODE_PUBLISH_DENY_RE = /deploy|publish|release|push|upload|prod|ship/i;
+/** Conservative build sub-suffix allowlist: exact `build` plus these only. */
+const NODE_BUILD_SUFFIX_ALLOW = new Set([
+  "test", "tests", "e2e", "integration", "spec", "specs", "ci",
+  "client", "server", "web", "app", "static", "bundle",
+]);
+
+/** True for exact `build` or a `build:<suffix>`/`build-<suffix>` name. */
+function isBuildScript(script: string): boolean {
+  const lower = script.toLowerCase();
+  return lower === "build" || lower.startsWith("build:") || lower.startsWith("build-");
+}
+
+/** True only for exact `build` or an allowlisted suffix without deny words. */
+function isAllowedBuildScript(script: string): boolean {
+  if (script.toLowerCase() === "build") return true;
+  const suffix = /^build[:\-](.+)$/i.exec(script)?.[1];
+  if (!suffix) return false;
+  if (NODE_PUBLISH_DENY_RE.test(script)) return false;
+  return NODE_BUILD_SUFFIX_ALLOW.has(suffix.toLowerCase());
+}
 /** Flags that narrow a run to interactive or single-test scope. */
 const NODE_WATCH_FLAGS = new Set(["--watch", "--watchAll", "--watch-all", "--ui", "--open", "--inspect", "--inspect-brk"]);
 const NODE_NARROW_FLAGS = new Set(["-t", "--testNamePattern", "--testPathPattern", "--grep", "-g"]);
@@ -184,7 +206,12 @@ export function classifyNode(runner: string, argv: string[], profile: ToolProfil
     const [script, ...scriptArgs] = rest;
     if (!script) return local(profile, "npm run without a script stays local", command, runner);
     if (NODE_WATCH_SCRIPT_RE.test(script)) return local(profile, `watch script ${script} stays local`, command, runner);
-    if (!NODE_TEST_SCRIPT_RE.test(script)) return local(profile, `script ${script} is not a test/e2e/build script`, command, runner);
+    if (NODE_PUBLISH_DENY_RE.test(script)) return local(profile, `script ${script} looks like a deploy/publish/release and stays local`, command, runner);
+    if (isBuildScript(script)) {
+      if (!isAllowedBuildScript(script)) return local(profile, `script ${script} is not an allowed build and stays local`, command, runner);
+    } else if (!NODE_TEST_SCRIPT_RE.test(script)) {
+      return local(profile, `script ${script} is not a test/e2e/build script`, command, runner);
+    }
     const { selection, suiteDir } = nodePositionals(scriptArgs);
     const narrowed = nodeWatchOrNarrow(scriptArgs, null, suiteDir);
     if (narrowed) return local(profile, narrowed, command, runner);

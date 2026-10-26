@@ -456,8 +456,10 @@ existing behaviour and is never gated by this setting.
 
 Short commands must stay local: sync plus VM overhead (~30 s) makes anything
 shorter slower remotely. Watch modes, single-file filters, lint/typecheck/
-format, install/ci, dev servers, inline `python -c` and anything unrecognized
-stay local. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
+format, install/ci, dev servers, inline `python -c`, deploy/publish/release-like
+scripts (any name containing deploy, publish, release, push, upload, prod or
+ship) and anything unrecognized stay local. Only exact `build` plus an
+allowlisted build suffix stays remote. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
 caches and build outputs; the guest installs dependencies from the lockfile
 (`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
 `requirements.txt` via `pip install --require-hashes -r`) into a per-VM cache

@@ -10,7 +10,6 @@ describe("classifyNode", () => {
     ["npm", ["run", "test:integration"]],
     ["npm", ["run", "e2e"]],
     ["npm", ["run", "build"]],
-    ["npm", ["run", "build:prod"]],
     ["npm", ["test"]],
     ["npm", ["test", "--", "--coverage"]],
     ["pnpm", ["run", "spec"]],
@@ -68,6 +67,16 @@ describe("classifyNode", () => {
     ["npx", ["rimraf", "dist"]],
   ])("keeps %s %s local", (runner, argv) => {
     expect(classifyNode(runner, argv, NODE).mode).toBe("local");
+  });
+
+  it("keeps build deploy/publish/release scripts local while plain build stays remote", () => {
+    expect(classifyNode("npm", ["run", "build"], NODE).mode).toBe("remote_candidate");
+    expect(classifyNode("npm", ["run", "build:test"], NODE).mode).toBe("remote_candidate");
+    expect(classifyNode("npm", ["run", "build:deploy-prod"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "build:publish"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "build:release"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "build:prod"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "build:ship"], NODE).mode).toBe("local");
   });
 
   it("keeps compound shell text local", () => {
