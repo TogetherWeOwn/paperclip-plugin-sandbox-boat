@@ -2,7 +2,8 @@
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, realpath } from "node:fs/promises";
+import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
@@ -82,10 +83,30 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
         try {
           const abs = path.join(dir, name);
           const info = await lstat(abs);
-          if (!info.isFile() && !info.isSymbolicLink()) continue;
+          // Never follow symlinks for config this scan reads: consistent
+          // with the sync symlink policy, a symlinked pyproject stays local
+          // without touching its target (link size must not stand in for the
+          // target, and the target must not be buffered unbounded).
+          if (info.isSymbolicLink()) return true;
+          if (!info.isFile()) continue;
           if (info.size > MAX_PYPROJECT_BYTES) return true;
-          const text = await readFile(abs, "utf8");
-          if (isUvAuthPyproject(text)) return true;
+          const handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+          try {
+            const target = await handle.stat();
+            if (target.isSymbolicLink() || !target.isFile()) return true;
+            if (target.size > MAX_PYPROJECT_BYTES) return true;
+            const buf = Buffer.alloc(MAX_PYPROJECT_BYTES + 1);
+            let off = 0;
+            for (;;) {
+              const { bytesRead } = await handle.read(buf, off, buf.length - off);
+              if (bytesRead === 0) break;
+              off += bytesRead;
+              if (off > MAX_PYPROJECT_BYTES) return true;
+            }
+            if (isUvAuthPyproject(buf.subarray(0, off).toString("utf8"))) return true;
+          } finally {
+            await handle.close().catch(() => undefined);
+          }
         } catch {
           return true;
         }

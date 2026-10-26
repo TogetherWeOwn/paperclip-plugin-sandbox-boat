@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,5 +52,11 @@ describe("hasRegistryCredentials", () => {
 
   it("returns false for a clean source", async () => {
     expect(await hasRegistryCredentials(root({ "package.json": "{}" }))).toBe(false);
+  });
+
+  it("stays local on a symlinked pyproject.toml without reading its large target", async () => {
+    const dir = root({ "target.txt": `[project]\nname = "app"\n${"x".repeat(300 * 1024)}\n` });
+    symlinkSync(path.join(dir, "target.txt"), path.join(dir, "pyproject.toml"));
+    expect(await hasRegistryCredentials(dir)).toBe(true);
   });
 });

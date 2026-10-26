@@ -15,8 +15,8 @@
 
 ### Fixed
 
-* Python commands from a `uv.lock` plan now run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with an empty env instead of the system PATH interpreter.
-* Registry credential detection now scans at any depth (skipping excluded dirs) and treats `uv.toml` plus `pyproject.toml` uv auth config as stay-local.
+* Python commands from a `uv.lock` plan now run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with `VIRTUAL_ENV=<checkout>/.venv` and `<checkout>/.venv/bin` prepended to the guest `PATH` for that command only (every other env key stays empty) instead of the system PATH interpreter.
+* Registry credential detection now scans at any depth (skipping excluded dirs) and treats `uv.toml` plus `pyproject.toml` uv auth config as stay-local; symlinked `pyproject.toml` stays local without following its target and regular files are read bounded at 256 KiB.
 * Node `run` scripts containing deploy, publish, release, push, upload, prod or ship stay local; only exact `build` plus an allowlisted suffix stays remote.
 * Pinned `requirements.txt` now requires `name[extras]==version` with `--hash=sha256:` per requirement and rejects pip option lines; malformed, editable or extra-index lines stay local.
 * Offload submissions reject NUL and other ASCII control characters in argv with HTTP 400 before workspace lookup, journaling or dispatch; the native SSH executor also refuses them defensively before resolving a pool.

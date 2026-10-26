@@ -68,7 +68,7 @@ describe("node/python guest prepare", () => {
       .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
   });
 
-  it("runs a uv python command inside the checkout venv with an empty env", async () => {
+  it("runs a uv python command inside the checkout venv with only VIRTUAL_ENV set", async () => {
     const seen: unknown[] = [];
     const ssh = {
       runStream: vi.fn(async (_session: unknown, _cmd: string, opts: { stdin?: AsyncIterable<Uint8Array> }) => {
@@ -92,7 +92,8 @@ describe("node/python guest prepare", () => {
     await guest.prepare("vm-1", command({ tool: "python", runner: "python", profileId: "python-public-1",
       argv: ["-m", "pytest", "tests/"] }));
     const input = seen[0] as Record<string, unknown>;
-    expect(input).toMatchObject({ executable: "/tmp/guest-checkout/.venv/bin/python", env: {} });
+    expect(input).toMatchObject({ executable: "/tmp/guest-checkout/.venv/bin/python",
+      env: { VIRTUAL_ENV: "/tmp/guest-checkout/.venv" } });
     expect(input.args).toEqual(["-m", "pytest", "tests/"]);
   });
 
@@ -101,5 +102,43 @@ describe("node/python guest prepare", () => {
     await guest.prepare("vm-1", command({ tool: "python", runner: "pytest", profileId: "python-public-1",
       argv: ["tests/"] }));
     expect(seen[0] as Record<string, unknown>).toMatchObject({ executable: "pytest", env: {} });
+  });
+
+  it("activates the checkout venv for child processes", async () => {
+    const seen: unknown[] = [];
+    const ssh = {
+      runStream: vi.fn(async (_session: unknown, _cmd: string, opts: { stdin?: AsyncIterable<Uint8Array> }) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of opts.stdin ?? []) chunks.push(Buffer.from(chunk as Uint8Array));
+        seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        return {
+          exitCode: 0, timedOut: false, signal: null,
+          stdout: JSON.stringify({ guestBootId: "boot-1", processGroupId: 1, cgroupPath: "/sys/fs/cgroup/x", journalGeneration: 1, heartbeatDeadline: 1, guestDeadline: 1 }),
+        };
+      }),
+    };
+    const guest = new SshOffloadGuest({
+      ssh: ssh as never,
+      session: async () => ({} as never),
+      cgroupParent: "/sys/fs/cgroup",
+      workspace: async () => "/tmp/work",
+      allowedEnv: () => [],
+      uvVenvRoot: async () => "/tmp/guest-checkout",
+    });
+    await guest.prepare("vm-1", command({ tool: "python", runner: "python", profileId: "python-public-1",
+      argv: ["-m", "pytest", "tests/"] }));
+    const input = seen[0] as Record<string, unknown>;
+    expect(input).toMatchObject({ executable: "/tmp/guest-checkout/.venv/bin/python",
+      env: { VIRTUAL_ENV: "/tmp/guest-checkout/.venv" } });
+    expect(input.path as string).toBe("/tmp/guest-checkout/.venv/bin:/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin");
+  });
+
+  it("leaves the guest PATH alone without a uv venv", async () => {
+    const { guest, seen } = stubGuest();
+    await guest.prepare("vm-1", command({ tool: "python", runner: "pytest", profileId: "python-public-1",
+      argv: ["tests/"] }));
+    const input = seen[0] as Record<string, unknown>;
+    expect(input.env).toEqual({});
+    expect(input.path as string).toBe("/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin");
   });
 });
