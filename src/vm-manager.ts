@@ -39,7 +39,7 @@ import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
-import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
+import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
@@ -2081,7 +2081,9 @@ export class BoatVmManager {
       };
     }
     // Default-deny env (env-policy.ts): only allowlisted names reach the VM.
-    const { kept: envEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
+    const { kept: allowedEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
+    // A host-side proxy address in the agent's own env must use the tunnel.
+    const envEntries = routeModelProxyThroughTunnel(allowedEntries, config);
     assertValidEnvKeys(envEntries);
     if (dropped.length > 0) this.logEnvDrops(sandboxId, dropped);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;

@@ -492,3 +492,30 @@ export function isAcpProcessSessionCommand(
   if ([command, ...args].some((part) => ACP_PROCESS_SESSION_TEXT_RE.test(part))) return true;
   return env != null && ACP_PROCESS_SESSION_ENV_NAMES.some((name) => Object.hasOwn(env, name));
 }
+
+/**
+ * Route a model-proxy base URL through this plugin's reverse tunnel. An
+ * agent's own adapter env can name the proxy by its host-side address (for
+ * example http://cliproxy:8317, a docker DNS name) and that value overrides
+ * the environment's tunnel address; inside the VM the name does not resolve.
+ * Only ANTHROPIC_BASE_URL pointing exactly at the tunnel target is rewritten,
+ * to 127.0.0.1:<tunnelRemotePort>; scheme and path are kept.
+ */
+export function routeModelProxyThroughTunnel(
+  entries: ReadonlyArray<[string, string]>,
+  tunnel: { cliproxyTunnel: boolean; tunnelTargetHost: string; tunnelTargetPort: number; tunnelRemotePort: number },
+): Array<[string, string]> {
+  if (!tunnel.cliproxyTunnel) return entries.map(([name, value]) => [name, value]);
+  return entries.map(([name, value]) => {
+    if (name !== "ANTHROPIC_BASE_URL") return [name, value];
+    let url: URL;
+    try { url = new URL(value); } catch { return [name, value]; }
+    const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    if (url.hostname !== tunnel.tunnelTargetHost || port !== tunnel.tunnelTargetPort) return [name, value];
+    url.hostname = "127.0.0.1";
+    url.port = String(tunnel.tunnelRemotePort);
+    const rewritten = url.toString();
+    // URL adds a trailing "/" to a bare origin; keep the caller's form.
+    return [name, value.endsWith("/") || url.pathname !== "/" ? rewritten : rewritten.replace(/\/$/, "")];
+  });
+}
