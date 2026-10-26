@@ -191,6 +191,8 @@ describe("stock concrete executor factory", () => {
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
     expect(await runtime.resolve(base, enabled)).not.toBe(null);
     expect(await runtime.resolve({ ...base, argv: ["-c", "print(1)"] }, enabled)).toBe(null);
+    // pytest's own -c/--config after -m is a config file, not inline code.
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "-c", "pytest.ini", "tests/"] }, enabled)).not.toBe(null);
     expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toBe(null);
     expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toBe(null);
     expect(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled)).not.toBe(null);

@@ -98,6 +98,8 @@ describe("classifyNode", () => {
     expect(classifyNode("npx", ["jest", "-t", "login", "--config", "foo/bar.js"], NODE).mode).toBe("local");
     expect(classifyNode("npx", ["vitest", "run", "__tests__/login.ts"], NODE).mode).toBe("local");
     expect(classifyNode("npx", ["jest", "login"], NODE).mode).toBe("local");
+    // --config's value is not a positional filter: the whole suite still runs.
+    expect(classifyNode("npx", ["jest", "--config", "jest.config.js"], NODE).mode).toBe("remote_candidate");
   });
 });
 

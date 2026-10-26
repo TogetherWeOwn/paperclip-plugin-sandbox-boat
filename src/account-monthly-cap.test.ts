@@ -99,6 +99,30 @@ describe("monthVmSeconds", () => {
   });
 });
 
+describe("monthly cap counts pending reservations", () => {
+  it("refuses when settled usage is under the cap but an unsettled reservation would cross it", async () => {
+    const state = memState();
+    const hashed = (await import("node:crypto")).createHash("sha256").update("acct").digest("hex");
+    const monthStart = Date.UTC(2026, 9, 1);
+    await state.set({ scopeKind: "instance", namespace: "boat-account", stateKey: hashed }, {
+      version: 1, observation: null, countedResumeUntil: null,
+      intents: [{ intentId: "pending-1", status: "reserved", settledAt: null, usageId: "a", jobSeconds: 3_000, tailSeconds: 600,
+        operation: "create", size: "default", createdAt: new Date(EPOCH).toISOString() }],
+      usage: [{ usageRecordId: "a", poolId: "p", kind: "command", commandId: "a", runId: "r", cardId: "c",
+        repoId: "repo", sandboxId: "vm-1", seconds: 0, dollars: 0, meterProvenance: "provider",
+        observedStartsDelta: null, intervals: [
+          { since: new Date(monthStart).toISOString(), until: new Date(monthStart + 1_800_000).toISOString(), phase: "command" },
+        ], tailSince: null, companyId: "co-1" }],
+    });
+    const ledger = new AccountLedger(state, "acct", () => EPOCH);
+    const api = { limits: async () => { throw new Error("no provider in unit test"); } } as never;
+    // 0.5 h settled + 1 h pending >= 1 h cap. Without the pending count the call passes the cap and fails on the provider read instead.
+    await expect(ledger.reserve(api, { operation: "create", size: "default", jobSeconds: 60, tailSeconds: 0,
+      maxActive: 10, maxStartsPerDay: 100, minComputeHoursLeft: 0,
+      monthlyCap: { companyId: "co-1", nowMs: EPOCH, capHours: 1 } })).rejects.toThrow(/monthly offload VM-hour cap/);
+  });
+});
+
 describe("offloadMonthlyVmHourCap", () => {
   it("keeps commands local once the month's tracked VM-hours reach the cap", async () => {
     const p = f.pool("cap-a", {}, async () => ({ exitCode: 0, seconds: 60 }));
