@@ -240,6 +240,20 @@ describe("templateSnapshot pool wiring", () => {
     expect(executor.config.templateSnapshot).toBe(null);
   });
 
+  it("updates a cached executor when a later binding selects another template", async () => {
+    const first = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    runtime.remember(withTemplate("tmpl-a"));
+    const a = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(a).toBe(first);
+    expect(a.config.templateSnapshot).toBe("tmpl-a");
+    runtime.remember(withTemplate("tmpl-b"));
+    const b = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(b).toBe(first);
+    expect(b.config.templateSnapshot).toBe("tmpl-b");
+    runtime.remember(native());
+    expect(((await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } }).config.templateSnapshot).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("forwards the configured template and keeps the pool identity, so recorded VMs stay owned", async () => {
     runtime.remember(withTemplate("tmpl-a"));
     const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };

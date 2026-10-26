@@ -251,7 +251,10 @@ export class SshOffloadRuntime {
     // are retired through the normal stop path. The executor keys VM reuse on
     // the template instead (compatibilityKey).
     const existing = this.pools.get(poolId);
-    if (existing) return existing.executor;
+    if (existing) {
+      existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
+      return existing.executor;
+    }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
     const sessions = new Map<string, SshSession>();
     const session = this.deps.session ?? (async (sandboxId: string) => {

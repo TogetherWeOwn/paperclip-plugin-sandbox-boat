@@ -563,6 +563,16 @@ export class OffloadExecutor {
     return await this.runOnVm(dispatch.vm, command, dispatch.warm, this.now() - enqueuedAt);
   }
 
+  /**
+   * The runtime caches one executor per pool, and the template is not part of
+   * the pool identity, so later native bindings deliver the current selection
+   * here. It applies to later claims and creates; recorded VMs keep the key
+   * they were created with and are retired if it no longer matches.
+   */
+  setTemplateSnapshot(name: string | null): void {
+    this.config.templateSnapshot = name;
+  }
+
   private compatibilityKey(command: OffloadCommand): string {
     // A VM booted from another guest image is never reused; it is retired like
     // any incompatible idle VM. Without a template the key is unchanged, so VMs

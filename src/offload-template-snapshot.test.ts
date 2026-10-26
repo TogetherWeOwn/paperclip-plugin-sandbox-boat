@@ -52,4 +52,16 @@ describe("offload pool templateSnapshot", () => {
       { compatibilityKey(c: ReturnType<typeof command>): string };
     expect(vm.compatibilityKey).not.toBe(after.compatibilityKey(command("swap-a")));
   });
+
+  it("uses the latest template selection for later creates on the same executor", async () => {
+    const p = f.pool("switch-pool", { maxOffloadVms: 4 });
+    const live = p as unknown as { setTemplateSnapshot(name: string | null): void };
+    live.setTemplateSnapshot("tmpl-b");
+    expect(await p.execute(command("switch-b"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("create").at(-1)!.args.from).toBe("tmpl-b");
+    live.setTemplateSnapshot(null);
+    expect(await p.execute(command("switch-none"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("create")).toHaveLength(2);           // the tmpl-b VM is not reused for the stock image
+    expect("from" in f.boat.callsOf("create").at(-1)!.args).toBe(false);
+  });
 });
