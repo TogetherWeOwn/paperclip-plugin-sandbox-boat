@@ -71,12 +71,31 @@ describe("monthVmSeconds", () => {
     expect(await ledger.monthVmSeconds("other", EPOCH)).toBe(0);
   });
 
-  it("returns 0 when the journal is unreadable instead of blocking dispatch", async () => {
+  it("fails closed when the journal is unreadable", async () => {
     const state = memState();
     const hashed = (await import("node:crypto")).createHash("sha256").update("acct").digest("hex");
     await state.set({ scopeKind: "instance", namespace: "boat-account", stateKey: hashed }, { version: 999 });
     const ledger = new AccountLedger(state, "acct", () => EPOCH);
-    expect(await ledger.monthVmSeconds("co-1", EPOCH)).toBe(0);
+    await expect(ledger.monthVmSeconds("co-1", EPOCH)).rejects.toThrow();
+  });
+
+  it("refuses admission atomically when the monthly cap is reached", async () => {
+    const state = memState();
+    const hashed = (await import("node:crypto")).createHash("sha256").update("acct").digest("hex");
+    const monthStart = Date.UTC(2026, 9, 1);
+    await state.set({ scopeKind: "instance", namespace: "boat-account", stateKey: hashed }, {
+      version: 1, observation: null, intents: [], countedResumeUntil: null,
+      usage: [{ usageRecordId: "a", poolId: "p", kind: "command", commandId: "a", runId: "r", cardId: "c",
+        repoId: "repo", sandboxId: "vm-1", seconds: 0, dollars: 0, meterProvenance: "provider",
+        observedStartsDelta: null, intervals: [
+          { since: new Date(monthStart).toISOString(), until: new Date(monthStart + 3_600_000).toISOString(), phase: "command" },
+        ], tailSince: null, companyId: "co-1" }],
+    });
+    const ledger = new AccountLedger(state, "acct", () => EPOCH);
+    const api = { limits: async () => { throw new Error("no provider in unit test"); } } as never;
+    await expect(ledger.reserve(api, { operation: "create", size: "default", jobSeconds: 60, tailSeconds: 0,
+      maxActive: 10, maxStartsPerDay: 100, minComputeHoursLeft: 0,
+      monthlyCap: { companyId: "co-1", nowMs: EPOCH, capHours: 0.5 } })).rejects.toThrow(/monthly offload VM-hour cap/);
   });
 });
 

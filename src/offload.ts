@@ -715,16 +715,10 @@ export class OffloadExecutor {
 
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
-    // Monthly VM-hour cap, when configured: the month's tracked offload
-    // VM-hours already reached the cap, so this command stays local. Uses the
-    // existing account-ledger usage rows; never starts or bills a VM.
+    // Monthly VM-hour cap, when configured, is enforced atomically with
+    // admission inside the ledger lock: fail closed on telemetry errors and
+    // count pending envelopes so concurrent claims cannot burst past the cap.
     const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
-    if (monthCap > 0) {
-      const usedSeconds = await ledger.monthVmSeconds(command.companyId, this.now()).catch(() => 0);
-      if (usedSeconds / 3600 >= monthCap) {
-        return { kind: "unavailable", reason: `monthly offload VM-hour cap reached (${monthCap}h); new commands run local until next month` };
-      }
-    }
     // Fund the provider-enforced TTL envelope, not the raw timeout: create,
     // resume and warm update all clamp the deadline to whole seconds with a
     // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
@@ -734,8 +728,12 @@ export class OffloadExecutor {
       reservation = await ledger.reserve(this.boat, { ...this.config, operation, sandboxId: existing?.sandboxId, poolId: this.poolId,
         jobSeconds, tailSeconds: this.config.offloadIdleStopSeconds,
         command: { commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId,
-          companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") } });
-    } catch {
+          companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") },
+        ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("monthly offload VM-hour cap reached")) {
+        return { kind: "unavailable", reason: `monthly offload VM-hour cap reached (${monthCap}h); new commands run local until next month` };
+      }
       return { kind: "unavailable", reason: "account admission refused: limits, capacity or durable state unavailable" };
     }
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
