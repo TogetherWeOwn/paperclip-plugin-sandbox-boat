@@ -427,9 +427,12 @@ builds the same payload from host-owned data only:
    resolved per binding and never stored; `offloadLocalEnvironmentId` and
    `offloadLocalDriverConfig` give the pool identity and settings.
 
-The agent and the offload request body supply nothing. A binding never replaces a
-whole-run realization for the same run and workspace, and `agent.run.finished`,
-`failed` and `cancelled` drop it from the executor. A missing host fact (no
+The agent and the offload request body supply nothing. The started event usually
+arrives before Paperclip prepares the run's workspace, so the bind is retried when
+that run's first offload request arrives. A binding never replaces a whole-run
+realization for the same run and workspace. `agent.run.finished`, `failed` and
+`cancelled` drop the executor binding and the persisted workspace record, and fence
+the run: a late or slow start handler cannot bind it again. A missing host fact (no
 execution workspace, no local path, no secret) leaves the run unbound, and its
 commands get 403 before dispatch. This adds three capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read` and `secrets.read-ref`; the

@@ -92,6 +92,83 @@ describe("plugin wiring", () => {
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
   });
 
+  it("binds on the first offload request when the workspace was prepared after the started event", async () => {
+    const harness = await setup(enabled);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    await harness.emit("agent.run.started", started);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId });
+    expect((await exec(runId)).status).toBe(200);
+    expect((await exec(randomUUID())).status).toBe(403);
+  });
+
+  it.each(["agent.run.finished", "agent.run.failed", "agent.run.cancelled"])("%s revokes the run's offload authority", async (terminal) => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    expect((await exec(runId)).status).toBe(200);
+    await harness.emit(terminal, { companyId, payload: { runId, issueId } });
+    expect((await exec(runId)).status).toBe(403);
+    // A late started delivery cannot revive an ended run.
+    await harness.emit("agent.run.started", started);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a terminal event during a slow start handler leaves no binding", async () => {
+    const harness = await setup(enabled);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = harness.ctx.issues.get;
+    harness.ctx.issues.get = async (id: string) => { await gate; return original(id); };
+    const pending = harness.emit("agent.run.started", started);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    release();
+    await pending;
+    harness.ctx.issues.get = original;
+    expect((await exec(runId)).status).toBe(403);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+  });
+
+  it("a terminal event while the workspace record is being written leaves no binding", async () => {
+    const harness = await setup(enabled);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const writing = new Promise<void>((resolve) => { reached = resolve; });
+    const originalSet = harness.ctx.state.set;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces") { reached(); await gate; }
+      return originalSet(input, value);
+    };
+    const pending = harness.emit("agent.run.started", started);
+    await writing;
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    release();
+    await pending;
+    harness.ctx.state.set = originalSet;
+    expect((await exec(runId)).status).toBe(403);
+    expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+  });
+
+  it("never replaces a whole-run native realization for the same run and workspace", async () => {
+    const harness = await setup(enabled);
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-"));
+    const nativeEnv = randomUUID();
+    try {
+      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
+      await harness.emit("agent.run.started", started);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    } finally {
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
   it("leaves local runs unbound while the setting is off", async () => {
     const harness = await setup({});
     await harness.emit("agent.run.started", started);

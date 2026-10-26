@@ -46,6 +46,10 @@ export class NativeOffloadWorkspaces {
     });
   }
 
+  async forget(companyId: string, workspaceId: string, runId: string): Promise<void> {
+    await this.state.delete(scope(companyId, workspaceId, runId));
+  }
+
   async get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null> {
     const saved = record(await this.state.get(scope(companyId, workspaceId, runId)));
     if (saved.version !== 1 || saved.companyId !== companyId || saved.runId !== runId || saved.workspaceId !== workspaceId) return null;

@@ -313,20 +313,62 @@ export class BoatVmManager {
     await this.offloadWorkspaces.remember(params);
   }
 
+  /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
+  private readonly localRuns = new Map<string, { issueId: string; workspaces: Set<string> }>();
+  /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
+  private readonly endedLocalRuns = new Map<string, number>();
+
+  private localRunKey(companyId: string, runId: string): string {
+    return JSON.stringify([companyId, runId]);
+  }
+
+  /** Record a started local run. Returns false for a run that already ended. */
+  startLocalRun(companyId: string, runId: string, issueId: string): boolean {
+    const id = this.localRunKey(companyId, runId);
+    const cutoff = this.now() - 24 * 60 * 60_000;
+    for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
+    if (this.endedLocalRuns.has(id)) return false;
+    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, workspaces: new Set() });
+    return true;
+  }
+
+  /** Issue of a live (started, not ended) local run, or null. */
+  localRunIssue(companyId: string, runId: string): string | null {
+    return this.localRuns.get(this.localRunKey(companyId, runId))?.issueId ?? null;
+  }
+
+  hasOffloadBinding(companyId: string, runId: string, workspaceId: string): boolean {
+    return this.nativeOffload.has(companyId, runId, workspaceId);
+  }
+
   /** Local-run binding built from host-owned event and workspace data (local-run-binding.ts).
-   * A native whole-run realization for the same run and workspace is never replaced. */
+   * Only for a live local run; a native whole-run realization for the same run and workspace is never replaced.
+   * The workspace record is persisted first, so a failed write leaves nothing half-installed and a later bind can retry. */
   async rememberLocalRun(params: PluginEnvironmentRealizeWorkspaceParams): Promise<boolean> {
     const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
     const runId = typeof request?.heartbeatRunId === "string" ? request.heartbeatRunId : "";
     const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : "";
-    if (!runId || !workspaceId || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
-    this.nativeOffload.remember(params);
+    const live = this.localRuns.get(this.localRunKey(params.companyId, runId));
+    if (!runId || !workspaceId || !live || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
+    live.workspaces.add(workspaceId);
     await this.offloadWorkspaces.remember(params);
+    // The terminal event may have arrived while the write was in flight.
+    if (!this.localRuns.has(this.localRunKey(params.companyId, runId))) {
+      await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+      return false;
+    }
+    this.nativeOffload.remember(params);
     return this.nativeOffload.has(params.companyId, runId, workspaceId);
   }
 
-  forgetLocalRun(companyId: string, runId: string): void {
+  /** Terminal run: drop executor bindings and the local-run workspace records, and fence late binds. */
+  async forgetLocalRun(companyId: string, runId: string): Promise<void> {
+    const id = this.localRunKey(companyId, runId);
+    this.endedLocalRuns.set(id, this.now());
+    const live = this.localRuns.get(id);
+    this.localRuns.delete(id);
     this.nativeOffload.forgetRun(companyId, runId);
+    for (const workspaceId of live?.workspaces ?? []) await this.offloadWorkspaces.forget(companyId, workspaceId, runId);
   }
 
   private offloadRouteHost(companyId: string) {

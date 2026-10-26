@@ -83,9 +83,13 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
-  /** Drop every binding of a finished run so its commands read as permanently terminal. */
-  forgetRun(companyId: string, runId: string): void {
-    for (const [id, entry] of this.bindings) if (entry.companyId === companyId && entry.runId === runId) this.bindings.delete(id);
+  /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
+  forgetRun(companyId: string, runId: string): string[] {
+    const dropped: string[] = [];
+    for (const [id, entry] of this.bindings) {
+      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.push(entry.workspaceId); }
+    }
+    return dropped;
   }
 
   remember(params: PluginEnvironmentRealizeWorkspaceParams): void {
