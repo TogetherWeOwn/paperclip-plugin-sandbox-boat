@@ -245,7 +245,9 @@ export class SshOffloadRuntime {
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot,
-      binding.config.templateSnapshot ?? null])).digest("hex").slice(0, 24);
+      // Appended only when set: pools without a template keep their persisted
+      // identity (and their recorded VMs) across this upgrade.
+      ...(binding.config.templateSnapshot ? [binding.config.templateSnapshot] : [])])).digest("hex").slice(0, 24);
     const existing = this.pools.get(poolId);
     if (existing) return existing.executor;
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
