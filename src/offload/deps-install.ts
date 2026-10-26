@@ -42,17 +42,26 @@ const PINNED_REQUIREMENTS_INSTALL = ["pip", "install", "--require-hashes", "-r",
 
 /**
  * True when requirements.txt is a pinned lockfile: at least one requirement,
- * every requirement line pinned with `==`, and `--hash` integrity entries
- * present. Anything else is an unlocked manifest and stays local.
+ * every requirement pinned as `name[extras]==version` (with an optional
+ * environment marker after `;`), every requirement carrying `--hash=sha256:`,
+ * and no pip option lines (`-e`, `--extra-index-url`, `--index-url`, `-f`,
+ * `--find-links`, `-r`, `-c`). Anything else is an unlocked manifest and
+ * stays local.
  */
 function isPinnedRequirements(bytes: Buffer): boolean {
   const text = bytes.toString("utf8");
-  if (!text.includes("--hash")) return false;
-  const reqs = text.split("\n")
+  // Join backslash continuations so hashes on the next line stay with their requirement.
+  const joined = text.replace(/\\\r?\n/g, " ");
+  const lines = joined.split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith("-"));
-  if (reqs.length === 0) return false;
-  return reqs.every((line) => line.includes("=="));
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  if (lines.length === 0) return false;
+  for (const line of lines) {
+    if (line.startsWith("-")) return false;
+    if (!/^[A-Za-z0-9._-]+(\[[^\]]*\])?==[^\s;]+/.test(line)) return false;
+    if (!line.includes("--hash=sha256:")) return false;
+  }
+  return true;
 }
 
 async function readIfFile(root: string, rel: string): Promise<Buffer | null> {

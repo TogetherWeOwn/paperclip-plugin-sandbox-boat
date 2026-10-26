@@ -462,8 +462,9 @@ ship) and anything unrecognized stay local. Only exact `build` plus an
 allowlisted build suffix stays remote. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
 caches and build outputs; the guest installs dependencies from the lockfile
 (`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
-`requirements.txt` via `pip install --require-hashes -r`) into a per-VM cache
-keyed by lockfile hash. Global pip installs reuse the cache across runs;
+`requirements.txt` via `pip install --require-hashes -r`, where every
+requirement is `name[extras]==version` with `--hash=sha256:` and no pip
+option lines) into a per-VM cache keyed by lockfile hash. Global pip installs reuse the cache across runs;
 checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
 warm VM never reuses a stale checkout. Python commands from a `uv.lock` plan
 run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with an empty

@@ -53,6 +53,20 @@ describe("planDependencies", () => {
     expect(await planDependencies(root({ "requirements.txt": "pytest==7.4.2\n" }))).toBe(null);
   });
 
+  it("stays local on a malformed pinned specifier", async () => {
+    expect(await planDependencies(root({ "requirements.txt": "pytest== --hash=sha256:abc123\n" }))).toBe(null);
+  });
+
+  it("stays local on an editable VCS requirement", async () => {
+    const mixed = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n-e git+https://example.com/pkg.git#egg=pkg\n";
+    expect(await planDependencies(root({ "requirements.txt": mixed }))).toBe(null);
+  });
+
+  it("stays local on an extra-index-url option", async () => {
+    const mixed = "--extra-index-url https://example.com/simple\npytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    expect(await planDependencies(root({ "requirements.txt": mixed }))).toBe(null);
+  });
+
   it("scopes ambiguity to the requested tool", async () => {
     const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
     const both = root({ "package-lock.json": "x", "yarn.lock": "y", "requirements.txt": pinned });
