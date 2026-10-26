@@ -18,7 +18,9 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "boat-offload-cargo": "./bin/boat-offload-cargo"
+    "boat-offload-cargo": "./bin/boat-offload-cargo",
+    "boat-offload-node": "./bin/boat-offload-node",
+    "boat-offload-python": "./bin/boat-offload-python"
   },
   "files": [
     "bin",

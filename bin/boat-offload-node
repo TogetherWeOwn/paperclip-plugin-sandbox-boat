@@ -1,0 +1,20 @@
+#!/usr/bin/env node
+// boat-offload-node: an npm/pnpm/yarn/npx wrapper for offload opt-in runs.
+// Install as `npm` (or pnpm/yarn/npx) ahead of the real executable (BOAT_OFFLOAD=1 opts in),
+// or invoke directly: boat-offload-node [--dry-run] [--json] [--runner <name>] -- <argv...>.
+// Needs the built plugin: run `npm run build` first so ../dist exists.
+import { createShimDeps } from "../dist/offload/shim-node.js";
+import { NODE_SHIM, shimMain } from "../dist/offload/shim-main.js";
+
+try {
+  const exit = await shimMain(
+    process.argv[1] ?? "boat-offload-node",
+    process.argv.slice(2),
+    createShimDeps(process.env),
+    NODE_SHIM,
+  );
+  process.exit(exit);
+} catch (error) {
+  process.stderr.write(`boat-offload-node: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+}
