@@ -2,7 +2,7 @@
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
 import { createHash } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
@@ -19,6 +19,7 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
+import { DEFAULT_SYNC_EXCLUDES } from "./offload-sync.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number };
@@ -35,14 +36,67 @@ export interface SshOffloadRuntimeDeps {
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
 
-/** True when the source root holds a registry credential file: stay local rather than sync a token. */
+/** Sync-excluded directory names: never descended when looking for stay-local config. */
+const SKIP_DIRS = new Set(
+  DEFAULT_SYNC_EXCLUDES.filter((pattern) => pattern.endsWith("/")).map((pattern) => pattern.slice(0, -1)),
+);
+
+const MAX_CREDENTIAL_ENTRIES = 20_000;
+const MAX_CREDENTIAL_DEPTH = 12;
+const MAX_PYPROJECT_BYTES = 256 * 1024;
+
+/** True when pyproject.toml carries uv auth: a [tool.uv] index/credential/auth
+ * setting, or a [[tool.uv.index]] entry with credentials or a URL userinfo. */
+function isUvAuthPyproject(text: string): boolean {
+  const start = text.search(/\[\s*tool\.uv[\s.\]]/i);
+  if (start < 0) return false;
+  // Bound the uv section window; a later unrelated section cannot authorize a remote.
+  const window = text.slice(start, start + 8_000);
+  if (/password|username|token|credentials?|keyring|auth/i.test(window)) return true;
+  if (/:\/\/[^/\s"']*@/.test(window)) return true;
+  return false;
+}
+
+/** True when the source holds stay-local config at any depth: a registry
+ * credential file (matched by basename, like the sync exclude), a uv.toml, or
+ * a pyproject.toml with uv auth. Bounded and skips excluded dirs such as
+ * node_modules; unreadable or over-limit sources fail closed to local. */
 export async function hasRegistryCredentials(sourceRoot: string): Promise<boolean> {
-  for (const file of REGISTRY_CREDENTIAL_FILES) {
+  let entriesSeen = 0;
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: sourceRoot, depth: 0 }];
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop()!;
+    if (depth > MAX_CREDENTIAL_DEPTH) return true;
+    let entries;
     try {
-      const info = await stat(path.join(sourceRoot, file));
-      if (info.isFile()) return true;
+      entries = await readdir(dir, { withFileTypes: true });
     } catch {
-      // Missing: keep checking.
+      return true;
+    }
+    for (const entry of entries) {
+      entriesSeen += 1;
+      if (entriesSeen > MAX_CREDENTIAL_ENTRIES) return true;
+      const name = entry.name;
+      if (REGISTRY_CREDENTIAL_FILES.includes(name) || name === "uv.toml") return true;
+      if (name === "pyproject.toml") {
+        try {
+          const abs = path.join(dir, name);
+          const info = await lstat(abs);
+          if (!info.isFile() && !info.isSymbolicLink()) continue;
+          if (info.size > MAX_PYPROJECT_BYTES) return true;
+          const text = await readFile(abs, "utf8");
+          if (isUvAuthPyproject(text)) return true;
+        } catch {
+          return true;
+        }
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(name)) continue;
+        stack.push({ dir: path.join(dir, name), depth: depth + 1 });
+      }
+      // Symlinks are never followed: a matching basename above already stays
+      // local, and anything else is left for the sync lstat guard.
     }
   }
   return false;

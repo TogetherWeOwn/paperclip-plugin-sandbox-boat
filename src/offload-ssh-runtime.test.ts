@@ -185,6 +185,26 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(node, enabled)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("keeps node local when a nested credential file is present", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await mkdir(path.join(source, "packages/app"), { recursive: true });
+    await writeFile(path.join(source, "packages/app/.npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps python local when uv auth config is present", async () => {
+    await writeFile(path.join(source, "uv.lock"), "x");
+    await writeFile(path.join(source, "uv.toml"), "[index]\n");
+    const py = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
+    expect(await runtime.resolve(py, enabled)).toBe(null);
+    await rm(path.join(source, "uv.toml"), { force: true });
+    await writeFile(path.join(source, "pyproject.toml"), `[project]\nname = "app"\n[tool.uv]\nindex-url = "https://user:secret@example.com/simple"\n`);
+    expect(await runtime.resolve(py, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
     await writeFile(path.join(source, "requirements.txt"), "pytest==7.4.2 \\\n    --hash=sha256:abc123\n");
     const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;

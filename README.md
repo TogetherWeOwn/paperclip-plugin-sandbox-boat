@@ -471,7 +471,8 @@ plugin never installs from an unlocked manifest, and an unpinned
 `requirements.txt` stays local.
 Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
 Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
-`.netrc`) are never synced and keep commands local. Only an empty env travels
+`.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,
+are never synced and keep commands local. Only an empty env travels
 with Node/Python requests; secret-free env policy, public allow-listed
 repositories and cwd/argv confinement apply unchanged.
 
