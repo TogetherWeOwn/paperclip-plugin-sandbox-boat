@@ -10,6 +10,7 @@ import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import type { RouteActor } from "./offload/routes.js";
+import { localRunRealization, localRunSettings } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -57,6 +58,28 @@ const plugin = definePlugin({
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }
     });
+    // Local runs: bind heavy-command offload from host-owned run, issue and workspace data.
+    ctx.events.on("agent.run.started", async (event) => {
+      const settings = localRunSettings(await ctx.config.get(event.companyId).catch(() => ({})));
+      if (!settings.enabled) return;
+      const params = await localRunRealization(event, settings, {
+        issueWorkspaceId: async (issueId, companyId) => (await ctx.issues.get(issueId, companyId))?.executionWorkspaceId ?? null,
+        workspace: async (workspaceId, companyId) => await ctx.executionWorkspaces.get(workspaceId, companyId),
+        apiKey: async (secretRef, companyId) => await ctx.secrets.resolve(secretRef as never, { companyId, configPath: "offloadLocalApiKeySecretRef" }),
+      }).catch((error: unknown) => {
+        ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
+        return null;
+      });
+      if (params && await requireManager().rememberLocalRun(params)) {
+        ctx.logger.info("boat: bound local run for offload", { runId: (event.payload as { runId?: string }).runId });
+      }
+    });
+    for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
+      ctx.events.on(done, async (event) => {
+        const runId = (event.payload as { runId?: unknown } | null)?.runId;
+        if (typeof runId === "string") manager?.forgetLocalRun(event.companyId, runId);
+      });
+    }
     ctx.logger.info("boat sandbox provider plugin ready");
   },
 

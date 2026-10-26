@@ -41,11 +41,12 @@ async function submit(extra: Record<string, unknown> = {}) {
 
 afterEach(async () => { await plugin.definition.onShutdown?.(); setManagerOverridesForTests({}); });
 
-describe("native workspace binding without capability escalation", () => {
-  it("keeps exactly the installed 0.2.2 capability set", () => {
+describe("native workspace binding", () => {
+  it("pins the capability set: 0.2.2 plus the three local-run binding reads", () => {
     expect([...manifest.capabilities].sort()).toEqual([
       "environment.drivers.register", "plugin.state.read", "plugin.state.write",
       "jobs.schedule", "api.routes.register", "issues.read",
+      "events.subscribe", "execution.workspaces.read", "secrets.read-ref",
     ].sort());
   });
 

@@ -313,6 +313,22 @@ export class BoatVmManager {
     await this.offloadWorkspaces.remember(params);
   }
 
+  /** Local-run binding built from host-owned event and workspace data (local-run-binding.ts).
+   * A native whole-run realization for the same run and workspace is never replaced. */
+  async rememberLocalRun(params: PluginEnvironmentRealizeWorkspaceParams): Promise<boolean> {
+    const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+    const runId = typeof request?.heartbeatRunId === "string" ? request.heartbeatRunId : "";
+    const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : "";
+    if (!runId || !workspaceId || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
+    this.nativeOffload.remember(params);
+    await this.offloadWorkspaces.remember(params);
+    return this.nativeOffload.has(params.companyId, runId, workspaceId);
+  }
+
+  forgetLocalRun(companyId: string, runId: string): void {
+    this.nativeOffload.forgetRun(companyId, runId);
+  }
+
   private offloadRouteHost(companyId: string) {
     return {
       broker: this.offloadBroker(companyId),

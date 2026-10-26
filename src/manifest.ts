@@ -24,6 +24,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "jobs.schedule",
     "api.routes.register",
     "issues.read",
+    "events.subscribe",
+    "execution.workspaces.read",
+    "secrets.read-ref",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -98,6 +101,23 @@ const manifest: PaperclipPluginManifestV1 = {
       offloadCgroupParent: {
         type: "string",
         description: "Canonical delegated cgroup v2 parent on the guest, below /sys/fs/cgroup/. Missing or unwritable delegation keeps commands local; the plugin never changes guest services or delegation.",
+      },
+      offloadLocalRunsEnabled: {
+        type: "boolean", default: false,
+        description: "Bind otherwise-local runs for heavy-command offload. On each agent.run.started event the plugin reads the run's issue and its execution workspace from Paperclip and records that local source as the run's offload binding. Off by default.",
+      },
+      offloadLocalEnvironmentId: {
+        type: "string",
+        description: "Boat environment ID whose pool settings local-run offload uses. Required with offloadLocalRunsEnabled.",
+      },
+      offloadLocalApiKeySecretRef: {
+        type: "object", required: ["type", "secretId"], additionalProperties: true,
+        properties: { type: { const: "secret_ref" }, secretId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } },
+        description: "Paperclip secret holding the scoped boat API key for local-run offload. Resolved per binding and never stored.",
+      },
+      offloadLocalDriverConfig: {
+        type: "object", additionalProperties: true, default: {},
+        description: "Driver settings for local-run offload pools (for example maxOffloadVms, maxActive, offloadIdleStopSeconds, size). apiKey is ignored here.",
       },
       offloadAllowedRepos: {
         type: "array", items: { type: "string" }, default: [],

@@ -2033,7 +2033,7 @@ describe("offload API routes", () => {
     };
   }
 
-  it("declares agent-authenticated offload routes without a workspace capability", () => {
+  it("declares agent-authenticated offload routes", () => {
     const routes = manifest.apiRoutes ?? [];
     expect(routes.map((route) => route.routeKey)).toEqual(
       expect.arrayContaining(["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]),
@@ -2041,7 +2041,8 @@ describe("offload API routes", () => {
     for (const key of ["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]) {
       expect(routes.find((route) => route.routeKey === key)).toMatchObject({ auth: "agent", capability: "api.routes.register" });
     }
-    expect(manifest.capabilities).not.toContain("execution.workspaces.read");
+    // execution.workspaces.read serves only the local-run binding (local-run-binding.ts), never the request body.
+    expect(manifest.capabilities).toContain("execution.workspaces.read");
   });
 
   it("submits, reads, heartbeats and cancels through the plugin dispatch", async () => {
