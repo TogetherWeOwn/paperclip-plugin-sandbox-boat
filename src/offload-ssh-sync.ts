@@ -142,9 +142,13 @@ export class SshOffloadSync implements OffloadSync {
   /**
    * Install Node/Python dependencies on the guest from the source lockfile.
    * Frozen sync excludes dependency dirs, so a checkout without node_modules
-   * cannot run until this installs them. The install runs once per lockfile
-   * hash per VM (guest-side marker plus an in-memory set); a warm pool VM
-   * reuses its cache across runs. Cargo checkouts skip this entirely.
+   * cannot run until this installs them. Global installs (pip) run once per
+   * lockfile hash per VM (guest-side marker plus an in-memory set); a warm
+   * pool VM reuses them across runs. Checkout-local installs (npm/pnpm/yarn,
+   * uv: node_modules/.venv live inside the per-command guest checkout)
+   * reinstall per command: every command gets a fresh guestDir, so a shared
+   * marker hit would leave the new checkout without deps. Cargo checkouts
+   * skip this entirely.
    */
   async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
     if ((command.tool ?? "cargo") === "cargo") return;
@@ -154,26 +158,37 @@ export class SshOffloadSync implements OffloadSync {
       // reaching here means the source changed under us. Never run unlocked.
       throw new Error("Offload node/python commands need a lockfile; refusing unlocked install");
     }
-    const done = this.installed.get(sandboxId);
-    if (done?.has(plan.hash)) return;
-    const session = await this.deps.session(sandboxId);
-    const marker = path.posix.join(this.depCacheDir(), `${plan.hash}.ok`);
-    const check = await this.deps.ssh.runStream(session,
-      buildRemoteCommand(`exec test -f ${shellQuote(marker)}`), { timeoutMs: 15_000 });
-    if (check.exitCode === 0 && !check.timedOut && !check.signal) {
-      this.markInstalled(sandboxId, plan.hash);
-      return;
+    // node_modules/.venv are checkout-local: each command syncs to a fresh
+    // guestDir, so a shared per-hash marker would skip the install the new
+    // checkout needs. Only global installs (pip) may reuse the shared cache.
+    const checkoutLocal = plan.installs.some((item) => item.lockfile !== "requirements.txt");
+    if (!checkoutLocal) {
+      const done = this.installed.get(sandboxId);
+      if (done?.has(plan.hash)) return;
+      const session = await this.deps.session(sandboxId);
+      const marker = path.posix.join(this.depCacheDir(), `${plan.hash}.ok`);
+      const check = await this.deps.ssh.runStream(session,
+        buildRemoteCommand(`exec test -f ${shellQuote(marker)}`), { timeoutMs: 15_000 });
+      if (check.exitCode === 0 && !check.timedOut && !check.signal) {
+        this.markInstalled(sandboxId, plan.hash);
+        return;
+      }
     }
+    const session = await this.deps.session(sandboxId);
     const steps = plan.installs
       .map((item) => `cd ${shellQuote(guestDir)} && ${item.install.map(shellQuote).join(" ")}`)
       .join(" && ");
-    const script = `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(marker)}`;
+    // Global installs record the shared marker; checkout-local installs run
+    // inside the per-command guestDir and leave no shared marker to mislead
+    // the next checkout.
+    const script = checkoutLocal ? steps
+      : `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
     const result = await this.deps.ssh.runStream(session,
       buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
     if (result.exitCode !== 0 || result.timedOut || result.signal) {
       throw new Error("Offload dependency install failed; no command ran");
     }
-    this.markInstalled(sandboxId, plan.hash);
+    if (!checkoutLocal) this.markInstalled(sandboxId, plan.hash);
   }
   private markInstalled(sandboxId: string, hash: string): void {
     let done = this.installed.get(sandboxId);

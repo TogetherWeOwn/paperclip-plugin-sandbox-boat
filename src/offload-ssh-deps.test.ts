@@ -68,18 +68,33 @@ describe("installDependencies", () => {
       .rejects.toThrow(/lockfile/i);
   });
 
-  it("installs once per lockfile hash and reuses the cache", async () => {
-    const root = source({ "package-lock.json": "{}" });
+  it("reuses the shared cache for global pip installs", async () => {
+    const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
+    const root = source({ "requirements.txt": pinned });
+    const py = command({ tool: "python", runner: "pytest", profileId: "python-public-1", argv: ["tests/"] });
     const { sync, ssh, calls } = setup(root);
-    await sync.installDependencies("vm-1", command(), root, "/guest/work");
+    await sync.installDependencies("vm-1", py, root, "/guest/work");
     expect(ssh.runStream).toHaveBeenCalledTimes(2); // marker check + install
-    expect(calls[1]).toContain("npm");
-    expect(calls[1]).toContain("ci");
+    expect(calls[1]).toContain("pip");
+    expect(calls[1]).toContain("--require-hashes");
     const before = ssh.runStream.mock.calls.length;
-    await sync.installDependencies("vm-1", command(), root, "/guest/work");
+    await sync.installDependencies("vm-1", py, root, "/guest/work");
     expect(ssh.runStream.mock.calls.length).toBe(before); // in-memory cache
-    await sync.installDependencies("vm-2", command(), root, "/guest/work");
+    await sync.installDependencies("vm-2", py, root, "/guest/work");
     expect(ssh.runStream.mock.calls.length).toBe(before + 1); // guest marker hit only
+  });
+
+  it("reinstalls checkout-local deps per guest checkout on a warm VM", async () => {
+    const root = source({ "package-lock.json": "{}" });
+    const { sync, ssh } = setup(root);
+    await sync.installDependencies("vm-1", command(), root, "/guest/work-cmd1");
+    const afterFirst = ssh.runStream.mock.calls.length;
+    // Warm VM, same lockfile hash, different per-command checkout: must reinstall.
+    await sync.installDependencies("vm-1", command(), root, "/guest/work-cmd2");
+    expect(ssh.runStream.mock.calls.length).toBeGreaterThan(afterFirst);
+    const lastInstall = ssh.runStream.mock.calls.map((c) => String(c[1])).filter((c) => !c.includes("test -f")).pop()!;
+    expect(lastInstall).toContain("/guest/work-cmd2");
+    expect(lastInstall).toContain("npm");
   });
 
   it("fails the push when the install fails", async () => {
