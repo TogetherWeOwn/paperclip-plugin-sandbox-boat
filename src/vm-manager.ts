@@ -317,6 +317,14 @@ export class BoatVmManager {
   private readonly localRuns = new Map<string, { issueId: string; workspaces: Set<string> }>();
   /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
   private readonly endedLocalRuns = new Map<string, number>();
+  /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
+  private readonly wholeRunRealizations = new Map<string, { params: PluginEnvironmentRealizeWorkspaceParams; at: number }>();
+
+  private pruneLocalRunState(): void {
+    const cutoff = this.now() - 24 * 60 * 60_000;
+    for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
+    for (const [id, entry] of this.wholeRunRealizations) if (entry.at < cutoff) this.wholeRunRealizations.delete(id);
+  }
 
   private localRunKey(companyId: string, runId: string): string {
     return JSON.stringify([companyId, runId]);
@@ -325,8 +333,7 @@ export class BoatVmManager {
   /** Record a started local run. Returns false for a run that already ended. */
   startLocalRun(companyId: string, runId: string, issueId: string): boolean {
     const id = this.localRunKey(companyId, runId);
-    const cutoff = this.now() - 24 * 60 * 60_000;
-    for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
+    this.pruneLocalRunState();
     if (this.endedLocalRuns.has(id)) return false;
     if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, workspaces: new Set() });
     return true;
@@ -357,6 +364,14 @@ export class BoatVmManager {
       await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
       return false;
     }
+    // A whole-run realization may have landed while the write was in flight: it keeps both stores.
+    if (this.nativeOffload.has(params.companyId, runId, workspaceId)) {
+      const whole = this.wholeRunRealizations.get(JSON.stringify([params.companyId, runId, workspaceId]));
+      if (whole) await this.offloadWorkspaces.remember(whole.params);
+      else await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+      live.workspaces.delete(workspaceId);
+      return false;
+    }
     this.nativeOffload.remember(params);
     return this.nativeOffload.has(params.companyId, runId, workspaceId);
   }
@@ -364,7 +379,12 @@ export class BoatVmManager {
   /** Terminal run: drop executor bindings and the local-run workspace records, and fence late binds. */
   async forgetLocalRun(companyId: string, runId: string): Promise<void> {
     const id = this.localRunKey(companyId, runId);
+    this.pruneLocalRunState();
     this.endedLocalRuns.set(id, this.now());
+    for (const key of this.wholeRunRealizations.keys()) {
+      const [company, run] = JSON.parse(key) as [string, string, string];
+      if (company === companyId && run === runId) this.wholeRunRealizations.delete(key);
+    }
     const live = this.localRuns.get(id);
     this.localRuns.delete(id);
     this.nativeOffload.forgetRun(companyId, runId);
@@ -1946,6 +1966,10 @@ export class BoatVmManager {
 
   async realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
     this.nativeOffload.remember(params);
+    const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+    if (typeof request?.heartbeatRunId === "string" && typeof request.executionWorkspaceId === "string") {
+      this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, request.executionWorkspaceId]), { params, at: this.now() });
+    }
     const config = parseDriverConfig(params.config);
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";

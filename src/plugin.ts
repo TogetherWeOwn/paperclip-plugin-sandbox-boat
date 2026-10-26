@@ -84,14 +84,19 @@ const plugin = definePlugin({
         ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
         return null;
       });
-      const bound = params ? await requireManager().rememberLocalRun(params) : false;
+      // A failed state write leaves the run unbound and retryable; the route answers 403, never a 500.
+      const bound = params ? await requireManager().rememberLocalRun(params).catch((error: unknown) => {
+        ctx.logger.warn("boat: local-run offload binding not persisted", { error: error instanceof Error ? error.message : String(error) });
+        return false;
+      }) : false;
       if (bound) ctx.logger.info("boat: bound local run for offload", { runId });
       return bound;
     };
     ctx.events.on("agent.run.started", async (event) => {
       const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown };
       if (typeof payload.runId !== "string" || typeof payload.issueId !== "string") return;
-      if (!localRunSettings(await ctx.config.get(event.companyId).catch(() => ({}))).enabled) return;
+      // Record every started run before reading settings: the record grants nothing, and a
+      // transient config failure here stays recoverable on the run's first offload request.
       if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId)) return;
       await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
     });

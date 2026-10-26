@@ -68,14 +68,14 @@ describe("plugin wiring", () => {
     dir = null;
   });
 
-  async function setup(config: Record<string, unknown>) {
+  async function setup(config: Record<string, unknown>, configGet?: () => Promise<Record<string, unknown>>) {
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-run-"));
     const harness = createFakeContext({
       issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId }]]),
       workspaces: new Map([[workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: dir, cwd: dir }]]),
     });
     harness.secrets.set(secretId, "scoped-key");
-    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
+    await plugin.definition.setup({ ...harness.ctx, config: { get: configGet ?? (async () => config) } } as never);
     return harness;
   }
   const exec = (actorRunId: string) => plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
@@ -148,6 +148,75 @@ describe("plugin wiring", () => {
     harness.ctx.state.set = originalSet;
     expect((await exec(runId)).status).toBe(403);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+  });
+
+  it("a terminal event removes only that run's executor binding", async () => {
+    const harness = await setup(enabled);
+    const otherRun = "abababab-abab-4bab-abab-abababababab";
+    await harness.emit("agent.run.started", started);
+    await harness.emit("agent.run.started", { companyId, payload: { runId: otherRun, issueId } });
+    const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
+    expect(manager.hasOffloadBinding(companyId, otherRun, workspaceId)).toBe(true);
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+    expect(manager.hasOffloadBinding(companyId, otherRun, workspaceId)).toBe(true);
+  });
+
+  it("a whole-run realization landing while the local record is written keeps both stores", async () => {
+    const harness = await setup(enabled);
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-race-"));
+    const nativeEnv = randomUUID();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const writing = new Promise<void>((resolve) => { reached = resolve; });
+    const originalSet = harness.ctx.state.set;
+    let gated = false;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces" && !gated) { gated = true; reached(); await gate; }
+      return originalSet(input, value);
+    };
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await writing;
+      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      release();
+      await pending;
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      const saved = [...harness.state.entries()].find(([key]) => key.includes("boat-offload-workspaces"))?.[1] as { workspace?: { path?: string } };
+      expect(saved?.workspace?.path).toBe(nativeSource);
+    } finally {
+      harness.ctx.state.set = originalSet;
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  it("a failed state write on the first offload request answers 403 and stays retryable", async () => {
+    const harness = await setup(enabled);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    await harness.emit("agent.run.started", started);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId });
+    const originalSet = harness.ctx.state.set;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces") throw new Error("state store unavailable");
+      return originalSet(input, value);
+    };
+    expect((await exec(runId)).status).toBe(403);
+    harness.ctx.state.set = originalSet;
+    expect((await exec(runId)).status).toBe(200);
+  });
+
+  it("a config read failure at run start is recovered on the first offload request", async () => {
+    let calls = 0;
+    const harness = await setup(enabled, async () => { calls += 1; if (calls === 1) throw new Error("config unavailable"); return enabled; });
+    await harness.emit("agent.run.started", started);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    expect((await exec(runId)).status).toBe(200);
   });
 
   it("never replaces a whole-run native realization for the same run and workspace", async () => {
