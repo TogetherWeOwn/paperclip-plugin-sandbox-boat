@@ -223,7 +223,8 @@ export class SshOffloadRuntime {
     // Node/Python: arbitrary inline code never goes remote, absolute host
     // paths are meaningless on the guest, and path-bearing flags must resolve
     // inside the workspace. Rust semantics above are unchanged.
-    if ((command.runner === "python" || command.runner === "python3") && command.argv.includes("-c")) return false;
+    if ((command.runner === "python" || command.runner === "python3")
+      && (command.argv[0] === "-c" || (command.argv.includes("-c") && !command.argv.includes("-m")))) return false;
     if (command.argv.some((arg) => path.posix.isAbsolute(arg) || /^[A-Za-z]:/.test(arg))) return false;
     const cwd = command.cwdRelative;
     for (let i = 0; i < command.argv.length; i++) {

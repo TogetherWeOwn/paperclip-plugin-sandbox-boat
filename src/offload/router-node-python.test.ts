@@ -84,6 +84,21 @@ describe("classifyNode", () => {
     const result = classifyNode("npx", ["jest", "-t", "login", "tests/e2e"], NODE);
     expect(result.mode).toBe("remote_candidate");
   });
+
+  it("keeps watch-mode Node commands local", () => {
+    expect(classifyNode("npm", ["run", "test:watch"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "test:watchAll"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "build:watch"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["run", "test", "--", "-w"], NODE).mode).toBe("local");
+    expect(classifyNode("npm", ["test", "--", "-w"], NODE).mode).toBe("local");
+    expect(classifyNode("yarn", ["run", "test", "--", "-w"], NODE).mode).toBe("local");
+  });
+
+  it("does not mistake flag values for suite dirs", () => {
+    expect(classifyNode("npx", ["jest", "-t", "login", "--config", "foo/bar.js"], NODE).mode).toBe("local");
+    expect(classifyNode("npx", ["vitest", "run", "__tests__/login.ts"], NODE).mode).toBe("local");
+    expect(classifyNode("npx", ["jest", "login"], NODE).mode).toBe("local");
+  });
 });
 
 describe("classifyPython", () => {
@@ -129,5 +144,19 @@ describe("classifyPython", () => {
     expect(classifyPython("pytest", ["tests/", "&&", "lint"], PY).mode).toBe("local");
     expect(classifyPython("ruby", ["-m", "pytest"], PY).mode).toBe("local");
     expect(classifyPython("python", [], PY).mode).toBe("local");
+  });
+
+  it("treats pytest -c config files as suite runs, not inline code", () => {
+    expect(classifyPython("python", ["-m", "pytest", "-c", "pytest.ini", "tests/"], PY).mode).toBe("remote_candidate");
+    expect(classifyPython("python", ["-c", "import pytest; pytest.main()"], PY).mode).toBe("local");
+  });
+
+  it("keeps verbose unittest discovery remote", () => {
+    expect(classifyPython("python", ["-m", "unittest", "discover", "--verbose"], PY).mode).toBe("remote_candidate");
+    expect(classifyPython("python", ["-m", "unittest", "discover", "--failfast"], PY).mode).toBe("remote_candidate");
+  });
+
+  it("does not mistake pytest flag values for suite dirs", () => {
+    expect(classifyPython("pytest", ["-k", "foo", "--junitxml", "results/out.xml"], PY).mode).toBe("local");
   });
 });

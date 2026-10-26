@@ -49,9 +49,17 @@ function remote(profile: { id: string }, reason: string, subcommand: string | nu
 const NODE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
 const NODE_BIN_RUNNERS = new Set(["npx", "pnpm", "yarn", "npm"]);
 const NODE_TEST_SCRIPT_RE = /^(test|tests|e2e|integration|spec|specs|build)([:\-]|$)/i;
+/** Watch-mode npm scripts never go remote: a killed watch burns VM-hours. */
+const NODE_WATCH_SCRIPT_RE = /:watch|watch$/i;
 /** Flags that narrow a run to interactive or single-test scope. */
 const NODE_WATCH_FLAGS = new Set(["--watch", "--watchAll", "--watch-all", "--ui", "--open", "--inspect", "--inspect-brk"]);
 const NODE_NARROW_FLAGS = new Set(["-t", "--testNamePattern", "--testPathPattern", "--grep", "-g"]);
+/** Node flags that take a separate value: skip the value when scanning positionals. */
+const NODE_VALUE_FLAGS = new Set([
+  "-t", "--testNamePattern", "--testPathPattern", "--grep", "-g",
+  "--config", "--outputFile", "--output-file", "--cacheDirectory", "--cache-directory",
+  "--rootDir", "--rootdir", "--reporters",
+]);
 const NODE_LOCAL_COMMANDS = new Set([
   "install", "ci", "add", "remove", "link", "publish", "login", "init",
   "dev", "start", "serve", "preview", "lint", "format", "typecheck", "clean",
@@ -60,20 +68,28 @@ const NODE_LOCAL_COMMANDS = new Set([
 
 /** A positional that selects specific tests rather than a whole suite. */
 function isNodeTestSelection(arg: string): boolean {
-  return arg.includes("::") || /(^|[./])([^/]*\.(test|spec)\.[a-z0-9]+)$/i.test(arg);
+  if (arg.includes("::")) return true;
+  if (/(^|[./])([^/]*\.(test|spec)\.[a-z0-9]+)$/i.test(arg)) return true;
+  // A file path with an extension is a single-file filter, not a suite dir.
+  if (arg.includes("/") && /\.[a-z0-9]+$/i.test(arg)) return true;
+  // A bare name filter (e.g. `jest login`): slash-free, not a suite dir.
+  if (!arg.includes("/") && arg !== "." && !arg.startsWith("-")
+    && !["test", "run", "build"].includes(arg) && /^[A-Za-z0-9_@#.+-]+$/.test(arg)) return true;
+  return false;
 }
 
 /** A positional that names a whole suite directory rather than a file. */
 function isNodeSuiteDir(arg: string): boolean {
   if (arg.startsWith("-") || arg.includes("::")) return false;
-  if (/\.(test|spec)\.[a-z0-9]+$/i.test(arg)) return false;
+  // Files (any extension) are filters, never suite dirs. Only bare dirs count.
+  if (/\.[a-z0-9]+$/i.test(arg)) return false;
   return arg.includes("/") || arg === ".";
 }
 
-function nodeWatchOnly(argv: string[], binary: string | null): string | null {
+function nodeWatchOnly(argv: string[], _binary: string | null): string | null {
   for (const arg of argv) {
     if (NODE_WATCH_FLAGS.has(arg)) return `watch/interactive flag ${arg} stays local`;
-    if (arg === "-w" && binary === "vitest") return "vitest -w stays local";
+    if (arg === "-w") return "watch flag -w stays local";
   }
   return null;
 }
@@ -97,9 +113,18 @@ function nodePositionals(argv: string[]): { selection: string | null; suiteDir: 
   let selection: string | null = null;
   let suiteDir = false;
   let seenDashDash = false;
+  let skipNext = false;
   for (const arg of argv) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
     if (arg === "--") {
       seenDashDash = true;
+      continue;
+    }
+    if (!seenDashDash && NODE_VALUE_FLAGS.has(arg)) {
+      skipNext = true;
       continue;
     }
     if (arg.startsWith("-") && !seenDashDash) continue;
@@ -158,6 +183,7 @@ export function classifyNode(runner: string, argv: string[], profile: ToolProfil
   if (command === "run") {
     const [script, ...scriptArgs] = rest;
     if (!script) return local(profile, "npm run without a script stays local", command, runner);
+    if (NODE_WATCH_SCRIPT_RE.test(script)) return local(profile, `watch script ${script} stays local`, command, runner);
     if (!NODE_TEST_SCRIPT_RE.test(script)) return local(profile, `script ${script} is not a test/e2e/build script`, command, runner);
     const { selection, suiteDir } = nodePositionals(scriptArgs);
     const narrowed = nodeWatchOrNarrow(scriptArgs, null, suiteDir);
@@ -187,6 +213,60 @@ export function classifyNode(runner: string, argv: string[], profile: ToolProfil
 const PYTHON_RUNNERS = new Set(["pytest", "python", "python3"]);
 const PYTEST_NARROW_FLAGS = new Set(["-k", "-m", "--deselect", "--ignore"]);
 const PYTEST_LOCAL_FLAGS = new Set(["--lf", "--ff", "--last-failed", "--failed", "--co", "--collect-only", "--stepwise"]);
+/** Pytest flags that take a separate value: skip the value when scanning positionals. */
+const PYTEST_VALUE_FLAGS = new Set([
+  "-k", "-m", "--deselect", "--ignore", "--junitxml", "--junit-xml",
+  "-o", "--rootdir", "-c", "--config",
+]);
+/** Unittest selectors only: --verbose/--failfast/--buffer/-v do not narrow. */
+const UNITTEST_NARROW_EXACT = new Set(["-k", "--deselect", "--ignore"]);
+const UNITTEST_NARROW_PREFIXES = ["-k=", "--deselect=", "--ignore="];
+const UNITTEST_VALUE_FLAGS = new Set(["-k", "--deselect", "--ignore"]);
+
+/** Bare positionals after skipping flag values. */
+function barePytestPositionals(args: string[]): string[] {
+  const out: string[] = [];
+  let skipNext = false;
+  let seenDashDash = false;
+  for (const arg of args) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (arg === "--") {
+      seenDashDash = true;
+      continue;
+    }
+    if (!seenDashDash && PYTEST_VALUE_FLAGS.has(arg)) {
+      skipNext = true;
+      continue;
+    }
+    if (arg.startsWith("-") && !seenDashDash) continue;
+    if (!seenDashDash && arg.includes("=")) continue;
+    out.push(arg);
+  }
+  return out;
+}
+
+/** Bare positionals for unittest after skipping selector values. */
+function bareUnittestPositionals(modArgs: string[]): string[] {
+  const out: string[] = [];
+  let skipNext = false;
+  for (const arg of modArgs) {
+    if (skipNext) {
+      skipNext = false;
+      continue;
+    }
+    if (UNITTEST_VALUE_FLAGS.has(arg)) {
+      skipNext = true;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    if (arg.includes("=")) continue;
+    out.push(arg);
+  }
+  return out;
+}
 
 function isPythonTestSelection(arg: string): boolean {
   return arg.includes("::");
@@ -208,9 +288,10 @@ function classifyPytestArgs(args: string[], profile: ToolProfile, runner: string
     if (isPythonTestSelection(arg)) return local(profile, `node id ${arg} stays local`, "pytest", runner);
     if (PYTEST_LOCAL_FLAGS.has(arg)) return local(profile, `${arg} selects a subset and stays local`, "pytest", runner);
   }
+  const bare = barePytestPositionals(args);
   const narrowed = args.some((arg) => PYTEST_NARROW_FLAGS.has(arg) || arg.startsWith("--deselect=") || arg.startsWith("--ignore="));
-  const hasFile = args.some(isPythonFileArg);
-  const hasSuiteDir = args.some(isPythonSuiteDir);
+  const hasFile = bare.some(isPythonFileArg);
+  const hasSuiteDir = bare.some(isPythonSuiteDir);
   if (hasFile && !hasSuiteDir) return local(profile, "single-file selection stays local", "pytest", runner);
   if (narrowed && !hasSuiteDir) return local(profile, "narrowed selection stays local without an explicit suite", "pytest", runner);
   return remote(profile, "eligible pytest suite", "pytest", runner);
@@ -231,16 +312,18 @@ export function classifyPython(runner: string, argv: string[], profile: ToolProf
   }
   if (isCompoundShell(argv)) return local(profile, "compound shell text stays local", null, runner);
   if (runner === "pytest") return classifyPytestArgs(argv, profile, runner);
-  // `python[3] -m pytest|unittest ...`, nothing else.
-  if (argv[0] === "-c" || argv.includes("-c")) return local(profile, "python -c stays local", null, runner);
+  // `python[3] -m pytest|unittest ...`, nothing else. `-c` is inline code only
+  // when there is no `-m` (pytest `-c/--config` takes a config-file value).
+  if (argv[0] === "-c" || (argv.includes("-c") && !argv.includes("-m"))) return local(profile, "python -c stays local", null, runner);
   if (argv[0] !== "-m") return local(profile, "only python -m pytest|unittest suites are eligible", null, runner);
   const [mod, ...modArgs] = argv.slice(1);
   if (mod === "pytest") return classifyPytestArgs(modArgs, profile, runner);
   if (mod === "unittest") {
     if (modArgs.some((arg) => arg.includes("::"))) return local(profile, "node id stays local", "unittest", runner);
-    const dotted = modArgs.some((arg) => !arg.startsWith("-") && arg.includes("."));
-    const narrowed = modArgs.some((arg) => arg === "-k" || arg.startsWith("-k=") || arg.startsWith("--"));
-    if ((dotted || narrowed) && !modArgs.some((arg) => !arg.startsWith("-") && !arg.includes(".") && (arg.includes("/") || arg === "."))) {
+    const bare = bareUnittestPositionals(modArgs);
+    const dotted = bare.some((arg) => arg.includes("."));
+    const narrowed = modArgs.some((arg) => UNITTEST_NARROW_EXACT.has(arg) || UNITTEST_NARROW_PREFIXES.some((p) => arg.startsWith(p)));
+    if ((dotted || narrowed) && !bare.some((arg) => !arg.includes(".") && (arg.includes("/") || arg === "."))) {
       return local(profile, "single-test selection stays local", "unittest", runner);
     }
     return remote(profile, "eligible unittest suite", "unittest", runner);
