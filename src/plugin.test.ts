@@ -821,6 +821,17 @@ describe("run env allowlist (incident TOG-37420)", () => {
     return { result, staged: staging?.stdin ?? "", script: unquoteShDashC(run!.args.at(-1)!) };
   }
 
+  it("routes an agent's host-side model proxy address through the tunnel", async () => {
+    // Agent adapter env wins over the environment's tunnel address in the merge;
+    // a docker DNS name like cliproxy does not resolve inside the VM.
+    const { result, staged } = await runWithEnv({ ...ALLOWED_RUN_ENV, ANTHROPIC_BASE_URL: "http://cliproxy:8317" },
+      { cliproxyTunnel: true, tunnelTargetHost: "cliproxy", tunnelTargetPort: 8317, tunnelRemotePort: 8317 });
+    expect(result.exitCode).toBe(0);
+    expect(staged).toContain("ANTHROPIC_BASE_URL=");
+    expect(staged).toContain("127.0.0.1:8317");
+    expect(staged).not.toContain("cliproxy:8317");
+  });
+
   it("delivers none of the project's or the server's secrets to the VM, in the staged env file or in argv", async () => {
     const { result, staged, script } = await runWithEnv({ ...PROJECT_SECRETS, ...SERVER_SECRETS, ...ALLOWED_RUN_ENV });
     expect(result.exitCode).toBe(0);
