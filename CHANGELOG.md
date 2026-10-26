@@ -15,6 +15,7 @@
 
 ### Fixed
 
+* Python commands from a `uv.lock` plan now run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with an empty env instead of the system PATH interpreter.
 * Offload submissions reject NUL and other ASCII control characters in argv with HTTP 400 before workspace lookup, journaling or dispatch; the native SSH executor also refuses them defensively before resolving a pool.
 * Successful guest-empty verification releases host shutdown tracking for that command, so long-lived pools do not replay cleanup for every completed command. Failed or uncertain verifications remain tracked and receipts stay readable.
 * Guest output polling defers an incomplete JSON-line tail until the next read, avoiding spurious uncertain-execution quarantines when a healthy command's output spans multiple writes. Complete malformed records still fail closed.

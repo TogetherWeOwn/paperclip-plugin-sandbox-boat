@@ -20,6 +20,8 @@ export interface SshOffloadGuestDeps {
   /** Per-command nonsecret env allowlist; defaults to the cargo pair. */
   allowedEnv?: (command: OffloadCommand) => string[];
   path?: string;
+  /** Guest checkout root when the source plans a uv (uv.lock) install, else null. */
+  uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
 }
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
@@ -66,10 +68,28 @@ export class SshOffloadGuest implements GuestController {
     if (Object.keys(command.env ?? {}).some((key) => !allowedEnv.includes(key))) {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
     }
+    const cwd = await this.deps.workspace(sandboxId, command);
+    let executable = command.runner ?? command.executable ?? this.deps.executable ?? "cargo";
+    // A uv (uv.lock) install lands in a checkout-local .venv that the guest
+    // never activates: run the interpreter from the venv so system PATH and an
+    // empty env cannot resolve a different interpreter. The venv path is an
+    // absolute guest checkout path plus a validated runner name; env stays empty.
+    if ((command.tool ?? "cargo") === "python") {
+      const venvRoot = await this.deps.uvVenvRoot?.(command).catch(() => null);
+      if (venvRoot !== null && venvRoot !== undefined) {
+        const base = command.runner ?? command.executable ?? this.deps.executable ?? "python";
+        if (!base || base.includes("/") || base.includes("\\") || base.includes("\0")
+          || base === "." || base === ".." || base.includes("..")) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+        if (!venvRoot.startsWith("/") || venvRoot.includes("\0") || venvRoot.split("/").includes("..")) {
+          throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+        }
+        executable = path.posix.join(venvRoot, ".venv/bin", base);
+      }
+    }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
       program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
-      cwd: await this.deps.workspace(sandboxId, command),
-      executable: command.runner ?? command.executable ?? this.deps.executable ?? "cargo",
+      cwd,
+      executable,
       args: this.deps.args?.(command) ?? command.argv, env: command.env ?? {}, timeoutMs: command.timeoutMs ?? 120_000,
       path: this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
       base: { companyId: command.companyId, runId: command.runId, commandId: command.commandId,

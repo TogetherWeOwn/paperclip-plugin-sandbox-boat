@@ -30,7 +30,7 @@ export interface SshOffloadRuntimeDeps {
   // Boundary test seams: real SSH is still used, not an injected guest mock.
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
-  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot">;
+  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot">;
 }
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
@@ -190,9 +190,18 @@ export class SshOffloadRuntime {
     };
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, artifactRoot: settings.offloadArtifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot });
+    const uvVenvRoot = async (cmd: OffloadCommand): Promise<string | null> => {
+      if ((cmd.tool ?? "cargo") !== "python") return null;
+      const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
+      if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) return null;
+      const plan = await planDependencies(native.source, cmd.tool).catch(() => null);
+      if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
+      return sync.directory(cmd);
+    };
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent: settings.offloadCgroupParent,
       workspace: (vm, cmd) => sync.cwd(vm, cmd),
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
+      uvVenvRoot,
       ...this.deps.guestOptions });
     // Sync-in begins every reservation, including resumed VMs: discard stale
     // host-key/IP state and authorize via the provider before transferring.

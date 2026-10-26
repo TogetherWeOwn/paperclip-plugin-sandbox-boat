@@ -463,9 +463,12 @@ caches and build outputs; the guest installs dependencies from the lockfile
 `requirements.txt` via `pip install --require-hashes -r`) into a per-VM cache
 keyed by lockfile hash. Global pip installs reuse the cache across runs;
 checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
-warm VM never reuses a stale checkout. No lockfile (or competing lockfiles
-for the same tool) means the command stays local: the plugin never installs
-from an unlocked manifest, and an unpinned `requirements.txt` stays local.
+warm VM never reuses a stale checkout. Python commands from a `uv.lock` plan
+run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with an empty
+env, so the system PATH cannot resolve a different interpreter. No lockfile
+(or competing lockfiles for the same tool) means the command stays local: the
+plugin never installs from an unlocked manifest, and an unpinned
+`requirements.txt` stays local.
 Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
 Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
 `.netrc`) are never synced and keep commands local. Only an empty env travels
