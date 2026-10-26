@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -57,6 +58,18 @@ describe("hasRegistryCredentials", () => {
   it("stays local on a symlinked pyproject.toml without reading its large target", async () => {
     const dir = root({ "target.txt": `[project]\nname = "app"\n${"x".repeat(300 * 1024)}\n` });
     symlinkSync(path.join(dir, "target.txt"), path.join(dir, "pyproject.toml"));
+    expect(await hasRegistryCredentials(dir)).toBe(true);
+  });
+
+  it("stays local on a non-regular pyproject.toml so no VM is reserved for an unsyncable tree", async () => {
+    const dir = root({});
+    mkdirSync(path.join(dir, "pyproject.toml"));
+    expect(await hasRegistryCredentials(dir)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("stays local on a FIFO pyproject.toml without blocking on it", async () => {
+    const dir = root({});
+    execFileSync("mkfifo", [path.join(dir, "pyproject.toml")]);
     expect(await hasRegistryCredentials(dir)).toBe(true);
   });
 });
