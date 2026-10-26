@@ -78,6 +78,20 @@ export class SshOffloadRuntime {
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
 
+  /** True when this run/workspace already has a native binding (whole-run realization wins). */
+  has(companyId: string, runId: string, workspaceId: string): boolean {
+    return this.bindings.has(key(companyId, runId, workspaceId));
+  }
+
+  /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
+  forgetRun(companyId: string, runId: string): string[] {
+    const dropped: string[] = [];
+    for (const [id, entry] of this.bindings) {
+      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.push(entry.workspaceId); }
+    }
+    return dropped;
+  }
+
   remember(params: PluginEnvironmentRealizeWorkspaceParams): void {
     const request = object(params.workspace.metadata?.workspaceRealizationRequest);
     const source = object(request?.source);

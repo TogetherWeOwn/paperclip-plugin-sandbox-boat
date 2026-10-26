@@ -151,7 +151,8 @@ describe("native sync opt-in", () => {
           if (end < 0) break;
           const message = JSON.parse(pending.slice(0, end));
           pending = pending.slice(end + 1);
-          if (message.id === 1) resolve(message);
+          // Worker->host calls (setup subscriptions) share the id space: only a reply without a method answers initialize.
+          if (message.id === 1 && !message.method) resolve(message);
           // Answer any setup host call, without asserting on the stand-in.
           else if (message.id != null && message.method) input.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result: null })}\n`);
         }

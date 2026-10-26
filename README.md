@@ -404,7 +404,8 @@ There are independent gates; none enables another automatically:
    rather than guessing how to translate host paths.
 
 Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
-payload, not `ctx.executionWorkspaces` or the offload request body. Paperclip's
+payload (whole-run leases) or from host-owned run, issue and workspace records
+(local runs, below), never from the offload request body. Paperclip's
 `server/src/services/environment-run-orchestrator.ts` supplies
 `workspace.metadata.workspaceRealizationRequest`, built by
 `server/src/services/workspace-realization.ts`: its `heartbeatRunId`,
@@ -413,13 +414,34 @@ source root. The provider persists only the required source fields in its
 existing company-scoped plugin state, keyed by run and execution workspace;
 the VM's remote cwd and runtime-overlay commands are not source authority.
 Bindings survive worker restart and cannot authorize another run or company.
-The manifest retains exactly the six capabilities installed with 0.2.2.
+**Local runs (agent stays on the Paperclip host).** Paperclip calls
+`environmentRealizeWorkspace` only for runs on a plugin sandbox lease, so a local
+run gets no realization payload. With `offloadLocalRunsEnabled: true` the plugin
+builds the same payload from host-owned data only:
 
-For otherwise-local runs, the trusted executor integration must call
-`BoatVmManager.rememberOffloadWorkspace(params)` with that same host-authored
-`PluginEnvironmentRealizeWorkspaceParams` payload before submitting commands.
-It performs no provider work and is not exposed as an agent route. An unbound
-run/workspace is rejected with 403 before dispatch; older hosts without the
+1. the `agent.run.started` domain event gives the run id and its issue id;
+2. `ctx.issues.get` gives the issue's `executionWorkspaceId`;
+3. `ctx.executionWorkspaces.get` gives that workspace's local `path`, repository
+   and project;
+4. `offloadLocalApiKeySecretRef` (a Paperclip secret) gives the scoped boat key,
+   resolved per binding and never stored; `offloadLocalEnvironmentId` and
+   `offloadLocalDriverConfig` give the pool identity and settings.
+
+The agent and the offload request body supply nothing. The started event usually
+arrives before Paperclip prepares the run's workspace, so the bind is retried when
+that run's first offload request arrives. A binding never replaces a whole-run
+realization for the same run and workspace. `agent.run.finished`, `failed` and
+`cancelled` drop the executor binding and the persisted workspace record, and fence
+the run: a late or slow start handler cannot bind it again. A missing host fact (no
+execution workspace, no local path, no secret) leaves the run unbound, and its
+commands get 403 before dispatch. This adds three capabilities to the 0.2.2
+set: `events.subscribe`, `execution.workspaces.read` and `secrets.read-ref`; the
+upgrade needs board approval of that capability change.
+
+A custom host integration can still call
+`BoatVmManager.rememberOffloadWorkspace(params)` with a host-authored
+`PluginEnvironmentRealizeWorkspaceParams` payload instead. It performs no
+provider work and is not exposed as an agent route. Older hosts without the
 native realization metadata must keep the shim off, not supply a root in the
 request body. This binding does not replace the executor resolver's source
 confinement or enable dispatch. Failed optional binding persistence does not
