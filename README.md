@@ -459,11 +459,16 @@ shorter slower remotely. Watch modes, single-file filters, lint/typecheck/
 format, install/ci, dev servers, inline `python -c` and anything unrecognized
 stay local. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
 caches and build outputs; the guest installs dependencies from the lockfile
-(`npm ci`, `pnpm/yarn --frozen-lockfile`, `pip install -r`, `uv sync`) into a
-per-VM cache keyed by lockfile hash, so a warm pool VM reuses them across
-runs. No lockfile (or competing lockfiles) means the command stays local:
-the plugin never installs from an unlocked manifest. Package lockfiles at the
-repo root are return-eligible like `Cargo.lock`. Only an empty env travels
+(`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
+`requirements.txt` via `pip install --require-hashes -r`) into a per-VM cache
+keyed by lockfile hash. Global pip installs reuse the cache across runs;
+checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
+warm VM never reuses a stale checkout. No lockfile (or competing lockfiles
+for the same tool) means the command stays local: the plugin never installs
+from an unlocked manifest, and an unpinned `requirements.txt` stays local.
+Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
+Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
+`.netrc`) are never synced and keep commands local. Only an empty env travels
 with Node/Python requests; secret-free env policy, public allow-listed
 repositories and cwd/argv confinement apply unchanged.
 
