@@ -5,10 +5,11 @@
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
 import type { OffloadBroker, BrokerPrincipal } from "./broker.js";
+import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
-import { OFFLOAD_BOUNDS, OFFLOAD_VERSION } from "./protocol.js";
-import { classifyCargo } from "./router.js";
-import { bodyTooLarge, validateSubmit } from "./validate.js";
+import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
+import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
+import { bodyTooLarge, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
 /** The refusal path must answer the same documented 409 as submit() for a reused ID. */
 async function recordRefusalOrConflict(
@@ -45,8 +46,17 @@ export interface OffloadWorkspaceMeta {
 
 export interface ServerProfile {
   id: string;
+  tool?: OffloadTool;
   toolchains: string[];
   allowRustflags: boolean;
+  runners?: string[];
+}
+
+export interface OffloadSettings {
+  /** Profile ids admitted for remote dispatch. Default ["rust-public-1"]: Node/Python are opt-in. */
+  offloadProfiles: string[];
+  /** A Node/Python signature is a remote candidate only at/above this recorded median. */
+  offloadMinExpectedSeconds: number;
 }
 
 export interface OffloadRouteHost {
@@ -55,6 +65,9 @@ export interface OffloadRouteHost {
     get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null>;
   };
   profile: ServerProfile;
+  extraProfiles?: ServerProfile[];
+  settings?: Partial<OffloadSettings>;
+  durations?: DurationStore;
 }
 
 export interface RouteResponse {
@@ -67,9 +80,79 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** v1 built-in server profile: public-source, secret-free Rust builds/tests. */
 export const V1_PROFILE: ServerProfile = {
   id: "rust-public-1",
+  tool: "cargo",
   toolchains: ["stable", "1.88.0"],
   allowRustflags: false,
+  runners: ["cargo"],
 };
+
+/** Node test/e2e/build profile: npm/pnpm/yarn scripts and test binaries. */
+export const NODE_PROFILE: ServerProfile = {
+  id: "node-public-1",
+  tool: "node",
+  toolchains: [],
+  allowRustflags: false,
+  runners: ["npm", "pnpm", "yarn", "npx"],
+};
+
+/** Python suite profile: pytest and python -m pytest/unittest. */
+export const PYTHON_PROFILE: ServerProfile = {
+  id: "python-public-1",
+  tool: "python",
+  toolchains: [],
+  allowRustflags: false,
+  runners: ["pytest", "python", "python3"],
+};
+
+export const DEFAULT_SETTINGS: OffloadSettings = {
+  offloadProfiles: ["rust-public-1"],
+  offloadMinExpectedSeconds: 120,
+};
+
+const KNOWN_PROFILE_IDS = new Set(["rust-public-1", "node-public-1", "python-public-1"]);
+const KNOWN_TOOLS: ReadonlySet<string> = new Set(["cargo", "node", "python"]);
+
+/** Sanitize company plugin config; unknown values fall back to defaults. */
+export function normalizeOffloadSettings(raw: unknown): OffloadSettings {
+  const record = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const profiles = Array.isArray(record.offloadProfiles)
+    ? record.offloadProfiles.filter((id): id is string => typeof id === "string" && KNOWN_PROFILE_IDS.has(id))
+    : [...DEFAULT_SETTINGS.offloadProfiles];
+  const min = Number(record.offloadMinExpectedSeconds);
+  return {
+    offloadProfiles: profiles,
+    offloadMinExpectedSeconds: Number.isFinite(min) && min >= 0 ? min : DEFAULT_SETTINGS.offloadMinExpectedSeconds,
+  };
+}
+
+export function profileTool(profile: ServerProfile): OffloadTool {
+  return profile.tool ?? "cargo";
+}
+
+export function profileRunners(profile: ServerProfile): string[] {
+  if (profile.runners) return profile.runners;
+  return profileTool(profile) === "cargo" ? ["cargo"] : [];
+}
+
+export function defaultRunnerFor(tool: OffloadTool): string {
+  return tool === "node" ? "npm" : tool === "python" ? "pytest" : "cargo";
+}
+
+function profileFor(host: OffloadRouteHost, tool: OffloadTool): ServerProfile | null {
+  if (profileTool(host.profile) === tool) return host.profile;
+  for (const extra of host.extraProfiles ?? []) {
+    if (profileTool(extra) === tool) return extra;
+  }
+  if (tool === "node") return NODE_PROFILE;
+  if (tool === "python") return PYTHON_PROFILE;
+  return null;
+}
+
+export function classifyRequest(profile: ServerProfile, tool: OffloadTool, runner: string, argv: string[]): CargoClassification {
+  if (tool === "node") return classifyNode(runner, argv, profile);
+  if (tool === "python") return classifyPython(runner, argv, profile);
+  return classifyCargo(argv, { id: profile.id, toolchains: profile.toolchains });
+}
 
 export function canonicalRepoId(workspace: { repoUrl: string | null; projectId: string }): string {
   const url = workspace.repoUrl?.trim().replace(/\/+$/, "").replace(/\.git$/, "");
@@ -105,23 +188,46 @@ export async function handleExec(
   if (bodyTooLarge(JSON.stringify(input.body ?? null))) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "request body exceeds 64 KiB", {}) };
   }
-  const validated = validateSubmit(input.body, { allowRustflags: host.profile.allowRustflags });
+  const rawTool = toolOfBody(input.body);
+  if (rawTool === null) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "tool must be cargo, node or python", {}) };
+  }
+  const profile = profileFor(host, rawTool);
+  if (!profile) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "tool must be cargo, node or python", {}) };
+  }
+  const validated = validateSubmit(input.body, {
+    allowRustflags: profile.allowRustflags,
+    tool: profileTool(profile),
+    runners: profileRunners(profile),
+  });
   if (!validated.ok) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
   const request = validated.value;
+  const tool = request.tool ?? profileTool(profile);
+  const runner = request.runner ?? defaultRunnerFor(tool);
+  const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
+  if (!settings.offloadProfiles.includes(profile.id)) {
+    // Not journaled as a refusal: enabling the profile later must accept the
+    // same command ID. The shim falls back locally.
+    return {
+      status: 503,
+      body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
+    };
+  }
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: request.commandId }) };
   }
-  const principal = principalFor(input.companyId, runId, workspace, host.profile);
+  const principal = principalFor(input.companyId, runId, workspace, profile);
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.
-    const classification = classifyCargo(request.argv, host.profile);
+    const classification = await decideRemote(host, settings, canonicalRepoId(workspace), profile, tool, runner, request.argv);
     return {
       status: 200,
-      body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: host.profile.id },
+      body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: profile.id },
     };
   }
   if (workspace.path == null && workspace.cwd == null) {
@@ -132,7 +238,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const classification = classifyCargo(request.argv, host.profile);
+  const classification = await decideRemote(host, settings, canonicalRepoId(workspace), profile, tool, runner, request.argv);
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
@@ -142,6 +248,103 @@ export async function handleExec(
     };
   }
   return host.broker.submit(request, principal);
+}
+
+/** Read the requested tool off the raw body before profile validation. Null when invalid. */
+function toolOfBody(body: unknown): OffloadTool | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "cargo";
+  const tool = (body as Record<string, unknown>).tool;
+  if (tool === undefined) return "cargo";
+  return typeof tool === "string" && KNOWN_TOOLS.has(tool) ? (tool as OffloadTool) : null;
+}
+
+/**
+ * Workload decision: classifier first, then the Node/Python duration gate.
+ * Rust keeps its existing behaviour ( classifier verdict, no duration gate).
+ */
+async function decideRemote(
+  host: OffloadRouteHost,
+  settings: OffloadSettings,
+  repoId: string,
+  profile: ServerProfile,
+  tool: OffloadTool,
+  runner: string,
+  argv: string[],
+): Promise<CargoClassification> {
+  const classification = classifyRequest(profile, tool, runner, argv);
+  if (classification.mode === "local" || tool === "cargo") return classification;
+  if (!host.durations) {
+    return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
+  }
+  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv));
+  const history = await readHistory(host.durations, key);
+  if (history.length === 0) {
+    return { mode: "local", reason: "no duration history yet; run local first and record", profileId: profile.id, subcommand: classification.subcommand, runner };
+  }
+  const median = medianSeconds(history, Date.now());
+  if (median !== null && median >= settings.offloadMinExpectedSeconds) return classification;
+  return {
+    mode: "local",
+    reason: `median ${median === null ? "unknown" : `${median.toFixed(0)}s`} below ${settings.offloadMinExpectedSeconds}s threshold; runs local and records`,
+    profileId: profile.id,
+    subcommand: classification.subcommand,
+    runner,
+  };
+}
+
+/**
+ * Local-run duration report: the shim records wall-clock seconds for a
+ * remote-candidate command it ran locally (unknown or short history), so the
+ * next identical command can go remote. Never dispatches, never journals a
+ * command; it only appends one bounded sample.
+ */
+export async function handleReport(
+  input: { actor: RouteActor; companyId: string; body: unknown },
+  host: OffloadRouteHost,
+): Promise<RouteResponse> {
+  const runId = authed(input.actor);
+  if (!runId) return { status: 401, body: offloadError("OFFLOAD_UNAUTHORIZED", "agent run authentication required", {}) };
+  if (bodyTooLarge(JSON.stringify(input.body ?? null))) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "request body exceeds 64 KiB", {}) };
+  }
+  const body = input.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "body must be a JSON object", {}) };
+  }
+  const record = body as Record<string, unknown>;
+  if (typeof record.executionWorkspaceId !== "string" || !UUID_RE.test(record.executionWorkspaceId)) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "executionWorkspaceId must be a UUID", {}) };
+  }
+  if (record.tool !== "node" && record.tool !== "python") {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "tool must be node or python", {}) };
+  }
+  const tool = record.tool as OffloadTool;
+  const profile = profileFor(host, tool)!;
+  if (typeof record.runner !== "string" || !profileRunners(profile).includes(record.runner)) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "runner is not allowed on this profile", {}) };
+  }
+  const argv = record.argv;
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > OFFLOAD_BOUNDS.maxArgs
+    || argv.some((a) => typeof a !== "string" || a.length === 0)) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "argv must be a non-empty array of non-empty strings", {}) };
+  }
+  if (argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg))) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "argv holds invalid control characters", {}) };
+  }
+  if (typeof record.durationSeconds !== "number" || !Number.isFinite(record.durationSeconds)
+    || record.durationSeconds < 0 || record.durationSeconds > 86_400) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "durationSeconds must be 0..86400", {}) };
+  }
+  if (!host.durations) {
+    return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "duration learning unavailable", { commandId: null, remoteStarted: false, fallbackSafe: true }) };
+  }
+  const workspace = await host.workspaces.get(record.executionWorkspaceId, input.companyId, runId);
+  if (!workspace) {
+    return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: null }) };
+  }
+  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[]));
+  await recordDuration(host.durations, key, { seconds: record.durationSeconds, at: Date.now() });
+  return { status: 200, body: { version: OFFLOAD_VERSION, recorded: true } };
 }
 
 function readAuth(input: { actor: RouteActor; params: { commandId?: string } }): { runId: string; commandId: string } | RouteResponse {

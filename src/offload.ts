@@ -30,6 +30,12 @@ export interface OffloadCommand {
   cardId: string;
   repoId: string;
   profileId: string;
+  /** Defaults to cargo; the route layer fills it before submit. */
+  tool?: "cargo" | "node" | "python";
+  /** Package runner / test binary; the route layer fills the default. */
+  runner?: string;
+  /** Guest executable; defaults to the runner, then cargo. */
+  executable?: string;
   argv: string[];
   executionWorkspaceId?: string;
   trustDomainId?: string;
@@ -149,7 +155,8 @@ interface Queued {
 
 function digestOf(command: OffloadCommand): string {
   // Internal payload identity; never included in logs or usage.
-  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId, argv: command.argv });
+  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId,
+    tool: command.tool ?? "cargo", runner: command.runner ?? "cargo", argv: command.argv });
 }
 
 function sandboxIdOf(response: unknown): string | null {

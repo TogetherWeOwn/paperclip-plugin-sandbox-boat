@@ -85,6 +85,13 @@ const manifest: PaperclipPluginManifestV1 = {
       auth: "agent",
       capability: "api.routes.register",
     },
+    {
+      routeKey: "offload_report",
+      method: "POST",
+      path: "/offload/report",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
   ],
   instanceConfigSchema: {
     type: "object",
@@ -126,6 +133,18 @@ const manifest: PaperclipPluginManifestV1 = {
       offloadArtifactRoot: {
         type: "string",
         description: "Operator-owned persistent host directory for private frozen snapshots and staged returns. Required for stock command offload; no automatic application to source files.",
+      },
+      offloadProfiles: {
+        type: "array", items: { type: "string" }, default: ["rust-public-1"],
+        description: "Server profiles admitted for remote dispatch. Default rust-public-1 only; add node-public-1 and/or python-public-1 to opt into Node/Python offload. Unknown ids are ignored.",
+      },
+      offloadMinExpectedSeconds: {
+        type: "number", default: 120,
+        description: "A Node/Python command is a remote candidate only when its recorded median duration meets this threshold in seconds. Unknown signatures run local first and record. Rust is not gated by this setting.",
+      },
+      offloadMonthlyVmHourCap: {
+        type: "number", default: 0,
+        description: "Monthly cap on tracked offload VM-hours for the company; 0 disables the extra cap (existing budget admission still applies). When reached, new commands run local until next month.",
       },
     },
   },

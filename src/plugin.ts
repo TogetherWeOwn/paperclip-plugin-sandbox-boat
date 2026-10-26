@@ -148,6 +148,10 @@ const plugin = definePlugin({
       const response = await boat.offloadCancel(input.companyId, toRouteActor(input.actor), input.params, input.body);
       return { status: response.status, body: response.body };
     }
+    if (input.routeKey === "offload_report") {
+      const response = await boat.offloadReport(input.companyId, toRouteActor(input.actor), input.body);
+      return { status: response.status, body: response.body };
+    }
     return { status: 404, body: { error: `unknown route ${input.routeKey}` } };
   },
 
