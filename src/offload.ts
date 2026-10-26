@@ -564,7 +564,11 @@ export class OffloadExecutor {
   }
 
   private compatibilityKey(command: OffloadCommand): string {
-    return JSON.stringify([command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null]);
+    // A VM booted from another guest image is never reused; it is retired like
+    // any incompatible idle VM. Without a template the key is unchanged, so VMs
+    // recorded before templates existed stay reusable.
+    const base = [command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null];
+    return JSON.stringify(this.config.templateSnapshot ? [...base, this.config.templateSnapshot] : base);
   }
 
   private workspaceKey(command: OffloadCommand): string | null {

@@ -620,8 +620,10 @@ default VM:
 5. Save the VM as a named snapshot (not available during the boat free trial)
    and set the driver `templateSnapshot` to that name. Offload pool VMs then
    boot from it, as whole-run leases do; a missing snapshot is a refused start
-   and the command stays local. The snapshot name is part of the pool identity,
-   so changing it never reuses VMs that booted from the old image.
+   and the command stays local. The pool identity does not include the
+   snapshot, so VMs recorded before a template change stay owned. They are
+   never reused: VM reuse is keyed on the template, and an idle VM from the old
+   image is retired through the normal stop path.
 
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)
 

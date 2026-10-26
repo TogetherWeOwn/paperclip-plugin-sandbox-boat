@@ -244,10 +244,12 @@ export class SshOffloadRuntime {
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
-      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot,
-      // Appended only when set: pools without a template keep their persisted
-      // identity (and their recorded VMs) across this upgrade.
-      ...(binding.config.templateSnapshot ? [binding.config.templateSnapshot] : [])])).digest("hex").slice(0, 24);
+      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]))
+      .digest("hex").slice(0, 24);
+    // templateSnapshot is deliberately NOT part of the pool identity: changing
+    // it must keep ownership of VMs already recorded under this pool so they
+    // are retired through the normal stop path. The executor keys VM reuse on
+    // the template instead (compatibilityKey).
     const existing = this.pools.get(poolId);
     if (existing) return existing.executor;
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });

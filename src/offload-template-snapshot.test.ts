@@ -32,4 +32,24 @@ describe("offload pool templateSnapshot", () => {
     expect(result.status).not.toBe("completed");
     expect(f.executions).toHaveLength(0);
   });
+
+  it("keys VM reuse on the template and keeps the legacy key without one", async () => {
+    type Keyed = { compatibilityKey(c: ReturnType<typeof command>): string };
+    const cmd = command("key-a");
+    const legacy = JSON.stringify([cmd.companyId, cmd.repoId, cmd.profileId, cmd.trustDomainId ?? null]);
+    const plain = f.pool("key-plain") as unknown as Keyed;
+    const tmpl = f.pool("key-tmpl", { templateSnapshot: "paperclip-offload-delegated-v1" }) as unknown as Keyed;
+    expect(plain.compatibilityKey(cmd)).toBe(legacy);
+    expect(tmpl.compatibilityKey(cmd)).not.toBe(legacy);
+    expect(tmpl.compatibilityKey(cmd)).toContain("paperclip-offload-delegated-v1");
+  });
+
+  it("does not reuse a VM booted from another image after the template changes", async () => {
+    const before = f.pool("swap-pool");
+    expect(await before.execute(command("swap-a"))).toMatchObject({ status: "completed" });
+    const vm = (before as unknown as { pool: Array<{ compatibilityKey: string }> }).pool[0]!;
+    const after = f.pool("swap-pool-2", { templateSnapshot: "paperclip-offload-delegated-v1" }) as unknown as
+      { compatibilityKey(c: ReturnType<typeof command>): string };
+    expect(vm.compatibilityKey).not.toBe(after.compatibilityKey(command("swap-a")));
+  });
 });
