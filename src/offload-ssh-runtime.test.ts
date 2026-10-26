@@ -177,6 +177,14 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve({ ...node } as BackendCommand, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("keeps node local when a registry credential file is present", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await writeFile(path.join(source, ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
     await writeFile(path.join(source, "requirements.txt"), "pytest==7.4.2 \\\n    --hash=sha256:abc123\n");
     const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;

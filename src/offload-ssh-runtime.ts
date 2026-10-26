@@ -2,7 +2,7 @@
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
@@ -32,6 +32,22 @@ export interface SshOffloadRuntimeDeps {
   session?: (sandboxId: string) => Promise<SshSession>;
   guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot">;
 }
+/** Registry credential files: never synced, and their presence keeps commands local. */
+export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
+
+/** True when the source root holds a registry credential file: stay local rather than sync a token. */
+export async function hasRegistryCredentials(sourceRoot: string): Promise<boolean> {
+  for (const file of REGISTRY_CREDENTIAL_FILES) {
+    try {
+      const info = await stat(path.join(sourceRoot, file));
+      if (info.isFile()) return true;
+    } catch {
+      // Missing: keep checking.
+    }
+  }
+  return false;
+}
+
 /** Profile by id; unknown ids never resolve. */
 function profileForId(profileId: string): ServerProfile | null {
   if (profileId === V1_PROFILE.id) return V1_PROFILE;
@@ -140,9 +156,12 @@ export class SshOffloadRuntime {
     if (!this.confined(command, tool)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
-      // never from an unlocked manifest.
+      // never from an unlocked manifest. A registry credential file also
+      // stays local: its token is excluded from sync, so the guest could not
+      // authenticate a private registry without it.
       const plan = await planDependencies(binding.source, tool).catch(() => null);
       if (!plan) return null;
+      if (await hasRegistryCredentials(binding.source).catch(() => true)) return null;
     }
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.

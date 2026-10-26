@@ -42,6 +42,12 @@ export const DEFAULT_SYNC_EXCLUDES: readonly string[] = [
   ".boat-offload/",
   ".env",
   ".env.*",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  ".pypirc",
+  "pip.conf",
+  ".netrc",
 ];
 
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;

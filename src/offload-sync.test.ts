@@ -84,6 +84,22 @@ describe("captureManifest", () => {
     expect(DEFAULT_SYNC_EXCLUDES.length).toBeGreaterThan(0);
   });
 
+  it("never syncs registry credential files", async () => {
+    const root = makeTemp();
+    writeTree(root, {
+      "src/main.rs": "fn main() {}\n",
+      ".npmrc": "//registry.npmjs.org/:_authToken=secret\n",
+      ".yarnrc": "registry-token\n",
+      ".yarnrc.yml": "npmAuthToken: secret\n",
+      ".pypirc": "[pypi]\npassword=secret\n",
+      "pip.conf": "[global]\npassword=secret\n",
+      ".netrc": "machine example.com password secret\n",
+      "nested/.npmrc": "//private/:_authToken=secret\n",
+    });
+    const { manifest } = await captureManifest(root);
+    expect(manifest.files.map((f) => f.path)).toEqual(["src/main.rs"]);
+  });
+
   it("keeps in-root relative symlinks as links without following them", async () => {
     const root = makeTemp();
     writeTree(root, { "src/real.rs": "real\n" });
