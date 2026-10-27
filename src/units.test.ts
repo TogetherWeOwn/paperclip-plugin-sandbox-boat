@@ -288,6 +288,16 @@ describe("env policy", () => {
       expect(outcome({ PATH: dotted, ZDOTDIR: dotted, BASH_ENV: `${dotted}/.bashrc` })).toEqual({ ZDOTDIR: "kept", BASH_ENV: "kept" });
     });
 
+    // remoteWorkspaceDirProblem accepts any plain path below the VM home, and
+    // Paperclip joins the launcher dir under it (path.posix.join) and quotes it.
+    it("delivers them under a workspace path with spaces or non-ASCII characters", () => {
+      for (const workspace of ["/home/user/my workspace", "/home/user/projets/équipe ü", "/home/user/工作区", "/home/user/a'b $(x) `y` \\z"]) {
+        const launcher = `${workspace}/.paperclip-runtime/paperclip-runner/github/run-1`;
+        const env = { PATH: `${launcher}:/usr/bin:/bin`, ZDOTDIR: launcher, BASH_ENV: `${launcher}/.bashrc` };
+        expect([workspace, outcome(env)]).toEqual([workspace, { ZDOTDIR: "kept", BASH_ENV: "kept" }]);
+      }
+    });
+
     it("drops any other value: host paths, other files, a dir PATH does not lead with, path tricks", () => {
       const mismatch = { ZDOTDIR: "github_launcher_mismatch", BASH_ENV: "github_launcher_mismatch" };
       expect(outcome(launcherEnv({ ZDOTDIR: "/home/ubuntu", BASH_ENV: "/tmp/evil.sh" }))).toEqual(mismatch);
@@ -295,6 +305,12 @@ describe("env policy", () => {
       expect(outcome(launcherEnv({ ZDOTDIR: `${dir}/` }))).toEqual({ ZDOTDIR: "github_launcher_mismatch", BASH_ENV: "kept" });
       expect(outcome(launcherEnv({ PATH: `/usr/bin:${dir}` }))).toEqual(mismatch);
       expect(outcome({ ZDOTDIR: dir, BASH_ENV: `${dir}/.bashrc` })).toEqual(mismatch);
+      // A spaced launcher dir that does not lead PATH, or differs from the one that does.
+      const spaced = "/home/user/my workspace/.paperclip-runtime/paperclip-runner/github/run-1";
+      expect(outcome({ PATH: `/usr/bin:${spaced}`, ZDOTDIR: spaced, BASH_ENV: `${spaced}/.bashrc` })).toEqual(mismatch);
+      const otherSpaced = "/home/user/my workspace 2/.paperclip-runtime/paperclip-runner/github/run-1";
+      expect(outcome({ PATH: `${spaced}:/usr/bin`, ZDOTDIR: otherSpaced, BASH_ENV: `${otherSpaced}/.bashrc` })).toEqual(mismatch);
+      expect(outcome({ PATH: `${spaced}:/usr/bin`, ZDOTDIR: spaced, BASH_ENV: `${spaced}/.bashrc\n` })).toEqual({ ZDOTDIR: "kept", BASH_ENV: "github_launcher_mismatch" });
       for (const other of [
         "/home/user/w/../../../etc/.paperclip-runtime/paperclip-runner/github/run-1",
         "/home/user/w/./.paperclip-runtime/paperclip-runner/github/run-1",
@@ -302,7 +318,21 @@ describe("env policy", () => {
         "/home/user/w/.paperclip-runtime/paperclip-runner/github/run-1/x",
         "/home/user/w/.paperclip-runtime/paperclip-runner/github/run 1",
         "home/user/w/.paperclip-runtime/paperclip-runner/github/run-1",
+        "my workspace/.paperclip-runtime/paperclip-runner/github/run-1",
         "/tmp/paperclip-github-runtime/run-1",
+        "/home/user/my workspace/../.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/équipe/./.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/my\nworkspace/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/my\u0000workspace/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/my\rworkspace/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/my\u007fworkspace/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user//w/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/.paperclip-runtime/paperclip-runner/github/run-1/",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/run-1\n",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/..",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/run-é",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/run.1",
       ]) {
         expect([other, outcome({ PATH: `${other}:/usr/bin`, ZDOTDIR: other, BASH_ENV: `${other}/.bashrc` })]).toEqual([other, mismatch]);
       }
@@ -326,11 +356,11 @@ describe("env policy", () => {
       // /etc/profile does), Paperclip's launcher dir with its `git` and the
       // profile prepareGitHubOperationLaunchers writes, then the plugin's
       // staged env file and login-shell script.
-      function vmRun(dropFromStaged: readonly string[] = []) {
+      function vmRun(dropFromStaged: readonly string[] = [], workspaceName = "paperclip-workspace") {
         root = mkdtempSync(path.join(tmpdir(), "pcb-launcher-"));
         const sysbin = path.join(root, "sysbin");
         const home = path.join(root, "home");
-        const workspace = path.join(root, "paperclip-workspace");
+        const workspace = path.join(root, workspaceName);
         const launcher = path.join(workspace, ".paperclip-runtime", "paperclip-runner", "github", "run-1");
         for (const created of [sysbin, home, launcher]) mkdirSync(created, { recursive: true });
         const vmPath = `${sysbin}:/usr/bin:/bin`;
@@ -373,6 +403,15 @@ describe("env policy", () => {
       it("resolves git to the launcher first in the agent's shell, nested shells and login shells, and the launcher posts to the bridge", () => {
         const { launcher, run, kept } = vmRun();
         expect(kept.find(([name]) => name === "PATH")?.[1].split(":")[0]).toBe(launcher);
+        expect(run.status).toBe(0);
+        const via = "launcher-git http://127.0.0.1:41234/runtime-tools/github/credentials capability";
+        expect(run.stdout.trim().split("\n")).toEqual([path.join(launcher, "git"), via, via, via, via]);
+      });
+
+      it("keeps the launcher first under a workspace path with spaces and non-ASCII characters", () => {
+        const { launcher, run, kept } = vmRun([], "my workspace équipe 工作区");
+        expect(kept.find(([name]) => name === "ZDOTDIR")?.[1]).toBe(launcher);
+        expect(kept.find(([name]) => name === "BASH_ENV")?.[1]).toBe(`${launcher}/.bashrc`);
         expect(run.status).toBe(0);
         const via = "launcher-git http://127.0.0.1:41234/runtime-tools/github/credentials capability";
         expect(run.stdout.trim().split("\n")).toEqual([path.join(launcher, "git"), via, via, via, via]);

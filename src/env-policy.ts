@@ -459,16 +459,21 @@ export function isRunGithubCapability(value: string, runId: string | undefined, 
 
 // Paperclip stages a sandbox run's launchers in
 // <remoteCwd>/.paperclip-runtime/paperclip-runner/github/<run id> (adapter-utils
-// execution-target.ts githubOperationLauncherDirectory): an absolute VM path,
-// no `.` or `..` segment, a run id of [A-Za-z0-9_-].
-const GITHUB_LAUNCHER_DIR_RE = /^(?:\/[A-Za-z0-9._@+-]+)*\/\.paperclip-runtime\/paperclip-runner\/github\/[A-Za-z0-9_-]+$/;
+// execution-target.ts githubOperationLauncherDirectory: path.posix.join, so no
+// `.`, `..` or empty segment, and a run id of [A-Za-z0-9_-]). remoteCwd is any
+// plain absolute path remoteWorkspaceDirProblem accepts, spaces and non-ASCII
+// included, so the prefix is checked by its shape, not by a character class.
+const GITHUB_LAUNCHER_DIR_SUFFIX_RE = /\/\.paperclip-runtime\/paperclip-runner\/github\/[A-Za-z0-9_-]+$/;
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 const GITHUB_LAUNCHER_SHELL_FILES: Readonly<Record<string, string>> = { ZDOTDIR: "", BASH_ENV: "/.bashrc" };
 
 /** The launcher dir when the run's PATH starts with one, else undefined. */
 function githubLauncherDirOf(path: string | undefined): string | undefined {
   const first = path?.split(":")[0];
-  if (!first || !GITHUB_LAUNCHER_DIR_RE.test(first)) return undefined;
-  return first.split("/").some((segment) => segment === "." || segment === "..") ? undefined : first;
+  if (!first?.startsWith("/") || CONTROL_CHAR_RE.test(first) || !GITHUB_LAUNCHER_DIR_SUFFIX_RE.test(first)) return undefined;
+  // Absolute, so the first segment is the empty one before the leading slash.
+  const plain = first.split("/").slice(1).every((segment) => segment !== "" && segment !== "." && segment !== "..");
+  return plain ? first : undefined;
 }
 
 /**
