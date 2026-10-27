@@ -832,6 +832,60 @@ describe("run env allowlist (incident TOG-37420)", () => {
     expect(staged).not.toContain("cliproxy:8317");
   });
 
+  // TOG-43128. Paperclip's heartbeat hands a sandbox run the env that
+  // githubBrokerEnvironment + prepareGitHubOperationLaunchers build. The VM's
+  // managed `git` launcher posts to the in-VM bridge (PAPERCLIP_API_URL, which
+  // forwards /runtime-tools/github/credentials) with the run capability in
+  // `x-paperclip-github-capability`; without the token it prints
+  // `GitHub capability_missing` and git push asks for a Username.
+  it("stages the run's managed-GitHub capability and nothing else of the launcher env, so git push in the VM reaches the bridge", async () => {
+    const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const now = Math.floor(Date.now() / 1000);
+    const capability = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ sub: "agent-1", company_id: "c-1", run_id: "run-1", responsible_user_id: "u-1", scope: "github_credentials", iat: now, exp: now + 3600 })}.c2ln`;
+    const launcherDir = "/home/user/paperclip-workspace/.paperclip-runtime/paperclip-runner/github/run-1";
+    const launcherEnv = {
+      PAPERCLIP_GITHUB_BROKER_URL: "http://paperclip.internal:3100",
+      PAPERCLIP_GITHUB_BROKER_TOKEN: capability,
+      PAPERCLIP_GITHUB_LAUNCHER_DIR: launcherDir,
+      GIT_SSH_COMMAND: "ssh -F /dev/null -o IdentityAgent=none -o BatchMode=yes",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_COUNT: "",
+      GIT_ASKPASS: "",
+      SSH_ASKPASS: "",
+      SSH_AUTH_SOCK: "",
+      ZDOTDIR: launcherDir,
+      BASH_ENV: `${launcherDir}/.bashrc`,
+      GH_CONFIG_DIR: `${launcherDir}/gh-config`,
+    };
+    const { result, staged, script } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_RUN_ID: "run-1", ...launcherEnv });
+    expect(result.exitCode).toBe(0);
+    const exported = new Map([...staged.matchAll(/^export ([A-Za-z_][A-Za-z0-9_]*)='(.*)';$/gm)].map((match) => [match[1], match[2]] as const));
+    // What the launcher needs in the VM: the capability, and no controller URL (so it falls back to PAPERCLIP_API_URL, the bridge).
+    expect(exported.get("PAPERCLIP_GITHUB_BROKER_TOKEN")).toBe(capability);
+    expect(exported.has("PAPERCLIP_GITHUB_BROKER_URL")).toBe(false);
+    // The token rides the stdin env file, never argv or the command script.
+    expect(script).not.toContain(capability);
+    expect(ssh.spawned.map((call) => call.args.join(" ")).join("\n")).not.toContain(capability);
+    // Host-only launcher state stays out; the VM's own launcher sets these per operation.
+    for (const name of ["GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_COUNT", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK", "ZDOTDIR", "BASH_ENV", "GH_CONFIG_DIR"]) {
+      expect([name, exported.has(name)]).toEqual([name, false]);
+    }
+    // The capability is not logged as a drop either, and no other JWT got through.
+    expect(JSON.stringify(harness.logs)).not.toContain(capability);
+  });
+
+  it("does not stage a github capability that belongs to another run, even to a list that names it", async () => {
+    const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const now = Math.floor(Date.now() / 1000);
+    const other = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ run_id: "run-OTHER", scope: "github_credentials", exp: now + 3600 })}.c2ln`;
+    const config = { envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), "PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"] };
+    const { staged } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_GITHUB_BROKER_TOKEN: other }, config);
+    expect(staged).not.toContain("PAPERCLIP_GITHUB_BROKER_TOKEN");
+    expect(staged).not.toContain(other);
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect((drop?.meta?.dropped as Record<string, string[]>).jwt).toEqual(["PAPERCLIP_GITHUB_BROKER_TOKEN"]);
+  });
+
   it("delivers none of the project's or the server's secrets to the VM, in the staged env file or in argv", async () => {
     const { result, staged, script } = await runWithEnv({ ...PROJECT_SECRETS, ...SERVER_SECRETS, ...ALLOWED_RUN_ENV });
     expect(result.exitCode).toBe(0);

@@ -150,6 +150,83 @@ describe("env policy", () => {
     }
   });
 
+  // TOG-43128: Paperclip's managed `git`/`gh` launchers read the run-scoped
+  // GitHub capability from PAPERCLIP_GITHUB_BROKER_TOKEN. It is an HS256 JWT
+  // minted per run, so the blanket JWT rule dropped it and every push from a
+  // whole-run VM failed with `capability_missing`.
+  describe("managed GitHub capability (PAPERCLIP_GITHUB_BROKER_TOKEN)", () => {
+    const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const capability = (claims: Record<string, unknown> = {}, header: Record<string, unknown> = { alg: "HS256", typ: "JWT" }) => {
+      const now = Math.floor(Date.now() / 1000);
+      return `${b64(header)}.${b64({
+        sub: "agent-1",
+        company_id: "company-1",
+        run_id: "run-1",
+        responsible_user_id: "user-1",
+        scope: "github_credentials",
+        iat: now,
+        exp: now + 3600,
+        ...claims,
+      })}.c2lnbmF0dXJl`;
+    };
+    const deliver = (token: string, allowlist: readonly string[] = DEFAULT_ENV_ALLOWLIST, extra: Record<string, string> = { PAPERCLIP_RUN_ID: "run-1" }) => {
+      const result = filterRunEnv({ PAPERCLIP_GITHUB_BROKER_TOKEN: token, ...extra }, allowlist);
+      return result.kept.some(([name]) => name === "PAPERCLIP_GITHUB_BROKER_TOKEN")
+        ? "kept"
+        : result.dropped.find((entry) => entry.name === "PAPERCLIP_GITHUB_BROKER_TOKEN")?.reason;
+    };
+
+    it("delivers the run's github_credentials capability by default", () => {
+      expect(deliver(capability())).toBe("kept");
+    });
+
+    it("still drops it from a custom list that does not name it exactly, prefix entries included", () => {
+      expect(deliver(capability(), ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_*"])).toBe("jwt");
+      expect(deliver(capability(), ["PAPERCLIP_RUN_ID"])).toBe("not_allowlisted");
+      expect(deliver(capability(), ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"])).toBe("kept");
+      expect(deliver(capability(), [])).toBe("not_allowlisted");
+    });
+
+    it("drops any other JWT under that name: another scope, another run, expired, wrong algorithm, malformed", () => {
+      expect(deliver(capability({ scope: "connection_intents" }))).toBe("jwt");
+      expect(deliver(capability({ scope: undefined }))).toBe("jwt");
+      expect(deliver(capability({ run_id: "run-2" }))).toBe("jwt");
+      expect(deliver(capability({ run_id: undefined }))).toBe("jwt");
+      expect(deliver(capability({ exp: Math.floor(Date.now() / 1000) - 5 }))).toBe("jwt");
+      expect(deliver(capability({ exp: "never" }))).toBe("jwt");
+      expect(deliver(capability({}, { alg: "none", typ: "JWT" }))).toBe("jwt");
+      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, {})).toBe("jwt");
+      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, { PAPERCLIP_RUN_ID: "" })).toBe("jwt");
+      expect(deliver(`${capability()}.extra`)).toBe("jwt");
+      expect(deliver(`${capability().split(".").slice(0, 2).join(".")}.`)).toBe("jwt");
+      expect(deliver(`Bearer ${capability()}`)).toBe("jwt");
+      expect(deliver(`${capability()} ${capability()}`)).toBe("jwt");
+      expect(deliver(`eyJ${"a".repeat(8192)}.eyJ${"b".repeat(8192)}.sig`)).toBe("jwt");
+    });
+
+    it("keeps every other JWT dropped, and never sends the controller's broker URL (the launcher then uses the in-VM bridge)", () => {
+      const result = filterRunEnv(
+        {
+          PAPERCLIP_RUN_ID: "run-1",
+          PAPERCLIP_API_KEY: capability(),
+          PAPERCLIP_GITHUB_BRIDGE_TOKEN: capability(),
+          PAPERCLIP_GITHUB_BROKER_URL: "https://paperclip.example.com/api",
+          GITHUB_TOKEN: capability(),
+        },
+        DEFAULT_ENV_ALLOWLIST,
+      );
+      expect(result.kept).toEqual([["PAPERCLIP_RUN_ID", "run-1"]]);
+      expect(result.dropped).toEqual(
+        expect.arrayContaining([
+          { name: "PAPERCLIP_API_KEY", reason: "jwt" },
+          { name: "PAPERCLIP_GITHUB_BRIDGE_TOKEN", reason: "not_allowlisted" },
+          { name: "PAPERCLIP_GITHUB_BROKER_URL", reason: "not_allowlisted" },
+          { name: "GITHUB_TOKEN", reason: "not_allowlisted" },
+        ]),
+      );
+    });
+  });
+
   it("a NAME_* prefix never delivers a secret-looking name; an exact entry does", () => {
     expect(decide("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")).toBe("secret_name_needs_exact_entry");
     expect(decide("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "not-a-number")).toBe("secret_name_needs_exact_entry");

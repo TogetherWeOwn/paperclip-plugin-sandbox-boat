@@ -36,6 +36,11 @@
 //      name with a whole-number value is a token budget
 //      (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
 //
+//   4. One JWT is let through: PAPERCLIP_GITHUB_BROKER_TOKEN, named exactly,
+//      when it is the run's own managed-GitHub capability (isRunGithubCapability).
+//      Paperclip's `git`/`gh` launchers in the VM need it to push; it is not a
+//      GitHub token and works only through the sandbox bridge while the run is live.
+//
 // An empty allowlist (`envAllowlist: []`) delivers nothing.
 
 /**
@@ -102,6 +107,15 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   "PAPERCLIP_BRIDGE_TOKEN",
   "PAPERCLIP_BRIDGE_*",
   "PAPERCLIP_SANDBOX_EXEC_CHANNEL",
+  // Managed GitHub: the run-scoped capability that Paperclip's git/gh launchers
+  // (staged in the VM, first on PATH) present to the broker through the bridge
+  // above. Delivered only when it is this run's github_credentials capability
+  // (isRunGithubCapability). PAPERCLIP_GITHUB_BROKER_URL is deliberately absent:
+  // it names the controller, which the VM cannot reach, and without it the
+  // launcher falls back to PAPERCLIP_API_URL, the bridge. The rest of the
+  // launcher env (GIT_*, ZDOTDIR, BASH_ENV, GH_CONFIG_DIR) is set by the
+  // launcher itself per operation.
+  "PAPERCLIP_GITHUB_BROKER_TOKEN",
   // Shell basics.
   "PATH",
   "HOME",
@@ -399,12 +413,46 @@ export function isDeniedEnvFamily(name: string): boolean {
   return DENIED_NAME_PREFIXES.some((prefix) => upper.startsWith(prefix));
 }
 
+const GITHUB_BROKER_TOKEN_NAME = "PAPERCLIP_GITHUB_BROKER_TOKEN";
+const GITHUB_CAPABILITY_MAX_LENGTH = 4096;
+const THREE_BASE64URL_SEGMENTS_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+function decodeJwtSegment(segment: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(segment, "base64url").toString("utf8"));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is `value` the managed-GitHub capability Paperclip minted for run `runId`
+ * (server runtime-tools-token.ts, scope `github_credentials`)? The plugin cannot
+ * verify the signature; it checks what makes the token harmless in the VM: one
+ * compact HS256 JWT of bounded size, scope `github_credentials`, bound to this
+ * run (the run id the same env carries), not expired. The controller rechecks
+ * the signature, the live run and the grants on every use.
+ */
+export function isRunGithubCapability(value: string, runId: string | undefined, now: number = Date.now()): boolean {
+  if (!runId || value.length > GITHUB_CAPABILITY_MAX_LENGTH || !THREE_BASE64URL_SEGMENTS_RE.test(value)) return false;
+  const [header, claims] = value.split(".").map(decodeJwtSegment);
+  if (!header || !claims || header.alg !== "HS256") return false;
+  return (
+    claims.scope === "github_credentials" &&
+    claims.run_id === runId &&
+    typeof claims.exp === "number" &&
+    claims.exp * 1000 > now
+  );
+}
+
 /** Decide one entry. Returns null when it may reach the VM. */
-function decide(name: string, value: string, allow: CompiledAllowlist): EnvDropReason | null {
+function decide(name: string, value: string, allow: CompiledAllowlist, runId?: string): EnvDropReason | null {
   if (!ENV_NAME_RE.test(name)) return "invalid_name";
   const exact = allow.exact.has(name);
   if (!exact && !allow.prefixes.some((prefix) => name.startsWith(prefix))) return "not_allowlisted";
   if (isDeniedEnvFamily(name)) return "denied_family";
+  if (name === GITHUB_BROKER_TOKEN_NAME && exact && isRunGithubCapability(value, runId)) return null;
   if (containsJwt(value)) return "jwt";
 
   const inspection = inspectValue(value);
@@ -430,9 +478,10 @@ export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist
   const allow = compile(allowlist);
   const kept: Array<[string, string]> = [];
   const dropped: EnvDrop[] = [];
+  const runId = typeof env?.PAPERCLIP_RUN_ID === "string" ? env.PAPERCLIP_RUN_ID : undefined;
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value !== "string") continue;
-    const reason = decide(name, value, allow);
+    const reason = decide(name, value, allow, runId);
     if (reason == null) kept.push([name, value]);
     else dropped.push({ name: ENV_NAME_RE.test(name) ? name : "(invalid name)", reason });
   }
