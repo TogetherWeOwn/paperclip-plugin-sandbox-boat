@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-sandbox-boat",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "boat.dev sandbox provider for Paperclip: one VM per card, started only while a run needs it and stopped on release, with a budget guard and per-run cost accounting. Built on the official @boatdev/sdk.",
   "license": "MIT",
   "type": "module",
