@@ -489,10 +489,11 @@ export class SshGuestStore implements GuestStore {
     if (result?.suspect !== null && typeof result?.suspect !== "string") {
       throw new Error("Offload mirror verification returned an invalid suspect path.");
     }
-    if (result?.marker !== null && !isMarker(result?.marker)) {
-      throw new Error("Offload mirror verification returned a malformed marker.");
-    }
-    return { marker: (result?.marker as MirrorMarker | null) ?? null, suspect: (result?.suspect as string | null) ?? null };
+    // The marker comes from a guest-side file that may be torn or tampered
+    // with: anything malformed degrades to a full sync, never a throw. Only
+    // the envelope shape (our own script's output) is fail-closed above.
+    const marker = result?.marker;
+    return { marker: isMarker(marker) ? marker : null, suspect: (result?.suspect as string | null) ?? null };
   }
 
   async writeMarker(guestDir: string, marker: MirrorMarker): Promise<void> {

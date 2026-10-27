@@ -279,6 +279,17 @@ describe("delta push over stub SSH", () => {
     expect(filesFromStdin(spawns[1]!.stdin).sort()).toEqual(["a.txt", "sub/b.txt"]);
   });
 
+  it("treats a malformed guest marker as missing and fully resyncs", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest } = setup(root);
+    await sync.push("vm-1", command());
+    // Valid JSON envelope, torn content: full sync, never a throw.
+    setMarker(guest, "vm-1", sync.directory(command()), { version: 1, mirrorKey: "k", manifestHash: "corrupt" });
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(2);
+    expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
+  });
+
   it("falls back to a full upload when the guest marker disagrees with host state", async () => {
     const root = source({ "a.txt": "a" });
     const { sync, spawns, guest } = setup(root);
@@ -341,6 +352,14 @@ describe("delta push over stub SSH", () => {
     expect(spawns).toHaveLength(1);
   });
 
+  it("does not refresh the session for a deterministic push failure", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, refreshSession, spawn } = setup(root);
+    spawn.mockResolvedValueOnce({ exitCode: 255, signal: null, timedOut: false });
+    await expect(sync.push("vm-1", command())).rejects.toThrow(/delta push failed/i);
+    expect(refreshSession).not.toHaveBeenCalled();
+  });
+
   it("surfaces the push failure when no session refresh is available", async () => {
     const root = source({ "a.txt": "a" });
     const guest = stubGuest();
@@ -371,6 +390,21 @@ describe("delta push over stub SSH", () => {
     writeFileSync(path.join(root, "package-lock.json"), JSON.stringify({ version: 2 }));
     await sync.push("vm-1", node());
     expect(installs()).toBe(2); // new lockfile hash reinstalls
+  });
+
+  it("reinstalls checkout-local dependencies after a mirror wipe", async () => {
+    const root = source({ "package.json": JSON.stringify({ name: "app" }), "package-lock.json": "{}" });
+    const node = (over: Partial<OffloadCommand> = {}) =>
+      command({ tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"], ...over });
+    const { sync, ssh, guest } = setup(root);
+    const installs = () => ssh.runStream.mock.calls.filter((call) => String(call[1]).includes("npm")).length;
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(1);
+    guest.suspect.set(guestKey("vm-1", sync.directory(node())), "sub");
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(2); // the wipe removed node_modules: install again
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(2); // remembered again after the reinstall
   });
 
   it("collects and stages without deleting the persistent mirror", async () => {

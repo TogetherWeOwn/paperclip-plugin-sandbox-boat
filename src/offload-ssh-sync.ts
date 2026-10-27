@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { captureSnapshot, collectAndStage, planPush, type SourceManifest } from "./offload-sync.js";
-import { hashManifest, SshGuestStore, type SpawnFn } from "./offload-ssh-guest-store.js";
+import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
 import type { SshManager, SshSession } from "./ssh.js";
@@ -26,7 +26,7 @@ export class SshOffloadSync implements OffloadSync {
   private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string }>();
   /** Previous manifest per card mirror (host-side delta base). Verified against the guest marker on every push. */
   private readonly mirrors = new Map<string, SourceManifest>();
-  /** Serialize pushes per mirror: two concurrent deltas against one base would corrupt the marker. */
+  /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
   private readonly mirrorLocks = new Map<string, Promise<void>>();
   /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
@@ -59,8 +59,10 @@ export class SshOffloadSync implements OffloadSync {
       const { manifest } = await captureSnapshot(source, frozen);
       const guestDir = this.directory(command);
       const mirrorKey = this.mirrorKey(command);
-      await this.withMirrorLock(mirrorKey, () => this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen));
-      await this.installDependencies(sandboxId, command, source, guestDir);
+      await this.withMirrorLock(mirrorKey, async () => {
+        await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
+        await this.installDependencies(sandboxId, command, source, guestDir);
+      });
       this.uploads.set(this.key(command), { source, manifest, scratch, guestDir });
       await rm(frozen, { recursive: true, force: true });
     } catch (error) {
@@ -80,36 +82,44 @@ export class SshOffloadSync implements OffloadSync {
       release();
     }
   }
-  /** Plan against the stored manifest, verify the guest agrees, then push only the delta. One session refresh + retry. */
+  /** Plan against the stored manifest, verify the guest agrees, then push only the delta. */
   private async pushLocked(sandboxId: string, guestDir: string, key: string, manifest: SourceManifest, frozen: string): Promise<void> {
     const stored = this.mirrors.get(key) ?? null;
-    const attempt = async (store: SshGuestStore): Promise<void> => {
-      const verification = await store.verifyMirror(guestDir, manifest.files.map((file) => file.path));
-      const trusted = stored !== null && verification.suspect === null && verification.marker !== null
-        && verification.marker.mirrorKey === key && verification.marker.manifestHash === hashManifest(stored);
-      if (verification.suspect !== null) await store.wipeMirror(guestDir);
-      // Never trust the stored manifest alone: a missing or disagreeing guest
-      // marker (fresh VM, new machine, failed marker write) fully resyncs,
-      // which also repairs any guest drift via rsync --checksum.
-      const plan = trusted ? planPush(stored, manifest) : planPush(null, manifest);
-      if (plan.toSend.length > 0) await store.push(frozen, plan.toSend, guestDir);
-      if (plan.toDeleteFromMirror.length > 0) await store.pruneMirror(guestDir, plan.toDeleteFromMirror);
-      const fresh = hashManifest(manifest);
-      if (verification.marker?.manifestHash !== fresh || verification.marker?.mirrorKey !== key) {
-        await store.writeMarker(guestDir, { version: 1, mirrorKey: key, manifestHash: fresh });
-      }
-      this.mirrors.set(key, manifest);
-    };
-    const store = new SshGuestStore({ ssh: this.deps.ssh, session: await this.deps.session(sandboxId), spawn: this.deps.spawn });
+    const planned = manifest.files.map((file) => file.path);
+    const openStore = async (session: SshSession): Promise<SshGuestStore> =>
+      new SshGuestStore({ ssh: this.deps.ssh, session, spawn: this.deps.spawn });
+    // A resumed VM has a new machine, IP and host key: the stale cached
+    // session fails at first contact, and exactly one refresh re-authorizes
+    // through the provider before the retry. Warm commands reuse the master.
+    // Later ops run on the proven session: their failures are deterministic
+    // and never evict it.
+    let store = await openStore(await this.deps.session(sandboxId));
+    let verification: MirrorVerification;
     try {
-      await attempt(store);
+      verification = await store.verifyMirror(guestDir, planned);
     } catch (error) {
-      // A resumed VM has a new machine, IP and host key: the first guest op on
-      // the stale cached session fails, and exactly one refresh re-authorizes
-      // through the provider before the retry. Warm commands reuse the master.
       if (!this.deps.refreshSession) throw error;
-      await attempt(new SshGuestStore({ ssh: this.deps.ssh, session: await this.deps.refreshSession(sandboxId), spawn: this.deps.spawn }));
+      store = await openStore(await this.deps.refreshSession(sandboxId));
+      verification = await store.verifyMirror(guestDir, planned);
     }
+    const trusted = stored !== null && verification.suspect === null && verification.marker !== null
+      && verification.marker.mirrorKey === key && verification.marker.manifestHash === hashManifest(stored);
+    if (verification.suspect !== null) {
+      await store.wipeMirror(guestDir);
+      // The wipe removed checkout-local installs too; the install below must run again.
+      this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
+    }
+    // Never trust the stored manifest alone: a missing or disagreeing guest
+    // marker (fresh VM, new machine, failed marker write) fully resyncs,
+    // which also repairs content drift in tracked files via rsync --checksum.
+    const plan = trusted ? planPush(stored, manifest) : planPush(null, manifest);
+    if (plan.toSend.length > 0) await store.push(frozen, plan.toSend, guestDir);
+    if (plan.toDeleteFromMirror.length > 0) await store.pruneMirror(guestDir, plan.toDeleteFromMirror);
+    const fresh = hashManifest(manifest);
+    if (verification.marker?.manifestHash !== fresh || verification.marker?.mirrorKey !== key) {
+      await store.writeMarker(guestDir, { version: 1, mirrorKey: key, manifestHash: fresh });
+    }
+    this.mirrors.set(key, manifest);
   }
   /**
    * Install Node/Python dependencies on the guest from the source lockfile.

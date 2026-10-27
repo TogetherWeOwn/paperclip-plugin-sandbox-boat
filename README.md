@@ -567,7 +567,8 @@ workspace). Only content-hash-changed files cross the wire, with mtimes and
 modes preserved; an unchanged tree uploads zero files. The host keeps the
 previous manifest per mirror and verifies the guest marker on every push; a
 missing or disagreeing marker (fresh VM, new machine) fully resyncs, which also
-repairs guest drift. Return inspection hashes files in bounded chunks and
+repairs content drift in tracked files. Guest-only extras are retained as
+caches; prune removes only host-known deletions. Return inspection hashes files in bounded chunks and
 fetches at most 4 MiB into private staged artifacts, never live source. Only
 approved public, secret-free inputs belong here: exclusions are defense in
 depth, not a secret scanner. The mirror persists across commands (delta base,
