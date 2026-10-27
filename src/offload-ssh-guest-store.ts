@@ -125,7 +125,6 @@ def open_parent(parent):
                 nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             except OSError as error:
                 if error.errno == errno.ENOENT:
-                    os.close(fd)
                     return None
                 raise ValueError('suspect parent')
             os.close(fd)

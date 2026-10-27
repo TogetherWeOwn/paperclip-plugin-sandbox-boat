@@ -313,6 +313,53 @@ describe("delta push over stub SSH", () => {
     expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
   });
 
+  it("pins the marker manifest hash: a right key with a wrong hash fully resyncs", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest } = setup(root);
+    await sync.push("vm-1", command());
+    const dir = sync.directory(command());
+    const marker = getMarker(guest, "vm-1", dir)!;
+    setMarker(guest, "vm-1", dir, { ...marker, manifestHash: "0".repeat(64) });
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(2);
+    expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
+  });
+
+  it("rewrites the marker after a suspect wipe so the next unchanged push sends nothing", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest } = setup(root);
+    await sync.push("vm-1", command());
+    const dir = sync.directory(command());
+    guest.suspect.set(guestKey("vm-1", dir), "sub");
+    await sync.push("vm-1", command()); // wipe + full resync of an unchanged tree
+    expect(spawns).toHaveLength(2);
+    expect(getMarker(guest, "vm-1", dir)?.manifestHash).toBe(hashManifest((await captureSnapshot(root, temp("boat-delta-cap-"))).manifest));
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(2); // delta, zero files
+  });
+
+  it("prunes a file deleted while commands ran on another VM when returning to the first VM", async () => {
+    const root = source({ "a.txt": "a", "gone.txt": "gone" });
+    const { sync, guest } = setup(root);
+    await sync.push("vm-1", command());
+    rmSync(path.join(root, "gone.txt"));
+    await sync.push("vm-2", command()); // vm-1's mirror still holds gone.txt
+    await sync.push("vm-1", command());
+    const dir = sync.directory(command());
+    expect(guest.prunes.filter((p) => p.vm === "vm-1" && p.dir === dir).flatMap((p) => p.paths)).toContain("gone.txt");
+  });
+
+  it("still prunes known deletions when the marker disagrees and the push falls back to full", async () => {
+    const root = source({ "a.txt": "a", "gone.txt": "gone" });
+    const { sync, guest } = setup(root);
+    await sync.push("vm-1", command());
+    const dir = sync.directory(command());
+    rmSync(path.join(root, "gone.txt"));
+    setMarker(guest, "vm-1", dir, { version: 1, mirrorKey: "forged", manifestHash: "0".repeat(64) });
+    await sync.push("vm-1", command());
+    expect(guest.prunes.flatMap((p) => p.paths)).toContain("gone.txt");
+  });
+
   it("isolates concurrent cards pushing on the same VM", async () => {
     const rootA = source({ "a.txt": "a" });
     const rootB = source({ "b.txt": "b" });
@@ -418,6 +465,34 @@ describe("delta push over stub SSH", () => {
     expect(installs()).toBe(2); // the wipe removed node_modules: install again
     await sync.push("vm-1", node());
     expect(installs()).toBe(2); // remembered again after the reinstall
+  });
+
+  it("reinstalls checkout-local dependencies when the guest mirror was lost (VM stop/resume)", async () => {
+    const root = source({ "package.json": JSON.stringify({ name: "app" }), "package-lock.json": "{}" });
+    const node = (over: Partial<OffloadCommand> = {}) =>
+      command({ tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"], ...over });
+    const { sync, ssh, guest } = setup(root);
+    const installs = () => ssh.runStream.mock.calls.filter((call) => String(call[1]).includes("npm")).length;
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(1);
+    guest.markers.delete(guestKey("vm-1", sync.directory(node()))); // /tmp is not in the boat snapshot
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(2);
+  });
+
+  it("reinstalls on a lockfile rollback A to B to A", async () => {
+    const root = source({ "package.json": JSON.stringify({ name: "app" }), "package-lock.json": "{}" });
+    const node = (over: Partial<OffloadCommand> = {}) =>
+      command({ tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"], ...over });
+    const { sync, ssh } = setup(root);
+    const installs = () => ssh.runStream.mock.calls.filter((call) => String(call[1]).includes("npm")).length;
+    await sync.push("vm-1", node());
+    writeFileSync(path.join(root, "package-lock.json"), JSON.stringify({ version: 2 }));
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(2);
+    writeFileSync(path.join(root, "package-lock.json"), "{}");
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(3); // node_modules now matches B, not A
   });
 
   it("collects and stages without deleting the persistent mirror", async () => {
@@ -554,6 +629,14 @@ describe("mirror scripts executed locally", () => {
     expect(JSON.parse(dirLeaf.stdout).suspect).toBe("adir");
     const clean = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["real/nested.txt", "new.txt"]]);
     expect(JSON.parse(clean.stdout)).toEqual({ marker: null, suspect: null });
+  });
+
+  it("verify accepts planned files whose parent directory does not exist yet", () => {
+    const mirror = temp("boat-delta-mirror-");
+    mkdirSync(path.join(mirror, "src"));
+    const result = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["new/file.txt", "src/deep/er/file.txt", "src/ok.txt", "top.txt"]]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ marker: null, suspect: null });
   });
 
   it("prune removes only files and links inside the mirror", () => {
