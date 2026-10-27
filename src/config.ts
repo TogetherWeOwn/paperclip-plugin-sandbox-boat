@@ -173,8 +173,11 @@ export function remoteWorkspaceDirProblem(value: string | null): string | null {
   const belowHome = value.startsWith(`${BOAT_VM_HOME}/`) && segments.length > BOAT_VM_HOME.split("/").length;
   const plain = !segments.some((segment) => segment === "." || segment === "..");
   // A control character (a newline above all) would break the path the VM reports back.
-  if (belowHome && plain && !/[\u0000-\u001f\u007f]/.test(value)) return null;
-  return `remoteWorkspaceDir must be a plain absolute path below ${BOAT_VM_HOME} (for example ${BOAT_VM_HOME}/paperclip-workspace, no . or .. segments, no ~ or $HOME), where ~/.boatignore keeps .paperclip-runtime out of boat's snapshots: ${JSON.stringify(value)}.`;
+  // Bash expands BASH_ENV (Paperclip's GitHub launcher .bashrc below this root)
+  // before it opens it, so a `$`, backtick or backslash would run code in every
+  // non-interactive bash; the env policy drops such launcher paths.
+  if (belowHome && plain && !/[\u0000-\u001f\u007f$`\\]/.test(value)) return null;
+  return `remoteWorkspaceDir must be a plain absolute path below ${BOAT_VM_HOME} (for example ${BOAT_VM_HOME}/paperclip-workspace, no . or .. segments, no ~ or $HOME, no $, backtick or backslash: shells would expand them), where ~/.boatignore keeps .paperclip-runtime out of boat's snapshots: ${JSON.stringify(value)}.`;
 }
 
 const UUID_SECRET_REF_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

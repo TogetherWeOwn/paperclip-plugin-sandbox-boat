@@ -43,8 +43,9 @@
 //      through; a raw GitHub token or any other value is dropped. Paperclip's
 //      `git`/`gh` launchers in the VM need it to push; it is not a GitHub token
 //      and works only through the sandbox bridge while the run is live.
-//      ZDOTDIR and BASH_ENV only as the launcher dir that leads PATH and its
-//      `.bashrc` (isGithubLauncherShellValue).
+//      ZDOTDIR and BASH_ENV only as this run's launcher dir that leads PATH and
+//      its `.bashrc` (isGithubLauncherShellValue), never with a shell expansion
+//      character (`$`, backtick, backslash) in the path.
 //
 // An empty allowlist (`envAllowlist: []`) delivers nothing.
 
@@ -426,7 +427,23 @@ export function isDeniedEnvFamily(name: string): boolean {
 
 const GITHUB_BROKER_TOKEN_NAME = "PAPERCLIP_GITHUB_BROKER_TOKEN";
 const GITHUB_CAPABILITY_MAX_LENGTH = 4096;
-const THREE_BASE64URL_SEGMENTS_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+// <header>.<claims>.<HMAC-SHA256 signature: 32 bytes, 43 base64url characters>.
+const GITHUB_CAPABILITY_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/;
+const HS256_SIGNATURE_BYTES = 32;
+// GitHub token prefixes (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_): never a signature.
+const GITHUB_TOKEN_PREFIX_RE = /^(?:gh[pousr]_|github_pat_)/;
+// What runtime-tools-token.ts createRuntimeToolsToken writes, and nothing else.
+const GITHUB_CAPABILITY_HEADER_KEYS: ReadonlySet<string> = new Set(["alg", "typ"]);
+const GITHUB_CAPABILITY_CLAIM_KEYS: ReadonlySet<string> = new Set([
+  "sub",
+  "company_id",
+  "run_id",
+  "responsible_user_id",
+  "scope",
+  "iat",
+  "exp",
+  "instance_id",
+]);
 
 function decodeJwtSegment(segment: string): Record<string, unknown> | null {
   try {
@@ -441,14 +458,23 @@ function decodeJwtSegment(segment: string): Record<string, unknown> | null {
  * Is `value` the managed-GitHub capability Paperclip minted for run `runId`
  * (server runtime-tools-token.ts, scope `github_credentials`)? The plugin cannot
  * verify the signature; it checks what makes the token harmless in the VM: one
- * compact HS256 JWT of bounded size, scope `github_credentials`, bound to this
- * run (the run id the same env carries), not expired. The controller rechecks
- * the signature, the live run and the grants on every use.
+ * compact HS256 JWT of bounded size whose signature segment is a canonical
+ * 32-byte HMAC-SHA256 (43 base64url characters, no GitHub token prefix), with
+ * only the header and claim keys Paperclip issues, scope `github_credentials`,
+ * bound to this run (the run id the same env carries), not expired. The
+ * controller rechecks the signature, the live run and the grants on every use.
  */
 export function isRunGithubCapability(value: string, runId: string | undefined, now: number = Date.now()): boolean {
-  if (!runId || value.length > GITHUB_CAPABILITY_MAX_LENGTH || !THREE_BASE64URL_SEGMENTS_RE.test(value)) return false;
-  const [header, claims] = value.split(".").map(decodeJwtSegment);
+  if (!runId || value.length > GITHUB_CAPABILITY_MAX_LENGTH || !GITHUB_CAPABILITY_SHAPE_RE.test(value)) return false;
+  const [headerSegment, claimsSegment, signature] = value.split(".");
+  if (GITHUB_TOKEN_PREFIX_RE.test(signature)) return false;
+  const signatureBytes = Buffer.from(signature, "base64url");
+  if (signatureBytes.length !== HS256_SIGNATURE_BYTES || signatureBytes.toString("base64url") !== signature) return false;
+  const header = decodeJwtSegment(headerSegment);
+  const claims = decodeJwtSegment(claimsSegment);
   if (!header || !claims || header.alg !== "HS256") return false;
+  if (!Object.keys(header).every((key) => GITHUB_CAPABILITY_HEADER_KEYS.has(key))) return false;
+  if (!Object.keys(claims).every((key) => GITHUB_CAPABILITY_CLAIM_KEYS.has(key))) return false;
   return (
     claims.scope === "github_credentials" &&
     claims.run_id === runId &&
@@ -458,19 +484,34 @@ export function isRunGithubCapability(value: string, runId: string | undefined, 
 }
 
 // Paperclip stages a sandbox run's launchers in
-// <remoteCwd>/.paperclip-runtime/paperclip-runner/github/<run id> (adapter-utils
+// <remoteCwd>/.paperclip-runtime/paperclip-runner/github/<name> (adapter-utils
 // execution-target.ts githubOperationLauncherDirectory: path.posix.join, so no
-// `.`, `..` or empty segment, and a run id of [A-Za-z0-9_-]). remoteCwd is any
-// plain absolute path remoteWorkspaceDirProblem accepts, spaces and non-ASCII
-// included, so the prefix is checked by its shape, not by a character class.
-const GITHUB_LAUNCHER_DIR_SUFFIX_RE = /\/\.paperclip-runtime\/paperclip-runner\/github\/[A-Za-z0-9_-]+$/;
+// `.`, `..` or empty segment). heartbeat.ts names a run's dir after the run
+// (runId: run.id, which adapters also set as PAPERCLIP_RUN_ID), so the name must
+// equal the PAPERCLIP_RUN_ID of the same env. The native runner's dirs are not
+// run-scoped and keep Paperclip's own names: `anonymous-<agent id>-<16 hex>`
+// (heartbeat-github-launchers.ts) and `native-session-<uuid>`
+// (native-github-access.ts). remoteCwd is any plain absolute path
+// remoteWorkspaceDirProblem accepts, spaces and non-ASCII included, so the prefix
+// is checked by its shape, not by a character class.
+const GITHUB_LAUNCHER_DIR_PARENT = "/.paperclip-runtime/paperclip-runner/github/";
+const NATIVE_GITHUB_LAUNCHER_NAME_RE =
+  /^(?:anonymous-[A-Za-z0-9_-]+-[0-9a-f]{16}|native-session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+// Bash runs parameter expansion, command substitution and arithmetic expansion
+// on BASH_ENV before it opens the file: a `$` or backtick in the path would run
+// code in every non-interactive bash, and a backslash is an escape to it.
+const SHELL_EXPANSION_CHAR_RE = /[$`\\]/;
 const GITHUB_LAUNCHER_SHELL_FILES: Readonly<Record<string, string>> = { ZDOTDIR: "", BASH_ENV: "/.bashrc" };
 
-/** The launcher dir when the run's PATH starts with one, else undefined. */
-function githubLauncherDirOf(path: string | undefined): string | undefined {
+/** This run's launcher dir when the run's PATH starts with one, else undefined. */
+function githubLauncherDirOf(path: string | undefined, runId: string | undefined): string | undefined {
   const first = path?.split(":")[0];
-  if (!first?.startsWith("/") || CONTROL_CHAR_RE.test(first) || !GITHUB_LAUNCHER_DIR_SUFFIX_RE.test(first)) return undefined;
+  if (!first?.startsWith("/") || CONTROL_CHAR_RE.test(first) || SHELL_EXPANSION_CHAR_RE.test(first)) return undefined;
+  const parentAt = first.lastIndexOf(GITHUB_LAUNCHER_DIR_PARENT);
+  if (parentAt < 0) return undefined;
+  const name = first.slice(parentAt + GITHUB_LAUNCHER_DIR_PARENT.length);
+  if (!(name !== "" && name === runId && /^[A-Za-z0-9_-]+$/.test(name)) && !NATIVE_GITHUB_LAUNCHER_NAME_RE.test(name)) return undefined;
   // Absolute, so the first segment is the empty one before the leading slash.
   const plain = first.split("/").slice(1).every((segment) => segment !== "" && segment !== "." && segment !== "..");
   return plain ? first : undefined;
@@ -531,9 +572,10 @@ export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist
   const allow = compile(allowlist);
   const kept: Array<[string, string]> = [];
   const dropped: EnvDrop[] = [];
+  const runId = typeof env?.PAPERCLIP_RUN_ID === "string" ? env.PAPERCLIP_RUN_ID : undefined;
   const run: RunContext = {
-    runId: typeof env?.PAPERCLIP_RUN_ID === "string" ? env.PAPERCLIP_RUN_ID : undefined,
-    githubLauncherDir: githubLauncherDirOf(typeof env?.PATH === "string" ? env.PATH : undefined),
+    runId,
+    githubLauncherDir: githubLauncherDirOf(typeof env?.PATH === "string" ? env.PATH : undefined, runId),
   };
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value !== "string") continue;
