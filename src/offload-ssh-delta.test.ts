@@ -71,7 +71,7 @@ async function readAll(stream: Readable | undefined): Promise<string> {
 interface StubGuest {
   markers: Map<string, MirrorMarker>;
   suspect: Map<string, string>;
-  failNext: { verify?: unknown; prune?: unknown; write?: unknown } | null;
+  failNext: { verify?: unknown; prune?: unknown; write?: unknown; install?: boolean } | null;
   wipes: Array<{ vm: string; dir: string }>;
   prunes: Array<{ vm: string; dir: string; paths: string[] }>;
   installs: string[];
@@ -166,6 +166,10 @@ function setup(root: string, guest: StubGuest = stubGuest()): Setup {
     if (remoteCommand.includes("test -f")) return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "" };
     if (remoteCommand.includes("shutil.rmtree")) throw new Error("test stub: guest checkout deletion is not expected on stage");
     guest.installs.push(remoteCommand);
+    if (guest.failNext?.install) {
+      guest.failNext = null;
+      return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "npm ERR! test stub" };
+    }
     return { exitCode: 0, timedOut: false, signal: null, stdout: "", stderr: "" };
   });
   const ssh = { runStream, ensureKey: async () => ({ privateKeyPath: "/test/id_ed25519", publicKey: "test" }) };
@@ -493,6 +497,23 @@ describe("delta push over stub SSH", () => {
     writeFileSync(path.join(root, "package-lock.json"), "{}");
     await sync.push("vm-1", node());
     expect(installs()).toBe(3); // node_modules now matches B, not A
+  });
+
+  it("reinstalls after a failed replacement install, even on a rollback to the old lockfile", async () => {
+    const root = source({ "package.json": JSON.stringify({ name: "app" }), "package-lock.json": "{}" });
+    const node = (over: Partial<OffloadCommand> = {}) =>
+      command({ tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"], ...over });
+    const { sync, ssh, guest } = setup(root);
+    const installs = () => ssh.runStream.mock.calls.filter((call) => String(call[1]).includes("npm")).length;
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(1);
+    writeFileSync(path.join(root, "package-lock.json"), JSON.stringify({ version: 2 }));
+    guest.failNext = { install: true };
+    await expect(sync.push("vm-1", node())).rejects.toThrow(/dependency install failed/);
+    expect(installs()).toBe(2);
+    writeFileSync(path.join(root, "package-lock.json"), "{}");
+    await sync.push("vm-1", node());
+    expect(installs()).toBe(3); // the failed B install may have left node_modules half-changed
   });
 
   it("collects and stages without deleting the persistent mirror", async () => {

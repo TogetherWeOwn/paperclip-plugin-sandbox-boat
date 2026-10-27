@@ -465,8 +465,10 @@ caches and build outputs; the guest installs dependencies from the lockfile
 `requirements.txt` via `pip install --require-hashes -r`, where every
 requirement is `name[extras]==version` with `--hash=sha256:` and no pip
 option lines) into a per-VM cache keyed by lockfile hash. Global pip installs reuse the cache across runs;
-checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
-warm VM never reuses a stale checkout. Python commands from a `uv.lock` plan
+checkout-local installs (`node_modules`, `.venv`) live in the per-card mirror
+and run again only when the lockfile hash changes, the mirror was wiped or
+lost, or the previous install failed, so a warm mirror never reuses a stale
+checkout. Python commands from a `uv.lock` plan
 run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with
 `VIRTUAL_ENV=<checkout>/.venv` and `<checkout>/.venv/bin` prepended to the
 guest `PATH` for that command only (every other env key stays empty), so

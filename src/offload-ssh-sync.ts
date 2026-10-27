@@ -172,14 +172,15 @@ export class SshOffloadSync implements OffloadSync {
     // inside the per-card guestDir and are remembered per mirror checkout.
     const script = checkoutLocal ? steps
       : `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
+    // Checkout-local node_modules/.venv match only the last installed lockfile:
+    // forget it before the install mutates them, so a failed install of B never
+    // leaves A trusted, and remember the one new hash only once it succeeded.
+    if (checkoutLocal) this.installed.delete(installedKey);
     const result = await this.deps.ssh.runStream(session,
       buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
     if (result.exitCode !== 0 || result.timedOut || result.signal) {
       throw new Error("Offload dependency install failed; no command ran");
     }
-    // Checkout-local node_modules/.venv match only the last installed lockfile:
-    // remember that one hash, so A -> B -> A reinstalls instead of trusting history.
-    if (checkoutLocal) this.installed.delete(installedKey);
     this.markInstalled(installedKey, plan.hash);
   }
   private markInstalled(installedKey: string, hash: string): void {
