@@ -560,14 +560,20 @@ Use an already delegated guest image; the plugin never changes systemd, mounts,
 delegation or services. This is lifecycle containment within a trusted pool,
 not a security boundary against hostile code sharing its UID/delegation authority.
 
-Source is frozen with the existing manifest/exclusion checks and sent through
-native sync. This first concrete adapter sends fresh command-scoped checkouts
-(no delta/cache preservation yet). Return inspection hashes files in bounded
-chunks and fetches at most 4 MiB into private staged artifacts, never live source.
-Only approved public, secret-free inputs belong here: exclusions are defense in
-depth, not a secret scanner. Successful collection removes the disposable guest
-checkout. Artifacts remain in the configured persistent host root for explicit
-review/removal. Failed or uncertain collection retains the reservation and files.
+Source is frozen with the existing manifest/exclusion checks, then delta-pushed
+with rsync over the pinned SSH control master into a persistent per-card mirror
+on the pool VM (`paperclip-boat-mirror-*`, keyed by company, repo and execution
+workspace). Only content-hash-changed files cross the wire, with mtimes and
+modes preserved; an unchanged tree uploads zero files. The host keeps the
+previous manifest per mirror and verifies the guest marker on every push; a
+missing or disagreeing marker (fresh VM, new machine) fully resyncs, which also
+repairs guest drift. Return inspection hashes files in bounded chunks and
+fetches at most 4 MiB into private staged artifacts, never live source. Only
+approved public, secret-free inputs belong here: exclusions are defense in
+depth, not a secret scanner. The mirror persists across commands (delta base,
+dependencies, cargo caches); VM stop/retirement reclaims it. Artifacts remain
+in the configured persistent host root for explicit review/removal. Failed or
+uncertain collection retains the reservation and files.
 A restart does not reattach old handles or reconstruct interrupted in-memory
 sync manifests; those commands remain held for inspection.
 
@@ -614,16 +620,22 @@ default VM:
    with stdio and exit status unchanged.
 3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
    guest PATH is fixed and has no `RUSTUP_HOME`.
-4. Reboot, then run the preflight with `offloadCgroupParent`
+4. Install `rsync` on the template VM. Delta push shells out to the worker
+   host's `rsync` over the pinned SSH transport, and the guest side needs the
+   `rsync` binary too; without either end the push fails and the command stays
+   local. The worker host needs `rsync` installed as well.
+5. Reboot, then run the preflight with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
    `true`.
-5. Save the VM as a named snapshot (not available during the boat free trial)
+6. Save the VM as a named snapshot (not available during the boat free trial)
    and set the driver `templateSnapshot` to that name. Offload pool VMs then
    boot from it, as whole-run leases do; a missing snapshot is a refused start
    and the command stays local. The pool identity does not include the
    snapshot, so VMs recorded before a template change stay owned. They are
-   never reused: VM reuse is keyed on the template, and an idle VM from the old
-   image is retired through the normal stop path.
+   never reused: VM reuse is keyed on the template name, and an idle VM from the old
+   image is retired through the normal stop path. Adding `rsync` to an existing
+   template therefore means saving under a NEW snapshot name and updating
+   `templateSnapshot`, so pre-rsync VMs are retired instead of served.
 
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)
 
