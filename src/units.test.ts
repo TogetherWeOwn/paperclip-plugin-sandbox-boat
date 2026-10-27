@@ -181,27 +181,50 @@ describe("env policy", () => {
     });
 
     it("still drops it from a custom list that does not name it exactly, prefix entries included", () => {
-      expect(deliver(capability(), ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_*"])).toBe("jwt");
+      expect(deliver(capability(), ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_*"])).toBe("github_capability_rejected");
       expect(deliver(capability(), ["PAPERCLIP_RUN_ID"])).toBe("not_allowlisted");
       expect(deliver(capability(), ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"])).toBe("kept");
       expect(deliver(capability(), [])).toBe("not_allowlisted");
     });
 
     it("drops any other JWT under that name: another scope, another run, expired, wrong algorithm, malformed", () => {
-      expect(deliver(capability({ scope: "connection_intents" }))).toBe("jwt");
-      expect(deliver(capability({ scope: undefined }))).toBe("jwt");
-      expect(deliver(capability({ run_id: "run-2" }))).toBe("jwt");
-      expect(deliver(capability({ run_id: undefined }))).toBe("jwt");
-      expect(deliver(capability({ exp: Math.floor(Date.now() / 1000) - 5 }))).toBe("jwt");
-      expect(deliver(capability({ exp: "never" }))).toBe("jwt");
-      expect(deliver(capability({}, { alg: "none", typ: "JWT" }))).toBe("jwt");
-      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, {})).toBe("jwt");
-      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, { PAPERCLIP_RUN_ID: "" })).toBe("jwt");
-      expect(deliver(`${capability()}.extra`)).toBe("jwt");
-      expect(deliver(`${capability().split(".").slice(0, 2).join(".")}.`)).toBe("jwt");
-      expect(deliver(`Bearer ${capability()}`)).toBe("jwt");
-      expect(deliver(`${capability()} ${capability()}`)).toBe("jwt");
-      expect(deliver(`eyJ${"a".repeat(8192)}.eyJ${"b".repeat(8192)}.sig`)).toBe("jwt");
+      expect(deliver(capability({ scope: "connection_intents" }))).toBe("github_capability_rejected");
+      expect(deliver(capability({ scope: undefined }))).toBe("github_capability_rejected");
+      expect(deliver(capability({ run_id: "run-2" }))).toBe("github_capability_rejected");
+      expect(deliver(capability({ run_id: undefined }))).toBe("github_capability_rejected");
+      expect(deliver(capability({ exp: Math.floor(Date.now() / 1000) - 5 }))).toBe("github_capability_rejected");
+      expect(deliver(capability({ exp: "never" }))).toBe("github_capability_rejected");
+      expect(deliver(capability({}, { alg: "none", typ: "JWT" }))).toBe("github_capability_rejected");
+      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, {})).toBe("github_capability_rejected");
+      expect(deliver(capability(), DEFAULT_ENV_ALLOWLIST, { PAPERCLIP_RUN_ID: "" })).toBe("github_capability_rejected");
+      expect(deliver(`${capability()}.extra`)).toBe("github_capability_rejected");
+      expect(deliver(`${capability().split(".").slice(0, 2).join(".")}.`)).toBe("github_capability_rejected");
+      expect(deliver(`Bearer ${capability()}`)).toBe("github_capability_rejected");
+      expect(deliver(`${capability()} ${capability()}`)).toBe("github_capability_rejected");
+      expect(deliver(`eyJ${"a".repeat(8192)}.eyJ${"b".repeat(8192)}.sig`)).toBe("github_capability_rejected");
+    });
+
+    // Review of PR #30: the name is an exclusive branch. Anything that is not the
+    // run's capability is dropped, also when it is no JWT at all, so a raw GitHub
+    // token under that name never reaches the VM, even from a list naming it exactly.
+    it("drops a raw GitHub token or any other non-capability value under that name, even from a list that names it exactly", () => {
+      const exactList = ["PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"];
+      const values = [
+        `ghp_${"A".repeat(36)}`,
+        `github_pat_11ABCDEFG0${"x".repeat(70)}`,
+        `gho_${"B".repeat(36)}`,
+        "not-a-token",
+        "a.b.c",
+        "",
+        " ",
+        `${capability()}\n`,
+        `x-access-token:ghp_${"C".repeat(36)}`,
+      ];
+      for (const value of values) {
+        for (const list of [DEFAULT_ENV_ALLOWLIST, exactList]) {
+          expect([value, deliver(value, list)]).toEqual([value, "github_capability_rejected"]);
+        }
+      }
     });
 
     it("keeps every other JWT dropped, and never sends the controller's broker URL (the launcher then uses the in-VM bridge)", () => {
@@ -224,6 +247,141 @@ describe("env policy", () => {
           { name: "GITHUB_TOKEN", reason: "not_allowlisted" },
         ]),
       );
+    });
+  });
+
+  // Review of PR #30: Paperclip's prepareGitHubOperationLaunchers (adapter-utils
+  // execution-target.ts) returns PATH=<launcher dir>:<VM PATH>, ZDOTDIR=<launcher
+  // dir> and BASH_ENV=<launcher dir>/.bashrc. Those profiles put the launcher dir
+  // back first on PATH in nested and login shells, where /etc/profile or
+  // ~/.profile can rebuild PATH. For a sandbox target the dir is a VM path:
+  // <remoteCwd>/.paperclip-runtime/paperclip-runner/github/<run id>.
+  describe("managed GitHub launcher shells (ZDOTDIR, BASH_ENV)", () => {
+    const dir = "/home/user/paperclip-workspace/.paperclip-runtime/paperclip-runner/github/run-1";
+    const launcherEnv = (overrides: Record<string, string> = {}) => ({
+      PATH: `${dir}:/usr/local/bin:/usr/bin:/bin`,
+      ZDOTDIR: dir,
+      BASH_ENV: `${dir}/.bashrc`,
+      ...overrides,
+    });
+    const outcome = (env: Record<string, string>, allowlist: readonly string[] = DEFAULT_ENV_ALLOWLIST) => {
+      const result = filterRunEnv(env, allowlist);
+      return Object.fromEntries(
+        ["ZDOTDIR", "BASH_ENV"].map((name) => [
+          name,
+          result.kept.some(([key]) => key === name) ? "kept" : result.dropped.find((entry) => entry.name === name)?.reason,
+        ]),
+      );
+    };
+
+    it("delivers them when they are the launcher dir that leads PATH", () => {
+      const result = filterRunEnv(launcherEnv(), DEFAULT_ENV_ALLOWLIST);
+      expect(result.kept).toEqual([
+        ["PATH", `${dir}:/usr/local/bin:/usr/bin:/bin`],
+        ["ZDOTDIR", dir],
+        ["BASH_ENV", `${dir}/.bashrc`],
+      ]);
+      // The anonymous (unconfigured) launcher dir is named differently but sits in the same place.
+      const anonymous = "/home/user/w/.paperclip-runtime/paperclip-runner/github/anonymous-agent-1-0123456789abcdef";
+      expect(outcome({ PATH: `${anonymous}:/usr/bin`, ZDOTDIR: anonymous, BASH_ENV: `${anonymous}/.bashrc` })).toEqual({ ZDOTDIR: "kept", BASH_ENV: "kept" });
+      const dotted = "/home/user/.cache/ws/.paperclip-runtime/paperclip-runner/github/run-1";
+      expect(outcome({ PATH: dotted, ZDOTDIR: dotted, BASH_ENV: `${dotted}/.bashrc` })).toEqual({ ZDOTDIR: "kept", BASH_ENV: "kept" });
+    });
+
+    it("drops any other value: host paths, other files, a dir PATH does not lead with, path tricks", () => {
+      const mismatch = { ZDOTDIR: "github_launcher_mismatch", BASH_ENV: "github_launcher_mismatch" };
+      expect(outcome(launcherEnv({ ZDOTDIR: "/home/ubuntu", BASH_ENV: "/tmp/evil.sh" }))).toEqual(mismatch);
+      expect(outcome(launcherEnv({ BASH_ENV: `${dir}/.zshrc` }))).toEqual({ ZDOTDIR: "kept", BASH_ENV: "github_launcher_mismatch" });
+      expect(outcome(launcherEnv({ ZDOTDIR: `${dir}/` }))).toEqual({ ZDOTDIR: "github_launcher_mismatch", BASH_ENV: "kept" });
+      expect(outcome(launcherEnv({ PATH: `/usr/bin:${dir}` }))).toEqual(mismatch);
+      expect(outcome({ ZDOTDIR: dir, BASH_ENV: `${dir}/.bashrc` })).toEqual(mismatch);
+      for (const other of [
+        "/home/user/w/../../../etc/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/w/./.paperclip-runtime/paperclip-runner/github/run-1",
+        "/home/user/w/.paperclip-runtime/claude/github/run-1",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/run-1/x",
+        "/home/user/w/.paperclip-runtime/paperclip-runner/github/run 1",
+        "home/user/w/.paperclip-runtime/paperclip-runner/github/run-1",
+        "/tmp/paperclip-github-runtime/run-1",
+      ]) {
+        expect([other, outcome({ PATH: `${other}:/usr/bin`, ZDOTDIR: other, BASH_ENV: `${other}/.bashrc` })]).toEqual([other, mismatch]);
+      }
+    });
+
+    it("keeps the rest of the launcher env out, and needs the names on the list", () => {
+      const result = filterRunEnv(
+        launcherEnv({ GH_CONFIG_DIR: `${dir}/gh-config`, GIT_CONFIG_GLOBAL: "/dev/null", SSH_AUTH_SOCK: "", PAPERCLIP_GITHUB_LAUNCHER_DIR: dir }),
+        DEFAULT_ENV_ALLOWLIST,
+      );
+      expect(result.kept.map(([name]) => name)).toEqual(["PATH", "ZDOTDIR", "BASH_ENV"]);
+      expect(outcome(launcherEnv(), ["PATH"])).toEqual({ ZDOTDIR: "not_allowlisted", BASH_ENV: "not_allowlisted" });
+    });
+
+    describe("in a real shell", () => {
+      let root: string;
+      afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+      // The VM side, played by local sh/bash: a system `git` and a login
+      // profile that rebuilds PATH without the launcher dir (as Debian's
+      // /etc/profile does), Paperclip's launcher dir with its `git` and the
+      // profile prepareGitHubOperationLaunchers writes, then the plugin's
+      // staged env file and login-shell script.
+      function vmRun(dropFromStaged: readonly string[] = []) {
+        root = mkdtempSync(path.join(tmpdir(), "pcb-launcher-"));
+        const sysbin = path.join(root, "sysbin");
+        const home = path.join(root, "home");
+        const workspace = path.join(root, "paperclip-workspace");
+        const launcher = path.join(workspace, ".paperclip-runtime", "paperclip-runner", "github", "run-1");
+        for (const created of [sysbin, home, launcher]) mkdirSync(created, { recursive: true });
+        const vmPath = `${sysbin}:/usr/bin:/bin`;
+        writeFileSync(path.join(sysbin, "git"), "#!/bin/sh\necho system-git\n", { mode: 0o755 });
+        writeFileSync(path.join(home, ".profile"), `export PATH=${shellQuote(vmPath)}\n`);
+        // The launcher stand-in reports where Paperclip's real launcher would post
+        // (github-launcher.ts: PAPERCLIP_GITHUB_BROKER_URL || PAPERCLIP_API_URL) and
+        // whether it holds the capability.
+        writeFileSync(
+          path.join(launcher, "git"),
+          '#!/bin/sh\necho "launcher-git ${PAPERCLIP_GITHUB_BROKER_URL:-$PAPERCLIP_API_URL}/runtime-tools/github/credentials ${PAPERCLIP_GITHUB_BROKER_TOKEN:+capability}"\n',
+          { mode: 0o700 },
+        );
+        writeFileSync(path.join(launcher, ".bashrc"), `export PATH=${shellQuote(`${launcher}:${vmPath}`)}\n`);
+        const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+        const capability = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ run_id: "run-1", scope: "github_credentials", exp: Math.floor(Date.now() / 1000) + 3600 })}.c2ln`;
+        // What Paperclip hands the provider's Execute for the agent command.
+        const hostEnv = {
+          PATH: `${launcher}:${vmPath}`,
+          HOME: home,
+          ZDOTDIR: launcher,
+          BASH_ENV: `${launcher}/.bashrc`,
+          GH_CONFIG_DIR: `${launcher}/gh-config`,
+          PAPERCLIP_RUN_ID: "run-1",
+          PAPERCLIP_API_URL: "http://127.0.0.1:41234",
+          PAPERCLIP_GITHUB_BROKER_URL: "http://paperclip.internal:3100",
+          PAPERCLIP_GITHUB_BROKER_TOKEN: capability,
+        };
+        const kept = filterRunEnv(hostEnv, DEFAULT_ENV_ALLOWLIST).kept.filter(([name]) => !dropFromStaged.includes(name));
+        const stageDir = path.join(root, "stage");
+        const stage = { dir: stageDir, path: path.join(stageDir, "env.sh") };
+        const vmEnv = { PATH: vmPath, HOME: home };
+        execFileSync("sh", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents(kept), env: vmEnv });
+        const payload = 'command -v git; git push; sh -c "git push"; bash -c "git push"; bash -lc "git push"';
+        const script = buildLoginShellScript({ command: "sh", args: ["-c", payload], cwd: workspace, remoteEnv: stage });
+        const run = spawnSync("sh", ["-c", buildRemoteCommand(script)], { env: vmEnv, encoding: "utf8" });
+        return { launcher, run, kept };
+      }
+
+      it("resolves git to the launcher first in the agent's shell, nested shells and login shells, and the launcher posts to the bridge", () => {
+        const { launcher, run, kept } = vmRun();
+        expect(kept.find(([name]) => name === "PATH")?.[1].split(":")[0]).toBe(launcher);
+        expect(run.status).toBe(0);
+        const via = "launcher-git http://127.0.0.1:41234/runtime-tools/github/credentials capability";
+        expect(run.stdout.trim().split("\n")).toEqual([path.join(launcher, "git"), via, via, via, via]);
+      });
+
+      it("without BASH_ENV a login shell's profile hides the launcher (why it is delivered)", () => {
+        const { run } = vmRun(["BASH_ENV"]);
+        expect(run.stdout.trim().split("\n").at(-1)).toBe("system-git");
+      });
     });
   });
 

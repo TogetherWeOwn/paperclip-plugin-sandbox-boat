@@ -36,10 +36,15 @@
 //      name with a whole-number value is a token budget
 //      (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
 //
-//   4. One JWT is let through: PAPERCLIP_GITHUB_BROKER_TOKEN, named exactly,
-//      when it is the run's own managed-GitHub capability (isRunGithubCapability).
-//      Paperclip's `git`/`gh` launchers in the VM need it to push; it is not a
-//      GitHub token and works only through the sandbox bridge while the run is live.
+//   4. Managed GitHub names are exclusive: each is delivered only in its one
+//      expected shape, any other value is dropped whatever the allowlist says.
+//      PAPERCLIP_GITHUB_BROKER_TOKEN, named exactly, only when it is the run's
+//      own managed-GitHub capability (isRunGithubCapability), the one JWT let
+//      through; a raw GitHub token or any other value is dropped. Paperclip's
+//      `git`/`gh` launchers in the VM need it to push; it is not a GitHub token
+//      and works only through the sandbox bridge while the run is live.
+//      ZDOTDIR and BASH_ENV only as the launcher dir that leads PATH and its
+//      `.bashrc` (isGithubLauncherShellValue).
 //
 // An empty allowlist (`envAllowlist: []`) delivers nothing.
 
@@ -112,10 +117,14 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   // above. Delivered only when it is this run's github_credentials capability
   // (isRunGithubCapability). PAPERCLIP_GITHUB_BROKER_URL is deliberately absent:
   // it names the controller, which the VM cannot reach, and without it the
-  // launcher falls back to PAPERCLIP_API_URL, the bridge. The rest of the
-  // launcher env (GIT_*, ZDOTDIR, BASH_ENV, GH_CONFIG_DIR) is set by the
-  // launcher itself per operation.
+  // launcher falls back to PAPERCLIP_API_URL, the bridge. ZDOTDIR and BASH_ENV
+  // point zsh and bash at the launcher's profiles, which put the launcher dir
+  // back first on PATH in nested and login shells (prepareGitHubOperationLaunchers);
+  // delivered only as that VM dir, the one PATH starts with. The launcher sets
+  // GIT_*, SSH_* and GH_CONFIG_DIR itself for each operation.
   "PAPERCLIP_GITHUB_BROKER_TOKEN",
+  "ZDOTDIR",
+  "BASH_ENV",
   // Shell basics.
   "PATH",
   "HOME",
@@ -175,6 +184,8 @@ export type EnvDropReason =
   | "jwt"
   | "remote_database_or_credential_url"
   | "secret_name_needs_exact_entry"
+  | "github_capability_rejected"
+  | "github_launcher_mismatch"
   | "invalid_name";
 
 export interface EnvDrop {
@@ -446,13 +457,49 @@ export function isRunGithubCapability(value: string, runId: string | undefined, 
   );
 }
 
+// Paperclip stages a sandbox run's launchers in
+// <remoteCwd>/.paperclip-runtime/paperclip-runner/github/<run id> (adapter-utils
+// execution-target.ts githubOperationLauncherDirectory): an absolute VM path,
+// no `.` or `..` segment, a run id of [A-Za-z0-9_-].
+const GITHUB_LAUNCHER_DIR_RE = /^(?:\/[A-Za-z0-9._@+-]+)*\/\.paperclip-runtime\/paperclip-runner\/github\/[A-Za-z0-9_-]+$/;
+const GITHUB_LAUNCHER_SHELL_FILES: Readonly<Record<string, string>> = { ZDOTDIR: "", BASH_ENV: "/.bashrc" };
+
+/** The launcher dir when the run's PATH starts with one, else undefined. */
+function githubLauncherDirOf(path: string | undefined): string | undefined {
+  const first = path?.split(":")[0];
+  if (!first || !GITHUB_LAUNCHER_DIR_RE.test(first)) return undefined;
+  return first.split("/").some((segment) => segment === "." || segment === "..") ? undefined : first;
+}
+
+/**
+ * Is `value` what prepareGitHubOperationLaunchers sets `name` (ZDOTDIR or
+ * BASH_ENV) to, for the launcher dir that leads the run's PATH? Those profiles
+ * only re-export that PATH, so in the VM they keep the launcher `git` first.
+ */
+export function isGithubLauncherShellValue(name: string, value: string, launcherDir: string | undefined): boolean {
+  const suffix = GITHUB_LAUNCHER_SHELL_FILES[name];
+  return suffix !== undefined && launcherDir !== undefined && value === `${launcherDir}${suffix}`;
+}
+
+interface RunContext {
+  runId?: string;
+  githubLauncherDir?: string;
+}
+
 /** Decide one entry. Returns null when it may reach the VM. */
-function decide(name: string, value: string, allow: CompiledAllowlist, runId?: string): EnvDropReason | null {
+function decide(name: string, value: string, allow: CompiledAllowlist, run: RunContext = {}): EnvDropReason | null {
   if (!ENV_NAME_RE.test(name)) return "invalid_name";
   const exact = allow.exact.has(name);
   if (!exact && !allow.prefixes.some((prefix) => name.startsWith(prefix))) return "not_allowlisted";
   if (isDeniedEnvFamily(name)) return "denied_family";
-  if (name === GITHUB_BROKER_TOKEN_NAME && exact && isRunGithubCapability(value, runId)) return null;
+  // Exclusive: the run's capability, named exactly, or nothing. Never falls
+  // through to the rules below, which would pass a raw GitHub token.
+  if (name === GITHUB_BROKER_TOKEN_NAME) {
+    return exact && isRunGithubCapability(value, run.runId) ? null : "github_capability_rejected";
+  }
+  if (Object.hasOwn(GITHUB_LAUNCHER_SHELL_FILES, name)) {
+    return isGithubLauncherShellValue(name, value, run.githubLauncherDir) ? null : "github_launcher_mismatch";
+  }
   if (containsJwt(value)) return "jwt";
 
   const inspection = inspectValue(value);
@@ -478,10 +525,13 @@ export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist
   const allow = compile(allowlist);
   const kept: Array<[string, string]> = [];
   const dropped: EnvDrop[] = [];
-  const runId = typeof env?.PAPERCLIP_RUN_ID === "string" ? env.PAPERCLIP_RUN_ID : undefined;
+  const run: RunContext = {
+    runId: typeof env?.PAPERCLIP_RUN_ID === "string" ? env.PAPERCLIP_RUN_ID : undefined,
+    githubLauncherDir: githubLauncherDirOf(typeof env?.PATH === "string" ? env.PATH : undefined),
+  };
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value !== "string") continue;
-    const reason = decide(name, value, allow, runId);
+    const reason = decide(name, value, allow, run);
     if (reason == null) kept.push([name, value]);
     else dropped.push({ name: ENV_NAME_RE.test(name) ? name : "(invalid name)", reason });
   }
