@@ -474,7 +474,8 @@ function githubLauncherDirOf(path: string | undefined): string | undefined {
 /**
  * Is `value` what prepareGitHubOperationLaunchers sets `name` (ZDOTDIR or
  * BASH_ENV) to, for the launcher dir that leads the run's PATH? Those profiles
- * only re-export that PATH, so in the VM they keep the launcher `git` first.
+ * re-export that PATH (and unset empty git identity values), so in the VM they
+ * keep the launcher `git` first.
  */
 export function isGithubLauncherShellValue(name: string, value: string, launcherDir: string | undefined): boolean {
   const suffix = GITHUB_LAUNCHER_SHELL_FILES[name];
