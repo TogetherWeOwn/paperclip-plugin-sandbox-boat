@@ -493,7 +493,8 @@ export function isRunGithubCapability(value: string, runId: string | undefined, 
 // (heartbeat-github-launchers.ts) and `native-session-<uuid>`
 // (native-github-access.ts). remoteCwd is any plain absolute path
 // remoteWorkspaceDirProblem accepts, spaces and non-ASCII included, so the prefix
-// is checked by its shape, not by a character class.
+// is checked by its shape, not by a character class, and must hold the parent
+// segment exactly once.
 const GITHUB_LAUNCHER_DIR_PARENT = "/.paperclip-runtime/paperclip-runner/github/";
 const NATIVE_GITHUB_LAUNCHER_NAME_RE =
   /^(?:anonymous-[A-Za-z0-9_-]+-[0-9a-f]{16}|native-session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
@@ -508,7 +509,9 @@ const GITHUB_LAUNCHER_SHELL_FILES: Readonly<Record<string, string>> = { ZDOTDIR:
 function githubLauncherDirOf(path: string | undefined, runId: string | undefined): string | undefined {
   const first = path?.split(":")[0];
   if (!first?.startsWith("/") || CONTROL_CHAR_RE.test(first) || SHELL_EXPANSION_CHAR_RE.test(first)) return undefined;
-  const parentAt = first.lastIndexOf(GITHUB_LAUNCHER_DIR_PARENT);
+  // The first parent, so a doubled or nested one (not a dir Paperclip staged)
+  // lands in `name`, which then holds a `/` and fails the name check below.
+  const parentAt = first.indexOf(GITHUB_LAUNCHER_DIR_PARENT);
   if (parentAt < 0) return undefined;
   const name = first.slice(parentAt + GITHUB_LAUNCHER_DIR_PARENT.length);
   if (!(name !== "" && name === runId && /^[A-Za-z0-9_-]+$/.test(name)) && !NATIVE_GITHUB_LAUNCHER_NAME_RE.test(name)) return undefined;

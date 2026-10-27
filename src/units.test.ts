@@ -361,6 +361,56 @@ describe("env policy", () => {
       }
     });
 
+    // Review of PR #30: Paperclip joins exactly one
+    // .paperclip-runtime/paperclip-runner/github parent under remoteCwd, so a path
+    // with that segment twice (doubled, or a launcher dir nested in another) is
+    // not one Paperclip staged and fails closed.
+    it("delivers them for a single launcher parent, even under look-alike workspace segments", () => {
+      for (const workspace of [
+        "/home/user/w",
+        "/home/user/.paperclip-runtime/paperclip-runner/w",
+        "/home/user/paperclip-runner/github/w",
+        "/home/user/.paperclip-runtime/paperclip-runner/github-w",
+        "/home/user/x.paperclip-runtime/paperclip-runner/github/w",
+      ]) {
+        for (const name of ["run-1", "native-session-6f1c2a9e-1b2c-4d3e-8f90-123456789abc"]) {
+          const single = `${workspace}/.paperclip-runtime/paperclip-runner/github/${name}`;
+          expect([single, outcome({ PATH: `${single}:/usr/bin`, ZDOTDIR: single, BASH_ENV: `${single}/.bashrc` })]).toEqual([single, { ZDOTDIR: "kept", BASH_ENV: "kept" }]);
+        }
+      }
+    });
+
+    it("drops them when the launcher parent appears more than once (doubled or nested)", () => {
+      const mismatch = { ZDOTDIR: "github_launcher_mismatch", BASH_ENV: "github_launcher_mismatch" };
+      const parent = ".paperclip-runtime/paperclip-runner/github";
+      const native = "native-session-6f1c2a9e-1b2c-4d3e-8f90-123456789abc";
+      for (const doubled of [
+        // Doubled parent, back to back.
+        `/home/user/w/${parent}/${parent}/run-1`,
+        `/home/user/w/${parent}/${parent}/${native}`,
+        // A workspace that is itself under a launcher parent.
+        `/home/user/${parent}/w/${parent}/run-1`,
+        `/home/user/${parent}/x/${parent}/${native}`,
+        `/${parent}/${parent}/run-1`,
+        // A launcher dir nested in another launcher dir.
+        `/home/user/w/${parent}/run-1/${parent}/run-1`,
+        `/home/user/w/${parent}/run-2/${parent}/run-1`,
+        `/home/user/w/${parent}/${native}/${parent}/run-1`,
+        `/home/user/w/${parent}/run-1/${parent}/${native}`,
+        `/home/user/my workspace/${parent}/run-1/${parent}/run-1`,
+      ]) {
+        expect([doubled, outcome({ PATH: `${doubled}:/usr/bin`, ZDOTDIR: doubled, BASH_ENV: `${doubled}/.bashrc` })]).toEqual([doubled, mismatch]);
+      }
+      const result = filterRunEnv(
+        { PAPERCLIP_RUN_ID: "run-1", PATH: `/home/user/w/${parent}/x/${parent}/run-1:/usr/bin`, ZDOTDIR: `/home/user/w/${parent}/x/${parent}/run-1`, BASH_ENV: `/home/user/w/${parent}/x/${parent}/run-1/.bashrc` },
+        DEFAULT_ENV_ALLOWLIST,
+      );
+      expect(result.dropped).toEqual([
+        { name: "ZDOTDIR", reason: "github_launcher_mismatch" },
+        { name: "BASH_ENV", reason: "github_launcher_mismatch" },
+      ]);
+    });
+
     // Review of PR #30: bash runs parameter expansion, command substitution and
     // arithmetic expansion on BASH_ENV before it opens the file, so a `$`, a
     // backtick or a backslash in the path would run code in every
