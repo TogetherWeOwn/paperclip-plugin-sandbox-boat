@@ -3,7 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
-import { captureSnapshot, collectAndStage, planPush, type SourceManifest } from "./offload-sync.js";
+import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
 import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
@@ -92,13 +92,14 @@ export class SshOffloadSync implements OffloadSync {
     // session fails at first contact, and exactly one refresh re-authorizes
     // through the provider before the retry. Warm commands reuse the master.
     // Later ops run on the proven session: their failures are deterministic
-    // and never evict it.
+    // and never evict it. Sync and parse errors are deterministic too: a bad
+    // planned path or a malformed envelope fails identically after a refresh.
     let store = await openStore(await this.deps.session(sandboxId));
     let verification: MirrorVerification;
     try {
       verification = await store.verifyMirror(guestDir, planned);
     } catch (error) {
-      if (!this.deps.refreshSession) throw error;
+      if (!this.deps.refreshSession || error instanceof SyncError || error instanceof SyntaxError) throw error;
       store = await openStore(await this.deps.refreshSession(sandboxId));
       verification = await store.verifyMirror(guestDir, planned);
     }

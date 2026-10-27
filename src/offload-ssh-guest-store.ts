@@ -487,7 +487,7 @@ export class SshGuestStore implements GuestStore {
       suspect?: unknown;
     };
     if (result?.suspect !== null && typeof result?.suspect !== "string") {
-      throw new Error("Offload mirror verification returned an invalid suspect path.");
+      throw new SyncError("SYNC_GUEST_READ", "Offload mirror verification returned an invalid suspect path.");
     }
     // The marker comes from a guest-side file that may be torn or tampered
     // with: anything malformed degrades to a full sync, never a throw. Only

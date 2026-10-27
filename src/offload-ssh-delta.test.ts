@@ -360,6 +360,19 @@ describe("delta push over stub SSH", () => {
     expect(refreshSession).not.toHaveBeenCalled();
   });
 
+  it("does not refresh the session for a malformed verification envelope", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, refreshSession, guest } = setup(root);
+    guest.suspect.set(guestKey("vm-1", sync.directory(command())), 42 as unknown as string);
+    const error = await sync.push("vm-1", command()).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(SyncError);
+    expect((error as SyncError).code).toBe("SYNC_GUEST_READ");
+    expect(refreshSession).not.toHaveBeenCalled();
+  });
+
   it("surfaces the push failure when no session refresh is available", async () => {
     const root = source({ "a.txt": "a" });
     const guest = stubGuest();
