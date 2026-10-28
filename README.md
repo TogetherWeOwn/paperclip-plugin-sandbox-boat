@@ -19,6 +19,57 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 | Probe | Read `GET /limits`, check the `ssh` client and the tunnel target. It never starts a VM. |
 | CaptureTemplate / DeleteTemplate | Save or delete a boat named snapshot. Capture refuses to go past the 10 free snapshots unless `allowPaidNamedSnapshots` is set. Before the save it removes the run MCP config and refuses the capture (`BOAT_RUNTIME_SCRUB_FAILED`) when it cannot verify that; a stopped VM is resumed for that, budget-guarded. |
 
+### Native task network-policy admission (not network isolation)
+
+Boat VMs have outbound internet and a guest user with passwordless sudo. This
+plugin does **not** implement default-deny egress, an allowlist firewall, guest
+root/Docker separation or runtime policy revocation. Environment filtering is not
+network containment. The command-level offload transport below is a separate
+boundary and is not certified by this native lease check.
+
+* **AcquireLease:** before config caches, provider calls, state writes or SSH,
+  reject every non-null `executionWorkspaceSettings.networkEgress` with
+  `BOAT_NETWORK_EGRESS_UNSUPPORTED`. Empty grants/lists and malformed values are
+  rejected too. Omitted/null settings or an omitted/null grant preserve existing
+  **unrestricted** compatibility. A malformed settings container is unavailable,
+  not an unrestricted grant.
+* **ResumeLease:** the SDK payload has no workspace settings. Read current policy
+  through company-scoped `ctx.issues.get(issueId, companyId)`, using only the
+  current request's issue identity, never lease metadata or cached settings.
+  Non-null grants are rejected as above. Missing task identity, reader, issue,
+  top-level settings field, undefined settings or malformed settings fail closed
+  with `BOAT_NETWORK_POLICY_UNAVAILABLE`, before provider/SSH/state effects. A
+  present null settings field or a valid settings object with an omitted/null
+  grant preserves unrestricted compatibility; it is not proof that a host-wide
+  base policy is satisfied. Lookup errors and policy values are not echoed.
+* Refusal is an admission error, not a warning or an expired-lease receipt. Never
+  strip the policy and retry unrestricted or locally. Ordinary stop/release/destroy
+  recovery remains separate; this check grants no authority to delete retained
+  data or start a VM for export.
+
+**Activation remains held until the deployed host contract is verified.** Pin the
+actual host revision and demonstrate that acquire forwards current task settings,
+resume's issue reader preserves current settings and field presence, and both
+errors terminate admission without unrestricted fallback or retained-disk
+cleanup. Upstream types alone do not establish forwarding, inheritance or
+omission semantics. No live provider activation is implied by merging this code.
+
+Before scheduling on the upgraded provider, inventory active/retained leases and
+VM mappings, reconcile unknown provenance, prevent concurrent unadmitted starts,
+and drain legacy runs using the existing authorized **stop-and-retain** path.
+Confirm termination and that every relevant host worker uses the reviewed artifact
+and routes new work through checked acquisition/resume. Execute/sync/realize can
+reconnect and restart an old lease without admission; if the host cannot prevent
+that path with its supported lifecycle controls, keep activation held. Tightening
+policy during an active lease does not stop its commands: drain before changing
+policy and re-admit afterward. Preserve export access and record the existing
+retention deadline; ordinary release can delete per-run or unverified disks, so
+it is not a substitute for explicit stop-and-retain.
+
+Rollback must preserve unsupported-policy refusal: do not remove a requested grant
+or resume through an unrestricted older artifact. Full isolation and live
+forbidden/approved-destination before/after measurements remain unverified.
+
 ### Command-level guest lifecycle (opt-in executor slice)
 
 The stock worker now has a concrete Linux guest transport over the existing

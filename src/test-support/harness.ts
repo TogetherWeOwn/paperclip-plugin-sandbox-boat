@@ -245,13 +245,19 @@ export interface FakeWorkspaceMeta {
   cwd: string | null;
 }
 
+export interface FakeIssue {
+  status: string;
+  executionWorkspaceId?: string | null;
+  executionWorkspaceSettings?: Record<string, unknown> | null;
+}
+
 export function createFakeContext(
-  options: { issues?: Map<string, { status: string; executionWorkspaceId?: string | null }>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta> } = {},
+  options: { issues?: Map<string, FakeIssue>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta> } = {},
 ) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
-  const issues = options.issues ?? new Map<string, { status: string; executionWorkspaceId?: string | null }>();
+  const issues = options.issues ?? new Map<string, FakeIssue>();
   const workspaces = options.workspaces ?? new Map<string, FakeWorkspaceMeta>();
   const events = new Map<string, Array<(event: unknown) => Promise<void>>>();
   const secrets = new Map<string, string>();
@@ -280,7 +286,7 @@ export function createFakeContext(
     },
     logger: { info: log("info"), warn: log("warn"), error: log("error"), debug: log("debug") },
     issues: {
-      get: async (issueId: string) => issues.get(issueId) ?? null,
+      get: async (issueId: string, _companyId?: string) => issues.get(issueId) ?? null,
     },
     jobs: {
       register: (key: string, fn: (job: unknown) => Promise<void>) => {

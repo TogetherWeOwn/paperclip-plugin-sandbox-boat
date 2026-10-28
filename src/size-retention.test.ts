@@ -72,7 +72,7 @@ async function restart(path: LeasePath, first: Lease, measurements: Record<strin
   // The environment says waiting, but the reusable lease's persisted class is rust.
   return await plugin.definition.onEnvironmentResumeLease!({
     ...base({ ...config, sizeCostTable: { rust: measurements } }),
-    providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
+    issueId: "issue-size-retention", providerLeaseId: first.providerLeaseId!, leaseMetadata: first.metadata,
   });
 }
 
@@ -84,7 +84,10 @@ beforeEach(async () => {
   spawnMock.mockImplementation(ssh.spawn);
   setBoatApiFactoryForTests(() => fake as unknown as BoatApiLike);
   setManagerOverridesForTests({ now: () => clock, sleep: async (ms) => { clock += ms; } });
-  await plugin.definition.setup(createFakeContext().ctx as never);
+  const harness = createFakeContext({
+    issues: new Map([["issue-size-retention", { status: "in_progress", executionWorkspaceSettings: {} }]]),
+  });
+  await plugin.definition.setup(harness.ctx as never);
 });
 
 afterEach(async () => {

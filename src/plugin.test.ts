@@ -46,7 +46,11 @@ let sleeps: number[];
 async function setup(
   options: { issues?: Map<string, { status: string }>; hostScopes?: { proactiveCompanies: string[] } } = {},
 ) {
-  harness = createFakeContext(options);
+  // An authoritative issue with no native network policy, not a missing issue.
+  harness = createFakeContext({
+    ...options,
+    issues: options.issues ?? new Map([[ISSUE, { status: "in_progress", executionWorkspaceSettings: {} }]]),
+  });
   await plugin.definition.setup(harness.ctx as never);
 }
 
@@ -1344,7 +1348,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
 
     // The kept disk resumes for the export, with its work in place.
     ssh.handler = null;
-    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
     expect(resumed.providerLeaseId).toBe(sandboxId);
   });
 
@@ -1419,7 +1423,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     ssh.handler = null;
     const other = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
     await release(other, { resourceDisposition: "stop_and_retain" });
-    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: other.providerLeaseId, leaseMetadata: other.metadata } as never);
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: other.providerLeaseId, leaseMetadata: other.metadata } as never);
     expect(fake.boxes.get(resumed.providerLeaseId!)?.state).toBe("ready");
     failScrub();
     clock.t += 16 * 60 * 1000;
@@ -1522,7 +1526,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(second.metadata?.runtimeDir).toBe(links().at(-1)!.runtimeDir);
     expect(links()).toHaveLength(2);
     await release(second, { resourceDisposition: "stop_and_retain" });
-    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: second.metadata } as never);
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: sandboxId, leaseMetadata: second.metadata } as never);
     expect(resumed.metadata).toMatchObject({ resumedLease: true, runtimeDir: links().at(-1)!.runtimeDir });
     const realized = await plugin.definition.onEnvironmentRealizeWorkspace!({ ...base(), lease: resumed, workspace: { localPath: "/tmp/x" } } as never);
     expect(realized).toEqual({
@@ -1648,7 +1652,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
 
 describe("ResumeLease and RealizeWorkspace", () => {
   it("reports an expired lease when the VM is gone", async () => {
-    const result = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: "bx_missing" } as never);
+    const result = await plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: "bx_missing" } as never);
     expect(result).toEqual({ providerLeaseId: null, metadata: { provider: "boat", expired: true } });
   });
 
@@ -1657,6 +1661,7 @@ describe("ResumeLease and RealizeWorkspace", () => {
     await release(lease);
     const resumed = await plugin.definition.onEnvironmentResumeLease!({
       ...base(),
+      issueId: ISSUE,
       providerLeaseId: lease.providerLeaseId,
       leaseMetadata: lease.metadata,
     } as never);
@@ -1705,7 +1710,7 @@ describe("ResumeLease and RealizeWorkspace", () => {
         return null;
       });
     }
-    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
     expect(resumed.providerLeaseId).toBe(sandboxId);
     expect(fake.callsOf("resume")).toHaveLength(1);
     expect(box.state).toBe("ready");
@@ -1717,7 +1722,7 @@ describe("ResumeLease and RealizeWorkspace", () => {
     fake.stopMode = "never";
     await release(lease);
     await expect(
-      plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never),
+      plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never),
     ).rejects.toMatchObject({ code: "BOAT_STOP_PENDING" });
     expect(fake.callsOf("resume")).toHaveLength(0);
   });
@@ -1726,7 +1731,7 @@ describe("ResumeLease and RealizeWorkspace", () => {
     const lease = await acquire("run-1");
     const sandboxId = lease.providerLeaseId!;
     const releasing = release(lease, { resourceDisposition: "stop_and_retain" });
-    const resuming = plugin.definition.onEnvironmentResumeLease!({ ...base(), providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
+    const resuming = plugin.definition.onEnvironmentResumeLease!({ ...base(), issueId: ISSUE, providerLeaseId: sandboxId, leaseMetadata: lease.metadata } as never);
     await expect(releasing).resolves.toEqual({ providerLeaseId: sandboxId, state: "stopped" });
     const resumed = await resuming;
     expect(resumed.providerLeaseId).toBe(sandboxId);

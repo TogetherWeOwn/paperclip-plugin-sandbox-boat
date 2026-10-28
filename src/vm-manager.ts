@@ -133,7 +133,23 @@ export interface ManagerLogger {
 }
 
 export interface IssueReader {
-  get(issueId: string, companyId: string): Promise<{ status?: string | null } | null>;
+  get(issueId: string, companyId: string): Promise<{
+    status?: string | null;
+    executionWorkspaceSettings?: unknown;
+  } | null>;
+}
+
+function networkPolicyUnavailable(): BoatProviderError {
+  return new BoatProviderError("BOAT_NETWORK_POLICY_UNAVAILABLE", "Current task network policy is unavailable; Boat admission refused.");
+}
+
+/** Boat cannot enforce a native network grant. Never echo its values or silently discard it. */
+function assertSupportedNetworkPolicy(settings: unknown): void {
+  if (settings == null) return;
+  if (typeof settings !== "object" || Array.isArray(settings)) throw networkPolicyUnavailable();
+  if ((settings as Record<string, unknown>).networkEgress != null) {
+    throw new BoatProviderError("BOAT_NETWORK_EGRESS_UNSUPPORTED", "Boat cannot enforce the requested network policy; admission refused.");
+  }
 }
 
 export interface ManagerDeps {
@@ -1171,6 +1187,7 @@ export class BoatVmManager {
   // --------------------------------------------------------------- lifecycle
 
   async acquire(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
+    assertSupportedNetworkPolicy(params.executionWorkspaceSettings);
     const config = parseDriverConfig(params.config);
     const taskClass = parseTaskClass(params.executionWorkspaceSettings?.boatTaskClass, config.taskClass);
     // A config saved before this check: such a root fails at the runtime directory on every VM, so refuse it before boat spends a start.
@@ -1473,7 +1490,24 @@ export class BoatVmManager {
     state.vms[input.key] = record;
   }
 
+  private async checkResumeNetworkPolicy(params: PluginEnvironmentResumeLeaseParams): Promise<void> {
+    // The SDK resume payload has no settings. Only the current host task, not old lease metadata, can supply them.
+    if (!params.issueId || !this.issues) throw networkPolicyUnavailable();
+    let issue;
+    try {
+      issue = await this.issues.get(params.issueId, params.companyId);
+    } catch {
+      // Reader errors can contain credentials or policy values; do not propagate their cause.
+      this.logger.warn("boat: current task network policy could not be read; admission refused", { issueId: params.issueId });
+      throw networkPolicyUnavailable();
+    }
+    if (!issue || !Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings")
+      || issue.executionWorkspaceSettings === undefined) throw networkPolicyUnavailable();
+    assertSupportedNetworkPolicy(issue.executionWorkspaceSettings);
+  }
+
   async resumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
+    await this.checkResumeNetworkPolicy(params);
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
     // The same protocol as acquire: under the card (and name) lock, so a release, a capture or the
