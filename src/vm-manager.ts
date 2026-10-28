@@ -39,7 +39,7 @@ import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
-import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand } from "./env-policy.js";
+import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
 import type { BoatErrorInfo } from "./errors.js";
@@ -69,7 +69,7 @@ import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, Vm
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
-import { V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, type RouteActor } from "./offload/routes.js";
+import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, normalizeOffloadSettings, type RouteActor } from "./offload/routes.js";
 import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -271,8 +271,10 @@ export class BoatVmManager {
   private lastSweepAt = 0;
   private sweeping: Promise<SweepReport> | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
+  private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
 
   constructor(deps: ManagerDeps) {
+    this.offloadConfigFn = deps.offloadConfig ?? null;
     this.store = new VmStateStore(deps.state);
     this.logger = deps.logger;
     this.issues = deps.issues ?? null;
@@ -329,16 +331,119 @@ export class BoatVmManager {
     await this.offloadWorkspaces.remember(params);
   }
 
-  private offloadRouteHost(companyId: string) {
+  /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
+  private readonly localRuns = new Map<string, { issueId: string; workspaces: Set<string> }>();
+  /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
+  private readonly endedLocalRuns = new Map<string, number>();
+  /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
+  private readonly wholeRunRealizations = new Map<string, { params: PluginEnvironmentRealizeWorkspaceParams; at: number }>();
+
+  private pruneLocalRunState(): void {
+    const cutoff = this.now() - 24 * 60 * 60_000;
+    for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
+    for (const [id, entry] of this.wholeRunRealizations) if (entry.at < cutoff) this.wholeRunRealizations.delete(id);
+  }
+
+  private localRunKey(companyId: string, runId: string): string {
+    return JSON.stringify([companyId, runId]);
+  }
+
+  /** Record a started local run. Returns false for a run that already ended. */
+  startLocalRun(companyId: string, runId: string, issueId: string): boolean {
+    const id = this.localRunKey(companyId, runId);
+    this.pruneLocalRunState();
+    if (this.endedLocalRuns.has(id)) return false;
+    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, workspaces: new Set() });
+    return true;
+  }
+
+  /** Issue of a live (started, not ended) local run, or null. */
+  localRunIssue(companyId: string, runId: string): string | null {
+    return this.localRuns.get(this.localRunKey(companyId, runId))?.issueId ?? null;
+  }
+
+  hasOffloadBinding(companyId: string, runId: string, workspaceId: string): boolean {
+    return this.nativeOffload.has(companyId, runId, workspaceId);
+  }
+
+  /** Local-run binding built from host-owned event and workspace data (local-run-binding.ts).
+   * Only for a live local run; a native whole-run realization for the same run and workspace is never replaced.
+   * The workspace record is persisted first, so a failed write leaves nothing half-installed and a later bind can retry. */
+  async rememberLocalRun(params: PluginEnvironmentRealizeWorkspaceParams): Promise<boolean> {
+    const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+    const runId = typeof request?.heartbeatRunId === "string" ? request.heartbeatRunId : "";
+    const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : "";
+    const live = this.localRuns.get(this.localRunKey(params.companyId, runId));
+    if (!runId || !workspaceId || !live || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
+    live.workspaces.add(workspaceId);
+    await this.offloadWorkspaces.remember(params);
+    // The terminal event may have arrived while the write was in flight.
+    if (!this.localRuns.has(this.localRunKey(params.companyId, runId))) {
+      await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+      return false;
+    }
+    // A whole-run realization may have landed while the write was in flight: it keeps both stores.
+    if (this.nativeOffload.has(params.companyId, runId, workspaceId)) {
+      const whole = this.wholeRunRealizations.get(JSON.stringify([params.companyId, runId, workspaceId]));
+      if (whole) await this.offloadWorkspaces.remember(whole.params);
+      else await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+      live.workspaces.delete(workspaceId);
+      return false;
+    }
+    this.nativeOffload.remember(params);
+    return this.nativeOffload.has(params.companyId, runId, workspaceId);
+  }
+
+  /** Terminal run: drop executor bindings and the local-run workspace records, and fence late binds. */
+  async forgetLocalRun(companyId: string, runId: string): Promise<void> {
+    const id = this.localRunKey(companyId, runId);
+    this.pruneLocalRunState();
+    this.endedLocalRuns.set(id, this.now());
+    for (const key of this.wholeRunRealizations.keys()) {
+      const [company, run] = JSON.parse(key) as [string, string, string];
+      if (company === companyId && run === runId) this.wholeRunRealizations.delete(key);
+    }
+    const live = this.localRuns.get(id);
+    this.localRuns.delete(id);
+    this.nativeOffload.forgetRun(companyId, runId);
+    for (const workspaceId of live?.workspaces ?? []) await this.offloadWorkspaces.forget(companyId, workspaceId, runId);
+  }
+
+  private offloadRouteHost(companyId: string, settings?: Record<string, unknown>) {
     return {
       broker: this.offloadBroker(companyId),
       workspaces: this.offloadWorkspaces,
       profile: V1_PROFILE,
+      extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],
+      settings: normalizeOffloadSettings(settings ?? {}),
+      durations: this.offloadDurations(companyId),
     };
   }
 
+  /** Bounded per-signature duration samples, company-scoped like the journal. */
+  private offloadDurations(companyId: string) {
+    const store = this.offloadStore(companyId);
+    return {
+      get: (key: string) => store.get(key),
+      set: (key: string, value: unknown) => store.set(key, value),
+    };
+  }
+
+  private async offloadCompanyConfig(companyId: string): Promise<Record<string, unknown> | undefined> {
+    if (!this.offloadConfigFn) return undefined;
+    try {
+      return await this.offloadConfigFn(companyId);
+    } catch {
+      return undefined;
+    }
+  }
+
   async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
-    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId));
+    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
+  }
+
+  async offloadReport(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
+    return handleReport({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
   }
 
   async offloadRead(
@@ -1393,6 +1498,7 @@ export class BoatVmManager {
       issue = await this.issues.get(params.issueId, params.companyId);
     } catch {
       // Reader errors can contain credentials or policy values; do not propagate their cause.
+      this.logger.warn("boat: current task network policy could not be read; admission refused", { issueId: params.issueId });
       throw networkPolicyUnavailable();
     }
     if (!issue || !Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings")
@@ -1921,6 +2027,10 @@ export class BoatVmManager {
 
   async realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult> {
     this.nativeOffload.remember(params);
+    const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+    if (typeof request?.heartbeatRunId === "string" && typeof request.executionWorkspaceId === "string") {
+      this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, request.executionWorkspaceId]), { params, at: this.now() });
+    }
     const config = parseDriverConfig(params.config);
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
@@ -2005,7 +2115,9 @@ export class BoatVmManager {
       };
     }
     // Default-deny env (env-policy.ts): only allowlisted names reach the VM.
-    const { kept: envEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
+    const { kept: allowedEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
+    // A host-side proxy address in the agent's own env must use the tunnel.
+    const envEntries = routeModelProxyThroughTunnel(allowedEntries, config);
     assertValidEnvKeys(envEntries);
     if (dropped.length > 0) this.logEnvDrops(sandboxId, dropped);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
@@ -11,6 +11,7 @@ import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
+import { DEFAULT_API_BASE } from "./config.js";
 
 let ssh: LoopbackSsh;
 let runtime: SshOffloadRuntime;
@@ -159,4 +160,105 @@ describe("stock concrete executor factory", () => {
       expect(["completed", "not_started"]).toContain(view.state);
     }
   }, 20_000);
+  it("admits a node command when the profile is enabled and a lockfile exists", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps node local without an enabled profile, a lockfile, or a remote-candidate shape", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    expect(await runtime.resolve(node, config)).toBe(null);
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"], offloadAllowedRepos: [] })).toBe(null);
+    expect(await runtime.resolve({ ...node, argv: ["run", "dev"] }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(await runtime.resolve({ ...node, runner: "bun" }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    await rm(path.join(source, "package-lock.json"), { force: true });
+    expect(await runtime.resolve({ ...node } as BackendCommand, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps node local when a registry credential file is present", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await writeFile(path.join(source, ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps node local when a nested credential file is present", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await mkdir(path.join(source, "packages/app"), { recursive: true });
+    await writeFile(path.join(source, "packages/app/.npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
+    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps python local when uv auth config is present", async () => {
+    await writeFile(path.join(source, "uv.lock"), "x");
+    await writeFile(path.join(source, "uv.toml"), "[index]\n");
+    const py = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
+    expect(await runtime.resolve(py, enabled)).toBe(null);
+    await rm(path.join(source, "uv.toml"), { force: true });
+    await writeFile(path.join(source, "pyproject.toml"), `[project]\nname = "app"\n[tool.uv]\nindex-url = "https://user:secret@example.com/simple"\n`);
+    expect(await runtime.resolve(py, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
+    await writeFile(path.join(source, "requirements.txt"), "pytest==7.4.2 \\\n    --hash=sha256:abc123\n");
+    const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
+    const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
+    expect(await runtime.resolve(base, enabled)).not.toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-c", "print(1)"] }, enabled)).toBe(null);
+    // pytest's own -c/--config after -m is a config file, not inline code.
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "-c", "pytest.ini", "tests/"] }, enabled)).not.toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toBe(null);
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toBe(null);
+    expect(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("templateSnapshot pool wiring", () => {
+  // Pool identity before templateSnapshot existed. Existing pools persist their
+  // VMs under this id, so an unset template must keep it byte-for-byte.
+  function legacyPoolId(profileId = "rust-public-1") {
+    return createHash("sha256").update(JSON.stringify([companyId, "env", "repo:https://github.com/example/public", profileId,
+      DEFAULT_API_BASE, "small", config.offloadCgroupParent, config.offloadArtifactRoot])).digest("hex").slice(0, 24);
+  }
+  function withTemplate(name: string): PluginEnvironmentRealizeWorkspaceParams {
+    const params = native();
+    params.config = { ...params.config, templateSnapshot: name };
+    return params;
+  }
+
+  it("keeps the legacy pool identity when no template is configured", async () => {
+    const executor = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    expect(executor.poolId).toBe(legacyPoolId());
+    expect(executor.config.templateSnapshot).toBe(null);
+  });
+
+  it("updates a cached executor when a later binding selects another template", async () => {
+    const first = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    runtime.remember(withTemplate("tmpl-a"));
+    const a = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(a).toBe(first);
+    expect(a.config.templateSnapshot).toBe("tmpl-a");
+    runtime.remember(withTemplate("tmpl-b"));
+    const b = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    expect(b).toBe(first);
+    expect(b.config.templateSnapshot).toBe("tmpl-b");
+    runtime.remember(native());
+    expect(((await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } }).config.templateSnapshot).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("forwards the configured template and keeps the pool identity, so recorded VMs stay owned", async () => {
+    runtime.remember(withTemplate("tmpl-a"));
+    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    expect(a.config.templateSnapshot).toBe("tmpl-a");
+    expect(a.poolId).toBe(legacyPoolId());
+    expect(boat.calls).toHaveLength(0);
+  });
 });

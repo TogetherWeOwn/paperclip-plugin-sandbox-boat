@@ -247,6 +247,7 @@ export interface FakeWorkspaceMeta {
 
 export interface FakeIssue {
   status: string;
+  executionWorkspaceId?: string | null;
   executionWorkspaceSettings?: Record<string, unknown> | null;
 }
 
@@ -258,6 +259,8 @@ export function createFakeContext(
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
   const issues = options.issues ?? new Map<string, FakeIssue>();
   const workspaces = options.workspaces ?? new Map<string, FakeWorkspaceMeta>();
+  const events = new Map<string, Array<(event: unknown) => Promise<void>>>();
+  const secrets = new Map<string, string>();
   const keyOf = (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
     `${input.scopeKind}|${input.scopeId ?? ""}|${input.namespace ?? "default"}|${input.stateKey}`;
   const log = (level: FakeLogEntry["level"]) => (message: string, meta?: Record<string, unknown>) => {
@@ -293,6 +296,20 @@ export function createFakeContext(
     executionWorkspaces: {
       get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
     },
+    events: {
+      on: (name: string, fn: (event: unknown) => Promise<void>) => {
+        const list = events.get(name) ?? [];
+        list.push(fn);
+        events.set(name, list);
+        return () => events.set(name, (events.get(name) ?? []).filter((item) => item !== fn));
+      },
+    },
+    secrets: {
+      resolve: async (ref: { secretId?: string } | null) => (ref?.secretId ? secrets.get(ref.secretId) ?? null : null),
+    },
   };
-  return { ctx, state, logs, jobs, issues, workspaces };
+  const emit = async (name: string, event: unknown) => {
+    for (const fn of events.get(name) ?? []) await fn(event);
+  };
+  return { ctx, state, logs, jobs, issues, workspaces, secrets, emit };
 }

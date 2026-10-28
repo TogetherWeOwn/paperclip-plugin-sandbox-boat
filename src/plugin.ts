@@ -10,6 +10,7 @@ import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import type { RouteActor } from "./offload/routes.js";
+import { localRunRealization, localRunSettings } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -34,6 +35,18 @@ function requireManager(): BoatVmManager {
 
 function toRouteActor(actor: PluginApiRequestInput["actor"]): RouteActor {
   return { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId ?? null };
+}
+
+let bindLocalRun: ((companyId: string, runId: string, issueId: string) => Promise<boolean>) | null = null;
+
+/** Retry the local-run bind once the run asks to offload: by then Paperclip has prepared its workspace. */
+async function bindOnFirstRequest(boat: BoatVmManager, input: PluginApiRequestInput): Promise<void> {
+  const runId = input.actor.actorType === "agent" ? input.actor.runId : null;
+  const workspaceId = (input.body as { executionWorkspaceId?: unknown } | null)?.executionWorkspaceId;
+  if (!runId || typeof workspaceId !== "string" || !bindLocalRun) return;
+  const issueId = boat.localRunIssue(input.companyId, runId);
+  if (!issueId || boat.hasOffloadBinding(input.companyId, runId, workspaceId)) return;
+  await bindLocalRun(input.companyId, runId, issueId);
 }
 
 const plugin = definePlugin({
@@ -61,6 +74,42 @@ const plugin = definePlugin({
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }
     });
+    // Local runs: bind heavy-command offload from host-owned run, issue and workspace data.
+    // The started event usually precedes workspace preparation, so the bind is retried
+    // when the run's first offload request arrives (onApiRequest below).
+    bindLocalRun = async (companyId: string, runId: string, issueId: string) => {
+      const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
+      if (!settings.enabled) return false;
+      const params = await localRunRealization({ companyId, payload: { runId, issueId } }, settings, {
+        issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
+        workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
+        apiKey: async (secretRef, company) => await ctx.secrets.resolve(secretRef as never, { companyId: company, configPath: "offloadLocalApiKeySecretRef" }),
+      }).catch((error: unknown) => {
+        ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
+        return null;
+      });
+      // A failed state write leaves the run unbound and retryable; the route answers 403, never a 500.
+      const bound = params ? await requireManager().rememberLocalRun(params).catch((error: unknown) => {
+        ctx.logger.warn("boat: local-run offload binding not persisted", { error: error instanceof Error ? error.message : String(error) });
+        return false;
+      }) : false;
+      if (bound) ctx.logger.info("boat: bound local run for offload", { runId });
+      return bound;
+    };
+    ctx.events.on("agent.run.started", async (event) => {
+      const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown };
+      if (typeof payload.runId !== "string" || typeof payload.issueId !== "string") return;
+      // Record every started run before reading settings: the record grants nothing, and a
+      // transient config failure here stays recoverable on the run's first offload request.
+      if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId)) return;
+      await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
+    });
+    for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
+      ctx.events.on(done, async (event) => {
+        const runId = (event.payload as { runId?: unknown } | null)?.runId;
+        if (typeof runId === "string") await manager?.forgetLocalRun(event.companyId, runId);
+      });
+    }
     ctx.logger.info("boat sandbox provider plugin ready");
   },
 
@@ -87,6 +136,7 @@ const plugin = definePlugin({
       return { status: 200, body: await boat.sweep("api", { force: true }) };
     }
     if (input.routeKey === "offload_exec") {
+      await bindOnFirstRequest(boat, input);
       const response = await boat.offloadExec(input.companyId, toRouteActor(input.actor), input.body);
       return { status: response.status, body: response.body };
     }
@@ -100,6 +150,10 @@ const plugin = definePlugin({
     }
     if (input.routeKey === "offload_cancel") {
       const response = await boat.offloadCancel(input.companyId, toRouteActor(input.actor), input.params, input.body);
+      return { status: response.status, body: response.body };
+    }
+    if (input.routeKey === "offload_report") {
+      const response = await boat.offloadReport(input.companyId, toRouteActor(input.actor), input.body);
       return { status: response.status, body: response.body };
     }
     return { status: 404, body: { error: `unknown route ${input.routeKey}` } };

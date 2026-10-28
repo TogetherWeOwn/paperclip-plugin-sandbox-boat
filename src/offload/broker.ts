@@ -58,6 +58,10 @@ export interface BackendCommand {
   cardId: string;
   repoId: string;
   profileId: string;
+  /** Absent means cargo; the route layer fills it before submit. */
+  tool?: "cargo" | "node" | "python";
+  /** Package runner / test binary, e.g. npm, pytest. Absent means cargo. */
+  runner?: string;
   executionWorkspaceId: string;
   cwdRelative: string;
   argv: string[];
@@ -142,6 +146,8 @@ function digestOf(request: OffloadSubmitRequest): string {
   return JSON.stringify({
     ws: request.executionWorkspaceId,
     cwd: request.cwdRelative,
+    tool: request.tool ?? "cargo",
+    runner: request.runner ?? "cargo",
     argv: request.argv,
     env: request.env,
     q: request.queueTimeoutMs,
@@ -385,6 +391,8 @@ export class OffloadBroker {
             cardId: principal.cardId,
             repoId: principal.repoId,
             profileId: principal.profileId,
+            tool: request.tool ?? "cargo",
+            runner: request.runner ?? "cargo",
             executionWorkspaceId: request.executionWorkspaceId,
             cwdRelative: request.cwdRelative,
             argv: request.argv,

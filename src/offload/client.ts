@@ -25,6 +25,10 @@ export interface BrokerHttp {
 }
 
 export interface ShimRequest {
+  /** Defaults to cargo; node/python shims set their tool. */
+  tool?: "cargo" | "node" | "python";
+  /** Package runner / test binary; defaults per tool. */
+  runner?: string;
   argv: string[];
   cwdRelative: string;
   executionWorkspaceId: string;
@@ -63,11 +67,33 @@ function signalExit(signal: "SIGINT" | "SIGTERM"): number {
 }
 
 /**
+ * Best-effort local-run duration report: teaches the server duration gate.
+ * Never throws; a learning write must not change the command's exit code.
+ */
+export async function reportDuration(request: ShimRequest, deps: ClientDeps, durationSeconds: number): Promise<void> {
+  const tool = request.tool ?? "cargo";
+  if (tool === "cargo") return;
+  try {
+    await deps.http.post("/offload/report", {
+      executionWorkspaceId: request.executionWorkspaceId,
+      tool,
+      runner: request.runner ?? (tool === "node" ? "npm" : "pytest"),
+      argv: request.argv,
+      durationSeconds,
+    });
+  } catch {
+    // Telemetry only.
+  }
+}
+
+/**
  * Build the request env from the process env. Only allowlisted keys travel;
  * RUSTFLAGS/RUSTDOCFLAGS stay local in v1 (the server profile cannot validate
  * them yet), and invalid enum values are omitted rather than sent as a 400.
+ * Node/Python commands travel with an empty env.
  */
-function buildEnv(processEnv: ShimRequest["processEnv"]): { local: true } | { local: false; env: Record<string, string> } {
+export function buildEnv(processEnv: ShimRequest["processEnv"], tool: "cargo" | "node" | "python" = "cargo"): { local: true } | { local: false; env: Record<string, string> } {
+  if (tool !== "cargo") return { local: false, env: {} };
   const rustflags = processEnv.RUSTFLAGS;
   const rustdocflags = processEnv.RUSTDOCFLAGS;
   if ((rustflags != null && rustflags !== "") || (rustdocflags != null && rustdocflags !== "")) return { local: true };
@@ -111,7 +137,8 @@ function asError(json: unknown): OffloadErrorEnvelope | null {
 }
 
 export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise<DryRunResult> {
-  const env = buildEnv(request.processEnv);
+  const tool = request.tool ?? "cargo";
+  const env = buildEnv(request.processEnv, tool);
   if (env.local) return { mode: "local", reason: "RUSTFLAGS/RUSTDOCFLAGS set; profile cannot validate them yet", profileId: "" };
   const commandId = deps.randomId();
   const response = await deps.http.post("/offload/exec", {
@@ -119,6 +146,7 @@ export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise
     commandId,
     executionWorkspaceId: request.executionWorkspaceId,
     cwdRelative: request.cwdRelative,
+    ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
     argv: request.argv,
     env: env.env,
     queueTimeoutMs: request.queueTimeoutMs,
@@ -285,7 +313,8 @@ function isLive(state: OffloadCommandState | string): boolean {
 }
 
 export async function runOffload(request: ShimRequest, deps: ClientDeps): Promise<number> {
-  const env = buildEnv(request.processEnv);
+  const tool = request.tool ?? "cargo";
+  const env = buildEnv(request.processEnv, tool);
   if (env.local) return deps.runLocal(request.argv);
   const commandId = deps.randomId();
   let pending: "SIGINT" | "SIGTERM" | null = null;
@@ -301,6 +330,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
       commandId,
       executionWorkspaceId: request.executionWorkspaceId,
       cwdRelative: request.cwdRelative,
+      ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
       argv: request.argv,
       env: env.env,
       queueTimeoutMs: request.queueTimeoutMs,

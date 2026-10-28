@@ -179,7 +179,24 @@ describe.each(acquirePaths)("native network policy AcquireLease: %s", (path) => 
   });
 
   it.each([
+    { name: "false", settings: false },
+    { name: "zero", settings: 0 },
+    { name: "empty string", settings: "" },
+    { name: "string", settings: POLICY_SECRET },
+    { name: "empty array", settings: [] },
+    { name: "nonempty array", settings: [POLICY_SECRET] },
+  ])("refuses malformed $name settings container before any effects", async ({ settings }) => {
+    await prepareAcquire(path);
+    const before = checkpoint();
+    const outcome = await settle(plugin.definition.onEnvironmentAcquireLease!({
+      ...acquireParams("denied"), executionWorkspaceSettings: settings,
+    } as never));
+    expectRefusal(outcome, before, UNAVAILABLE, true);
+  });
+
+  it.each([
     { name: "omitted settings", settings: undefined },
+    { name: "null settings", settings: null },
     { name: "omitted policy", settings: {} },
     { name: "null policy", settings: { networkEgress: null } },
   ])("keeps explicitly unrestricted legacy compatibility for $name", async ({ settings }) => {
@@ -271,6 +288,13 @@ describe.each(resumeStates)("native network policy ResumeLease: %s VM", (state) 
       const before = checkpoint();
       const outcome = await settle(plugin.definition.onEnvironmentResumeLease!(leaseParams(lease) as never));
       expectRefusal(outcome, before, UNAVAILABLE);
+      if (missing === "read failure") {
+        expect(harness.logs.slice(before.logAt)).toContainEqual({
+          level: "warn",
+          message: "boat: current task network policy could not be read; admission refused",
+          meta: { issueId: ISSUE },
+        });
+      }
     },
   );
 

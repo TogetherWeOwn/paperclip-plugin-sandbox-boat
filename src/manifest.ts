@@ -2,7 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { BOAT_SIZES } from "./size-policy.js";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
-export const PLUGIN_VERSION = "0.2.2";
+export const PLUGIN_VERSION = "0.2.3";
 export const DRIVER_KEY = "boat";
 export const SWEEP_JOB_KEY = "boat-idle-sweep";
 
@@ -24,6 +24,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "jobs.schedule",
     "api.routes.register",
     "issues.read",
+    "events.subscribe",
+    "execution.workspaces.read",
+    "secrets.read-ref",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -82,6 +85,13 @@ const manifest: PaperclipPluginManifestV1 = {
       auth: "agent",
       capability: "api.routes.register",
     },
+    {
+      routeKey: "offload_report",
+      method: "POST",
+      path: "/offload/report",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
   ],
   instanceConfigSchema: {
     type: "object",
@@ -99,6 +109,23 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         description: "Canonical delegated cgroup v2 parent on the guest, below /sys/fs/cgroup/. Missing or unwritable delegation keeps commands local; the plugin never changes guest services or delegation.",
       },
+      offloadLocalRunsEnabled: {
+        type: "boolean", default: false,
+        description: "Bind otherwise-local runs for heavy-command offload. On each agent.run.started event the plugin reads the run's issue and its execution workspace from Paperclip and records that local source as the run's offload binding. Off by default.",
+      },
+      offloadLocalEnvironmentId: {
+        type: "string",
+        description: "Boat environment ID whose pool settings local-run offload uses. Required with offloadLocalRunsEnabled.",
+      },
+      offloadLocalApiKeySecretRef: {
+        type: "object", required: ["type", "secretId"], additionalProperties: true,
+        properties: { type: { const: "secret_ref" }, secretId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } },
+        description: "Paperclip secret holding the scoped boat API key for local-run offload. Resolved per binding and never stored.",
+      },
+      offloadLocalDriverConfig: {
+        type: "object", additionalProperties: true, default: {},
+        description: "Driver settings for local-run offload pools (for example maxOffloadVms, maxActive, offloadIdleStopSeconds, size). apiKey is ignored here.",
+      },
       offloadAllowedRepos: {
         type: "array", items: { type: "string" }, default: [],
         description: "Exact canonical repository IDs approved for public, secret-free offload (for example repo:https://github.com/example/public). Empty denies every repository, even with both flags enabled.",
@@ -106,6 +133,18 @@ const manifest: PaperclipPluginManifestV1 = {
       offloadArtifactRoot: {
         type: "string",
         description: "Operator-owned persistent host directory for private frozen snapshots and staged returns. Required for stock command offload; no automatic application to source files.",
+      },
+      offloadProfiles: {
+        type: "array", items: { type: "string" }, default: ["rust-public-1"],
+        description: "Server profiles admitted for remote dispatch. Default rust-public-1 only; add node-public-1 and/or python-public-1 to opt into Node/Python offload. Unknown ids are ignored.",
+      },
+      offloadMinExpectedSeconds: {
+        type: "number", default: 120,
+        description: "A Node/Python command is a remote candidate only when its recorded median duration meets this threshold in seconds. Unknown signatures run local first and record. Rust is not gated by this setting.",
+      },
+      offloadMonthlyVmHourCap: {
+        type: "number", default: 0,
+        description: "Monthly cap on tracked offload VM-hours for the company; 0 disables the extra cap (existing budget admission still applies). When reached, new commands run local until next month.",
       },
     },
   },

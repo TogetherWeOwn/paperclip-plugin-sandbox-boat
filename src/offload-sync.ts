@@ -24,12 +24,30 @@ export const DEFAULT_SYNC_EXCLUDES: readonly string[] = [
   ".git/",
   "target/",
   "node_modules/",
+  ".venv/",
+  "venv/",
+  "__pycache__/",
+  ".pytest_cache/",
+  ".coverage/",
+  "htmlcov/",
+  "coverage/",
+  ".next/",
+  "dist/",
+  "build/",
+  ".nuxt/",
+  ".turbo/",
   ".paperclip-runtime/",
   ".claude/",
   ".cargo/",
   ".boat-offload/",
   ".env",
   ".env.*",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  ".pypirc",
+  "pip.conf",
+  ".netrc",
 ];
 
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
@@ -763,9 +781,17 @@ function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${escaped.replaceAll(placeholder, ".*")}$`);
 }
 
-/** Cargo.lock at the root, snapshots at any depth, plus the generated allowlist. Nothing else returns. */
+/** Package lockfiles at the root (the Cargo.lock analogs), snapshots at any depth, plus the generated allowlist. Nothing else returns. */
+const ROOT_LOCKFILES = new Set([
+  "Cargo.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "requirements.txt",
+  "uv.lock",
+]);
 export function isReturnEligible(relPath: string, policy: ReturnPolicy): boolean {
-  if (relPath === "Cargo.lock") return true;
+  if (ROOT_LOCKFILES.has(relPath)) return true;
   const base = relPath.split("/").pop() ?? "";
   if (base.endsWith(".snap") || base.endsWith(".snap.new")) return true;
   return policy.generatedAllowlist.some((glob) => globToRegExp(glob).test(relPath));

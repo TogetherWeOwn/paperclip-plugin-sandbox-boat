@@ -17,7 +17,11 @@ export interface SshOffloadGuestDeps {
   stateRoot?: string;
   executable?: string;
   args?: (command: OffloadCommand) => string[];
+  /** Per-command nonsecret env allowlist; defaults to the cargo pair. */
+  allowedEnv?: (command: OffloadCommand) => string[];
   path?: string;
+  /** Guest checkout root when the source plans a uv (uv.lock) install, else null. */
+  uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
 }
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
@@ -58,14 +62,44 @@ export class SshOffloadGuest implements GuestController {
   }
   async prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity> {
     // Explicit nonsecret command env only; no inherited host/Boat credentials.
-    if (Object.keys(command.env ?? {}).some((key) => !["CARGO_TERM_COLOR", "RUST_BACKTRACE"].includes(key))) {
+    // Node/Python commands travel with an empty env (validateSubmit enforces
+    // it); cargo keeps its two validated keys.
+    const allowedEnv = this.deps.allowedEnv?.(command) ?? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"];
+    if (Object.keys(command.env ?? {}).some((key) => !allowedEnv.includes(key))) {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+    }
+    const cwd = await this.deps.workspace(sandboxId, command);
+    let executable = command.runner ?? command.executable ?? this.deps.executable ?? "cargo";
+    let preparedEnv: Record<string, string> = { ...(command.env ?? {}) };
+    let guestPath = this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
+    // A uv (uv.lock) install lands in a checkout-local .venv that the guest
+    // never activates: run the interpreter from the venv and activate it for
+    // child processes, so console scripts and bare python subprocesses cannot
+    // resolve the system interpreter. The venv path is an absolute guest
+    // checkout path plus a validated runner name; every other env key stays
+    // empty and the activation applies to that command only.
+    if ((command.tool ?? "cargo") === "python") {
+      const venvRoot = await this.deps.uvVenvRoot?.(command).catch(() => null);
+      if (venvRoot !== null && venvRoot !== undefined) {
+        const base = command.runner ?? command.executable ?? this.deps.executable ?? "python";
+        if (!base || base.includes("/") || base.includes("\\") || base.includes("\0")
+          || base === "." || base === ".." || base.includes("..")) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+        if (!venvRoot.startsWith("/") || venvRoot.includes("\0") || venvRoot.split("/").includes("..")) {
+          throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+        }
+        const venvDir = path.posix.join(venvRoot, ".venv");
+        const venvBin = path.posix.join(venvDir, "bin");
+        executable = path.posix.join(venvBin, base);
+        preparedEnv = { ...preparedEnv, VIRTUAL_ENV: venvDir };
+        guestPath = `${venvBin}:${guestPath}`;
+      }
     }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
       program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
-      cwd: await this.deps.workspace(sandboxId, command), executable: this.deps.executable ?? "cargo",
-      args: this.deps.args?.(command) ?? command.argv, env: command.env ?? {}, timeoutMs: command.timeoutMs ?? 120_000,
-      path: this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin",
+      cwd,
+      executable,
+      args: this.deps.args?.(command) ?? command.argv, env: preparedEnv, timeoutMs: command.timeoutMs ?? 120_000,
+      path: guestPath,
       base: { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
         digest: commandDigest(command), sandboxId },
     });

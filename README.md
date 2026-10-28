@@ -338,7 +338,7 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `noEnv` | true | |
 | `monitoring` | true | Explicit opt-out: `false` for **new** VMs. Existing VMs keep their creation policy. Never changes an account-wide switch; see [monitoring privacy](#monitoring-retention-and-privacy). |
 | `boatEnvironment` | account default | |
-| `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | A plain absolute path below `/home/user`, used as typed (no `~` or `$HOME`). Anything else is a config error (`BOAT_CONFIG_INVALID` at acquire, before any start): the home `.boatignore` applies only there. |
+| `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | A plain absolute path below `/home/user`, used as typed (no `~` or `$HOME`), with no `$`, backtick or backslash (bash would expand them in the launcher's `BASH_ENV`). Anything else is a config error (`BOAT_CONFIG_INVALID` at acquire, before any start): the home `.boatignore` applies only there. |
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
@@ -455,7 +455,8 @@ There are independent gates; none enables another automatically:
    rather than guessing how to translate host paths.
 
 Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
-payload, not `ctx.executionWorkspaces` or the offload request body. Paperclip's
+payload (whole-run leases) or from host-owned run, issue and workspace records
+(local runs, below), never from the offload request body. Paperclip's
 `server/src/services/environment-run-orchestrator.ts` supplies
 `workspace.metadata.workspaceRealizationRequest`, built by
 `server/src/services/workspace-realization.ts`: its `heartbeatRunId`,
@@ -464,13 +465,96 @@ source root. The provider persists only the required source fields in its
 existing company-scoped plugin state, keyed by run and execution workspace;
 the VM's remote cwd and runtime-overlay commands are not source authority.
 Bindings survive worker restart and cannot authorize another run or company.
-The manifest retains exactly the six capabilities installed with 0.2.2.
+**Local runs (agent stays on the Paperclip host).** Paperclip calls
+`environmentRealizeWorkspace` only for runs on a plugin sandbox lease, so a local
+run gets no realization payload. With `offloadLocalRunsEnabled: true` the plugin
+builds the same payload from host-owned data only:
 
-For otherwise-local runs, the trusted executor integration must call
-`BoatVmManager.rememberOffloadWorkspace(params)` with that same host-authored
-`PluginEnvironmentRealizeWorkspaceParams` payload before submitting commands.
-It performs no provider work and is not exposed as an agent route. An unbound
-run/workspace is rejected with 403 before dispatch; older hosts without the
+1. the `agent.run.started` domain event gives the run id and its issue id;
+2. `ctx.issues.get` gives the issue's `executionWorkspaceId`;
+3. `ctx.executionWorkspaces.get` gives that workspace's local `path`, repository
+   and project;
+4. `offloadLocalApiKeySecretRef` (a Paperclip secret) gives the scoped boat key,
+   resolved per binding and never stored; `offloadLocalEnvironmentId` and
+   `offloadLocalDriverConfig` give the pool identity and settings.
+
+### Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
+
+Rust offload above extends to long Node and Python commands on two more server
+profiles: `node-public-1` (npm/pnpm/yarn scripts and test binaries such as
+`vitest run`, `jest`, `playwright test`, `next build`) and `python-public-1`
+(`pytest` and `python -m pytest|unittest` suites). Install the shim as
+`npm`/`pytest`/etc. ahead of the real executable for opted-in runs
+(`BOAT_OFFLOAD=1`); anything else runs locally. Diagnostics work the same:
+`boat-offload-node --dry-run -- run test`. Only profile `rust-public-1` is
+enabled by default; add profiles explicitly:
+
+```json
+{
+  "offloadProfiles": ["rust-public-1", "node-public-1", "python-public-1"]
+}
+```
+
+Only LONG commands go remote. The plugin keeps per company + repository +
+profile + normalized-command-signature duration history (last 20 runs,
+30-day TTL) in its existing company-scoped state. A Node/Python command is a
+remote candidate only when its recorded median meets
+`offloadMinExpectedSeconds` (default 120); unknown signatures run local first
+and record, so the second identical long run can go remote. Recordings come
+from completed remote runs (server-side) and from shim-reported local runs
+(`POST /offload/report`, agent-authed, bounded samples). Rust keeps its
+existing behaviour and is never gated by this setting.
+
+Short commands must stay local: sync plus VM overhead (~30 s) makes anything
+shorter slower remotely. Watch modes, single-file filters, lint/typecheck/
+format, install/ci, dev servers, inline `python -c`, deploy/publish/release-like
+scripts (any name containing deploy, publish, release, push, upload, prod or
+ship) and anything unrecognized stay local. Only exact `build` plus an
+allowlisted build suffix stays remote. Frozen source sync excludes `node_modules`, `.venv`/`venv`,
+caches and build outputs; the guest installs dependencies from the lockfile
+(`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
+`requirements.txt` via `pip install --require-hashes -r`, where every
+requirement is `name[extras]==version` with `--hash=sha256:` and no pip
+option lines) into a per-VM cache keyed by lockfile hash. Global pip installs reuse the cache across runs;
+checkout-local installs (`node_modules`, `.venv`) reinstall per command so a
+warm VM never reuses a stale checkout. Python commands from a `uv.lock` plan
+run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with
+`VIRTUAL_ENV=<checkout>/.venv` and `<checkout>/.venv/bin` prepended to the
+guest `PATH` for that command only (every other env key stays empty), so
+console scripts and bare `python` subprocesses cannot resolve the system
+interpreter. No lockfile
+(or competing lockfiles for the same tool) means the command stays local: the
+plugin never installs from an unlocked manifest, and an unpinned
+`requirements.txt` stays local.
+Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
+Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
+`.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,
+are never synced and keep commands local. Symlinked config is never followed:
+a symlinked `pyproject.toml` stays local without reading its target, and
+regular `pyproject.toml` files are read bounded at 256 KiB. Only an empty env
+travels with Node/Python requests except `VIRTUAL_ENV` for `uv.lock` venv
+commands; secret-free env policy, public allow-listed
+repositories and cwd/argv confinement apply unchanged.
+
+`offloadMonthlyVmHourCap` (default 0, disabled) caps the month's tracked
+offload VM-hours per company against the existing account-ledger usage rows;
+once reached, new commands run local until next month.
+
+The agent and the offload request body supply nothing. The started event usually
+arrives before Paperclip prepares the run's workspace, so the bind is retried when
+that run's first offload request arrives. A binding never replaces a whole-run
+realization for the same run and workspace. `agent.run.finished`, `failed` and
+`cancelled` drop the executor binding and the persisted workspace record, and fence
+the run: a late or slow start handler cannot bind it again. A missing host fact (no
+execution workspace, no local path, no secret) leaves the run unbound, and its
+commands get 403 before dispatch. This adds three capabilities to the 0.2.2
+set: `events.subscribe`, `execution.workspaces.read` and `secrets.read-ref`; the
+upgrade needs board approval of that capability change.
+
+A custom host integration can still call
+`BoatVmManager.rememberOffloadWorkspace(params)` with a host-authored
+`PluginEnvironmentRealizeWorkspaceParams` payload instead. It performs no
+provider work and is not exposed as an agent route. Older hosts without the
 native realization metadata must keep the shim off, not supply a root in the
 request body. This binding does not replace the executor resolver's source
 confinement or enable dispatch. Failed optional binding persistence does not
@@ -563,6 +647,35 @@ boundary, then reaps only its own descendants. `PAPERCLIP_TEST_CGROUP_PARENT` ca
 select an existing test delegation. Provider calls are fake; SSH, file transfer,
 watchdogs, cgroups, cancellation and staging are real. No live Boat VM is used.
 
+### Delegated guest template (required for remote offload)
+
+The stock boat image has no cgroup v2 delegation for SSH sessions: session
+scopes sit under `user-1000.slice`, systemd ignores `Delegate=` on slices,
+and the guest preflight therefore returns false. Build a template once, on one
+default VM:
+
+1. Add `/etc/systemd/system/user@.service.d/10-delegate.conf` containing
+   `[Service]` and `Delegate=cpu memory pids`, then run `daemon-reload` and
+   `loginctl enable-linger user`.
+2. Install `scripts/guest/paperclip-delegated-ssh` as
+   `/usr/local/sbin/paperclip-delegated-ssh`. Add
+   `/etc/ssh/sshd_config.d/60-paperclip-delegated.conf` with
+   `Match User user` and `ForceCommand /usr/local/sbin/paperclip-delegated-ssh`.
+   Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
+   with stdio and exit status unchanged.
+3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
+   guest PATH is fixed and has no `RUSTUP_HOME`.
+4. Reboot, then run the preflight with `offloadCgroupParent`
+   `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
+   `true`.
+5. Save the VM as a named snapshot (not available during the boat free trial)
+   and set the driver `templateSnapshot` to that name. Offload pool VMs then
+   boot from it, as whole-run leases do; a missing snapshot is a refused start
+   and the command stays local. The pool identity does not include the
+   snapshot, so VMs recorded before a template change stay owned. They are
+   never reused: VM reuse is keyed on the template, and an idle VM from the old
+   image is retired through the normal stop path.
+
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)
 
 Run later on the **Boat Pilot Builder** agent, after the reviewed package is
@@ -618,7 +731,7 @@ For each `NAME=value` that Paperclip passes to Execute:
    * a database URL, or a URL with credentials (a user, a password or a credential query parameter such as `access_token`), unless its effective destination is the VM itself: the literal host `localhost`, `127.0.0.1` or `[::1]`, an empty host or a unix socket path, and no query parameter that names another endpoint (libpq's `host`, `hostaddr`, `service`, and anything like them; a `host` or `socket` of absolute paths is a socket). No other IP spelling (`0xc0000214` is 192.0.2.20 to the resolver) and no one-label name (a DNS search domain can resolve it off the VM) counts. Such a VM-local URL is allowed only by an exact entry. A `..._DATABASE_URL` or `..._DB_URL` name (also `_URI`, `_DSN`) counts as a database URL whatever its value, so it must be one such URL.
 3. A name with `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PRIVATE_KEY`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `CREDENTIAL`, `COOKIE`, `SIGNING`, `HMAC` or `SALT` in it, or ending in `_KEY` (or named just `KEY`), `_AUTH` or `_PAT`, is sent only when the allowlist names it exactly, never through a prefix. So `PAPERCLIP_BRIDGE_SIGNING_KEY` and `LC_SESSION_KEY` are dropped although `PAPERCLIP_BRIDGE_*` and `LC_*` are on the built-in list. A `..._TOKENS` name with a whole-number value is a token budget, not a credential.
 
-Dropped keys are logged once per run as a warning, by name and reason (`not_allowlisted`, `denied_family`, `jwt`, `remote_database_or_credential_url`, `secret_name_needs_exact_entry`, `invalid_name`). Values are never logged.
+Dropped keys are logged once per run as a warning, by name and reason (`not_allowlisted`, `denied_family`, `jwt`, `remote_database_or_credential_url`, `secret_name_needs_exact_entry`, `github_capability_rejected`, `github_launcher_mismatch`, `invalid_name`). Values are never logged.
 
 The plugin also refuses every command of Paperclip's ACP process-session launcher, because that launcher starts the agent from a base64 envelope of its command and its whole launch env (project secrets included) that no env filter sees. An envelope up to 64 KiB rides the launch inline as `PAPERCLIP_PROCESS_SESSION_COMMAND_B64`. A larger one is uploaded through Execute as a file, `<runtime root>/process-sessions/<uuid>/command.b64`, in `printf '%s' <base64 chunk> >> ...` commands, and the launch then carries only `PAPERCLIP_PROCESS_SESSION_DIR`. So Execute refuses a command whose command or arguments name a `/process-sessions` directory or a `command.b64` file, or contain `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=` or `PAPERCLIP_PROCESS_SESSION_DIR=`, and a command whose env holds either variable. Every ACP step names that directory, starting with the wrapper-script sync, so an ACP run fails at its first step, before any envelope reaches the VM (error `BOAT_ACP_PROCESS_SESSION_REFUSED`). claude_local uses ACP unless its engine is set, so set `engine` to `cli` for agents on boat environments.
 
@@ -632,11 +745,16 @@ It covers a Claude Code run through the model-proxy tunnel and Paperclip's sandb
 | Claude Code | `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`, `API_TIMEOUT_MS`, `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `MCP_TOOL_TIMEOUT`, `DISABLE_AUTOUPDATER`, `DISABLE_ERROR_REPORTING`, `DISABLE_TELEMETRY`, `DISABLE_NON_ESSENTIAL_MODEL_CALLS`, `IS_SANDBOX` |
 | Paperclip run context | `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_RUN_ID`, `PAPERCLIP_TASK_ID`, `PAPERCLIP_ISSUE_WORK_MODE`, `PAPERCLIP_WAKE_REASON`, `PAPERCLIP_WAKE_COMMENT_ID`, `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, `PAPERCLIP_LINKED_ISSUE_IDS`, `PAPERCLIP_WORKSPACE_CWD`, `PAPERCLIP_WORKSPACE_SOURCE`, `PAPERCLIP_WORKSPACE_STRATEGY`, `PAPERCLIP_WORKSPACE_ID`, `PAPERCLIP_WORKSPACE_REPO_URL`, `PAPERCLIP_WORKSPACE_REPO_REF`, `PAPERCLIP_WORKSPACE_BRANCH`, `PAPERCLIP_WORKSPACE_WORKTREE_PATH`, `PAPERCLIP_WORKSPACES_JSON`, `AGENT_HOME` |
 | Paperclip sandbox bridge | `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, `PAPERCLIP_API_BRIDGE_MODE`, `PAPERCLIP_BRIDGE_TOKEN`, `PAPERCLIP_BRIDGE_*`, `PAPERCLIP_SANDBOX_EXEC_CHANNEL` |
+| Managed GitHub | `PAPERCLIP_GITHUB_BROKER_TOKEN` (the one JWT let through), `ZDOTDIR`, `BASH_ENV` (only as the launcher dir; see below) |
 | Shell | `PATH`, `HOME`, `TERM`, `LANG`, `LC_*`, `TZ` |
 
 In a sandbox run, `PAPERCLIP_API_KEY` and `PAPERCLIP_BRIDGE_TOKEN` hold the bridge token: a random per-run value that only the bridge inside this VM accepts, and the host forwards each bridged call with the real run token. When `PAPERCLIP_API_KEY` holds the run JWT itself (the commands Paperclip runs before the bridge starts), the JWT rule drops it.
 
-Not on the list, on purpose: `ANTHROPIC_API_KEY` and any other model key (the Paperclip server's own key reaches the probe otherwise), `PAPERCLIP_RUNTIME_SERVICES_JSON` and its siblings (host services a VM cannot reach), `PAPERCLIP_PROCESS_SESSION_COMMAND_B64` and `PAPERCLIP_PROCESS_SESSION_DIR` (the ACP launcher, refused anyway), git and GitHub credentials (Paperclip restores the workspace and its git history to the host after each run).
+**Managed GitHub (`git push` from the VM).** Paperclip stages token-free `git` and `gh` launchers in the VM at `<workspace>/.paperclip-runtime/paperclip-runner/github/<run id>` and puts that dir first on `PATH`. For a push or fetch they ask Paperclip for a credential through the sandbox bridge (`POST /runtime-tools/github/credentials`, which the bridge allows), presenting the run's capability in `PAPERCLIP_GITHUB_BROKER_TOKEN`. That capability is a JWT (HS256, scope `github_credentials`, bound to the run, valid only while the run is live), so the JWT rule would drop it. The name is handled on its own: its value is sent only when the allowlist names `PAPERCLIP_GITHUB_BROKER_TOKEN` exactly (a prefix such as `PAPERCLIP_GITHUB_*` does not deliver it), the same env carries `PAPERCLIP_RUN_ID`, and the token has the shape Paperclip's `runtime-tools-token.ts` mints: a signature segment that is one 32-byte HMAC-SHA256 (43 base64url characters), only the header keys `alg`/`typ` and the claim keys `sub`, `company_id`, `run_id`, `responsible_user_id`, `scope`, `iat`, `exp` and `instance_id`, with `scope: github_credentials`, `run_id` equal to that run and an `exp` in the future. Any other value under that name, a raw `ghp_` or `github_pat_` token, a GitHub token in the signature segment of a capability-shaped value, extra claims or a malformed value included, is dropped (`github_capability_rejected`). A custom `envAllowlist` must add that exact name. No GitHub token is sent. `PAPERCLIP_GITHUB_BROKER_URL` (the controller's address, unreachable from the VM) is not on the list: without it the launcher falls back to `PAPERCLIP_API_URL`, the in-VM bridge.
+
+A login shell can rebuild `PATH` from `/etc/profile` or `~/.profile` and lose the launcher dir, so `git` would be the image's own binary with no credential. Paperclip's launcher setup (adapter-utils `prepareGitHubOperationLaunchers`) covers that with `ZDOTDIR=<launcher dir>` and `BASH_ENV=<launcher dir>/.bashrc`: those profiles re-export the launcher `PATH` (and unset empty `GIT_AUTHOR_*`/`GIT_COMMITTER_*` identity values), so zsh and non-interactive bash, login or not, find the launcher first. Both names are on the built-in list and are sent only as exactly those VM paths for the launcher dir that `PATH` starts with. That dir must be an absolute path ending in `/.paperclip-runtime/paperclip-runner/github/<name>`, with that parent only once (a doubled or nested parent is not a dir Paperclip stages), where `<name>` is the `PAPERCLIP_RUN_ID` of the same env (Paperclip names a run's launcher dir after the run) or one of the native runner's own names (`anonymous-<agent id>-<16 hex>`, `native-session-<uuid>`), with no `.`, `..` or empty segment, no control character, and no `$`, backtick or backslash: bash runs parameter expansion, command substitution and arithmetic expansion on `BASH_ENV` before it opens the file, so such a path would run code in every non-interactive bash (`remoteWorkspaceDir` rejects these characters for the same reason). Spaces, quotes and non-ASCII characters in the workspace path are fine. Any other value is dropped (`github_launcher_mismatch`), since `BASH_ENV` runs a file in every non-interactive bash. A custom `envAllowlist` must add them to keep this. An interactive bash that is not a login shell reads neither, and inherits the launcher `PATH`. `GIT_*`, `SSH_ASKPASS`, `SSH_AUTH_SOCK` and `GH_CONFIG_DIR` (a denied `GH_` name) stay out: the launcher sets them itself for each operation and falls back to a temporary `gh` config dir, so sending the controller's values would only add host state.
+
+Not on the list, on purpose: `ANTHROPIC_API_KEY` and any other model key (the Paperclip server's own key reaches the probe otherwise), `PAPERCLIP_RUNTIME_SERVICES_JSON` and its siblings (host services a VM cannot reach), `PAPERCLIP_PROCESS_SESSION_COMMAND_B64` and `PAPERCLIP_PROCESS_SESSION_DIR` (the ACP launcher, refused anyway), GitHub tokens (Paperclip restores the workspace and its git history to the host after each run).
 
 ### Adding names
 

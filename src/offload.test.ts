@@ -339,6 +339,32 @@ describe("offload executor", () => {
     expect(runs).toBe(1);
     await executor.shutdown();
   });
+
+  it("records the duration of a completed remote node command", async () => {
+    const { fake, logger, now, set, clear } = setup;
+    const recorded: Array<{ command: OffloadCommand; seconds: number }> = [];
+    const executor = new OffloadExecutor({
+      ...setup.account,
+      boat: fake as unknown as BoatApiLike,
+      logger,
+      now,
+      timers: { set, clear },
+      config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
+      runCommand: async () => ({ exitCode: 0, seconds: 42 }),
+      recordDuration: async (command, seconds) => {
+        recorded.push({ command, seconds });
+      },
+    });
+    const result = await executor.execute(cmd({ commandId: "cmd-duration-1",
+      tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"] }));
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") throw new Error("expected completed");
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.seconds).toBe(result.seconds);
+    expect(recorded[0]!.seconds).toBe(42);
+    expect(recorded[0]!.command.commandId).toBe("cmd-duration-1");
+    await executor.shutdown();
+  });
 });
 
 describe("offload driver config", () => {

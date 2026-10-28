@@ -30,6 +30,12 @@ export interface OffloadCommand {
   cardId: string;
   repoId: string;
   profileId: string;
+  /** Defaults to cargo; the route layer fills it before submit. */
+  tool?: "cargo" | "node" | "python";
+  /** Package runner / test binary; the route layer fills the default. */
+  runner?: string;
+  /** Guest executable; defaults to the runner, then cargo. */
+  executable?: string;
   argv: string[];
   executionWorkspaceId?: string;
   trustDomainId?: string;
@@ -100,6 +106,10 @@ export interface OffloadExecutorConfig {
   maxActive?: number;
   maxStartsPerDay?: number;
   minComputeHoursLeft?: number;
+  /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
+  offloadMonthlyVmHourCap?: number;
+  /** Named boat snapshot new pool VMs boot from (driver `templateSnapshot`); null = stock image. */
+  templateSnapshot?: string | null;
 }
 
 export interface OffloadTimers {
@@ -125,6 +135,12 @@ export interface OffloadDeps extends Partial<OffloadDurableDeps> {
   config: OffloadExecutorConfig;
   guest?: undefined;
   runCommand: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>;
+  /**
+   * Telemetry hook: completed remote command durations feed the duration
+   * gate. Failures must be swallowed by the implementation; a learning write
+   * never fails a command.
+   */
+  recordDuration?: (command: OffloadCommand, seconds: number) => Promise<void> | void;
 }
 
 // A separate transport shape keeps the landed identity-only runner compatible.
@@ -149,7 +165,8 @@ interface Queued {
 
 function digestOf(command: OffloadCommand): string {
   // Internal payload identity; never included in logs or usage.
-  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId, argv: command.argv });
+  return JSON.stringify({ repoId: command.repoId, profileId: command.profileId,
+    tool: command.tool ?? "cargo", runner: command.runner ?? "cargo", argv: command.argv });
 }
 
 function sandboxIdOf(response: unknown): string | null {
@@ -184,9 +201,11 @@ export class OffloadExecutor {
   private readonly now: () => number;
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
-    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">>;
+    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
+    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot">;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
+  private readonly recordDuration?: OffloadDeps["recordDuration"];
   private readonly durable: OffloadJournal | null;
   private readonly lifecycle: OffloadLifecycle | null;
   private readonly pool: PoolVm[] = [];
@@ -215,6 +234,8 @@ export class OffloadExecutor {
       maxActive: deps.config.maxActive ?? DEFAULTS.maxActive,
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
+      offloadMonthlyVmHourCap: deps.config.offloadMonthlyVmHourCap ?? 0,
+      templateSnapshot: deps.config.templateSnapshot ?? null,
     };
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
@@ -234,6 +255,7 @@ export class OffloadExecutor {
     this.runCommand = this.durable
       ? (vm, command) => this.durable!.run(vm, command, transport)
       : transport;
+    this.recordDuration = deps.recordDuration;
     if (!(deps.state && deps.accountId && deps.poolId)) throw new Error("account admission requires durable state, accountId and poolId");
     this.poolId = deps.poolId;
     this.ledger = new AccountLedger(deps.state, deps.accountId, this.now);
@@ -541,8 +563,22 @@ export class OffloadExecutor {
     return await this.runOnVm(dispatch.vm, command, dispatch.warm, this.now() - enqueuedAt);
   }
 
+  /**
+   * The runtime caches one executor per pool, and the template is not part of
+   * the pool identity, so later native bindings deliver the current selection
+   * here. It applies to later claims and creates; recorded VMs keep the key
+   * they were created with and are retired if it no longer matches.
+   */
+  setTemplateSnapshot(name: string | null): void {
+    this.config.templateSnapshot = name;
+  }
+
   private compatibilityKey(command: OffloadCommand): string {
-    return JSON.stringify([command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null]);
+    // A VM booted from another guest image is never reused; it is retired like
+    // any incompatible idle VM. Without a template the key is unchanged, so VMs
+    // recorded before templates existed stay reusable.
+    const base = [command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null];
+    return JSON.stringify(this.config.templateSnapshot ? [...base, this.config.templateSnapshot] : base);
   }
 
   private workspaceKey(command: OffloadCommand): string | null {
@@ -696,6 +732,10 @@ export class OffloadExecutor {
 
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
+    // Monthly VM-hour cap, when configured, is enforced atomically with
+    // admission inside the ledger lock: fail closed on telemetry errors and
+    // count pending envelopes so concurrent claims cannot burst past the cap.
+    const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
     // Fund the provider-enforced TTL envelope, not the raw timeout: create,
     // resume and warm update all clamp the deadline to whole seconds with a
     // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
@@ -705,8 +745,12 @@ export class OffloadExecutor {
       reservation = await ledger.reserve(this.boat, { ...this.config, operation, sandboxId: existing?.sandboxId, poolId: this.poolId,
         jobSeconds, tailSeconds: this.config.offloadIdleStopSeconds,
         command: { commandId: command.commandId, runId: command.runId, cardId: command.cardId, repoId: command.repoId,
-          companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") } });
-    } catch {
+          companyId: command.companyId, profileId: command.profileId, payloadDigest: createHash("sha256").update(digestOf(command)).digest("hex") },
+        ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("monthly offload VM-hour cap reached")) {
+        return { kind: "unavailable", reason: `monthly offload VM-hour cap reached (${monthCap}h); new commands run local until next month` };
+      }
       return { kind: "unavailable", reason: "account admission refused: limits, capacity or durable state unavailable" };
     }
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
@@ -722,7 +766,11 @@ export class OffloadExecutor {
     try {
       await this.persistPool();
       if (operation === "create") {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+        // Same semantics as whole-run leases (vm-manager): a configured named
+        // snapshot is the guest image; a missing one is a refused start, so the
+        // command stays local.
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+          ...(this.config.templateSnapshot ? { from: this.config.templateSnapshot } : {}) });
         const id = sandboxIdOf(response);
         if (!id) throw new Error("create returned no sandbox id");
         vm.sandboxId = id;
@@ -798,6 +846,16 @@ export class OffloadExecutor {
       accountingFailed = true;
       this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
     });
+    if (result.status === "completed") {
+      // Feed the duration gate: completed remote runs teach the next decision.
+      // A learning write never fails the command it just measured.
+      try {
+        await this.recordDuration?.(command, result.seconds);
+      } catch (error) {
+        this.logger.warn("boat offload duration recording failed", { commandId: command.commandId });
+        void error;
+      }
+    }
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
       commandId: command.commandId,

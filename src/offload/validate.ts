@@ -3,6 +3,10 @@ import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadSubmitRequest } from "./pr
 
 export interface ValidateOptions {
   allowRustflags?: boolean;
+  /** Expected tool; a present body tool must match it. Defaults to cargo. */
+  tool?: "cargo" | "node" | "python";
+  /** Allowed runner names for the tool; a present body runner must be listed. */
+  runners?: string[];
 }
 
 export type ValidateResult = { ok: true; value: OffloadSubmitRequest } | { ok: false; detail: string };
@@ -12,6 +16,8 @@ const KNOWN_KEYS = new Set([
   "commandId",
   "executionWorkspaceId",
   "cwdRelative",
+  "runner",
+  "tool",
   "argv",
   "env",
   "queueTimeoutMs",
@@ -88,6 +94,13 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
   if (Buffer.byteLength(JSON.stringify(envRecord), "utf8") > OFFLOAD_BOUNDS.maxEnvBytes) {
     return invalid("env exceeds 4 KiB encoded");
   }
+  // Node/Python commands travel with an empty env: only cargo has validated
+  // request env (CARGO_TERM_COLOR, RUST_BACKTRACE, flags). Check first so the
+  // error names the rule, not the first offending key.
+  const expectedToolForEnv = options.tool ?? "cargo";
+  if (expectedToolForEnv !== "cargo" && Object.keys(envRecord).length > 0) {
+    return invalid("env must be empty for node/python commands");
+  }
   for (const [key, value] of Object.entries(envRecord)) {
     if (typeof value !== "string") return invalid(`env ${JSON.stringify(key)} must be a string`);
     if (value.length > MAX_RUSTFLAGS_BYTES && (key === "RUSTFLAGS" || key === "RUSTDOCFLAGS")) {
@@ -115,6 +128,22 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
   }
   if (typeof record.dryRun !== "boolean") return invalid("dryRun must be a boolean");
 
+  const expectedTool = options.tool ?? "cargo";
+  if (record.tool !== undefined && record.tool !== expectedTool) {
+    return invalid(`tool must be ${expectedTool}`);
+  }
+  if (record.runner !== undefined) {
+    if (typeof record.runner !== "string" || record.runner.length === 0 || record.runner.length > 64) {
+      return invalid("runner must be a non-empty string");
+    }
+    if (/[\u0000-\u001f\u007f]/.test(record.runner) || LONE_SURROGATE.test(record.runner) || /\s|\//.test(record.runner)) {
+      return invalid("runner holds invalid characters");
+    }
+    if (options.runners && !options.runners.includes(record.runner)) {
+      return invalid(`runner ${JSON.stringify(record.runner)} is not allowed on this profile`);
+    }
+  }
+
   return {
     ok: true,
     value: {
@@ -122,6 +151,8 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
       commandId: record.commandId as string,
       executionWorkspaceId: record.executionWorkspaceId as string,
       cwdRelative: record.cwdRelative as string,
+      ...(record.runner === undefined ? {} : { runner: record.runner as string }),
+      ...(record.tool === undefined ? {} : { tool: record.tool as "cargo" | "node" | "python" }),
       argv: argv as string[],
       env: envRecord as Record<string, string>,
       queueTimeoutMs: record.queueTimeoutMs as number,
