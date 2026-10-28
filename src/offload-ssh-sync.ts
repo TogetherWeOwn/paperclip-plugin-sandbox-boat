@@ -1,109 +1,34 @@
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import path from "node:path";
-import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
-import { syncFiles } from "./file-sync.js";
 import { planDependencies } from "./offload/deps-install.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
-import { captureSnapshot, collectAndStage, DEFAULT_SYNC_EXCLUDES, type GuestStore, type GuestFileState, type SourceManifest } from "./offload-sync.js";
+import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
+import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
 import type { SshManager, SshSession } from "./ssh.js";
 
-// Read-only guest inspection. No guest-supplied path becomes a host filename.
-// Hash large files in chunks; only return-eligible bytes cross the bounded read.
-const INSPECT = String.raw`
-import base64, fnmatch, hashlib, json, os, stat, sys
-root, action, argument, excludes = json.load(sys.stdin)
-if os.path.realpath(root) != root:
-    raise ValueError('symlinked guest workspace')
-def excluded(name):
-    return any(fnmatch.fnmatchcase(p, pattern.rstrip('/')) for p in name.split('/') for pattern in excludes)
-def open_file(name):
-    parts = name.split('/')
-    if any(p in ('', '.', '..') for p in parts) or name.startswith('/'):
-        raise ValueError('guest path escapes workspace')
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        for part in parts[:-1]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = nxt
-        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-    finally:
-        os.close(fd)
-if action == 'read':
-    name, cap = argument
-    fd = open_file(name)
-    with os.fdopen(fd, 'rb') as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:
-            result = None
-        else:
-            contents = source.read(cap + 1)
-            result = base64.b64encode(contents).decode() if len(contents) <= cap else None
-else:
-    result = {}
-    total = 0
-    stack = ['']
-    while stack:
-        relative = stack.pop()
-        directory = root + ('/' + relative if relative else '')
-        if os.path.realpath(directory) != directory:
-            raise ValueError('symlinked scan directory')
-        for entry in os.scandir(directory):
-            name = relative + '/' + entry.name if relative else entry.name
-            if excluded(name):
-                continue
-            info = entry.stat(follow_symlinks=False)
-            if stat.S_ISDIR(info.st_mode):
-                stack.append(name)
-                if len(stack) > 100000:
-                    raise ValueError('guest directory limit')
-                continue
-            total += info.st_size
-            if total > 268435456 or len(result) >= 100000:
-                raise ValueError('guest scan limit')
-            value = {'size': info.st_size, 'mtimeMs': info.st_mtime * 1000}
-            if stat.S_ISLNK(info.st_mode):
-                target = os.readlink(entry.path)
-                resolved = os.path.normpath(os.path.join(os.path.dirname(name), target))
-                if target.startswith('/') or resolved == '..' or resolved.startswith('../'):
-                    value.update({'escaping': True, 'sha256': ''})
-                else:
-                    value.update({'symlink': target, 'sha256': hashlib.sha256(('offload-symlink\0' + target).encode()).hexdigest()})
-            elif stat.S_ISREG(info.st_mode):
-                digest = hashlib.sha256()
-                fd = open_file(name)
-                with os.fdopen(fd, 'rb') as source:
-                    remaining = 268435456 - total + info.st_size
-                    while True:
-                        chunk = source.read(65536)
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        if remaining < 0:
-                            raise ValueError('guest file grew past scan limit')
-                        digest.update(chunk)
-                value['sha256'] = digest.hexdigest()
-            else:
-                raise ValueError('special guest file')
-            result[name] = value
-print(json.dumps(result))
-`;
-
 export interface SshOffloadSyncDeps {
   ssh: SshManager;
   session(sandboxId: string): Promise<SshSession>;
+  /** Drop a stale cached session and re-authorize through the provider. Push retries once through it. */
+  refreshSession?(sandboxId: string): Promise<SshSession>;
   sourceRoot(command: OffloadCommand): Promise<string>;
   artifactRoot: string;
   workRoot?: string;
+  /** Test seam for the rsync delta spawn. */
+  spawn?: SpawnFn;
 }
 
-/** Frozen inbound native sync and bounded, staged-only return collection. */
+/** Delta push into a persistent per-card guest mirror, and bounded staged-only return collection. */
 export class SshOffloadSync implements OffloadSync {
   private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string }>();
-  /** Sandbox ids with a verified per-VM dependency cache entry (lockfile hash). */
+  /** Previous manifest per (VM, card mirror): the host-side delta base. A mirror lives on one VM, so a push on another VM never moves it. Verified against the guest marker on every push. */
+  private readonly mirrors = new Map<string, SourceManifest>();
+  /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
+  private readonly mirrorLocks = new Map<string, Promise<void>>();
+  /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
   /** Guest-side content-addressed marker root for installed dependencies. */
@@ -111,7 +36,11 @@ export class SshOffloadSync implements OffloadSync {
   private key(command: OffloadCommand): string {
     return createHash("sha256").update(JSON.stringify([command.companyId, command.runId, command.commandId])).digest("hex");
   }
-  directory(command: OffloadCommand): string { return path.posix.join(this.deps.workRoot ?? "/tmp", `paperclip-boat-work-${this.key(command)}`); }
+  /** Mirror scope: one card workspace on one repo. Without a workspace, fall back to per-command isolation. */
+  private mirrorKey(command: OffloadCommand): string {
+    return createHash("sha256").update(JSON.stringify([command.companyId, command.repoId, command.executionWorkspaceId ?? command.commandId])).digest("hex");
+  }
+  directory(command: OffloadCommand): string { return path.posix.join(this.deps.workRoot ?? "/tmp", `paperclip-boat-mirror-${this.mirrorKey(command).slice(0, 32)}`); }
   async cwd(_sandboxId: string, command: OffloadCommand): Promise<string> {
     const relative = command.cwdRelative ?? ".";
     if (path.posix.isAbsolute(relative) || relative.split("/").some((part) => part === ".." || part === "") || relative.includes("\0")) {
@@ -129,9 +58,11 @@ export class SshOffloadSync implements OffloadSync {
       await mkdir(frozen, { mode: 0o700 });
       const { manifest } = await captureSnapshot(source, frozen);
       const guestDir = this.directory(command);
-      await syncFiles({ ssh: this.deps.ssh, session: await this.deps.session(sandboxId), timeoutMs: 300_000, remoteRoot: guestDir }, "in",
-        [{ operationId: this.key(command), files: [{ sourcePath: frozen, targetPath: guestDir, kind: "directory" }] }]);
-      await this.installDependencies(sandboxId, command, source, guestDir);
+      const mirrorKey = this.mirrorKey(command);
+      await this.withMirrorLock(mirrorKey, async () => {
+        await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
+        await this.installDependencies(sandboxId, command, source, guestDir);
+      });
       this.uploads.set(this.key(command), { source, manifest, scratch, guestDir });
       await rm(frozen, { recursive: true, force: true });
     } catch (error) {
@@ -139,16 +70,72 @@ export class SshOffloadSync implements OffloadSync {
       throw error;
     }
   }
+  private async withMirrorLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.mirrorLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    this.mirrorLocks.set(key, previous.then(() => gate));
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+  /** Plan against the stored manifest, verify the guest agrees, then push only the delta. */
+  private async pushLocked(sandboxId: string, guestDir: string, key: string, manifest: SourceManifest, frozen: string): Promise<void> {
+    const baseKey = `${sandboxId}:${key}`;
+    const stored = this.mirrors.get(baseKey) ?? null;
+    const planned = manifest.files.map((file) => file.path);
+    const openStore = async (session: SshSession): Promise<SshGuestStore> =>
+      new SshGuestStore({ ssh: this.deps.ssh, session, spawn: this.deps.spawn });
+    // A resumed VM has a new machine, IP and host key: the stale cached
+    // session fails at first contact, and exactly one refresh re-authorizes
+    // through the provider before the retry. Warm commands reuse the master.
+    // Later ops run on the proven session: their failures are deterministic
+    // and never evict it. Sync and parse errors are deterministic too: a bad
+    // planned path or a malformed envelope fails identically after a refresh.
+    let store = await openStore(await this.deps.session(sandboxId));
+    let verification: MirrorVerification;
+    try {
+      verification = await store.verifyMirror(guestDir, planned);
+    } catch (error) {
+      if (!this.deps.refreshSession || error instanceof SyncError || error instanceof SyntaxError) throw error;
+      store = await openStore(await this.deps.refreshSession(sandboxId));
+      verification = await store.verifyMirror(guestDir, planned);
+    }
+    // A wipe removes the marker with the rest of the mirror: treat it as gone.
+    const marker = verification.suspect === null ? verification.marker : null;
+    const trusted = stored !== null && marker !== null
+      && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
+    if (verification.suspect !== null) await store.wipeMirror(guestDir);
+    // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
+    // snapshot), removed checkout-local installs too; the install must run again.
+    if (marker === null) this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
+    // Never trust the stored manifest alone: a missing or disagreeing guest
+    // marker (fresh VM, new machine, failed marker write) fully resyncs,
+    // which also repairs content drift in tracked files via rsync --checksum.
+    // Known deletions are still pruned: they are a property of the host tree,
+    // not of the guest state.
+    const plan = planPush(trusted ? stored : null, manifest);
+    const stale = trusted ? plan.toDeleteFromMirror : planPush(stored, manifest).toDeleteFromMirror;
+    if (plan.toSend.length > 0) await store.push(frozen, plan.toSend, guestDir);
+    if (stale.length > 0) await store.pruneMirror(guestDir, stale);
+    const fresh = hashManifest(manifest);
+    if (marker?.manifestHash !== fresh || marker?.mirrorKey !== key) {
+      await store.writeMarker(guestDir, { version: 1, mirrorKey: key, manifestHash: fresh });
+    }
+    this.mirrors.set(baseKey, manifest);
+  }
   /**
    * Install Node/Python dependencies on the guest from the source lockfile.
    * Frozen sync excludes dependency dirs, so a checkout without node_modules
    * cannot run until this installs them. Global installs (pip) run once per
    * lockfile hash per VM (guest-side marker plus an in-memory set); a warm
    * pool VM reuses them across runs. Checkout-local installs (npm/pnpm/yarn,
-   * uv: node_modules/.venv live inside the per-command guest checkout)
-   * reinstall per command: every command gets a fresh guestDir, so a shared
-   * marker hit would leave the new checkout without deps. Cargo checkouts
-   * skip this entirely.
+   * uv: node_modules/.venv live inside the persistent per-card mirror) run
+   * once per mirror checkout per lockfile hash; a worker restart reinstalls
+   * them once. Cargo checkouts skip this entirely.
    */
   async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
     if ((command.tool ?? "cargo") === "cargo") return;
@@ -158,79 +145,67 @@ export class SshOffloadSync implements OffloadSync {
       // reaching here means the source changed under us. Never run unlocked.
       throw new Error("Offload node/python commands need a lockfile; refusing unlocked install");
     }
-    // node_modules/.venv are checkout-local: each command syncs to a fresh
-    // guestDir, so a shared per-hash marker would skip the install the new
-    // checkout needs. Only global installs (pip) may reuse the shared cache.
+    // node_modules/.venv are checkout-local inside the persistent per-card
+    // mirror: reinstall when the mirror or the lockfile hash changes, never
+    // once per command. Only global installs (pip) share a per-VM cache.
     const checkoutLocal = plan.installs.some((item) => item.lockfile !== "requirements.txt");
+    const installedKey = checkoutLocal ? `mirror:${sandboxId}:${guestDir}` : `vm:${sandboxId}`;
     if (!checkoutLocal) {
-      const done = this.installed.get(sandboxId);
+      const done = this.installed.get(installedKey);
       if (done?.has(plan.hash)) return;
       const session = await this.deps.session(sandboxId);
       const marker = path.posix.join(this.depCacheDir(), `${plan.hash}.ok`);
       const check = await this.deps.ssh.runStream(session,
         buildRemoteCommand(`exec test -f ${shellQuote(marker)}`), { timeoutMs: 15_000 });
       if (check.exitCode === 0 && !check.timedOut && !check.signal) {
-        this.markInstalled(sandboxId, plan.hash);
+        this.markInstalled(installedKey, plan.hash);
         return;
       }
+    } else if (this.installed.get(installedKey)?.has(plan.hash)) {
+      return;
     }
     const session = await this.deps.session(sandboxId);
     const steps = plan.installs
       .map((item) => `cd ${shellQuote(guestDir)} && ${item.install.map(shellQuote).join(" ")}`)
       .join(" && ");
     // Global installs record the shared marker; checkout-local installs run
-    // inside the per-command guestDir and leave no shared marker to mislead
-    // the next checkout.
+    // inside the per-card guestDir and are remembered per mirror checkout.
     const script = checkoutLocal ? steps
       : `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
+    // Checkout-local node_modules/.venv match only the last installed lockfile:
+    // forget it before the install mutates them, so a failed install of B never
+    // leaves A trusted, and remember the one new hash only once it succeeded.
+    if (checkoutLocal) this.installed.delete(installedKey);
     const result = await this.deps.ssh.runStream(session,
       buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
     if (result.exitCode !== 0 || result.timedOut || result.signal) {
       throw new Error("Offload dependency install failed; no command ran");
     }
-    if (!checkoutLocal) this.markInstalled(sandboxId, plan.hash);
+    this.markInstalled(installedKey, plan.hash);
   }
-  private markInstalled(sandboxId: string, hash: string): void {
-    let done = this.installed.get(sandboxId);
+  private markInstalled(installedKey: string, hash: string): void {
+    let done = this.installed.get(installedKey);
     if (!done) {
       done = new Set();
-      this.installed.set(sandboxId, done);
+      this.installed.set(installedKey, done);
     }
     done.add(hash);
   }
   async collect(sandboxId: string, command: OffloadCommand): Promise<unknown> {
     const upload = this.uploads.get(this.key(command));
     if (!upload) throw new Error("Missing frozen offload manifest; hold for reconciliation");
-    const inspect = async <T>(action: string, argument: unknown, maxOutputBytes: number): Promise<T> => {
-      const response = await this.deps.ssh.runStream(await this.deps.session(sandboxId),
-        buildRemoteCommand(`exec python3 -I -c ${shellQuote(INSPECT)}`),
-        { stdin: Readable.from([JSON.stringify([upload.guestDir, action, argument, DEFAULT_SYNC_EXCLUDES])]),
-          timeoutMs: 60_000, maxOutputBytes });
-      if (response.exitCode !== 0 || response.timedOut || response.signal) throw new Error("Offload return inspection failed");
-      return JSON.parse(response.stdout) as T;
-    };
-    const guest: GuestStore = {
-      push: async () => { throw new Error("Read-only return adapter"); },
-      pruneMirror: async () => { throw new Error("Read-only return adapter"); },
-      scan: async () => new Map(Object.entries(await inspect<Record<string, GuestFileState>>("scan", null, 16 * 1024 * 1024))),
-      readBounded: async (_dir, relative, cap) => {
-        const encoded = await inspect<string | null>("read", [relative, Math.min(cap, 4 * 1024 * 1024)], 6 * 1024 * 1024);
-        return encoded === null ? null : Buffer.from(encoded, "base64");
-      },
-    };
+    const guest = new SshGuestStore({ ssh: this.deps.ssh, session: await this.deps.session(sandboxId), spawn: this.deps.spawn });
     return collectAndStage({ liveRoot: upload.source, uploaded: upload.manifest, guest, guestDir: upload.guestDir,
       stagingDir: path.join(upload.scratch, "returned") });
   }
-  async stage(sandboxId: string, command: OffloadCommand, collected: unknown) {
+  async stage(_sandboxId: string, command: OffloadCommand, collected: unknown) {
     const staged = collected as Awaited<ReturnType<typeof collectAndStage>>;
     const upload = this.uploads.get(this.key(command));
     if (!upload) throw new Error("Missing frozen offload manifest");
-    // After collection, reclaim only this command's disposable guest checkout.
-    // Returned artifacts remain private on persistent host storage for review.
-    const cleanup = await this.deps.ssh.runStream(await this.deps.session(sandboxId),
-      buildRemoteCommand(`exec python3 -I -c ${shellQuote("import shutil,sys; shutil.rmtree(sys.argv[1])")} ${shellQuote(upload.guestDir)}`),
-      { timeoutMs: 15_000 });
-    if (cleanup.exitCode !== 0 || cleanup.timedOut || cleanup.signal) throw new Error("Offload workspace cleanup unverified");
+    // The per-card mirror persists on the guest for the next command: it is the
+    // next delta base and keeps dependencies and cargo caches warm. Returned
+    // artifacts remain private on persistent host storage for review; VM
+    // stop/retirement reclaims the mirror.
     if (!staged.artifactDir) await rm(upload.scratch, { recursive: true, force: true });
     this.uploads.delete(this.key(command));
     return { state: staged.state, changedPaths: staged.changedPaths, conflictPaths: staged.conflictPaths, artifactId: staged.artifactDir };

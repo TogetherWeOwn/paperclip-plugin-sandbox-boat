@@ -274,7 +274,11 @@ export class SshOffloadRuntime {
       return native.source;
     };
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, artifactRoot: settings.offloadArtifactRoot,
-      workRoot: this.deps.guestOptions?.stateRoot });
+      workRoot: this.deps.guestOptions?.stateRoot,
+      // Warm commands reuse the cached session and its control master. After a
+      // resume (new machine, IP and host key) the first guest op fails on the
+      // stale session, and push re-authorizes exactly once through this refresh.
+      refreshSession: async (sandboxId: string) => { sessions.delete(sandboxId); return session(sandboxId); } });
     const uvVenvRoot = async (cmd: OffloadCommand): Promise<string | null> => {
       if ((cmd.tool ?? "cargo") !== "python") return null;
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
@@ -288,8 +292,9 @@ export class SshOffloadRuntime {
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       uvVenvRoot,
       ...this.deps.guestOptions });
-    // Sync-in begins every reservation, including resumed VMs: discard stale
-    // host-key/IP state and authorize via the provider before transferring.
+    // Sync-in begins every reservation, including resumed VMs. Sessions stay
+    // cached across warm commands; push refreshes a stale session once through
+    // the provider before retrying the transfer.
     const executor = new OffloadExecutor({ boat: api, state: this.deps.state, accountId: this.deps.accountId, poolId,
       logger: this.deps.logger, now: Date.now,
       config: { maxOffloadVms: binding.config.maxOffloadVms, offloadIdleStopSeconds: binding.config.offloadIdleStopSeconds,
@@ -318,7 +323,7 @@ export class SshOffloadRuntime {
         permanentlyTerminal: this.closed || ![...this.bindings.values()].some((entry) => entry.companyId === companyId && entry.runId === runId && Date.now() - entry.seenAt < 24 * 60 * 60_000),
         terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
       }),
-      sync: { push: async (vm, cmd) => { sessions.delete(vm); await sync.push(vm, cmd); },
+      sync: { push: (vm, cmd) => sync.push(vm, cmd),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected) },
     });
     this.pools.set(poolId, { executor, guest });
