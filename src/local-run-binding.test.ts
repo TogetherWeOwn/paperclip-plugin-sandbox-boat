@@ -72,7 +72,7 @@ describe("plugin wiring", () => {
   async function setup(config: Record<string, unknown>, configGet?: () => Promise<Record<string, unknown>>) {
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-run-"));
     const harness = createFakeContext({
-      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId }]]),
+      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId }]]),
       workspaces: new Map([[workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: dir, cwd: dir }]]),
     });
     harness.secrets.set(secretId, "scoped-key");
@@ -309,6 +309,43 @@ describe("plugin wiring", () => {
     harness.ctx.state.delete = originalDelete;
     await restart(harness);
     expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a finished run stays refused after a restart when every write of its owner record fails", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    const { delete: originalDelete, set: originalSet } = harness.ctx.state;
+    harness.ctx.state.delete = async (input: { namespace?: string }) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalDelete(input as never);
+    };
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalSet(input, value);
+    };
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    harness.ctx.state.delete = originalDelete;
+    harness.ctx.state.set = originalSet;
+    // The host no longer shows the run on its issue.
+    harness.issues.set(issueId, { status: "done", executionWorkspaceId: workspaceId, executionRunId: null });
+    await restart(harness);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a restarted worker trusts the saved owner of a run without an issue for a day", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const harness = await setup(enabled);
+      await harness.emit("agent.run.started", { companyId, payload: { runId, issueId: null, agentId, status: "running" } });
+      await restart(harness);
+      const manager = () => import("./plugin.js").then((module) => module.currentManager());
+      expect(await (await manager()).localRunOwnedBy(companyId, runId, agentId)).toBe(true);
+      vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+      await restart(harness);
+      expect(await (await manager()).localRunOwnedBy(companyId, runId, agentId)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("leaves local runs unbound while the setting is off", async () => {

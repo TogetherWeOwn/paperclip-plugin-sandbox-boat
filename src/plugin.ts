@@ -60,6 +60,8 @@ const plugin = definePlugin({
           const issue = await ctx.issues.get(issueId, companyId);
           return issue ? {
             status: issue.status,
+            executionRunId: issue.executionRunId ?? null,
+            checkoutRunId: issue.checkoutRunId ?? null,
             ...(Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings")
               ? { executionWorkspaceSettings: issue.executionWorkspaceSettings } : {}),
           } : null;

@@ -29,7 +29,8 @@ export function nativeWorkspace(overrides: Record<string, unknown> = {}) {
 
 /** The host starts every run with agent.run.started; pass start=false to rely on the persisted owner (a restarted worker). */
 async function setup(state?: ReturnType<typeof createFakeContext>["ctx"]["state"], start = true) {
-  const harness = createFakeContext();
+  // The host shows the run executing on its issue, which a restarted worker confirms.
+  const harness = createFakeContext({ issues: new Map([["issue-a", { status: "in_progress", executionRunId: runId }]]) });
   // Any attempt to use the SDK workspace client would require a new capability.
   const ctx = { ...harness.ctx, ...(state ? { state } : {}) };
   Object.defineProperty(ctx, "executionWorkspaces", { get() { throw new Error("capability unavailable"); } });

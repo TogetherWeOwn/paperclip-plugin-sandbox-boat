@@ -79,7 +79,8 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 // Below the minimum idle-stop threshold (one minute), including silent syncs.
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 15_000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
-/** How long the in-memory end fence and whole-run realizations are kept. */
+/** How long the in-memory end fence and whole-run realizations are kept, and how long a
+ * persisted owner of a run without an issue (which the host cannot confirm live) is trusted. */
 const LOCAL_RUN_STATE_MAX_AGE_MS = 24 * 60 * 60_000;
 const STOP_POLL_INTERVAL_MS = 2000;
 // After an accepted stop, release waits at most this long for the VM to leave
@@ -138,6 +139,9 @@ export interface IssueReader {
   get(issueId: string, companyId: string): Promise<{
     status?: string | null;
     executionWorkspaceSettings?: unknown;
+    /** Host-owned: the run executing or holding the issue's checkout. */
+    executionRunId?: string | null;
+    checkoutRunId?: string | null;
   } | null>;
 }
 
@@ -388,11 +392,21 @@ export class BoatVmManager {
       | null;
     if (saved?.version !== 1 || saved.companyId !== companyId || saved.runId !== runId
       || typeof saved.agentId !== "string" || (saved.issueId !== null && typeof saved.issueId !== "string")) return false;
+    // The record outlives the run if every write on the terminal event failed, so confirm the run is live:
+    // with the host for an issue run, by age for a run without an issue.
+    if (!(await this.savedRunLive(companyId, runId, saved.issueId, saved.startedAt))) return false;
     // Rehydrate after a restart, unless the terminal event arrived during the read.
     if (this.endedLocalRuns.has(id)) return false;
     if (live) live.agentId = saved.agentId;
     else this.localRuns.set(id, { issueId: saved.issueId as string | null, agentId: saved.agentId });
     return saved.agentId === agentId;
+  }
+
+  /** A host or lookup failure counts as not live, so the request is refused and a later one retries. */
+  private async savedRunLive(companyId: string, runId: string, issueId: string | null, startedAt: unknown): Promise<boolean> {
+    if (issueId === null) return typeof startedAt === "number" && this.now() - startedAt <= LOCAL_RUN_STATE_MAX_AGE_MS;
+    const issue = await this.issues?.get(issueId, companyId).catch(() => null);
+    return issue?.executionRunId === runId || issue?.checkoutRunId === runId;
   }
 
   /** Issue of a live (started, not ended) local run, or null. */

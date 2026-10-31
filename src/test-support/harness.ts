@@ -249,6 +249,8 @@ export interface FakeIssue {
   status: string;
   executionWorkspaceId?: string | null;
   executionWorkspaceSettings?: Record<string, unknown> | null;
+  executionRunId?: string | null;
+  checkoutRunId?: string | null;
 }
 
 export function createFakeContext(
