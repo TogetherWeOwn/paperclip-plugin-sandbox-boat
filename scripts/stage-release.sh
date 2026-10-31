@@ -74,10 +74,14 @@ if [ ! -f "$tarball.sha256" ]; then
   echo "stage-release: $tarball.sha256 is missing" >&2
   exit 1
 fi
-(cd "$(dirname "$tarball")" && sha256sum -c --status "$file.sha256") || {
+# Compare the hash itself: `sha256sum -c` would check whichever file the
+# .sha256 names, which need not be this tarball.
+want=$(cat "$tarball.sha256")
+got=$(cd "$(dirname "$tarball")" && sha256sum "$file")
+if [ "$want" != "$got" ]; then
   echo "stage-release: $file does not match $file.sha256" >&2
   exit 1
-}
+fi
 
 dest="$root/$name"
 if [ -e "$dest" ] || [ -L "$dest" ]; then

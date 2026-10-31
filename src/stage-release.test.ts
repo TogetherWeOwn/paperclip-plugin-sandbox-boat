@@ -124,6 +124,18 @@ describe("stage-release.sh", () => {
     expect(existsSync(path.join(dir, NAME))).toBe(false);
   });
 
+  it.skipIf(win)("refuses a .sha256 that vouches for another file", () => {
+    const dir = scratch();
+    const tgz = release(dir);
+    const decoy = path.join(path.dirname(tgz), "decoy.tgz");
+    writeFileSync(decoy, "decoy");
+    const sum = spawnSync("sha256sum", ["decoy.tgz"], { cwd: path.dirname(tgz), encoding: "utf8" });
+    writeFileSync(`${tgz}.sha256`, sum.stdout);
+    const r = sh(dir, stageRelease, [tgz, dir, hostSdk(path.join(dir, "sdk"))]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("does not match");
+  });
+
   it.skipIf(win)("refuses a tarball with any other link", () => {
     const dir = scratch();
     const tgz = release(dir, { extraLink: true });
