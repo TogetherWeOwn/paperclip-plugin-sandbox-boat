@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+* `rust-public-1` now pins toolchain `1.98.1` (replacing `1.88.0`) with clippy, matching two-bot-next. Its server-owned guest build env (`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`) gives remote Cargo the same lean settings as `scripts/cargo_cache.py`, and no host env is forwarded. A workspace toolchain file pinning an uninstalled channel stays local; the native backend re-reads it from the host-owned source.
+
+### Fixed
+
+* Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
+* Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
+
 ## 0.2.3
 
 ### Added

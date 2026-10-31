@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { NeverDispatchBackend, OffloadBroker, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
-import { canonicalRepoId, handleCancel, handleExec, handleHeartbeat, handleRead, type OffloadRouteHost, type RouteActor } from "./routes.js";
+import { canonicalRepoId, handleCancel, handleExec, handleHeartbeat, handleRead, V1_PROFILE, type OffloadRouteHost, type RouteActor } from "./routes.js";
 
 const COMPANY = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const RUN = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
@@ -179,6 +182,88 @@ describe("handleExec", () => {
     expect(
       (await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ dryRun: true }) }, { ...t.host, workspaces: { get: async () => null } })).status,
     ).toBe(403);
+  });
+});
+
+describe("rust-public-1 profile parity", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  function workspaceWith(files: Record<string, string>): string {
+    const root = mkdtempSync(path.join(tmpdir(), "boat-toolchain-"));
+    roots.push(root);
+    for (const [name, text] of Object.entries(files)) writeFileSync(path.join(root, name), text);
+    return root;
+  }
+  async function dryRun(root: string, argv: string[]) {
+    const t = setup();
+    t.host.profile = V1_PROFILE;
+    t.workspaces.set(WS, { repoUrl: "https://github.com/TogetherWeOwn/two-bot-next", projectId: "proj-1", projectWorkspaceId: "pws-1", path: root, cwd: root });
+    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv, dryRun: true }) }, t.host);
+    expect(response.status).toBe(200);
+    return response.body as { mode: string; reason: string };
+  }
+  const TWO_BOT_NEXT_TOOLCHAIN = '# Pinned toolchain\n[toolchain]\nchannel = "1.98.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n';
+
+  it("pins 1.98.1 with clippy and owns the lean build env", () => {
+    expect(V1_PROFILE.toolchains).toContain("1.98.1");
+    expect(V1_PROFILE.components).toContain("clippy");
+    expect(V1_PROFILE.env).toEqual({ CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0" });
+    // Host paths from the local wrapper never become guest env.
+    expect(Object.keys(V1_PROFILE.env!).some((key) => /TARGET_DIR|BUILD_DIR|TMP|SCRATCH/.test(key))).toBe(false);
+  });
+
+  it("classifies two-bot-next's wrapper argv as remote candidates on its pinned toolchain", async () => {
+    const root = workspaceWith({ "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN });
+    for (const sub of ["check", "test", "clippy", "build"]) {
+      // cargo_cache.py inserts --offline --locked after the subcommand.
+      expect((await dryRun(root, [sub, "--offline", "--locked", "--workspace"])).mode).toBe("remote_candidate");
+    }
+    expect((await dryRun(root, ["fmt", "--check"])).mode).toBe("local");
+  });
+
+  it("keeps a workspace pinned to an uninstalled or unparseable toolchain local", async () => {
+    const pinned = await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"]);
+    expect(pinned).toMatchObject({ mode: "local", reason: "rust-toolchain.toml pins 1.99.0, not installed on the profile" });
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "nightly-2026-01-01\n" }), ["check"])).mode).toBe("local");
+    expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\npath = "/opt/rust"\n' }), ["check"])).mode).toBe("local");
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1" }), ["check"])).mode).toBe("remote_candidate");
+    // rustup reads the legacy file when both exist.
+    expect(await dryRun(workspaceWith({ "rust-toolchain": "1.99.0", "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN }), ["check"]))
+      .toMatchObject({ mode: "local", reason: "rust-toolchain pins 1.99.0, not installed on the profile" });
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1", "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"])).mode)
+      .toBe("remote_candidate");
+    // An explicit installed +toolchain overrides the file, as rustup does.
+    expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["+1.98.1", "check"])).mode).toBe("remote_candidate");
+  });
+
+  it("keeps test runs that reach agent-testdb without any env local", async () => {
+    const root = workspaceWith({ "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN });
+    const cases: Array<[string[], RegExp]> = [
+      [["test", "--offline", "--locked", "--workspace", "--lib", "--bins", "--features", "two-bot-core/db"], /^feature two-bot-core\/db /],
+      [["test", "-p", "two-bot-core", "--features=db", "--test", "custom_command_store"], /^feature db /],
+      [["test", "-p", "two-bot-core", "-F", "serde,db"], /^feature db /],
+      [["test", "--workspace", "--all-features"], /^--all-features /],
+      [["test", "-p", "two-bot-core", "--lib", "--", "--ignored"], /^ignored tests /],
+      [["test", "--", "--include-ignored"], /^ignored tests /],
+      [["nextest", "run", "--run-ignored", "all"], /^ignored tests /],
+    ];
+    for (const [argv, reason] of cases) {
+      expect(await dryRun(root, argv)).toMatchObject({ mode: "local", reason: expect.stringMatching(reason) });
+    }
+    // Compile-only commands with the feature never run tests: still eligible.
+    for (const argv of [["clippy", "--workspace", "--all-targets", "--all-features"], ["check", "--features", "two-bot-core/db"],
+      ["build", "--all-features"], ["test", "--features", "dashboard"], ["test", "-p", "two-bot", "--", "--test-threads=1"]]) {
+      expect((await dryRun(root, argv)).mode).toBe("remote_candidate");
+    }
+  });
+
+  it("keeps clippy local on a profile without the clippy component", async () => {
+    const t = setup();
+    t.host.profile = { ...V1_PROFILE, components: [] };
+    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv: ["clippy"], dryRun: true }) }, t.host);
+    expect(response.body).toMatchObject({ mode: "local", reason: "clippy is not installed on the profile" });
   });
 });
 
