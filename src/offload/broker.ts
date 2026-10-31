@@ -357,31 +357,34 @@ export class OffloadBroker {
    */
   async collectGarbage(): Promise<void> {
     const index = await this.chain(INDEX_KEY, () => this.readIndex());
-    const gone: string[] = [];
     for (const [commandId, runId] of Object.entries(index.commands)) {
-      const done = await this.chain(`run:${runId}`, () => this.chain(`cmd:${commandId}`, async () => {
+      await this.chain(`run:${runId}`, () => this.chain(`cmd:${commandId}`, async () => {
         const now = this.now();
         const record = await this.load(commandId);
         if (record) {
           if (TERMINAL.has(record.state) && record.terminalAt !== null && record.terminalAt + OFFLOAD_BOUNDS.resultRetentionMs < now) {
             await this.expire(record);
           }
-          return false;
+          return;
         }
         const tomb = (await this.store.get(tombKey(commandId))) as Tombstone | null;
         if (tomb && typeof tomb.expiresAt !== "number") {
           await this.store.set(tombKey(commandId), { ...tomb, expiresAt: now + TOMBSTONE_RETENTION_MS });
-          return false;
+          return;
         }
-        if (tomb && now < tomb.expiresAt!) return false;
+        if (tomb && now < tomb.expiresAt!) return;
         if (tomb) await this.store.delete(tombKey(commandId));
-        return true;
+        // Unindex under the run lock: a retried submit of this ID re-tracks it
+        // only after, never between this check and the prune.
+        await this.chain(INDEX_KEY, async () => {
+          const current = await this.readIndex();
+          delete current.commands[commandId];
+          await this.store.set(INDEX_KEY, current);
+        });
       }));
-      if (done) gone.push(commandId);
     }
     await this.chain(INDEX_KEY, async () => {
       const current = await this.readIndex();
-      for (const commandId of gone) delete current.commands[commandId];
       const referenced = new Set(Object.values(current.commands));
       const now = this.now();
       for (const [runId, at] of Object.entries(current.runs)) {

@@ -633,6 +633,33 @@ describe("retention", () => {
     expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[ORPHAN]).toBeUndefined();
   });
 
+  it("keeps a retried orphan indexed when the retry lands while the sweep is still scanning", async () => {
+    const { broker, store } = setup();
+    const realSet = store.set.bind(store);
+    store.set = async (key, value) => {
+      if (key === `offload.cmd.${CMD}`) throw new Error("record write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(), PRINCIPAL)).rejects.toThrow("record write lost");
+    store.set = realSet;
+    // A second, later-indexed command in another run, so the sweep is still
+    // scanning after it has seen the orphan.
+    const LATER = "4c1d0e5a-8b5e-4a8f-9d6c-1e2f3a4b5c6d";
+    await broker.submit(submitFor(LATER), { ...PRINCIPAL, runId: OTHER_RUN });
+    const realGet = store.get.bind(store);
+    let retry: Promise<unknown> | null = null;
+    store.get = async (key) => {
+      if (key === `offload.cmd.${LATER}` && !retry) {
+        retry = broker.submit(submitFor(), PRINCIPAL);
+        await retry;
+      }
+      return realGet(key);
+    };
+    await broker.collectGarbage();
+    expect(persisted(store)).toMatchObject({ state: "queued" });
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[CMD]).toBe(RUN);
+  });
+
   it("never expires an unresolved command or its run count", async () => {
     const { broker, backend, clock, store } = setup();
     await broker.submit(submitFor(), PRINCIPAL);

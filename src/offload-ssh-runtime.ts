@@ -351,8 +351,9 @@ export class SshOffloadRuntime {
         discard: (vm, cmd) => sync.discard(vm, cmd) },
     });
     this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
-    // Bookkeeping only: a lost write is retried by the next sweep while the pool is loaded.
-    await this.updateRegistry(command.companyId, (registry) => {
+    // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
+    // lost write is retried by every sweep while the pool is loaded.
+    void this.updateRegistry(command.companyId, (registry) => {
       registry[poolId] = { artifactRoot: settings.offloadArtifactRoot as string, seenAt: Date.now() };
     }).catch(() => undefined);
     return executor;
@@ -427,14 +428,15 @@ export class SshOffloadRuntime {
       await sync.collectGarbage();
     }));
     const companies = new Set([...companyIds, ...[...this.pools.values()].map((pool) => pool.companyId)]);
+    let failed = false;
     const retired = await Promise.allSettled([...companies].map((companyId) => this.updateRegistry(companyId, async (registry) => {
+      // (Re-)register loaded pools first: this retries a lost write from resolve.
+      for (const [poolId, loaded] of this.pools) {
+        if (loaded.companyId === companyId) registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now() };
+      }
       const roots = new Set<string>();
       for (const [poolId, entry] of Object.entries(registry)) {
-        if (this.pools.has(poolId)) {
-          const loaded = this.pools.get(poolId)!;
-          registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now() };
-          continue;
-        }
+        if (this.pools.has(poolId)) continue;
         if (!entry || typeof entry.artifactRoot !== "string" || !Number.isFinite(entry.seenAt)) { delete registry[poolId]; continue; }
         const task = this.collectRetiredPool(companyId, poolId, entry.seenAt);
         this.retiredSweeps.set(poolId, task.then(() => undefined, () => undefined));
@@ -443,14 +445,20 @@ export class SshOffloadRuntime {
           roots.add(entry.artifactRoot);
           // Forget the pool once nothing of it is left to expire.
           if (empty && Date.now() - entry.seenAt >= ARTIFACT_RETENTION_MS) delete registry[poolId];
+        } catch {
+          // One unreadable pool must not starve the company's other pools.
+          failed = true;
         } finally {
           this.retiredSweeps.delete(poolId);
         }
       }
       // A loaded pool's own sweep covers its root and spares its live uploads.
       const loadedRoots = new Set([...this.pools.values()].map((pool) => pool.artifactRoot));
-      for (const root of roots) if (!loadedRoots.has(root)) await sweepArtifactRoot(root, Date.now() - ARTIFACT_RETENTION_MS);
+      for (const root of roots) {
+        if (!loadedRoots.has(root)) await sweepArtifactRoot(root, Date.now() - ARTIFACT_RETENTION_MS).catch(() => { failed = true; });
+      }
     })));
+    if (failed) throw new Error("Offload pool sweep unverified");
     if ([...outcomes, ...retired].some((outcome) => outcome.status === "rejected")) throw new Error("Offload pool sweep unverified");
   }
 
@@ -462,6 +470,7 @@ export class SshOffloadRuntime {
       await executor.shutdown();
       await guest.shutdown();
     }));
+    await this.registryTail;
     this.closed = true;
   }
 }
