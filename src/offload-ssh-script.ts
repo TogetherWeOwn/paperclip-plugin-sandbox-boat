@@ -36,12 +36,19 @@ def save(root, value):
 
 def load(root):
     filename = root / 'state'
-    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd) as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 131072:
-            raise ValueError('unsafe guest state')
-        return json.load(source)
+    # save() swaps state with os.replace, and lock-free readers (prepare's
+    # poll, the watchdog) can open the old inode just before it is unlinked.
+    # Reopen to read the current state, and still refuse a hardlinked state.
+    for _ in range(100):
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as source:
+            info = os.fstat(source.fileno())
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 0:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 131072:
+                raise ValueError('unsafe guest state')
+            return json.load(source)
+    raise ValueError('unsafe guest state')
 
 
 def locked(root):
