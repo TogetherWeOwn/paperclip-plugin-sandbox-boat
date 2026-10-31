@@ -4,13 +4,24 @@ on:
   pull_request:
   push:
     branches: [main]
+  merge_group:
 
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the old run; main keeps every run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Required status check on main. Renaming this changes the check context
+    # and blocks every merge until the ruleset is updated to match.
+    name: check
+    # Pinned: ubuntu-latest moved to 26.04, where native-sync timing tests fail.
+    # Move up deliberately once the suite passes on the new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
