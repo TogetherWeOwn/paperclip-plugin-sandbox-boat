@@ -444,7 +444,11 @@ export async function runStreamProcess(command: string, args: string[], options:
   // Observe every pipe immediately: waiting for exit first deadlocks a full pipe.
   const pipes = [
     pipeline(child.stdout, options.stdout ?? collector(stdout)),
-    pipeline(child.stderr, collector(stderr)),
+    // The detach destroys stderr before its EOF whenever the slave exits
+    // first; that premature close is ours, not a stream failure.
+    pipeline(child.stderr, collector(stderr)).catch((error: NodeJS.ErrnoException) => {
+      if (!stderrDetached || error.code !== "ERR_STREAM_PREMATURE_CLOSE") throw error;
+    }),
     pipeline(options.stdin ?? Readable.from([]), child.stdin),
   ];
   for (const pipe of pipes) void pipe.catch((error: Error) => abort(error));

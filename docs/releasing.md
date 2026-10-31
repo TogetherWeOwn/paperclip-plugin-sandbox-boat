@@ -13,7 +13,7 @@ Releases are git tags with a GitHub Release. Each release has the staged package
    git push origin vX.Y.Z
    ```
 
-3. The tag push runs the [release workflow](../.github/workflows/release.yml), which uses only `GITHUB_TOKEN`. The workflow:
+3. The tag push runs the [release workflow](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/.github/workflows/release.yml), which uses only `GITHUB_TOKEN`. The workflow:
    * fails unless the tag, `package.json` `version` and `PLUGIN_VERSION` agree at the tagged commit (`scripts/check-release-version.sh`), and unless `CHANGELOG.md` has a section for the version (`scripts/release-notes.sh`);
    * builds the commit with `scripts/stage-package.sh`, which refuses a commit that is not on `main` and runs `npm run check`;
    * attaches `sandbox-boat-X.Y.Z-<short sha>.tgz` and `.tgz.sha256` to a new GitHub Release, with that `CHANGELOG.md` section as its notes. A release that already exists is never overwritten.

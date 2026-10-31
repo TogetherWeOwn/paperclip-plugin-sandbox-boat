@@ -72,6 +72,13 @@ describe("recordDuration", () => {
     expect(normalizeSignature("node", "npm", ["test"])).not.toBe(normalizeSignature("python", "pytest", ["test"]));
   });
 
+  it("keeps signatures distinct per run directory, with the root keeping its original encoding", () => {
+    expect(normalizeSignature("node", "npm", ["test"], ".")).toBe(JSON.stringify(["node", "npm", ["test"]]));
+    expect(normalizeSignature("node", "npm", ["test"], "./")).toBe(normalizeSignature("node", "npm", ["test"]));
+    expect(normalizeSignature("node", "npm", ["test"], "packages/tiny/")).toBe(normalizeSignature("node", "npm", ["test"], "packages/./tiny"));
+    expect(normalizeSignature("node", "npm", ["test"], "packages/tiny")).not.toBe(normalizeSignature("node", "npm", ["test"]));
+  });
+
   it("scopes keys per repo and profile", () => {
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:b", "node-public-1", "s"));
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:a", "python-public-1", "s"));

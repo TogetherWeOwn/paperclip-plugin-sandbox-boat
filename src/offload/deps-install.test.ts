@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { planDependencies } from "./deps-install.js";
+import { nestedLockfile, planDependencies } from "./deps-install.js";
 
 const tmpdirs: string[] = [];
 afterEach(() => {
@@ -99,5 +99,16 @@ describe("planDependencies", () => {
     expect(a?.hash).not.toBe(b?.hash);
     const again = await planDependencies(root({ "package-lock.json": "v1" }));
     expect(a?.hash).toBe(again?.hash);
+  });
+});
+
+describe("nestedLockfile", () => {
+  it("finds a lockfile between the run directory and the root, never the root's own", async () => {
+    const dir = root({ "package-lock.json": "{}", "packages/a/src/x.ts": "", "tools/b/package-lock.json": "{}", "py/c/uv.lock": "x" });
+    expect(await nestedLockfile(dir, ".", "node")).toBe(null);
+    expect(await nestedLockfile(dir, "packages/a/src", "node")).toBe(null);
+    expect(await nestedLockfile(dir, "tools/b", "node")).toBe("tools/b/package-lock.json");
+    expect(await nestedLockfile(dir, "py/c", "node")).toBe(null);
+    expect(await nestedLockfile(dir, "py/c", "python")).toBe("py/c/uv.lock");
   });
 });

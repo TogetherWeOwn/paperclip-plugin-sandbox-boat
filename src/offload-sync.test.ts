@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, lstat
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_RETURN_POLICY,
   DEFAULT_SYNC_EXCLUDES,
@@ -21,8 +21,16 @@ import {
   resolveContained,
 } from "./offload-sync.js";
 
+// Every temp root is removed after its test so a full run leaves nothing in $TMPDIR.
+const temps: string[] = [];
+afterEach(() => {
+  for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 function makeTemp(): string {
-  return mkdtempSync(path.join(tmpdir(), "offload-sync-"));
+  const dir = mkdtempSync(path.join(tmpdir(), "offload-sync-"));
+  temps.push(dir);
+  return dir;
 }
 
 function writeTree(root: string, files: Record<string, string>): void {

@@ -5,13 +5,14 @@
 // metadata. Body identifiers are consistency checks, never authority: no
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
+import path from "node:path";
 import type { OffloadBroker, BrokerPrincipal } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
 import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
-import { bodyTooLarge, LONE_SURROGATE, validateSubmit } from "./validate.js";
+import { bodyTooLarge, cwdProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
 /** The refusal path must answer the same documented 409 as submit() for a reused ID. */
 async function recordRefusalOrConflict(
@@ -229,10 +230,17 @@ function serviceTestReason(argv: string[], serviceFeatures: string[]): string | 
  * Cargo workload decision including the workspace toolchain file. An explicit
  * `+toolchain` already passed the profile check and overrides the file.
  */
-export async function classifyCargoWorkspace(profile: ServerProfile, argv: string[], root: string | null): Promise<CargoClassification> {
+export async function classifyCargoWorkspace(profile: ServerProfile, argv: string[], root: string | null, cwdRelative = "."): Promise<CargoClassification> {
   const classification = classifyRequest(profile, "cargo", "cargo", argv);
   if (classification.mode === "local" || root === null || argv[0]?.startsWith("+")) return classification;
-  const mismatch = toolchainPinMismatch(await readToolchainPin(root), profile.toolchains);
+  // rustup uses the nearest toolchain file from the run directory up to the root.
+  const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
+  let pin = await readToolchainPin(root);
+  for (let depth = segments.length; depth > 0; depth--) {
+    const nested = await readToolchainPin(path.join(root, ...segments.slice(0, depth)));
+    if (nested.kind !== "none") { pin = nested; break; }
+  }
+  const mismatch = toolchainPinMismatch(pin, profile.toolchains);
   if (mismatch === null) return classification;
   return { mode: "local", reason: mismatch, profileId: profile.id, subcommand: classification.subcommand };
 }
@@ -307,7 +315,7 @@ export async function handleExec(
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.
-    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
+    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
     return {
       status: 200,
       body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: profile.id },
@@ -321,7 +329,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
+  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
@@ -353,15 +361,16 @@ async function decideRemote(
   tool: OffloadTool,
   runner: string,
   argv: string[],
+  cwdRelative: string,
 ): Promise<CargoClassification> {
-  if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd);
+  if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd, cwdRelative);
   const repoId = canonicalRepoId(workspace);
   const classification = classifyRequest(profile, tool, runner, argv);
   if (classification.mode === "local") return classification;
   if (!host.durations) {
     return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
   }
-  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv));
+  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv, cwdRelative));
   const history = await readHistory(host.durations, key);
   if (history.length === 0) {
     return { mode: "local", reason: "no duration history yet; run local first and record", profileId: profile.id, subcommand: classification.subcommand, runner };
@@ -420,6 +429,10 @@ export async function handleReport(
     || record.durationSeconds < 0 || record.durationSeconds > 86_400) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "durationSeconds must be 0..86400", {}) };
   }
+  // Optional for older shims, which only ever ran at the workspace root.
+  const cwdRelative = record.cwdRelative ?? ".";
+  const cwdIssue = typeof cwdRelative === "string" ? cwdProblem(cwdRelative) : "cwdRelative must be a string";
+  if (cwdIssue) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", cwdIssue, {}) };
   if (!host.durations) {
     return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "duration learning unavailable", { commandId: null, remoteStarted: false, fallbackSafe: true }) };
   }
@@ -427,7 +440,7 @@ export async function handleReport(
   if (!workspace) {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: null }) };
   }
-  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[]));
+  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[], cwdRelative as string));
   await recordDuration(host.durations, key, { seconds: record.durationSeconds, at: Date.now() });
   return { status: 200, body: { version: OFFLOAD_VERSION, recorded: true } };
 }

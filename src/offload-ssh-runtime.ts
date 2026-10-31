@@ -10,7 +10,7 @@ import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./config.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import type { OffloadStore } from "./offload-journal.js";
-import { planDependencies } from "./offload/deps-install.js";
+import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
 import { classifyNode, classifyPython } from "./offload/router.js";
@@ -20,7 +20,7 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
-import { DEFAULT_SYNC_EXCLUDES } from "./offload-sync.js";
+import { DEFAULT_SYNC_EXCLUDES, snapshotHasDirectory } from "./offload-sync.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number };
@@ -233,11 +233,14 @@ export class SshOffloadRuntime {
     const runners = profile.id === V1_PROFILE.id ? ["cargo"] : profile.id === NODE_PROFILE.id ? NODE_PROFILE.runners! : PYTHON_PROFILE.runners!;
     if (!runners.includes(runner)) return null;
     // Cargo re-reads the toolchain pin from the host-owned source, not the route's view.
-    const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source)
+    const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source, command.cwdRelative)
       : tool === "node" ? classifyNode(runner, command.argv, profile)
       : classifyPython(runner, command.argv, profile);
     if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
     if (!this.confined(command, tool)) return null;
+    // The guest runs in the mirrored cwd: an empty or sync-excluded directory
+    // is absent there, so the command could not start remotely.
+    if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
@@ -245,6 +248,7 @@ export class SshOffloadRuntime {
       // authenticate a private registry without it.
       const plan = await planDependencies(binding.source, tool).catch(() => null);
       if (!plan) return null;
+      if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) return null;
       if (await hasRegistryCredentials(binding.source).catch(() => true)) return null;
     }
     // Source and credentials only from host-authored native params. An API
@@ -317,7 +321,7 @@ export class SshOffloadRuntime {
         const tool = cmd.tool ?? "cargo";
         if (tool === "cargo") return;
         const scope = { scopeKind: "company" as const, scopeId: cmd.companyId, namespace: "boat-offload", stateKey: "" };
-        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv));
+        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
             set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value) }, key, { seconds, at: Date.now() });
