@@ -554,3 +554,120 @@ describe("expiry", () => {
     expect(view.result).toMatchObject({ timedOut: true });
   });
 });
+
+describe("retention", () => {
+  const HOUR = 60 * 60_000;
+  const clean = { exitCode: 0, signal: null, timedOut: false, syncBack: { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null } };
+
+  it("tombstones a never-read terminal record, then deletes the tombstone and the run count", async () => {
+    const { broker, backend, clock, store } = setup();
+    await broker.submit(submitFor(), PRINCIPAL);
+    backend.starts[0]!.sink.started();
+    backend.starts[0]!.sink.complete(clean);
+    await broker.read(CMD, PRINCIPAL, 0);
+    clock.t += 25 * HOUR;
+    await broker.collectGarbage();
+    expect(await store.get(`offload.cmd.${CMD}`)).toBeNull();
+    expect(await store.get(`offload.tomb.${CMD}`)).not.toBeNull();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBe(1);
+    // Within the tombstone window the ID still refuses reuse.
+    clock.t += 29 * 24 * HOUR;
+    await broker.collectGarbage();
+    expect((await broker.submit(submitFor(), PRINCIPAL)).status).toBe(410);
+    clock.t += 2 * 24 * HOUR;
+    await broker.collectGarbage();
+    expect(await store.get(`offload.tomb.${CMD}`)).toBeNull();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBeNull();
+    expect(await store.get("offload.retention")).toEqual({ version: 1, commands: {}, runs: {} });
+  });
+
+  it("expires a tombstone written by an expired read", async () => {
+    const { broker, backend, clock, store } = setup();
+    await broker.submit(submitFor(), PRINCIPAL);
+    backend.starts[0]!.sink.complete(clean);
+    await broker.read(CMD, PRINCIPAL, 0);
+    clock.t += 25 * HOUR;
+    expect((await broker.read(CMD, PRINCIPAL, 0)).status).toBe(410);
+    clock.t += 31 * 24 * HOUR;
+    await broker.collectGarbage();
+    expect(await store.get(`offload.tomb.${CMD}`)).toBeNull();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBeNull();
+  });
+
+  it("expires refusal receipts recorded without a backend start", async () => {
+    const { broker, clock, store } = setup();
+    await broker.recordRefusal(submitFor(), PRINCIPAL, "incompatible");
+    clock.t += 25 * HOUR;
+    await broker.collectGarbage();
+    clock.t += 31 * 24 * HOUR;
+    await broker.collectGarbage();
+    expect([...store.data.keys()].filter((key) => key !== "offload.retention")).toEqual([]);
+  });
+
+  it("a failed index write strands nothing: the retry dispatches and an orphaned entry is pruned", async () => {
+    const { broker, backend, clock, store } = setup();
+    const realSet = store.set.bind(store);
+    store.set = async (key, value) => {
+      if (key === "offload.retention") throw new Error("index write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(), PRINCIPAL)).rejects.toThrow("index write lost");
+    expect(persisted(store)).toBeUndefined();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBeNull();
+    store.set = realSet;
+    expect((await broker.submit(submitFor(), PRINCIPAL)).status).toBe(202);
+    expect(backend.starts).toHaveLength(1);
+    expect(persisted(store)).toMatchObject({ state: "queued" });
+
+    // An index entry whose record write then failed is pruned, not kept forever.
+    const ORPHAN = "0f6b7c38-6c0e-4c1b-9a4e-2f1f3c1e9b11";
+    store.set = async (key, value) => {
+      if (key === `offload.cmd.${ORPHAN}`) throw new Error("record write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(ORPHAN), PRINCIPAL)).rejects.toThrow("record write lost");
+    store.set = realSet;
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[ORPHAN]).toBe(RUN);
+    clock.t += HOUR;
+    await broker.collectGarbage();
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[ORPHAN]).toBeUndefined();
+  });
+
+  it("keeps a retried orphan indexed when the retry lands while the sweep is still scanning", async () => {
+    const { broker, store } = setup();
+    const realSet = store.set.bind(store);
+    store.set = async (key, value) => {
+      if (key === `offload.cmd.${CMD}`) throw new Error("record write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(), PRINCIPAL)).rejects.toThrow("record write lost");
+    store.set = realSet;
+    // A second, later-indexed command in another run, so the sweep is still
+    // scanning after it has seen the orphan.
+    const LATER = "4c1d0e5a-8b5e-4a8f-9d6c-1e2f3a4b5c6d";
+    await broker.submit(submitFor(LATER), { ...PRINCIPAL, runId: OTHER_RUN });
+    const realGet = store.get.bind(store);
+    let retry: Promise<unknown> | null = null;
+    store.get = async (key) => {
+      if (key === `offload.cmd.${LATER}` && !retry) {
+        retry = broker.submit(submitFor(), PRINCIPAL);
+        await retry;
+      }
+      return realGet(key);
+    };
+    await broker.collectGarbage();
+    expect(persisted(store)).toMatchObject({ state: "queued" });
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[CMD]).toBe(RUN);
+  });
+
+  it("never expires an unresolved command or its run count", async () => {
+    const { broker, backend, clock, store } = setup();
+    await broker.submit(submitFor(), PRINCIPAL);
+    backend.starts[0]!.sink.started();
+    await broker.read(CMD, PRINCIPAL, 0);
+    clock.t += 60 * 24 * HOUR;
+    await broker.collectGarbage();
+    expect(await store.get(`offload.cmd.${CMD}`)).not.toBeNull();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBe(1);
+  });
+});
