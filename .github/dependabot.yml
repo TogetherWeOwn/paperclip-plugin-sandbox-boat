@@ -1,0 +1,12 @@
+# Keeps the SHA-pinned actions in .github/workflows current: a PR bumps the
+# SHA and its version comment together. npm stays manual: dependencies are
+# pinned exact and a bump of @boatdev/sdk touches the budget guard.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ['*']
