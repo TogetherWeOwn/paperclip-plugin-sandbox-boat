@@ -16,8 +16,32 @@ function scope(companyId: string, workspaceId: string, runId: string) {
   return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-workspaces", stateKey: JSON.stringify([runId, workspaceId]) };
 }
 
+/** Every workspace a run was ever bound to, so a terminal event or release can forget them all without in-memory state. */
+function runIndexScope(companyId: string, runId: string) {
+  return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-run-workspaces", stateKey: runId };
+}
+
 export class NativeOffloadWorkspaces {
+  private readonly indexWrites = new Map<string, Promise<unknown>>();
+
   constructor(private readonly state: StateClientLike) {}
+
+  /** Serialize read-modify-write of one run's index in this worker. */
+  private withIndex<T>(companyId: string, runId: string, fn: () => Promise<T>): Promise<T> {
+    const key = JSON.stringify([companyId, runId]);
+    const next = (this.indexWrites.get(key) ?? Promise.resolve()).then(fn);
+    const settled = next.catch(() => undefined);
+    this.indexWrites.set(key, settled);
+    void settled.then(() => {
+      if (this.indexWrites.get(key) === settled) this.indexWrites.delete(key);
+    });
+    return next;
+  }
+
+  private async indexed(companyId: string, runId: string): Promise<string[]> {
+    const saved = record(await this.state.get(runIndexScope(companyId, runId)));
+    return Array.isArray(saved.workspaces) ? saved.workspaces.filter((id): id is string => typeof id === "string") : [];
+  }
 
   /** Trusted host integration only, using the SDK realization payload. Never
    * expose this as an agent API. Source fields follow WorkspaceRealizationRequest
@@ -41,6 +65,13 @@ export class NativeOffloadWorkspaces {
       path: localPath,
       cwd: localPath,
     };
+    // Index first: a binding must never exist that forgetRun cannot find.
+    await this.withIndex(params.companyId, runId, async () => {
+      const workspaces = await this.indexed(params.companyId, runId);
+      if (!workspaces.includes(workspaceId)) {
+        await this.state.set(runIndexScope(params.companyId, runId), { version: 1, workspaces: [...workspaces, workspaceId] });
+      }
+    });
     await this.state.set(scope(params.companyId, workspaceId, runId), {
       version: 1, companyId: params.companyId, runId, workspaceId, workspace,
     });
@@ -48,6 +79,14 @@ export class NativeOffloadWorkspaces {
 
   async forget(companyId: string, workspaceId: string, runId: string): Promise<void> {
     await this.state.delete(scope(companyId, workspaceId, runId));
+  }
+
+  /** Forget every workspace binding of a run, from the persisted index. */
+  async forgetRun(companyId: string, runId: string): Promise<void> {
+    await this.withIndex(companyId, runId, async () => {
+      for (const workspaceId of await this.indexed(companyId, runId)) await this.forget(companyId, workspaceId, runId);
+      await this.state.delete(runIndexScope(companyId, runId));
+    });
   }
 
   async get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null> {

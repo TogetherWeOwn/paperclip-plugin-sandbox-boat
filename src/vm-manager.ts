@@ -269,7 +269,7 @@ export class BoatVmManager {
   /** Per VM, workspace roots already written to its state record (saves a state write per realize). */
   private readonly knownRoots = new Map<string, Set<string>>();
   private lastSweepAt = 0;
-  private sweeping: Promise<SweepReport> | null = null;
+  private sweeping: { scope: string | null; report: Promise<TaggedSweepReport> } | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
   private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
 
@@ -332,7 +332,7 @@ export class BoatVmManager {
   }
 
   /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
-  private readonly localRuns = new Map<string, { issueId: string; agentId: string | null; workspaces: Set<string> }>();
+  private readonly localRuns = new Map<string, { issueId: string; agentId: string | null }>();
   /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
   private readonly endedLocalRuns = new Map<string, number>();
   /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
@@ -348,20 +348,49 @@ export class BoatVmManager {
     return JSON.stringify([companyId, runId]);
   }
 
+  /** The persisted owner of a started run, so a restarted worker still knows it. */
+  private runOwnerScope(companyId: string, runId: string) {
+    return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-runs", stateKey: runId };
+  }
+
   /** Record a started local run and the agent the host started it for. Returns false for a run that already ended. */
-  startLocalRun(companyId: string, runId: string, issueId: string, agentId: string | null = null): boolean {
+  async startLocalRun(companyId: string, runId: string, issueId: string, agentId: string | null = null): Promise<boolean> {
     const id = this.localRunKey(companyId, runId);
     this.pruneLocalRunState();
     if (this.endedLocalRuns.has(id)) return false;
-    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId, workspaces: new Set() });
-    return true;
+    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId });
+    if (agentId) {
+      await this.offloadState.set(this.runOwnerScope(companyId, runId), { version: 1, companyId, runId, issueId, agentId }).catch((error) => {
+        this.logger.warn("boat: could not persist the local run's owner", { runId, error: errorText(error) });
+      });
+      // The terminal event may have arrived while the write was in flight.
+      if (this.endedLocalRuns.has(id)) {
+        await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
+        return false;
+      }
+    }
+    return this.localRuns.has(id);
   }
 
-  /** True when a live run was started for a different agent. Agent API keys carry the run id
-   * from an unsigned header, so the run id alone does not prove the caller owns the run. */
-  localRunHeldByOtherAgent(companyId: string, runId: string, agentId: string | null | undefined): boolean {
-    const owner = this.localRuns.get(this.localRunKey(companyId, runId))?.agentId;
-    return typeof owner === "string" && owner !== agentId;
+  /** True only when the run is known to be started for this agent. Agent API keys carry the run id
+   * from an unsigned header, so the run id alone does not prove the caller owns the run. An unknown
+   * owner (a start event without one, or a restarted worker with nothing persisted) is refused. */
+  async localRunOwnedBy(companyId: string, runId: string, agentId: string | null | undefined): Promise<boolean> {
+    if (!agentId) return false;
+    const id = this.localRunKey(companyId, runId);
+    if (this.endedLocalRuns.has(id)) return false;
+    const live = this.localRuns.get(id);
+    if (live?.agentId) return live.agentId === agentId;
+    const saved = (await this.offloadState.get(this.runOwnerScope(companyId, runId)).catch(() => null)) as
+      | { version?: unknown; companyId?: unknown; runId?: unknown; issueId?: unknown; agentId?: unknown }
+      | null;
+    if (saved?.version !== 1 || saved.companyId !== companyId || saved.runId !== runId
+      || typeof saved.agentId !== "string" || typeof saved.issueId !== "string") return false;
+    // Rehydrate after a restart, unless the terminal event arrived during the read.
+    if (this.endedLocalRuns.has(id)) return false;
+    if (live) live.agentId = saved.agentId;
+    else this.localRuns.set(id, { issueId: saved.issueId, agentId: saved.agentId });
+    return saved.agentId === agentId;
   }
 
   /** Issue of a live (started, not ended) local run, or null. */
@@ -382,11 +411,10 @@ export class BoatVmManager {
     const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : "";
     const live = this.localRuns.get(this.localRunKey(params.companyId, runId));
     if (!runId || !workspaceId || !live || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
-    live.workspaces.add(workspaceId);
     await this.offloadWorkspaces.remember(params);
     // The terminal event may have arrived while the write was in flight.
     if (!this.localRuns.has(this.localRunKey(params.companyId, runId))) {
-      await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+      await this.offloadWorkspaces.forgetRun(params.companyId, runId);
       return false;
     }
     // A whole-run realization may have landed while the write was in flight: it keeps both stores.
@@ -394,26 +422,35 @@ export class BoatVmManager {
       const whole = this.wholeRunRealizations.get(JSON.stringify([params.companyId, runId, workspaceId]));
       if (whole) await this.offloadWorkspaces.remember(whole.params);
       else await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
-      live.workspaces.delete(workspaceId);
       return false;
     }
     this.nativeOffload.remember(params);
     return this.nativeOffload.has(params.companyId, runId, workspaceId);
   }
 
-  /** Terminal run: drop executor bindings and the local-run workspace records, and fence late binds. */
+  /** Terminal run: drop its owner, executor bindings and every persisted workspace record, and fence late binds. */
   async forgetLocalRun(companyId: string, runId: string): Promise<void> {
     const id = this.localRunKey(companyId, runId);
     this.pruneLocalRunState();
     this.endedLocalRuns.set(id, this.now());
+    this.localRuns.delete(id);
+    await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch((error) => {
+      this.logger.warn("boat: could not forget the local run's owner", { runId, error: errorText(error) });
+    });
+    // From the persisted index, so bindings are forgotten even when this worker never saw the run start.
+    await this.forgetRunOffload(companyId, runId);
+  }
+
+  /** Drop a run's whole-run realizations, executor bindings and persisted workspace bindings. */
+  private async forgetRunOffload(companyId: string, runId: string): Promise<void> {
     for (const key of this.wholeRunRealizations.keys()) {
       const [company, run] = JSON.parse(key) as [string, string, string];
       if (company === companyId && run === runId) this.wholeRunRealizations.delete(key);
     }
-    const live = this.localRuns.get(id);
-    this.localRuns.delete(id);
     this.nativeOffload.forgetRun(companyId, runId);
-    for (const workspaceId of live?.workspaces ?? []) await this.offloadWorkspaces.forget(companyId, workspaceId, runId);
+    await this.offloadWorkspaces.forgetRun(companyId, runId).catch((error) => {
+      this.logger.warn("boat: could not forget the run's offload workspace bindings", { runId, error: errorText(error) });
+    });
   }
 
   private offloadRouteHost(companyId: string, settings?: Record<string, unknown>) {
@@ -1823,6 +1860,8 @@ export class BoatVmManager {
     const api = this.opsApi(config);
 
     return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+      // The run's lease ends: its offload workspace bindings must not outlive it.
+      if (runId) await this.forgetRunOffload(params.companyId, runId);
       const snapshot = await this.store.update(params.companyId, (doc) => {
         const record = findBySandboxId(doc, sandboxId);
         if (!record) return null;
@@ -2005,7 +2044,9 @@ export class BoatVmManager {
     const config = parseDriverConfig(params.config);
     this.rememberConfig(params.companyId, params.environmentId, config);
     const api = this.opsApi(config);
+    const runId = str(params.leaseMetadata?.runId);
     return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+      if (runId) await this.forgetRunOffload(params.companyId, runId);
       // The delete removes the disk, but a delete that fails leaves the VM as it
       // is, so remove the run JWT first, the same as before a stop.
       const record = await this.store
@@ -2447,17 +2488,28 @@ export class BoatVmManager {
    * Every stop and delete runs under the card lock (an orphan's: the name
    * lock) and re-checks first. While a company's state cannot be read, a VM
    * with no record may be that company's, so it is left alone.
+   * With companyId, only that company's recorded VMs are touched and the report
+   * holds only that company's entries (orphans and account upkeep are left to
+   * the unscoped sweep).
    */
-  async sweep(reason: string, options: { force?: boolean } = {}): Promise<SweepReport> {
-    if (this.sweeping) return this.sweeping;
+  async sweep(reason: string, options: { force?: boolean; companyId?: string } = {}): Promise<SweepReport> {
+    const scope = options.companyId ?? null;
+    const running = this.sweeping;
+    if (running) {
+      if (running.scope === null || running.scope === scope) return scopeSweepReport(await running.report, scope);
+      // Another company's sweep: it did not cover this scope, so run after it.
+      await running.report.catch(() => undefined);
+      return await this.sweep(reason, options);
+    }
     if (!options.force && this.now() - this.lastSweepAt < SWEEP_MIN_INTERVAL_MS) {
       return { skipped: "recent", stopped: [], deleted: [], forgotten: [], errors: [] };
     }
-    this.sweeping = this.doSweep(reason).finally(() => {
-      this.lastSweepAt = this.now();
-      this.sweeping = null;
+    const report: Promise<TaggedSweepReport> = this.doSweep(reason, scope).finally(() => {
+      if (scope === null) this.lastSweepAt = this.now();
+      if (this.sweeping?.report === report) this.sweeping = null;
     });
-    return this.sweeping;
+    this.sweeping = { scope, report };
+    return scopeSweepReport(await report, scope);
   }
 
   /**
@@ -2474,7 +2526,8 @@ export class BoatVmManager {
 
   /** Test hook: the sweep in flight, if any. */
   sweepInFlight(): Promise<SweepReport> | null {
-    return this.sweeping;
+    const running = this.sweeping;
+    return running ? running.report.then((report) => scopeSweepReport(report, running.scope)) : null;
   }
 
   /** The lock the sweep holds to stop or delete a VM: its card's, or for an orphan, its name's (acquire holds both). */
@@ -2521,10 +2574,12 @@ export class BoatVmManager {
     return true;
   }
 
-  private async doSweep(reason: string): Promise<SweepReport> {
-    const report: SweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
-    // Existing native job owns stop retry/reconciliation; no host pacer.
-    await this.nativeOffload.sweep().catch(() => report.errors.push("offload pool sweep unverified"));
+  /** scope: a company id to sweep only that company's recorded VMs, or null for all. Every entry is tagged with its company. */
+  private async doSweep(reason: string, scope: string | null): Promise<TaggedSweepReport> {
+    const report: TaggedSweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
+    const tag = (companyId: string | null, value: string) => ({ companyId, value });
+    // Existing native job owns stop retry/reconciliation; no host pacer. It spans companies: unscoped sweeps only.
+    if (scope === null) await this.nativeOffload.sweep().catch(() => report.errors.push(tag(null, "offload pool sweep unverified")));
     if (this.configs.size === 0) {
       report.skipped = "no_config_seen";
       return report;
@@ -2546,10 +2601,10 @@ export class BoatVmManager {
         docs.set(companyId, await this.store.read(companyId));
       } catch (error) {
         unreadable.add(companyId);
-        report.errors.push(`state ${companyId}: ${errorText(error)}`);
+        report.errors.push(tag(companyId, `state ${companyId}: ${errorText(error)}`));
       }
     }
-    if (!companiesKnown) report.errors.push("state: the list of companies could not be read");
+    if (!companiesKnown) report.errors.push(tag(null, "state: the list of companies could not be read"));
     /** Could a company whose state is unknown own VMs of this account? (No cached config for it: it could own any.) */
     const ownershipUnknown = (cachedList: CachedConfig[]): boolean =>
       !companiesKnown ||
@@ -2578,6 +2633,8 @@ export class BoatVmManager {
 
     const now = this.now();
     for (const cachedList of accounts.values()) {
+      // A scoped sweep visits only accounts that company uses.
+      if (scope !== null && !cachedList.some((cached) => cached.companyId === scope)) continue;
       const primary = cachedList[0];
       const prefixes = new Set(cachedList.map((c) => c.config.namePrefix));
       const namePattern = new RegExp(`^(${[...prefixes].map((p) => p.replace(/[^a-z0-9-]/g, "")).join("|")})-[0-9a-f]{16}$`);
@@ -2585,20 +2642,24 @@ export class BoatVmManager {
       try {
         sandboxes = await this.listSandboxes(this.opsApi(primary.config));
       } catch (error) {
-        report.errors.push(`list: ${errorText(error)}`);
+        report.errors.push(tag(scope, `list: ${errorText(error)}`));
         continue;
       }
       // Every intent is reconciled only through its persisted credential group,
       // not whichever inventory happened to list first. Legacy unscoped holds
       // cannot be assigned to a client when multiple groups are configured.
-      await this.account(primary.config).reconcile(this.opsApi(primary.config), sandboxes, true, accounts.size === 1).catch(() => {
-        report.errors.push("account reservation reconciliation failed");
-      });
+      // Account reservations span the companies sharing it: unscoped sweeps only.
+      if (scope === null) {
+        await this.account(primary.config).reconcile(this.opsApi(primary.config), sandboxes, true, accounts.size === 1).catch(() => {
+          report.errors.push(tag(null, "account reservation reconciliation failed"));
+        });
+      }
       const seen = new Set(sandboxes.map((s) => s.id));
       const unknownOwner = ownershipUnknown(cachedList);
       const leftAlone: string[] = [];
       for (const sandbox of sandboxes) {
         const record = recordFor(sandbox.id);
+        if (scope !== null && record?.companyId !== scope) continue; // another company's, or an orphan
         if (!record && !(sandbox.name && namePattern.test(sandbox.name))) continue; // not ours
         if (!record && unknownOwner) {
           // Maybe an orphan, maybe a VM of the company whose state could not be read (with an active lease): leave it.
@@ -2689,11 +2750,11 @@ export class BoatVmManager {
             });
             if (!outcome) continue;
             if (outcome === "deleted") {
-              report.deleted.push(sandbox.id);
+              report.deleted.push(tag(record?.companyId ?? null, sandbox.id));
               this.logger.info("boat: sweep deleted an idle VM instead of stopping it (runtime_scrub_failed)", { sandboxId: sandbox.id, orphan: !record, reason });
               continue;
             }
-            report.stopped.push(sandbox.id);
+            report.stopped.push(tag(record?.companyId ?? null, sandbox.id));
             this.logger.info(`boat: sweep stopped an idle VM after ${Math.round(idleMinutes)} min`, {
               sandboxId: sandbox.id,
               hadActiveLease: hasActive,
@@ -2754,10 +2815,10 @@ export class BoatVmManager {
             this.logger.info("boat: sweep left a stopped VM alone: it changed while the sweep decided to delete it", { sandboxId: sandbox.id, deleteReason, reason });
             continue;
           }
-          report.deleted.push(sandbox.id);
+          report.deleted.push(tag(record?.companyId ?? null, sandbox.id));
           this.logger.info(`boat: sweep deleted a stopped VM (${deleteReason})`, { sandboxId: sandbox.id, reason });
         } catch (error) {
-          report.errors.push(`${sandbox.id}: ${errorText(error)}`);
+          report.errors.push(tag(record?.companyId ?? null, `${sandbox.id}: ${errorText(error)}`));
         }
       }
       if (leftAlone.length > 0) {
@@ -2765,12 +2826,13 @@ export class BoatVmManager {
       }
       // Records whose VM no longer exists at boat: forget them.
       for (const [companyId, doc] of docs) {
+        if (scope !== null && companyId !== scope) continue;
         for (const record of Object.values(doc.vms)) {
           if (record.status === "deleted" || seen.has(record.sandboxId)) continue;
           const owner = this.configs.get(record.environmentId);
           if (!owner || !cachedList.includes(owner)) continue;
           await this.markDeleted(companyId, record.sandboxId).catch(() => undefined);
-          report.forgotten.push(record.sandboxId);
+          report.forgotten.push(tag(companyId, record.sandboxId));
         }
       }
     }
@@ -2903,6 +2965,32 @@ export interface SweepReport {
   deleted: string[];
   forgotten: string[];
   errors: string[];
+}
+
+/** A sweep report entry and the company it concerns (null: no company, such as an orphan VM). */
+interface SweepEntry {
+  companyId: string | null;
+  value: string;
+}
+
+interface TaggedSweepReport {
+  skipped: string | null;
+  stopped: SweepEntry[];
+  deleted: SweepEntry[];
+  forgotten: SweepEntry[];
+  errors: SweepEntry[];
+}
+
+/** The report a caller may see: everything for an unscoped sweep, else only its company's entries. */
+function scopeSweepReport(report: TaggedSweepReport, scope: string | null): SweepReport {
+  const pick = (entries: SweepEntry[]) => entries.filter((entry) => scope === null || entry.companyId === scope).map((entry) => entry.value);
+  return {
+    skipped: report.skipped,
+    stopped: pick(report.stopped),
+    deleted: pick(report.deleted),
+    forgotten: pick(report.forgotten),
+    errors: pick(report.errors),
+  };
 }
 
 export interface UsageSummary {

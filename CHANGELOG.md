@@ -10,6 +10,8 @@
 
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
 * Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
+* `POST /sweep` now acts on and reports only the calling company's VMs. The scheduled sweep still covers every company, orphan VMs and account upkeep.
+* Offload routes admit a run only when its owning agent is known. The owner from `agent.run.started` is persisted, so a restarted worker still admits it; a run with no known owner is refused. A run's workspace bindings are indexed in plugin state and forgotten on its terminal event, and on release or destroy of its lease, even when the worker holds nothing about the run in memory.
 
 ## 0.2.3
 

@@ -103,7 +103,7 @@ const plugin = definePlugin({
       // Record every started run before reading settings: the record grants nothing, and a
       // transient config failure here stays recoverable on the run's first offload request.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
-      if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId, agentId)) return;
+      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId, agentId))) return;
       await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
@@ -135,11 +135,12 @@ const plugin = definePlugin({
       return { status: 200, body: await boat.usageSummary(input.companyId, { refresh }) };
     }
     if (input.routeKey === "sweep") {
-      return { status: 200, body: await boat.sweep("api", { force: true }) };
+      // Acts on and reports only the caller's company; the scheduled job sweeps every company.
+      return { status: 200, body: await boat.sweep("api", { force: true, companyId: input.companyId }) };
     }
     if (input.routeKey.startsWith("offload_") && input.actor.actorType === "agent" && input.actor.runId
-      && boat.localRunHeldByOtherAgent(input.companyId, input.actor.runId, input.actor.agentId)) {
-      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run belongs to another agent", { commandId: null }) };
+      && !(await boat.localRunOwnedBy(input.companyId, input.actor.runId, input.actor.agentId))) {
+      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run is not known to belong to this agent", { commandId: null }) };
     }
     if (input.routeKey === "offload_exec") {
       await bindOnFirstRequest(boat, input);

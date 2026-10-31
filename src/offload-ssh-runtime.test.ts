@@ -6,7 +6,7 @@ import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
-import plugin, { setManagerOverridesForTests } from "./plugin.js";
+import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { BoatApiLike } from "./boat-client.js";
@@ -90,7 +90,9 @@ describe("stock concrete executor factory", () => {
     await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
     await plugin.definition.onEnvironmentRealizeWorkspace!(native());
     const cmd = command();
-    const actor = { actorType: "agent", actorId: randomUUID(), runId };
+    const agentId = randomUUID();
+    const actor = { actorType: "agent", actorId: agentId, agentId, runId };
+    await currentManager().startLocalRun(companyId, runId, randomUUID(), agentId);
     await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor, params: {}, query: {},
       body: { version: 1, commandId: cmd.commandId, executionWorkspaceId, argv: cmd.argv, cwdRelative: ".", env: {},
         queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: false } } as never);

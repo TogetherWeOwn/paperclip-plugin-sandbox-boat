@@ -239,6 +239,48 @@ describe("plugin wiring", () => {
     }
   });
 
+  const workspaceBindings = (harness: Awaited<ReturnType<typeof setup>>) =>
+    [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
+  const restart = async (harness: Awaited<ReturnType<typeof setup>>) => {
+    await plugin.definition.onShutdown?.();
+    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => enabled } } as never);
+  };
+
+  it("refuses a run whose owner is unknown: a started event without an agent", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", { companyId, payload: { runId, issueId, status: "running" } });
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("refuses a bound run that this worker never saw start", async () => {
+    await setup(enabled);
+    await (await import("./plugin.js")).currentManager().rememberOffloadWorkspace((await localRunRealization(started, localRunSettings(enabled), host()))!);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a restarted worker keeps the persisted owner: the owner is admitted, another agent is not", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    await restart(harness);
+    expect((await exec(runId)).status).toBe(200);
+    const other = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
+      actor: { actorType: "agent", actorId: randomUUID(), agentId: randomUUID(), runId }, params: {}, query: {},
+      body: { version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId, argv: ["test"], cwdRelative: ".", env: {},
+        queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true } } as never);
+    expect(other.status).toBe(403);
+  });
+
+  it("a terminal event forgets the run's persisted workspace bindings and owner after a worker restart", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    expect(workspaceBindings(harness)).toHaveLength(1);
+    await restart(harness); // nothing about the run in memory
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    expect(workspaceBindings(harness)).toEqual([]);
+    expect([...harness.state.keys()].some((key) => key.includes("boat-offload-run"))).toBe(false);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
   it("leaves local runs unbound while the setting is off", async () => {
     const harness = await setup({});
     await harness.emit("agent.run.started", started);
