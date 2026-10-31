@@ -24,5 +24,5 @@ until systemctl --user is-system-running --wait >/dev/null 2>&1 || [ "$(systemct
   sleep 1
 done
 
-exec \
+exec systemd-run --user --scope --quiet -p Delegate=yes \
   env PAPERCLIP_TEST_CGROUP_REQUIRED=1 npx vitest run --project guest-watchdog
