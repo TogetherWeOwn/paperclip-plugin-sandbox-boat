@@ -44,6 +44,9 @@ export interface OffloadRecord {
   cancelRequested?: string;
   output?: OffloadOutputEvent[];
   tombstone?: boolean;
+  // First sweep that saw the run permanently terminal, persisted on the
+  // tombstone: a host that cannot report terminatedAt still bounds retention.
+  runTerminalSeenAt?: number;
 }
 
 export interface OffloadReceipt {
@@ -64,6 +67,8 @@ export interface OffloadSync {
   // Collection is adapter-owned data; orchestration passes it to stage intact.
   collect(sandboxId: string, command: OffloadCommand): Promise<unknown>;
   stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
+  // Drop the host-side upload after a failed command; never throws.
+  discard?(sandboxId: string, command: OffloadCommand): Promise<void>;
 }
 
 export interface OffloadDurableDeps {
@@ -155,6 +160,7 @@ function parseRecord(value: unknown, key: string): OffloadRecord {
     || typeof value.commandId !== "string" || typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest)
     || !STATES.has(value.state as OffloadState) || !Number.isFinite(value.acceptedAt) || !Number.isFinite(value.updatedAt)
     || (value.resultAt !== null && !Number.isFinite(value.resultAt))
+    || (value.runTerminalSeenAt !== undefined && !Number.isFinite(value.runTerminalSeenAt))
     || ![null, false, true].includes(value.remoteStarted as null | boolean) || typeof value.fallbackSafe !== "boolean"
     || (value.identity !== null && !validIdentity(value.identity))) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
   if (value.output !== undefined && (!Array.isArray(value.output) || !value.output.every((event, index) =>
@@ -364,29 +370,39 @@ export class OffloadJournal {
     // cancellation can fence spawn, but need not abort an already-running push.
     if (record.state === "not_started" || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
     await this.deps.sync.push(sandboxId, command);
-    const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
-    if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
-    const base: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
-      digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
-    const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
+    // A transport failure keeps the upload: receipt reconciliation may still
+    // collect from it. Every other failure ends the command's use of it.
+    let transporting = false;
     try {
-      await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
-      await this.pool.bind?.(identity);
+      const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
+      if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      const base: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
+        digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
+      const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
+      try {
+        await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
+        await this.pool.bind?.(identity);
+      } catch (error) {
+        // A failed commit or pre-start cancellation must not retain an entry
+        // registered by prepare(); neither watchdog nor transport was invoked.
+        this.lifecycle?.discard(identity);
+        throw error;
+      }
+      transporting = true;
+      const result = await transport(sandboxId, command, identity);
+      transporting = false;
+      // The legacy transport resolves at exit, not at spawn. Do not claim a
+      // running acknowledgement until it actually returns evidence of execution.
+      await this.transition(record, async () => {
+        await this.commit(record, { state: "running", remoteStarted: true });
+        await this.commit(record, { state: "syncing_out" });
+      });
+      const syncBack = await this.syncOut(sandboxId, command);
+      return { ...result, ...(syncBack ? { syncBack } : {}) };
     } catch (error) {
-      // A failed commit or pre-start cancellation must not retain an entry
-      // registered by prepare(); neither watchdog nor transport was invoked.
-      this.lifecycle?.discard(identity);
+      if (!transporting) await this.deps.sync.discard?.(sandboxId, command);
       throw error;
     }
-    const result = await transport(sandboxId, command, identity);
-    // The legacy transport resolves at exit, not at spawn. Do not claim a
-    // running acknowledgement until it actually returns evidence of execution.
-    await this.transition(record, async () => {
-      await this.commit(record, { state: "running", remoteStarted: true });
-      await this.commit(record, { state: "syncing_out" });
-    });
-    const syncBack = await this.syncOut(sandboxId, command);
-    return { ...result, ...(syncBack ? { syncBack } : {}) };
   }
 
   private async syncOut(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
@@ -631,12 +647,21 @@ export class OffloadJournal {
         const record = parseRecord(await this.deps.journalStore.get(key), key);
         if (!TERMINAL.has(record.state)) continue;
         const run = await this.deps.resolveRunState(record.companyId, record.runId);
-        if (record.tombstone && run.permanentlyTerminal && run.terminatedAt !== null
-          && this.now() >= run.terminatedAt + 30 * DAY && this.now() >= run.tokenExpiresAt) {
-          await this.deps.journalStore.delete(key);
-        } else if (!record.tombstone && record.resultAt !== null && this.now() - record.resultAt >= DAY) {
+        if (record.tombstone) {
+          const terminatedAt = run.permanentlyTerminal ? run.terminatedAt ?? record.runTerminalSeenAt ?? null : null;
+          if (terminatedAt !== null && this.now() >= terminatedAt + 30 * DAY && this.now() >= run.tokenExpiresAt) {
+            await this.deps.journalStore.delete(key);
+          } else if (run.permanentlyTerminal && run.terminatedAt === null && record.runTerminalSeenAt === undefined) {
+            await this.deps.journalStore.set(key, { ...record, runTerminalSeenAt: this.now() });
+          } else if (!run.permanentlyTerminal && record.runTerminalSeenAt !== undefined) {
+            // The run is live again: its retention clock restarts once it ends.
+            const { runTerminalSeenAt: _seen, ...live } = record;
+            await this.deps.journalStore.set(key, live);
+          }
+        } else if (record.resultAt !== null && this.now() - record.resultAt >= DAY) {
           const { command: _command, output: _output, ...compact } = record;
-          await this.deps.journalStore.set(key, { ...compact, result: null, tombstone: true });
+          await this.deps.journalStore.set(key, { ...compact, result: null, tombstone: true,
+            ...(run.permanentlyTerminal && run.terminatedAt === null ? { runTerminalSeenAt: this.now() } : {}) });
         }
       }
     });

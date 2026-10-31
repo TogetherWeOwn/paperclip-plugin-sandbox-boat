@@ -185,7 +185,7 @@ function journalStore(state: StateClientLike, companyId: string, poolId: string)
 
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
-  private readonly pools = new Map<string, { executor: OffloadExecutor; guest: SshOffloadGuest }>();
+  private readonly pools = new Map<string, { executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
   private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
@@ -332,9 +332,10 @@ export class SshOffloadRuntime {
         terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
       }),
       sync: { push: (vm, cmd) => sync.push(vm, cmd),
-        collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected) },
+        collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
+        discard: (vm, cmd) => sync.discard(vm, cmd) },
     });
-    this.pools.set(poolId, { executor, guest });
+    this.pools.set(poolId, { executor, guest, sync });
     return executor;
   }
 
@@ -368,9 +369,10 @@ export class SshOffloadRuntime {
   }
 
   async sweep(): Promise<void> {
-    const outcomes = await Promise.allSettled([...this.pools.values()].map(async ({ executor }) => {
+    const outcomes = await Promise.allSettled([...this.pools.values()].map(async ({ executor, sync }) => {
       await executor.sweep();
       await executor.collectGarbage();
+      await sync.collectGarbage();
     }));
     if (outcomes.some((outcome) => outcome.status === "rejected")) throw new Error("Offload pool sweep unverified");
   }

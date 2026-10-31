@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
@@ -19,11 +19,16 @@ export interface SshOffloadSyncDeps {
   workRoot?: string;
   /** Test seam for the rsync delta spawn. */
   spawn?: SpawnFn;
+  /** Clock for upload and artifact retention. */
+  now?: () => number;
 }
+
+/** Returned artifacts outlive the one-day result retention, then the sweep reclaims them. */
+export const ARTIFACT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
 /** Delta push into a persistent per-card guest mirror, and bounded staged-only return collection. */
 export class SshOffloadSync implements OffloadSync {
-  private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string }>();
+  private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string; at: number }>();
   /** Previous manifest per (VM, card mirror): the host-side delta base. A mirror lives on one VM, so a push on another VM never moves it. Verified against the guest marker on every push. */
   private readonly mirrors = new Map<string, SourceManifest>();
   /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
@@ -31,6 +36,7 @@ export class SshOffloadSync implements OffloadSync {
   /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
+  private now(): number { return (this.deps.now ?? Date.now)(); }
   /** Guest-side content-addressed marker root for installed dependencies. */
   depCacheDir(): string { return path.posix.join(this.deps.workRoot ?? "/tmp", "paperclip-boat-deps"); }
   private key(command: OffloadCommand): string {
@@ -63,7 +69,7 @@ export class SshOffloadSync implements OffloadSync {
         await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
         await this.installDependencies(sandboxId, command, source, guestDir);
       });
-      this.uploads.set(this.key(command), { source, manifest, scratch, guestDir });
+      this.uploads.set(this.key(command), { source, manifest, scratch, guestDir, at: this.now() });
       await rm(frozen, { recursive: true, force: true });
     } catch (error) {
       await rm(scratch, { recursive: true, force: true });
@@ -209,5 +215,35 @@ export class SshOffloadSync implements OffloadSync {
     if (!staged.artifactDir) await rm(upload.scratch, { recursive: true, force: true });
     this.uploads.delete(this.key(command));
     return { state: staged.state, changedPaths: staged.changedPaths, conflictPaths: staged.conflictPaths, artifactId: staged.artifactDir };
+  }
+  /** Drop a failed command's upload and its scratch dir, staged returns included. */
+  async discard(_sandboxId: string, command: OffloadCommand): Promise<void> {
+    const upload = this.uploads.get(this.key(command));
+    if (!upload) return;
+    this.uploads.delete(this.key(command));
+    await rm(upload.scratch, { recursive: true, force: true }).catch(() => undefined);
+  }
+  /**
+   * Retention: forget uploads and remove command-* scratch dirs, staged
+   * returns included, once older than the artifact window. The artifact root
+   * may be shared by several pools, so age alone decides; a live command's
+   * scratch dir is touched at push and is far younger than the window.
+   */
+  async collectGarbage(): Promise<void> {
+    const cutoff = this.now() - ARTIFACT_RETENTION_MS;
+    for (const [id, upload] of this.uploads) if (upload.at < cutoff) this.uploads.delete(id);
+    const live = new Set([...this.uploads.values()].map((upload) => upload.scratch));
+    const entries = await readdir(this.deps.artifactRoot).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
+    for (const name of entries) {
+      if (!name.startsWith("command-")) continue;
+      const dir = path.join(this.deps.artifactRoot, name);
+      if (live.has(dir)) continue;
+      const info = await lstat(dir).catch(() => null);
+      if (!info?.isDirectory() || info.mtimeMs >= cutoff) continue;
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 }

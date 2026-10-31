@@ -2525,6 +2525,12 @@ export class BoatVmManager {
     const report: SweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
     // Existing native job owns stop retry/reconciliation; no host pacer.
     await this.nativeOffload.sweep().catch(() => report.errors.push("offload pool sweep unverified"));
+    // Broker retention: after a restart a company's broker exists only once
+    // its config is seen again, so cover both.
+    const brokerCompanies = new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId)]);
+    for (const companyId of brokerCompanies) {
+      await this.offloadBroker(companyId).collectGarbage().catch(() => report.errors.push("offload broker retention unverified"));
+    }
     if (this.configs.size === 0) {
       report.skipped = "no_config_seen";
       return report;
