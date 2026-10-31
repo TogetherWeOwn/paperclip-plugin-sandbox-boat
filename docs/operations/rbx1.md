@@ -212,24 +212,24 @@ Each step stands alone and takes effect on the next command. Stop at the first o
 
 1. **Shim off:** set the project env `BOAT_OFFLOAD` to `0`, or remove the entry. From the next run, the shim runs local Cargo with no broker call. `cargo_cache.py` and its local path are unchanged.
 2. **Flags off:** save the company plugin config with `offloadExecutorEnabled`, `offloadGuestTransportEnabled` and `offloadLocalRunsEnabled` set to `false`. New commands stay local. Commands in flight settle, and their receipts and staged artifacts are kept.
-3. **Record the plugin's VMs** before the uninstall. The plugin keeps two kinds, in different places, and both go into `boat-vms-to-delete.txt` for step 5:
+3. **Record the plugin's VMs** before the uninstall. The plugin keeps two kinds, in different places:
 
-   * card VMs (whole-run leases), named `paperclip-<hash>`. The `usage` route lists them:
+   * card VMs (whole-run leases), named `paperclip-<hash>`. The `usage` route lists them;
+   * offload pool VMs. These are created **without a name**, so a `paperclip-*` filter never finds them. Their ids are only in the plugin's instance state (`boat-offload-pool`), which no route lists, so they are read from the Paperclip database (read-only).
 
-     ```sh
-     curl -fsS -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
-       | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const v of JSON.parse(s).vms)if(v.status!=="deleted")console.log(v.sandboxId)})' \
-       | tee boat-vms-to-delete.txt
-     ```
+   Both reads must succeed. No pipes, so a failed read cannot pass for an empty one. Go on to step 4 only if the last line printed is `recorded`:
 
-   * offload pool VMs. These are created **without a name**, so a `paperclip-*` filter never finds them. Their ids are only in the plugin's instance state (`boat-offload-pool`), which no route lists. Read them from the Paperclip database (read-only):
-
-     ```sh
-     DB=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/home/ubuntu/.paperclip/instances/default/config.json","utf8")).database.connectionString)')
-     psql "$DB" -At -v ON_ERROR_STOP=1 -c "select vm->>'sandboxId' from plugin_state, jsonb_array_elements(value_json->'vms') vm
-       where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool' and vm->>'sandboxId' <> ''" \
-       | tee -a boat-vms-to-delete.txt
-     ```
+   ```sh
+   DB=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/home/ubuntu/.paperclip/instances/default/config.json","utf8")).database.connectionString)')
+   if curl -fsS -o usage.json -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
+     && node -e 'for (const v of JSON.parse(require("fs").readFileSync("usage.json","utf8")).vms) if (v.status !== "deleted") console.log(v.sandboxId)' > card-vms.txt \
+     && psql "$DB" -At -v ON_ERROR_STOP=1 -o pool-vms.txt -c "select vm->>'sandboxId' from plugin_state, jsonb_array_elements(value_json->'vms') vm
+          where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool' and vm->>'sandboxId' <> ''"; then
+     cat card-vms.txt pool-vms.txt > boat-vms-to-delete.txt && cat boat-vms-to-delete.txt && echo recorded
+   else
+     echo 'STOP: the VM inventory failed; do not uninstall' >&2
+   fi
+   ```
 
    Do not print `$DB`: it holds the database password.
 
