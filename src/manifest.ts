@@ -351,7 +351,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           apiBase: {
             type: "string",
-            description: "boat API base URL. Default https://boat.dev/api/v1.",
+            description: "boat API base URL. Default https://boat.dev/api/v1. Any other base needs its own apiKey (usage reads use costApiKey if set, else that apiKey): the host BOAT_API_KEY and BOAT_READONLY_KEY are only sent to the default.",
             ...advanced("API"),
           },
           timeoutMs: {
