@@ -34,7 +34,10 @@ if [ -e "$shims/cargo" ] && [ ! -L "$shims/cargo" ]; then
 fi
 
 mkdir -p "$shims"
-tmp="$shims/.cargo.$$"
-ln -s "$target" "$tmp"
+# An unpredictable name: a planted entry at a guessable one could redirect the
+# link. ln -sf replaces mktemp's placeholder file.
+tmp=$(mktemp "$shims/.cargo.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+ln -sf "$target" "$tmp"
 mv -T "$tmp" "$shims/cargo"
 echo "$shims/cargo -> $target"

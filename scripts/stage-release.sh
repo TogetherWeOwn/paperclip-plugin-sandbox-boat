@@ -91,12 +91,12 @@ fi
 
 SUDO=
 [ -w "$root" ] || SUDO=sudo
-partial="$dest.partial.$$"
+partial=
 work=$(mktemp -d "${TMPDIR:-/tmp}/stage-release-XXXXXX")
 cleanup() {
   chmod -R u+w "$work" 2>/dev/null || true
   rm -rf "$work"
-  if [ -e "$partial" ]; then $SUDO rm -rf "$partial"; fi
+  if [ -n "$partial" ] && [ -e "$partial" ]; then $SUDO rm -rf "$partial"; fi
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM
@@ -141,9 +141,12 @@ rm "$link"
 ln -s "$host_sdk" "$link"
 
 # Same order as stage-package.sh: copy next to the destination, rename in one
-# step, make it read-only last.
-$SUDO cp -R -P "$pkg" "$partial"
+# step, make it read-only last. mktemp gives the partial copy a name nobody can
+# plant first, and mv -T never moves it into a $dest that appeared meanwhile.
+partial=$($SUDO mktemp -d "$root/.$name.partial.XXXXXX")
+$SUDO cp -R -P "$pkg/." "$partial"
+$SUDO chmod 755 "$partial"
 if [ -n "$SUDO" ]; then $SUDO chown -R -h "$(id -u):$(id -g)" "$partial"; fi
-$SUDO mv "$partial" "$dest"
+$SUDO mv -T "$partial" "$dest"
 $SUDO chmod -R a-w "$dest"
 echo "$dest"

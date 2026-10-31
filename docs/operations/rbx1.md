@@ -47,7 +47,8 @@ Install the first release that has all of these:
 mkdir -p /home/ubuntu/.paperclip/plugin-packages
 cd "$(mktemp -d)"
 gh release download vX.Y.Z -R TogetherWeOwn/paperclip-plugin-sandbox-boat
-git clone -q https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat src
+# the scripts from the same tag as the tarball, not from main
+git clone -q --depth 1 --branch vX.Y.Z https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat src
 src/scripts/stage-release.sh "$PWD"/sandbox-boat-X.Y.Z-*.tgz /home/ubuntu/.paperclip/plugin-packages
 # prints /home/ubuntu/.paperclip/plugin-packages/sandbox-boat-X.Y.Z-<sha>
 ```
@@ -62,13 +63,14 @@ scripts/stage-package.sh <commit on main> /home/ubuntu/.paperclip/plugin-package
   /home/ubuntu/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk
 ```
 
-Check it before installing:
+Check it before installing. Do not go on unless the last line prints `ready`:
 
 ```sh
 PKG=/home/ubuntu/.paperclip/plugin-packages/sandbox-boat-X.Y.Z-<sha>
 readlink "$PKG/node_modules/@paperclipai/plugin-sdk"   # the cli/current path
 cat "$PKG/.source-commit"                              # the tagged commit
-ls "$PKG/bin"                                          # boat-offload-cargo, -node, -python
+test -f "$PKG/bin/boat-offload-cargo" && test -f "$PKG/dist/offload/shim-main.js" \
+  && echo ready || echo 'STOP: this package has no Cargo shim'
 ```
 
 ## 3. Install
@@ -160,7 +162,10 @@ Then set two env entries on the **two-bot-next project**. Paperclip adds a proje
 * then the server's own `PATH`, read from the running server.
 
 ```sh
-SERVER_PATH=$(tr '\0' '\n' < "/proc/$(pgrep -f 'paperclipai/dist/index.js run' | head -n 1)/environ" | sed -n 's/^PATH=//p')
+SERVER_PID=$(pgrep -o -f 'paperclipai/dist/index.js run --instance default')
+SERVER_PATH=$(tr '\0' '\n' < "/proc/$SERVER_PID/environ" | sed -n 's/^PATH=//p')
+# An empty value would leave runs with only the shim and Cargo dirs on PATH.
+[ -n "$SERVER_PATH" ] && echo "$SERVER_PATH" || echo 'STOP: no server PATH; do not send the PATCH'
 PROJECT_ID=<two-bot-next project id>   # GET /api/companies/$CID/projects
 curl -fsS -X PATCH "$PAPERCLIP/api/projects/$PROJECT_ID" \
   -H "Authorization: Bearer $BOARD_TOKEN" -H 'content-type: application/json' -d @- <<EOF
@@ -204,8 +209,16 @@ Each step stands alone and takes effect on the next command. Stop at the first o
 
 1. **Shim off:** set the project env `BOAT_OFFLOAD` to `0`, or remove the entry. From the next run, the shim runs local Cargo with no broker call. `cargo_cache.py` and its local path are unchanged.
 2. **Flags off:** save the company plugin config with `offloadExecutorEnabled`, `offloadGuestTransportEnabled` and `offloadLocalRunsEnabled` set to `false`. New commands stay local. Commands in flight settle, and their receipts and staged artifacts are kept.
-3. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Add `?purge=true` only to delete the plugin's state too.
-4. **Delete VMs:** list the account's VMs with the boat CLI, then delete every `paperclip-*` VM with `boat delete <id> --yes`. List them again to check that none are left. A stopped VM still holds disk.
-5. **Clean up the host:** remove `BOAT_OFFLOAD` and `PATH` from the two-bot-next project env, delete the shim dir, and, after reviewing the artifact root, delete it. Delete the package directory as in step 7.
+3. **Record the plugin's VMs**, while the plugin still runs. These ids are the VMs to delete in step 5:
+
+   ```sh
+   curl -fsS -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
+     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const v of JSON.parse(s).vms)if(v.status!=="deleted")console.log(v.sandboxId,v.sandboxName,v.status)})' \
+     | tee boat-vms-to-delete.txt
+   ```
+
+4. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Add `?purge=true` only to delete the plugin's state too.
+5. **Delete VMs:** delete each id in `boat-vms-to-delete.txt` with `boat delete <id> --yes`. Then list the account's VMs with the boat CLI to check that none of those ids are left; a stopped VM still holds disk. A name prefix does not prove the plugin owns a VM. Do not delete a `paperclip-*` VM that is not in the file: report it on the card for a human decision.
+6. **Clean up the host:** remove `BOAT_OFFLOAD` and `PATH` from the two-bot-next project env, delete the shim dir, and, after reviewing the artifact root, delete it. Delete the package directory as in step 7.
 
 Keep the steps in this order. Turning the shim or flags off first means no new command can start a VM while you delete them.
