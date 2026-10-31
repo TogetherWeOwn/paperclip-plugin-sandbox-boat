@@ -12,7 +12,7 @@ import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
 import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
-import { bodyTooLarge, LONE_SURROGATE, validateSubmit } from "./validate.js";
+import { bodyTooLarge, cwdProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
 /** The refusal path must answer the same documented 409 as submit() for a reused ID. */
 async function recordRefusalOrConflict(
@@ -370,7 +370,7 @@ async function decideRemote(
   if (!host.durations) {
     return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
   }
-  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv));
+  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv, cwdRelative));
   const history = await readHistory(host.durations, key);
   if (history.length === 0) {
     return { mode: "local", reason: "no duration history yet; run local first and record", profileId: profile.id, subcommand: classification.subcommand, runner };
@@ -429,6 +429,10 @@ export async function handleReport(
     || record.durationSeconds < 0 || record.durationSeconds > 86_400) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "durationSeconds must be 0..86400", {}) };
   }
+  // Optional for older shims, which only ever ran at the workspace root.
+  const cwdRelative = record.cwdRelative ?? ".";
+  const cwdIssue = typeof cwdRelative === "string" ? cwdProblem(cwdRelative) : "cwdRelative must be a string";
+  if (cwdIssue) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", cwdIssue, {}) };
   if (!host.durations) {
     return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "duration learning unavailable", { commandId: null, remoteStarted: false, fallbackSafe: true }) };
   }
@@ -436,7 +440,7 @@ export async function handleReport(
   if (!workspace) {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: null }) };
   }
-  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[]));
+  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[], cwdRelative as string));
   await recordDuration(host.durations, key, { seconds: record.durationSeconds, at: Date.now() });
   return { status: 200, body: { version: OFFLOAD_VERSION, recorded: true } };
 }

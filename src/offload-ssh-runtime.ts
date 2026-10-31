@@ -20,7 +20,7 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
-import { DEFAULT_SYNC_EXCLUDES } from "./offload-sync.js";
+import { DEFAULT_SYNC_EXCLUDES, snapshotHasDirectory } from "./offload-sync.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number };
@@ -238,6 +238,9 @@ export class SshOffloadRuntime {
       : classifyPython(runner, command.argv, profile);
     if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
     if (!this.confined(command, tool)) return null;
+    // The guest runs in the mirrored cwd: an empty or sync-excluded directory
+    // is absent there, so the command could not start remotely.
+    if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
@@ -318,7 +321,7 @@ export class SshOffloadRuntime {
         const tool = cmd.tool ?? "cargo";
         if (tool === "cargo") return;
         const scope = { scopeKind: "company" as const, scopeId: cmd.companyId, namespace: "boat-offload", stateKey: "" };
-        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv));
+        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
             set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value) }, key, { seconds, at: Date.now() });

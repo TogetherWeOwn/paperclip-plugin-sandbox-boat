@@ -37,7 +37,7 @@ function invalid(detail: string): ValidateResult {
 }
 
 /** Reject absolute paths and any `..` that escapes the workspace root. */
-function cwdProblem(cwd: string): string | null {
+export function cwdProblem(cwd: string): string | null {
   if (cwd.length === 0 || cwd.length > 1024) return "cwdRelative must be 1..1024 chars";
   if (cwd.startsWith("/") || /^[A-Za-z]:/.test(cwd)) return "cwdRelative must be relative";
   if (cwd.includes("\\") || /[\u0000-\u001f\u007f]/.test(cwd) || LONE_SURROGATE.test(cwd)) return "cwdRelative holds invalid characters";

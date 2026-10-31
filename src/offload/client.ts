@@ -79,6 +79,7 @@ export async function reportDuration(request: ShimRequest, deps: ClientDeps, dur
       tool,
       runner: request.runner ?? (tool === "node" ? "npm" : "pytest"),
       argv: request.argv,
+      cwdRelative: request.cwdRelative,
       durationSeconds,
     });
   } catch {
