@@ -661,6 +661,54 @@ describe("outbound untrusted archive boundary (when using tar)", () => {
       }
     }, TIMEOUT);
   }
+
+  async function receiveHostile(entries: Parameters<typeof hostileTar>[0], exclude?: string[]) {
+    const hook = requireHook("out");
+    const source = path.join(root, "sandbox", "source");
+    const target = path.join(root, "host", "target");
+    await put(path.join(source, "safe"), "safe");
+    const archive = path.join(root, "hostile.tar");
+    await put(archive, hostileTar([{ name: "safe", body: "safe" }, ...entries]));
+    ssh.archiveOverride = archive;
+    const run = hook(params([{ operationId: "untrusted", files: [{ sourcePath: source, targetPath: target, kind: "directory", ...(exclude ? { exclude } : {}) }] }]));
+    return { run, target };
+  }
+
+  for (const [attack, link] of [["absolute", "/etc"], ["parent", "../outside-sentinel"], ["climb after descent", "sub/../.."], ["nested parent", "a/../../x"]] as const) {
+    it(`refuses a ${attack} symlink target from the guest archive`, async () => {
+      const { run, target } = await receiveHostile([{ name: "pivot", link }]);
+      await expect(run).rejects.toThrow();
+      expect(existsSync(ssh.archiveInjected)).toBe(true);
+      expect(existsSync(path.join(target, "pivot"))).toBe(false);
+    }, TIMEOUT);
+  }
+
+  it("keeps symlinks that stay inside the target", async () => {
+    const { run, target } = await receiveHostile([
+      { name: "sub/inner", body: "inner" }, { name: "sub/up", link: "../safe" }, { name: "here", link: "./safe" },
+    ]);
+    await run;
+    expect(existsSync(ssh.archiveInjected)).toBe(true);
+    expect(await readlink(path.join(target, "sub", "up"))).toBe("../safe");
+    expect(await readFile(path.join(target, "sub", "up"), "utf8")).toBe("safe");
+    expect(await readFile(path.join(target, "here"), "utf8")).toBe("safe");
+  }, TIMEOUT);
+
+  it("drops runtime-state and mapping-excluded members the guest archive carries", async () => {
+    const { run, target } = await receiveHostile([
+      { name: ".paperclip-runtime/state", body: "CORRUPT" },
+      { name: "nested/.paperclip-runtime/state", body: "CORRUPT" },
+      { name: "drop.tmp", body: "CORRUPT" },
+      { name: "cache/blob", body: "CORRUPT" },
+    ], ["**/*.tmp", "cache"]);
+    await run;
+    expect(existsSync(ssh.archiveInjected)).toBe(true);
+    expect(await readFile(path.join(target, "safe"), "utf8")).toBe("safe");
+    expect(existsSync(path.join(target, ".paperclip-runtime"))).toBe(false);
+    expect(existsSync(path.join(target, "nested", ".paperclip-runtime"))).toBe(false);
+    expect(existsSync(path.join(target, "drop.tmp"))).toBe(false);
+    expect(existsSync(path.join(target, "cache"))).toBe(false);
+  }, TIMEOUT);
 });
 
 describe("production streaming SSH seam", () => {

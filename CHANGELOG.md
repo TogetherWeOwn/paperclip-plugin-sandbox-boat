@@ -10,6 +10,7 @@
 
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
 * Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
+* The host now validates sync data the guest produces instead of trusting it. Native outbound sync refuses symlinks that are absolute or could resolve outside the mapped target, and drops `.paperclip-runtime` and mapping-excluded members (inbound sync still preserves links on the guest as before). The offload guest-store scan checks every returned path, entry shape and the entry count, and drops `DEFAULT_SYNC_EXCLUDES` matches. Hashing the live workspace during collection streams under the capture byte cap, opens leaves without following links and never walks through a symlinked parent.
 
 ## 0.2.3
 
