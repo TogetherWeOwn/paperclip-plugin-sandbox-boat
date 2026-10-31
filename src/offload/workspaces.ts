@@ -65,15 +65,16 @@ export class NativeOffloadWorkspaces {
       path: localPath,
       cwd: localPath,
     };
-    // Index first: a binding must never exist that forgetRun cannot find.
+    // Index first, and write the binding under the same lock: a binding must
+    // never exist that forgetRun cannot find, even when forgetRun runs meanwhile.
     await this.withIndex(params.companyId, runId, async () => {
       const workspaces = await this.indexed(params.companyId, runId);
       if (!workspaces.includes(workspaceId)) {
         await this.state.set(runIndexScope(params.companyId, runId), { version: 1, workspaces: [...workspaces, workspaceId] });
       }
-    });
-    await this.state.set(scope(params.companyId, workspaceId, runId), {
-      version: 1, companyId: params.companyId, runId, workspaceId, workspace,
+      await this.state.set(scope(params.companyId, workspaceId, runId), {
+        version: 1, companyId: params.companyId, runId, workspaceId, workspace,
+      });
     });
   }
 

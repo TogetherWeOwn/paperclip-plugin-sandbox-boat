@@ -79,6 +79,8 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 // Below the minimum idle-stop threshold (one minute), including silent syncs.
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 15_000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
+/** A persisted local-run owner older than this is not rehydrated (same window as the in-memory end fence). */
+const LOCAL_RUN_OWNER_MAX_AGE_MS = 24 * 60 * 60_000;
 const STOP_POLL_INTERVAL_MS = 2000;
 // After an accepted stop, release waits at most this long for the VM to leave
 // UP before returning: returning stopped while the VM still looks up would
@@ -339,7 +341,7 @@ export class BoatVmManager {
   private readonly wholeRunRealizations = new Map<string, { params: PluginEnvironmentRealizeWorkspaceParams; at: number }>();
 
   private pruneLocalRunState(): void {
-    const cutoff = this.now() - 24 * 60 * 60_000;
+    const cutoff = this.now() - LOCAL_RUN_OWNER_MAX_AGE_MS;
     for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
     for (const [id, entry] of this.wholeRunRealizations) if (entry.at < cutoff) this.wholeRunRealizations.delete(id);
   }
@@ -360,7 +362,7 @@ export class BoatVmManager {
     if (this.endedLocalRuns.has(id)) return false;
     if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId });
     if (agentId) {
-      await this.offloadState.set(this.runOwnerScope(companyId, runId), { version: 1, companyId, runId, issueId, agentId }).catch((error) => {
+      await this.offloadState.set(this.runOwnerScope(companyId, runId), { version: 1, companyId, runId, issueId, agentId, startedAt: this.now() }).catch((error) => {
         this.logger.warn("boat: could not persist the local run's owner", { runId, error: errorText(error) });
       });
       // The terminal event may have arrived while the write was in flight.
@@ -382,10 +384,12 @@ export class BoatVmManager {
     const live = this.localRuns.get(id);
     if (live?.agentId) return live.agentId === agentId;
     const saved = (await this.offloadState.get(this.runOwnerScope(companyId, runId)).catch(() => null)) as
-      | { version?: unknown; companyId?: unknown; runId?: unknown; issueId?: unknown; agentId?: unknown }
+      | { version?: unknown; companyId?: unknown; runId?: unknown; issueId?: unknown; agentId?: unknown; startedAt?: unknown }
       | null;
     if (saved?.version !== 1 || saved.companyId !== companyId || saved.runId !== runId
       || typeof saved.agentId !== "string" || (saved.issueId !== null && typeof saved.issueId !== "string")) return false;
+    // A record whose delete failed at the terminal event must not revive a finished run forever.
+    if (typeof saved.startedAt !== "number" || this.now() - saved.startedAt > LOCAL_RUN_OWNER_MAX_AGE_MS) return false;
     // Rehydrate after a restart, unless the terminal event arrived during the read.
     if (this.endedLocalRuns.has(id)) return false;
     if (live) live.agentId = saved.agentId;
@@ -434,9 +438,20 @@ export class BoatVmManager {
     this.pruneLocalRunState();
     this.endedLocalRuns.set(id, this.now());
     this.localRuns.delete(id);
-    await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch((error) => {
-      this.logger.warn("boat: could not forget the local run's owner", { runId, error: errorText(error) });
-    });
+    // Retried: a surviving record would let a restarted worker admit this finished run (until it ages out).
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.offloadState.delete(this.runOwnerScope(companyId, runId));
+        break;
+      } catch (error) {
+        if (attempt >= 3) {
+          // Overwrite it without an owner instead, so rehydration refuses it.
+          await this.offloadState.set(this.runOwnerScope(companyId, runId), { version: 1, companyId, runId, ended: true }).catch(() => undefined);
+          this.logger.warn("boat: could not forget the local run's owner", { runId, error: errorText(error) });
+          break;
+        }
+      }
+    }
     // From the persisted index, so bindings are forgotten even when this worker never saw the run start.
     await this.forgetRunOffload(companyId, runId);
   }
@@ -2589,11 +2604,15 @@ export class BoatVmManager {
     // proactive.ts, or the store fails) is skipped, and its VMs' ownership is
     // unknown, not absent: they must not be taken for orphans.
     let companiesKnown = true;
-    const remembered = await this.store.companies().catch(() => {
+    const remembered = scope !== null ? [] : await this.store.companies().catch(() => {
       companiesKnown = false;
       return [] as string[];
     });
-    const companies = new Set<string>([...remembered, ...[...this.configs.values()].map((c) => c.companyId)]);
+    // A scoped sweep acts only on the scope's own records (orphans and other companies' VMs are skipped below),
+    // so it reads only that company's state.
+    const companies = scope !== null
+      ? new Set<string>([scope])
+      : new Set<string>([...remembered, ...[...this.configs.values()].map((c) => c.companyId)]);
     const docs = new Map<string, StateDoc>();
     const unreadable = new Set<string>();
     for (const companyId of companies) {

@@ -143,9 +143,11 @@ describe("plugin wiring", () => {
     };
     const pending = harness.emit("agent.run.started", started);
     await writing;
-    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    // The terminal event queues behind the in-flight write (same per-run lock), then removes it.
+    const ending = harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
     release();
-    await pending;
+    await Promise.all([pending, ending]);
     harness.ctx.state.set = originalSet;
     expect((await exec(runId)).status).toBe(403);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
@@ -181,13 +183,14 @@ describe("plugin wiring", () => {
     try {
       const pending = harness.emit("agent.run.started", started);
       await writing;
-      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+      const realizing = plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
         config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
         workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
           environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
           source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      await new Promise((resolve) => setTimeout(resolve, 10));
       release();
-      await pending;
+      await Promise.all([pending, realizing]);
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
       const saved = [...harness.state.entries()].find(([key]) => key.includes("boat-offload-workspaces"))?.[1] as { workspace?: { path?: string } };
       expect(saved?.workspace?.path).toBe(nativeSource);
@@ -278,6 +281,20 @@ describe("plugin wiring", () => {
     await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
     expect(workspaceBindings(harness)).toEqual([]);
     expect([...harness.state.keys()].some((key) => key.includes("boat-offload-run"))).toBe(false);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a finished run stays refused after a restart even when deleting its owner record fails", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    const originalDelete = harness.ctx.state.delete;
+    harness.ctx.state.delete = async (input: { namespace?: string }) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalDelete(input as never);
+    };
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    harness.ctx.state.delete = originalDelete;
+    await restart(harness);
     expect((await exec(runId)).status).toBe(403);
   });
 

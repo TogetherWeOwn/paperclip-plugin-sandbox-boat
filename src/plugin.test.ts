@@ -1826,13 +1826,16 @@ describe("idle sweep", () => {
     clock.t += 21 * 60 * 1000;
     // The other company's state turns unreadable: its error must not reach this company's caller.
     const originalGet = harness.ctx.state.get;
+    const otherReads: string[] = [];
     harness.ctx.state.get = async (input: { scopeId?: string; namespace?: string; stateKey: string; scopeKind: string }) => {
+      if (input.scopeId === OTHER) otherReads.push(`${input.namespace}/${input.stateKey}`);
       if (input.scopeId === OTHER && input.namespace === "boat-sandbox" && input.stateKey === "vms") throw new Error(`state of ${OTHER} unavailable`);
       return originalGet(input as never);
     };
     const reply = await plugin.definition.onApiRequest!({ routeKey: "sweep", method: "POST", path: "/sweep", params: {}, query: {},
       body: { companyId: COMPANY }, actor: { actorType: "user", actorId: "board-user", userId: "board-user" }, companyId: COMPANY, headers: {} } as never);
     harness.ctx.state.get = originalGet;
+    expect(otherReads).toEqual([]); // a scoped sweep never reads another company's state
     expect(reply).toMatchObject({ status: 200, body: { stopped: [mine.providerLeaseId], deleted: [], forgotten: [], errors: [] } });
     expect(JSON.stringify(reply.body)).not.toContain(theirs.providerLeaseId!);
     expect(JSON.stringify(reply.body)).not.toContain(OTHER);

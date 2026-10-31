@@ -69,6 +69,25 @@ describe("native workspace binding", () => {
     expect(await submit()).toMatchObject({ status: 200 });
   });
 
+  it("a run cleanup during a binding write leaves no binding behind", async () => {
+    const t = await setup();
+    let unblock!: () => void;
+    const gate = new Promise<void>((resolve) => { unblock = resolve; });
+    const originalSet = t.ctx.state.set;
+    t.ctx.state.set = async (input: { namespace?: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces") await gate;
+      return originalSet(input as never, value as never);
+    };
+    const realizing = plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+    await new Promise((resolve) => setTimeout(resolve, 10)); // indexed, binding write pending
+    const ending = t.emit("agent.run.finished", { companyId, payload: { runId, issueId: "issue-a" } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    unblock();
+    await Promise.all([realizing, ending]);
+    t.ctx.state.set = originalSet;
+    expect([...t.state.keys()].filter((key) => key.includes("boat-offload-workspaces"))).toEqual([]);
+  });
+
   it("admits the owner of a whole-run realization whose run started without an issue", async () => {
     const t = await setup(undefined, false);
     await t.emit("agent.run.started", { companyId, payload: { runId, agentId: "agent-a", issueId: null } });
