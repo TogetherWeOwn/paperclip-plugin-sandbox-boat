@@ -217,26 +217,37 @@ Each step stands alone and takes effect on the next command. Stop at the first o
    * card VMs (whole-run leases), named `paperclip-<hash>`. The `usage` route lists them;
    * offload pool VMs. These are created **without a name**, so a `paperclip-*` filter never finds them. Their ids are only in the plugin's instance state (`boat-offload-pool`), which no route lists, so they are read from the Paperclip database (read-only).
 
-   Run this after step 2. Work admitted before the flags went off can still create or use a pool VM, so the inventory refuses while any pool VM is busy or any pool entry has no VM id yet (a create in flight). It also stops if either read fails: there are no pipes, so a failed read cannot pass for an empty one. Re-run it until the last line printed is `recorded`, then go on to step 4:
+   Run this after step 2. Work admitted before the flags went off can still create or use a pool VM, so the inventory refuses while any pool VM is `busy` (a create in flight is busy too). It also stops if any read fails: there are no pipes, so a failed read cannot pass for an empty one. Re-run it until it prints a line starting with `recorded`.
+
+   A create whose reply was lost leaves a pool entry with no VM id that never clears; boat may still have made the VM. The inventory reports such entries instead of waiting on them. If it prints `recorded, with ... lost pool create(s)`, report them on the card: a human matches them against the boat VM list (an unnamed VM created around that time) before step 4.
 
    ```sh
-   # The password goes into a private pgpass file, never into psql's arguments.
+   # No credential in any argument: the password goes into a private pgpass
+   # file, the rest into PG* variables, and psql gets no connection string.
    export PGPASSFILE=$(mktemp)
-   DB=$(node -e '
-     const fs = require("fs");
-     const u = new URL(JSON.parse(fs.readFileSync("/home/ubuntu/.paperclip/instances/default/config.json", "utf8")).database.connectionString);
-     fs.writeFileSync(process.env.PGPASSFILE, `*:*:*:*:${decodeURIComponent(u.password).replace(/[\\:]/g, "\\$&")}\n`, { mode: 0o600 });
-     u.password = "";
-     console.log(u.href)')
    POOL="from plugin_state, jsonb_array_elements(value_json->'vms') vm where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool'"
-   if curl -fsS -o usage.json -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
+   if pg=$(node -e '
+         const fs = require("fs");
+         const u = new URL(JSON.parse(fs.readFileSync("/home/ubuntu/.paperclip/instances/default/config.json", "utf8")).database.connectionString);
+         if (u.search || u.hash) { console.error("the connection string has parameters; read the pool state by hand"); process.exit(1); }
+         fs.writeFileSync(process.env.PGPASSFILE, `*:*:*:*:${decodeURIComponent(u.password).replace(/[\\:]/g, "\\$&")}\n`, { mode: 0o600 });
+         const q = (v) => `'"'"'${v.replace(/'"'"'/g, `'"'"'\\'"'"''"'"'`)}'"'"'`;
+         console.log(`export PGHOST=${q(u.hostname)} PGPORT=${q(u.port || "5432")} PGDATABASE=${q(decodeURIComponent(u.pathname.slice(1)))} PGUSER=${q(decodeURIComponent(u.username))}`)') \
+     && eval "$pg" \
+     && curl -fsS -o usage.json -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
      && node -e 'for (const v of JSON.parse(require("fs").readFileSync("usage.json","utf8")).vms) if (v.status !== "deleted") console.log(v.sandboxId)' > card-vms.txt \
-     && pending=$(psql "$DB" -At -v ON_ERROR_STOP=1 -c "select count(*) $POOL and (vm->>'sandboxId' = '' or vm->>'busy' = 'true')") \
-     && [ "$pending" = 0 ] \
-     && psql "$DB" -At -v ON_ERROR_STOP=1 -o pool-vms.txt -c "select vm->>'sandboxId' $POOL"; then
-     cat card-vms.txt pool-vms.txt > boat-vms-to-delete.txt && cat boat-vms-to-delete.txt && echo recorded
+     && busy=$(psql -At -v ON_ERROR_STOP=1 -c "select count(*) $POOL and vm->>'busy' = 'true'") \
+     && [ "$busy" = 0 ] \
+     && psql -At -v ON_ERROR_STOP=1 -o pool-vms.txt -c "select vm->>'sandboxId' $POOL and vm->>'sandboxId' <> ''" \
+     && psql -At -v ON_ERROR_STOP=1 -o lost-creates.txt -c "select vm->'accountReservation'->>'id' $POOL and vm->>'sandboxId' = ''"; then
+     cat card-vms.txt pool-vms.txt > boat-vms-to-delete.txt && cat boat-vms-to-delete.txt
+     if [ -s lost-creates.txt ]; then
+       echo "recorded, with $(wc -l < lost-creates.txt) lost pool create(s), reservations: $(tr '\n' ' ' < lost-creates.txt)"
+     else
+       echo recorded
+     fi
    else
-     echo "STOP: the inventory failed, or offload work is still in flight (${pending:-?} busy or unnamed pool entries); wait and run it again" >&2
+     echo "STOP: the inventory failed, or a pool VM is still busy (${busy:-?}); wait and run it again" >&2
    fi
    rm -f "$PGPASSFILE"
    ```
