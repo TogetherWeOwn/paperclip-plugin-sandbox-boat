@@ -307,7 +307,7 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "array",
             items: { type: "string" },
             description:
-              "Run env names that may reach the VM: exact names (ANTHROPIC_AUTH_TOKEN) and NAME_* prefixes (CARGO_*). Everything else Paperclip passes (project and routine env, its own process env) is dropped and logged by name. Secret-looking names (TOKEN, SECRET, PASSWORD, API_KEY, ..._KEY, SIGNING, HMAC, SALT, _AUTH, _PAT...) need an exact entry; PLANETSCALE_, CLOUDFLARE_, CF_, DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_ names, values with a JWT in them and database URLs that leave the VM are never sent. Unset: the built-in list, which covers a Claude Code run through the model-proxy tunnel and Paperclip's sandbox bridge (see the README). A list you set replaces the built-in one; an empty list sends nothing.",
+              "Run env names that may reach the VM: exact names (ANTHROPIC_AUTH_TOKEN) and NAME_* prefixes (CARGO_*). Everything else Paperclip passes (project and routine env, its own process env) is dropped and logged by name. Secret-looking names (TOKEN, SECRET, PASSWORD, API_KEY, ..._KEY, SIGNING, HMAC, SALT, _AUTH, _PAT...) need an exact entry; PLANETSCALE_, CLOUDFLARE_, CF_, DISCORD_, GH_, GITHUB_, BOAT_ and ASCII_ names, values with a JWT in them and database URLs that leave the VM are never sent. Unset: the built-in list, which covers a Claude Code run through the model-proxy tunnel and Paperclip's sandbox bridge (see docs/security.md, Run env allowlist). A list you set replaces the built-in one; an empty list sends nothing.",
           },
           monitoring: {
             type: "boolean",
@@ -351,7 +351,7 @@ const manifest: PaperclipPluginManifestV1 = {
           },
           apiBase: {
             type: "string",
-            description: "boat API base URL. Default https://boat.dev/api/v1.",
+            description: "boat API base URL. Default https://boat.dev/api/v1. Any other base needs its own apiKey (usage reads use costApiKey if set, else that apiKey): the host BOAT_API_KEY and BOAT_READONLY_KEY are only sent to the default.",
             ...advanced("API"),
           },
           timeoutMs: {

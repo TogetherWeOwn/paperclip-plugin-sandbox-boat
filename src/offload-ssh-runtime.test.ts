@@ -195,6 +195,27 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(node, enabled)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("keeps a command local when its directory would be absent from the guest mirror", async () => {
+    await mkdir(path.join(source, "scratch"));
+    await mkdir(path.join(source, "crates/foo/target"), { recursive: true });
+    await writeFile(path.join(source, "crates/foo/target/out"), "build output");
+    await mkdir(path.join(source, "secrets"));
+    await writeFile(path.join(source, "secrets/.env"), "DO_NOT_UPLOAD=secret");
+    for (const cwdRelative of ["scratch", "crates/foo/target", "missing", "secrets"]) {
+      expect(await runtime.resolve({ ...command(), cwdRelative }, config)).toBe(null);
+    }
+    expect(boat.calls).toHaveLength(0);
+    await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
+    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config)).not.toBe(null);
+  });
+  it("keeps a node command in a separately locked sub-project local", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await mkdir(path.join(source, "tools/app"), { recursive: true });
+    await writeFile(path.join(source, "tools/app/package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"], cwdRelative: "tools/app" } as BackendCommand;
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("keeps python local when uv auth config is present", async () => {
     await writeFile(path.join(source, "uv.lock"), "x");
     await writeFile(path.join(source, "uv.toml"), "[index]\n");

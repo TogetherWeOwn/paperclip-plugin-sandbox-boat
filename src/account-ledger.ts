@@ -177,15 +177,29 @@ function monthUsageSeconds(doc: AccountDoc, companyId: string, nowMs: number): n
   return totalMs / 1000;
 }
 
-/** Pending reservation envelopes for one company: prevents monthly-cap burst overshoot. */
+/**
+ * Reserved envelopes for one company's commands whose time is not yet in
+ * monthUsageSeconds: pending starts and started-but-unfinished commands. Once
+ * finished()/terminal() record an interval or open tail, the row's own time
+ * counts instead, so nothing is counted twice. An ambiguous start or finish
+ * records elapsed time while the VM may still run, so the rest of its
+ * envelope stays held until terminal() resolves it.
+ */
 function pendingCapSeconds(doc: AccountDoc, companyId: string): number {
   const byUsage = new Map(doc.usage.map((row) => [row.usageRecordId, row]));
   let total = 0;
   for (const intent of doc.intents) {
-    if (intent.status === "rejected" || intent.settledAt != null) continue;
-    const company = intent.usageId ? byUsage.get(intent.usageId)?.companyId : undefined;
-    if (company !== companyId) continue;
-    total += intent.jobSeconds + intent.tailSeconds;
+    if (intent.status === "rejected" || intent.status === "stopped") continue;
+    const row = intent.usageId ? byUsage.get(intent.usageId) : undefined;
+    if (row?.companyId !== companyId) continue;
+    const envelope = intent.jobSeconds + intent.tailSeconds;
+    if (intent.status === "ambiguous") {
+      const recordedMs = row.intervals.reduce((sum, i) => sum + Math.max(0, Date.parse(i.until) - Date.parse(i.since)), 0);
+      total += Math.max(0, envelope - (Number.isFinite(recordedMs) ? recordedMs : 0) / 1000);
+      continue;
+    }
+    if (row.intervals.length > 0 || row.tailSince != null) continue;
+    total += envelope;
   }
   return total;
 }

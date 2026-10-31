@@ -111,7 +111,7 @@ async function runWrapper(argv: string[], env: Record<string, string>): Promise<
   const child = spawn("python3", ["-I", path.join(root, "wrapper.py"), ...argv], {
     // The shim's `#!/usr/bin/env node` needs node on PATH; CI installs it outside /usr/bin.
     env: { PATH: `${shimDir}:${realDir}:/usr/bin:/bin:${path.dirname(process.execPath)}`, HOME: root, CALLS: calls, PAPERCLIP_API_URL: broker.url, PAPERCLIP_API_KEY: "run-token",
-      PAPERCLIP_WORKSPACE_ID: WS, ...env },
+      PAPERCLIP_WORKSPACE_ID: WS, PAPERCLIP_WORKSPACE_CWD: process.cwd(), ...env },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";

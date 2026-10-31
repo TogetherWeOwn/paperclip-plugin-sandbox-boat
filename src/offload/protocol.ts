@@ -1,4 +1,4 @@
-// Offload API v1 wire contract. Design: docs/adr/0001-heavy-command-offload.md.
+// Offload API v1 wire contract. Design: docs/design/adr/0001-heavy-command-offload.md.
 // Pure types, bounds and code tables shared by the broker, the shim and tests.
 
 export const OFFLOAD_VERSION = 1;

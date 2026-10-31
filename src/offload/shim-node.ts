@@ -117,6 +117,14 @@ export function createShimDeps(env: Record<string, string | undefined>): ShimDep
         return p;
       }
     },
+    cwd: () => process.cwd(),
+    canonicalDir: (p) => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return null;
+      }
+    },
     readToolchains: createReadToolchains(),
     spawn: createSpawn(),
   };

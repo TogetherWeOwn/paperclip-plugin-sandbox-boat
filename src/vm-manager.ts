@@ -36,6 +36,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
+import type { AccountReservation } from "./account-ledger.js";
 import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
@@ -1109,16 +1110,25 @@ export class BoatVmManager {
     let ttlSeconds = config.autoStopMinutes * 60;
     if (hard != null) ttlSeconds = Math.min(ttlSeconds, Math.floor((hard - this.now()) / 1000));
     if (ttlSeconds < 60) return;
+    // An unsettled warm intent holds compute forever: terminal() skips it, so a
+    // failed update must settle it. Always as ambiguous, even on a definitive
+    // refusal: reserve() folded the predecessor's remaining deadline into this
+    // hold and the VM keeps billing to that deadline. The VM's terminal
+    // receipt then trims the hold to the time it actually ran.
+    let pending: AccountReservation | null = null;
     try {
       const api = this.opsApi(config);
-      const reservation = await this.account(config).reserve(api, { ...config, operation: "warm", sandboxId, allowCachedLimits: true,
+      pending = await this.account(config).reserve(api, { ...config, operation: "warm", sandboxId, allowCachedLimits: true,
         jobSeconds: ttlSeconds, tailSeconds: 0 });
       const response = await api.update({ sandboxId, ttlSeconds });
+      const reservation = pending;
+      pending = null;
       await this.account(config).started(api, reservation, sandboxId);
       const view = toView((response as { sandbox?: unknown }).sandbox);
       this.deadlines.set(sandboxId, view?.archiveAfter ? Date.parse(view.archiveAfter) : this.now() + ttlSeconds * 1000);
       this.logger.info("boat: extended auto-stop deadline while a command runs", { sandboxId, ttlSeconds });
     } catch (error) {
+      if (pending) await this.account(config).failed(pending, false).catch(() => {});
       this.logger.warn("boat: could not extend the auto-stop deadline", { sandboxId, error: errorText(error) });
     }
   }
