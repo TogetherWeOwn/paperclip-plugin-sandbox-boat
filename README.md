@@ -794,7 +794,7 @@ scripts/stage-package.sh <commit> <plugin packages root>   # prints <root>/sandb
 The script:
 
 * exports the commit with `git archive`, then runs `npm ci` and `npm run check` (typecheck, tests, build) on that copy;
-* copies `dist`, `package.json`, `README.md`, `LICENSE` and `@boatdev/sdk` into the package, links `node_modules/@paperclipai/plugin-sdk` to `/app/packages/plugins/sdk` (the SDK path inside the Paperclip container; a third argument changes it), and writes the full sha to `.source-commit`;
+* copies `dist`, `bin` (the offload shims), `package.json`, `README.md`, `LICENSE` and `@boatdev/sdk` into the package, links `node_modules/@paperclipai/plugin-sdk` to `/app/packages/plugins/sdk` (the SDK path inside the Paperclip container; a third argument changes it), and writes the full sha to `.source-commit`;
 * makes the package read-only, and uses `sudo` only for the final move when the root is not writable.
 
 It refuses:
@@ -805,7 +805,10 @@ It refuses:
 * a build that does not delete Paperclip's run MCP config before a stop, delete or capture. Without it the run JWT stays in boat snapshots;
 * a build that does not put the `.paperclip-runtime/` rule into `~/.boatignore`, or that does not tell every command's tar to skip `.paperclip-runtime`. Without the rule, the run JWT is in boat's per-minute snapshots while a run holds the VM. Without the tar exclude, Paperclip's workspace extract unpacks the host's runtime files over the run's;
 * a build that still links `.paperclip-runtime` into `/tmp` (0.2.0). Paperclip refuses that link and fails every run;
+* a host SDK path inside one versioned Paperclip install (`cli/installs/`). The next upgrade prunes it;
 * a destination that already exists.
+
+On a native npm install (no container), the SDK is at `~/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk`. Pass that path, through `current`, as the third argument. To stage a downloaded release tarball instead of building, use `scripts/stage-release.sh <tarball> <root>`: it checks the `.sha256` and re-points the tarball's `/app` SDK link at this host's SDK. [docs/operations/rbx1.md](docs/operations/rbx1.md) is the full install, config, shim and rollback runbook for rbx1.
 
 Then install it as an instance admin. `packageName` is the path as the server sees it:
 

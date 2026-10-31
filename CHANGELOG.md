@@ -2,12 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+* `scripts/stage-release.sh` stages a downloaded release tarball on a host that is not the Paperclip container. It checks the `.sha256` and the tarball's contents, then re-points its plugin-sdk link at the host's SDK (default `$PAPERCLIP_HOME/cli/current/...`, which follows Paperclip upgrades). `scripts/install-offload-shims.sh` points a shim dir's `cargo` at a staged package. [docs/operations/rbx1.md](docs/operations/rbx1.md) is the install, config, two-bot-next shim and rollback runbook for rbx1.
+
 ### Changed
 
 * `rust-public-1` now pins toolchain `1.98.1` (replacing `1.88.0`) with clippy, matching two-bot-next. Its server-owned guest build env (`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`) gives remote Cargo the same lean settings as `scripts/cargo_cache.py`, and no host env is forwarded. A workspace toolchain file pinning an uninstalled channel stays local; the native backend re-reads it from the host-owned source.
 
 ### Fixed
 
+* Staged packages now include `bin/` (the offload shims, already in `package.json` `files`). Before, `stage-package.sh` left it out, so no staged package or release tarball (including `v0.2.3`) had a shim to install. `stage-package.sh` and `stage-release.sh` refuse a host SDK path inside a versioned Paperclip install (`cli/installs/`), which the next upgrade prunes.
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
 * Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
 
