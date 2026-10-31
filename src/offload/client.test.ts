@@ -124,7 +124,7 @@ describe("submit and env", () => {
   it("stays local, with no broker call, when host-service env is set", async () => {
     // two-bot-next DB tests SKIP without TWO_TEST_DATABASE_URL: a remote run
     // would pass with less coverage, so presence alone keeps the command local.
-    for (const key of ["TWO_TEST_DATABASE_URL", "TWO_ROLES_TEST_DATABASE_URL", "TEST_DATABASE_URL", "DATABASE_URL", "PGHOST", "PGOPTIONS", "REDIS_URL",
+    for (const key of ["TWO_TEST_DATABASE_URL", "TWO_ROLES_TEST_DATABASE_URL", "TEST_DATABASE_URL", "DATABASE_URL", "PGHOST", "PGOPTIONS", "PGSSLROOTCERT", "PGCONNECT_TIMEOUT", "REDIS_URL",
       "MEMBER_TESTDB", "TWO_LFG_TESTDB_CI", "TICKET_TEST_DB_HOST"]) {
       for (const tool of ["cargo", "node", "python"] as const) {
         const t = setup();
@@ -140,7 +140,7 @@ describe("submit and env", () => {
 
   it("ignores empty or lookalike service env keys", async () => {
     const t = setup();
-    t.request.processEnv = { TWO_TEST_DATABASE_URL: "", DATABASE_URL_FILE: "/x", PGDATA: "/var/lib/pg", SQLX_OFFLINE: "true", TESTDBX: "1", DB_HOST: "x" };
+    t.request.processEnv = { TWO_TEST_DATABASE_URL: "", DATABASE_URL_FILE: "/x", PG: "x", SQLX_OFFLINE: "true", TESTDBX: "1", DB_HOST: "x" };
     t.http.post.mockImplementation(async () => ({ ok: true, status: 200, json: { version: 1, commandId: CMD, mode: "remote_candidate", reason: "eligible", profileId: "rust-public-1" } }));
     expect((await runDryRun(t.request, t.deps)).mode).toBe("remote_candidate");
   });

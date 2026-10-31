@@ -93,9 +93,9 @@ export async function reportDuration(request: ShimRequest, deps: ClientDeps, dur
  * travel; presence alone keeps the command local. Covers two-bot-next's
  * `TWO_*TEST_DATABASE_URL` family and test-DB selectors (`MEMBER_TESTDB`,
  * `TWO_LFG_TESTDB_CI`, `TICKET_TEST_DB_HOST`), sqlx's `DATABASE_URL` and
- * libpq's `PG*`.
+ * every libpq `PG*` connection setting.
  */
-const SERVICE_ENV_RE = /(^|_)(DATABASE|REDIS)_URL$|(^|_)TESTDB(_|$)|_DB_HOST$|^PG(HOST|HOSTADDR|PORT|USER|PASSWORD|PASSFILE|DATABASE|SERVICE|SERVICEFILE|OPTIONS|SSLMODE)$/;
+const SERVICE_ENV_RE = /(^|_)(DATABASE|REDIS)_URL$|(^|_)TESTDB(_|$)|_DB_HOST$|^PG[A-Z_]+$/;
 
 /** First non-empty host-service env key, or null. */
 export function serviceEnvKey(processEnv: ShimRequest["processEnv"]): string | null {

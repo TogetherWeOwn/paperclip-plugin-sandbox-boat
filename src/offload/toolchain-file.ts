@@ -12,7 +12,8 @@ export type ToolchainPin =
   | { kind: "pinned"; channel: string; file: string }
   | { kind: "unreadable"; file: string };
 
-const FILES = ["rust-toolchain.toml", "rust-toolchain"];
+// rustup prefers the legacy name when both exist in one directory.
+const FILES = ["rust-toolchain", "rust-toolchain.toml"];
 const MAX_BYTES = 16 * 1024;
 const CHANNEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 

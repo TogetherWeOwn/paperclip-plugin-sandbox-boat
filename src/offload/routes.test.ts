@@ -229,6 +229,11 @@ describe("rust-public-1 profile parity", () => {
     expect((await dryRun(workspaceWith({ "rust-toolchain": "nightly-2026-01-01\n" }), ["check"])).mode).toBe("local");
     expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\npath = "/opt/rust"\n' }), ["check"])).mode).toBe("local");
     expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1" }), ["check"])).mode).toBe("remote_candidate");
+    // rustup reads the legacy file when both exist.
+    expect(await dryRun(workspaceWith({ "rust-toolchain": "1.99.0", "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN }), ["check"]))
+      .toMatchObject({ mode: "local", reason: "rust-toolchain pins 1.99.0, not installed on the profile" });
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1", "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"])).mode)
+      .toBe("remote_candidate");
     // An explicit installed +toolchain overrides the file, as rustup does.
     expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["+1.98.1", "check"])).mode).toBe("remote_candidate");
   });
