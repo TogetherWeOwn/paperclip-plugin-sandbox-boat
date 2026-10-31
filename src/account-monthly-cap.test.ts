@@ -144,6 +144,20 @@ describe("monthly cap counts running commands", () => {
     await expect(ledger.reserve(api, { ...request("third", 60), monthlyCap: { companyId: "co-1", nowMs: Date.now(), capHours: 1 } }))
       .resolves.toMatchObject({ id: expect.any(String) });
   });
+
+  it("keeps an uncertain start's remaining envelope until a terminal receipt", async () => {
+    const ledger = new AccountLedger(f.state, f.accountId, () => Date.now());
+    const api = f.boat as never;
+    const request = (id: string, jobSeconds: number) => ({ operation: "create" as const, size: "default" as const, jobSeconds, tailSeconds: 600,
+      maxActive: 10, maxStartsPerDay: 70, minComputeHoursLeft: 0, poolId: "cap-uncertain",
+      command: { commandId: id, runId: `run-${id}`, cardId: "card", repoId: "repo", companyId: "co-1" },
+      monthlyCap: { companyId: "co-1", nowMs: Date.now(), capHours: 1 } });
+    const first = await ledger.reserve(api, request("first", 3_000));
+    await advance(7_000);
+    // The reply was lost: the VM may be running, so 7 s of interval must not free the 3600 s hold.
+    await ledger.failed(first, false);
+    await expect(ledger.reserve(api, request("second", 60))).rejects.toThrow(/monthly offload VM-hour cap/);
+  });
 });
 
 describe("offloadMonthlyVmHourCap", () => {

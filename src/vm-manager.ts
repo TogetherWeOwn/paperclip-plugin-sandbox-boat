@@ -1110,8 +1110,11 @@ export class BoatVmManager {
     let ttlSeconds = config.autoStopMinutes * 60;
     if (hard != null) ttlSeconds = Math.min(ttlSeconds, Math.floor((hard - this.now()) / 1000));
     if (ttlSeconds < 60) return;
-    // An unsettled warm intent holds compute forever: only started()/failed()
-    // settle it, so a failed update must release (or mark ambiguous) the hold.
+    // An unsettled warm intent holds compute forever: terminal() skips it, so a
+    // failed update must settle it. Always as ambiguous, even on a definitive
+    // refusal: reserve() folded the predecessor's remaining deadline into this
+    // hold and the VM keeps billing to that deadline. The VM's terminal
+    // receipt then trims the hold to the time it actually ran.
     let pending: AccountReservation | null = null;
     try {
       const api = this.opsApi(config);
@@ -1125,7 +1128,7 @@ export class BoatVmManager {
       this.deadlines.set(sandboxId, view?.archiveAfter ? Date.parse(view.archiveAfter) : this.now() + ttlSeconds * 1000);
       this.logger.info("boat: extended auto-stop deadline while a command runs", { sandboxId, ttlSeconds });
     } catch (error) {
-      if (pending) await this.account(config).failed(pending, await definitiveStartRejection(error)).catch(() => {});
+      if (pending) await this.account(config).failed(pending, false).catch(() => {});
       this.logger.warn("boat: could not extend the auto-stop deadline", { sandboxId, error: errorText(error) });
     }
   }

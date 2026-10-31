@@ -39,7 +39,7 @@ describe("review safety mutation pins", () => {
     expect(JSON.stringify(f.logs)).toContain("could not extend the auto-stop deadline");
   });
 
-  it.each([[422, "rejected"], [500, "ambiguous"]])("settles the warm hold when a TTL extension update fails (%i)", async (status, settled) => {
+  it.each([[422], [500]])("settles the warm hold when a TTL extension update fails (%i)", async (status) => {
     const manager = f.manager();
     const lease = await f.acquire(manager, "extension-fails", { autoStopMinutes: 1 });
     const id = lease.providerLeaseId!;
@@ -50,10 +50,16 @@ describe("review safety mutation pins", () => {
     const intents = journal().intents;
     expect(intents).toHaveLength(before + 1);
     const warm = intents.at(-1)!;
-    expect(warm).toMatchObject({ operation: "warm", sandboxId: id, status: settled });
-    // A definitive refusal frees the compute hold for later admissions.
-    if (settled === "rejected") expect(warm).toMatchObject({ compute: 0, settledAt: expect.any(Number) });
+    // Even a definitive refusal keeps the hold: it carries the predecessor's
+    // remaining deadline, which the still-running VM can bill until it stops.
+    expect(warm).toMatchObject({ operation: "warm", sandboxId: id, status: "ambiguous" });
+    expect(warm.compute).toBeGreaterThan(0);
     expect(JSON.stringify(f.logs)).toContain("could not extend the auto-stop deadline");
+    // The VM's terminal receipt then settles the hold, which an unsettled intent never got.
+    f.boat.boxes.get(id)!.state = "archived";
+    await manager.sweep("api", { force: true });
+    const settled = journal().intents.find((i) => i.id === warm.id)!;
+    expect(settled.status).toBe("stopped");
   });
 
   it("persists a SHA-256 payload digest, never raw argv or environment canaries", async () => {
