@@ -1,5 +1,6 @@
-// Agent-authenticated offload route handlers. The host verifies the run token
-// and resolves the company before dispatch; these handlers additionally bind
+// Agent-authenticated offload route handlers. The host authenticates the agent
+// and resolves the company before dispatch (an agent API key's run id is an
+// unsigned header; plugin.ts checks local runs' agent); these handlers bind
 // the principal (company, run) to the execution workspace via host-owned
 // metadata. Body identifiers are consistency checks, never authority: no
 // caller-selected root, endpoint, VM, shell or environment is trusted.

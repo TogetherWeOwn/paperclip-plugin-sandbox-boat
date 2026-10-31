@@ -13,10 +13,11 @@ const issueId = "cccccccc-cccc-4ccc-cccc-cccccccccccc";
 const workspaceId = "dddddddd-dddd-4ddd-dddd-dddddddddddd";
 const environmentId = "eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee";
 const secretId = "ffffffff-ffff-4fff-ffff-ffffffffffff";
+const agentId = "abcdabcd-abcd-4bcd-abcd-abcdabcdabcd";
 const secretRef = { type: "secret_ref", secretId };
 const enabled = { offloadLocalRunsEnabled: true, offloadLocalEnvironmentId: environmentId, offloadLocalApiKeySecretRef: secretRef,
   offloadLocalDriverConfig: { maxOffloadVms: 1, apiKey: "must-not-win" } };
-const started = { companyId, payload: { runId, issueId, agentId: randomUUID(), status: "running" } };
+const started = { companyId, payload: { runId, issueId, agentId, status: "running" } };
 
 function host(overrides: Partial<LocalRunHost> = {}): LocalRunHost {
   return {
@@ -79,7 +80,7 @@ describe("plugin wiring", () => {
     return harness;
   }
   const exec = (actorRunId: string) => plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
-    actor: { actorType: "agent", actorId: randomUUID(), runId: actorRunId }, params: {}, query: {},
+    actor: { actorType: "agent", actorId: agentId, agentId, runId: actorRunId }, params: {}, query: {},
     body: { version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId, argv: ["test", "--locked"], cwdRelative: ".", env: {},
       queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true } } as never);
 
