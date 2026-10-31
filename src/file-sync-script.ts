@@ -197,15 +197,22 @@ def receive():
                         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd_parent)
                         try:
                             os.fchmod(fd, mode)
-                            with os.fdopen(fd, 'wb') as dest:
+                            # Default io buffers are interpreter-defined (8 KiB
+                            # through 3.13, 128 KiB from 3.14). Pin both ends to
+                            # CHUNK so bytes land as they arrive: an unbuffered
+                            # write, and read1(), one bounded read of the member,
+                            # instead of read() filling the default buffer first.
+                            with os.fdopen(fd, 'wb', buffering=0) as dest:
                                 fd = None
                                 contents = archive.extractfile(member)
                                 remaining = member.size
                                 while remaining:
-                                    chunk = contents.read(min(CHUNK, remaining))
+                                    chunk = contents.read1(min(CHUNK, remaining))
                                     if not chunk:
                                         raise ValueError('truncated tar payload')
-                                    dest.write(chunk)
+                                    view = memoryview(chunk)
+                                    while view:
+                                        view = view[dest.write(view):]
                                     remaining -= len(chunk)
                         finally:
                             if fd is not None:

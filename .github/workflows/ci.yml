@@ -17,11 +17,15 @@ concurrency:
 jobs:
   check:
     # Required status check on main. Renaming this changes the check context
-    # and blocks every merge until the ruleset is updated to match.
-    name: check
-    # Pinned: ubuntu-latest moved to 26.04, where native-sync timing tests fail.
-    # Move up deliberately once the suite passes on the new image.
-    runs-on: ubuntu-24.04
+    # and blocks every merge until the ruleset is updated to match. Only the
+    # 26.04 leg is named `check`; the 24.04 leg keeps the previous image green
+    # (Python 3.12 there, 3.14 on 26.04: the sync helper runs on both).
+    name: ${{ matrix.os == 'ubuntu-26.04' && 'check' || format('check ({0})', matrix.os) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +33,14 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Toolchain versions
+        run: |
+          grep PRETTY_NAME /etc/os-release
+          uname -r
+          python3 --version
+          tar --version | head -n 1
+          ls -l "$(command -v cat)"
+          cat --version | head -n 1
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
