@@ -5,6 +5,7 @@
 // metadata. Body identifiers are consistency checks, never authority: no
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
+import path from "node:path";
 import type { OffloadBroker, BrokerPrincipal } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
@@ -229,10 +230,17 @@ function serviceTestReason(argv: string[], serviceFeatures: string[]): string | 
  * Cargo workload decision including the workspace toolchain file. An explicit
  * `+toolchain` already passed the profile check and overrides the file.
  */
-export async function classifyCargoWorkspace(profile: ServerProfile, argv: string[], root: string | null): Promise<CargoClassification> {
+export async function classifyCargoWorkspace(profile: ServerProfile, argv: string[], root: string | null, cwdRelative = "."): Promise<CargoClassification> {
   const classification = classifyRequest(profile, "cargo", "cargo", argv);
   if (classification.mode === "local" || root === null || argv[0]?.startsWith("+")) return classification;
-  const mismatch = toolchainPinMismatch(await readToolchainPin(root), profile.toolchains);
+  // rustup uses the nearest toolchain file from the run directory up to the root.
+  const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
+  let pin = await readToolchainPin(root);
+  for (let depth = segments.length; depth > 0; depth--) {
+    const nested = await readToolchainPin(path.join(root, ...segments.slice(0, depth)));
+    if (nested.kind !== "none") { pin = nested; break; }
+  }
+  const mismatch = toolchainPinMismatch(pin, profile.toolchains);
   if (mismatch === null) return classification;
   return { mode: "local", reason: mismatch, profileId: profile.id, subcommand: classification.subcommand };
 }
@@ -307,7 +315,7 @@ export async function handleExec(
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.
-    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
+    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
     return {
       status: 200,
       body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: profile.id },
@@ -321,7 +329,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
+  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
@@ -353,8 +361,9 @@ async function decideRemote(
   tool: OffloadTool,
   runner: string,
   argv: string[],
+  cwdRelative: string,
 ): Promise<CargoClassification> {
-  if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd);
+  if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd, cwdRelative);
   const repoId = canonicalRepoId(workspace);
   const classification = classifyRequest(profile, tool, runner, argv);
   if (classification.mode === "local") return classification;

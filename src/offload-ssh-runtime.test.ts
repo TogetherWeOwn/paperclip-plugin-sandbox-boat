@@ -195,6 +195,14 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(node, enabled)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("keeps a node command in a separately locked sub-project local", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await mkdir(path.join(source, "tools/app"), { recursive: true });
+    await writeFile(path.join(source, "tools/app/package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"], cwdRelative: "tools/app" } as BackendCommand;
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("keeps python local when uv auth config is present", async () => {
     await writeFile(path.join(source, "uv.lock"), "x");
     await writeFile(path.join(source, "uv.toml"), "[index]\n");

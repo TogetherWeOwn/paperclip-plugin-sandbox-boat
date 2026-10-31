@@ -10,7 +10,7 @@ import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./config.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import type { OffloadStore } from "./offload-journal.js";
-import { planDependencies } from "./offload/deps-install.js";
+import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
 import { classifyNode, classifyPython } from "./offload/router.js";
@@ -233,7 +233,7 @@ export class SshOffloadRuntime {
     const runners = profile.id === V1_PROFILE.id ? ["cargo"] : profile.id === NODE_PROFILE.id ? NODE_PROFILE.runners! : PYTHON_PROFILE.runners!;
     if (!runners.includes(runner)) return null;
     // Cargo re-reads the toolchain pin from the host-owned source, not the route's view.
-    const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source)
+    const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source, command.cwdRelative)
       : tool === "node" ? classifyNode(runner, command.argv, profile)
       : classifyPython(runner, command.argv, profile);
     if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
@@ -245,6 +245,7 @@ export class SshOffloadRuntime {
       // authenticate a private registry without it.
       const plan = await planDependencies(binding.source, tool).catch(() => null);
       if (!plan) return null;
+      if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) return null;
       if (await hasRegistryCredentials(binding.source).catch(() => true)) return null;
     }
     // Source and credentials only from host-authored native params. An API
