@@ -51,7 +51,7 @@
     "@paperclipai/plugin-sdk": "*"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "2026.1012.0",
+    "@paperclipai/plugin-sdk": "2026.1023.0",
     "@types/node": "24.19.2",
     "typescript": "5.9.3",
     "vitest": "4.1.12"

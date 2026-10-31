@@ -12,8 +12,8 @@ import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offl
 import type { OffloadStore } from "./offload-journal.js";
 import { planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
-import { canonicalRepoId, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
-import { classifyCargo, classifyNode, classifyPython } from "./offload/router.js";
+import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
+import { classifyNode, classifyPython } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
@@ -133,6 +133,12 @@ function profileForId(profileId: string): ServerProfile | null {
   return null;
 }
 
+/** Server-owned guest build env for a command's profile; Node/Python stay empty. */
+export function profileGuestEnv(command: OffloadCommand): Record<string, string> {
+  if ((command.tool ?? "cargo") !== "cargo") return {};
+  return { ...(profileForId(command.profileId)?.env ?? {}) };
+}
+
 /** Path-bearing flags whose values must resolve inside the workspace. */
 const PATH_FLAGS = ["--config", "--rootdir", "--prefix", "--cwd", "--dir", "--cache-dir", "-C", "--target-dir", "--out-dir"];
 
@@ -226,7 +232,8 @@ export class SshOffloadRuntime {
     const runner = command.runner ?? defaultRunnerFor(tool);
     const runners = profile.id === V1_PROFILE.id ? ["cargo"] : profile.id === NODE_PROFILE.id ? NODE_PROFILE.runners! : PYTHON_PROFILE.runners!;
     if (!runners.includes(runner)) return null;
-    const classified = tool === "cargo" ? classifyCargo(command.argv, V1_PROFILE)
+    // Cargo re-reads the toolchain pin from the host-owned source, not the route's view.
+    const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source)
       : tool === "node" ? classifyNode(runner, command.argv, profile)
       : classifyPython(runner, command.argv, profile);
     if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
@@ -290,6 +297,7 @@ export class SshOffloadRuntime {
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent: settings.offloadCgroupParent,
       workspace: (vm, cmd) => sync.cwd(vm, cmd),
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
+      profileEnv: profileGuestEnv,
       uvVenvRoot,
       ...this.deps.guestOptions });
     // Sync-in begins every reservation, including resumed VMs. Sessions stay

@@ -9,6 +9,7 @@ import type {
 import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
+import { offloadError } from "./offload/errors.js";
 import type { RouteActor } from "./offload/routes.js";
 import { localRunRealization, localRunSettings } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
@@ -97,11 +98,12 @@ const plugin = definePlugin({
       return bound;
     };
     ctx.events.on("agent.run.started", async (event) => {
-      const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown };
+      const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown; agentId?: unknown };
       if (typeof payload.runId !== "string" || typeof payload.issueId !== "string") return;
       // Record every started run before reading settings: the record grants nothing, and a
       // transient config failure here stays recoverable on the run's first offload request.
-      if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId)) return;
+      const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
+      if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId, agentId)) return;
       await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
@@ -134,6 +136,10 @@ const plugin = definePlugin({
     }
     if (input.routeKey === "sweep") {
       return { status: 200, body: await boat.sweep("api", { force: true }) };
+    }
+    if (input.routeKey.startsWith("offload_") && input.actor.actorType === "agent" && input.actor.runId
+      && boat.localRunHeldByOtherAgent(input.companyId, input.actor.runId, input.actor.agentId)) {
+      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run belongs to another agent", { commandId: null }) };
     }
     if (input.routeKey === "offload_exec") {
       await bindOnFirstRequest(boat, input);
