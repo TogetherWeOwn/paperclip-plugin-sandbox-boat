@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -271,6 +271,19 @@ describe("plugin wiring", () => {
       body: { version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId, argv: ["test"], cwdRelative: ".", env: {},
         queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true } } as never);
     expect(other.status).toBe(403);
+  });
+
+  it("a run still active after more than a day keeps its owner across a restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const harness = await setup(enabled);
+      await harness.emit("agent.run.started", started);
+      vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+      await restart(harness);
+      expect((await exec(runId)).status).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a terminal event forgets the run's persisted workspace bindings and owner after a worker restart", async () => {

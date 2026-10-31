@@ -79,8 +79,8 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 // Below the minimum idle-stop threshold (one minute), including silent syncs.
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 15_000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
-/** A persisted local-run owner older than this is not rehydrated (same window as the in-memory end fence). */
-const LOCAL_RUN_OWNER_MAX_AGE_MS = 24 * 60 * 60_000;
+/** How long the in-memory end fence and whole-run realizations are kept. */
+const LOCAL_RUN_STATE_MAX_AGE_MS = 24 * 60 * 60_000;
 const STOP_POLL_INTERVAL_MS = 2000;
 // After an accepted stop, release waits at most this long for the VM to leave
 // UP before returning: returning stopped while the VM still looks up would
@@ -341,7 +341,7 @@ export class BoatVmManager {
   private readonly wholeRunRealizations = new Map<string, { params: PluginEnvironmentRealizeWorkspaceParams; at: number }>();
 
   private pruneLocalRunState(): void {
-    const cutoff = this.now() - LOCAL_RUN_OWNER_MAX_AGE_MS;
+    const cutoff = this.now() - LOCAL_RUN_STATE_MAX_AGE_MS;
     for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
     for (const [id, entry] of this.wholeRunRealizations) if (entry.at < cutoff) this.wholeRunRealizations.delete(id);
   }
@@ -388,8 +388,6 @@ export class BoatVmManager {
       | null;
     if (saved?.version !== 1 || saved.companyId !== companyId || saved.runId !== runId
       || typeof saved.agentId !== "string" || (saved.issueId !== null && typeof saved.issueId !== "string")) return false;
-    // A record whose delete failed at the terminal event must not revive a finished run forever.
-    if (typeof saved.startedAt !== "number" || this.now() - saved.startedAt > LOCAL_RUN_OWNER_MAX_AGE_MS) return false;
     // Rehydrate after a restart, unless the terminal event arrived during the read.
     if (this.endedLocalRuns.has(id)) return false;
     if (live) live.agentId = saved.agentId;
@@ -438,7 +436,7 @@ export class BoatVmManager {
     this.pruneLocalRunState();
     this.endedLocalRuns.set(id, this.now());
     this.localRuns.delete(id);
-    // Retried: a surviving record would let a restarted worker admit this finished run (until it ages out).
+    // Retried: a surviving record would let a restarted worker admit this finished run.
     for (let attempt = 1; ; attempt++) {
       try {
         await this.offloadState.delete(this.runOwnerScope(companyId, runId));
