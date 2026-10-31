@@ -69,7 +69,7 @@ Then install it as an instance admin. `packageName` is the path as the server se
 
 ```sh
 curl -X POST "$PAPERCLIP/api/plugins/install" -H 'content-type: application/json' \
-  -d '{"packageName":"/paperclip/plugin-packages-root/sandbox-boat-0.2.1-<sha>","isLocalPath":true}'
+  -d '{"packageName":"/paperclip/plugin-packages-root/sandbox-boat-<version>-<short sha>","isLocalPath":true}'
 ```
 
 The capabilities are:
@@ -78,7 +78,9 @@ The capabilities are:
 * `plugin.state.read` and `plugin.state.write`;
 * `jobs.schedule`;
 * `api.routes.register`;
-* `issues.read`, used to see whether a card is done.
+* `issues.read`, used to see whether a card is done;
+* `events.subscribe` and `execution.workspaces.read`, used to bind a local run to offload on `agent.run.started`;
+* `secrets.read-ref`, used to resolve `offloadLocalApiKeySecretRef`.
 
 After the install, save a plugin config for every company that uses the plugin. It can be empty:
 

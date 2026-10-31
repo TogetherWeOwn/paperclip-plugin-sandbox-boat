@@ -76,8 +76,7 @@ watchdog paths and quarantines busy, unobservable or mismatched ownership. An
 idle VM is swept only after its durable deadline; sweep never creates a
 replacement. Admission may stop an idle incompatible VM earlier to reclaim a
 full pool slot, but only replaces it after confirmed termination and durable
-stop accounting. The API is ready for job integration, but this slice does not wire
-or schedule that job or enable command-level HTTP routes.
+stop accounting.
 
 Stop acceptance and termination are distinct. While Boat is archiving, capacity
 remains unavailable for reuse, and usage has integer epoch-ms `stopRequestedAt`
@@ -130,8 +129,7 @@ Sync-inclusive reservations and staged results are part of this opt-in executor:
 
 The acceptance tests model process trees, transfers and timer ownership; they
 are not proof of a real guest's cgroup enforcement or a real sync adapter's path
-confinement. Real adapters, HTTP route activation and native job scheduling are
-separate integration work. No live VM use or deployment is part of this change.
+confinement.
 
 ## Executor backend adapter
 
