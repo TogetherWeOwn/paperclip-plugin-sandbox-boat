@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type TestContext } from "vitest";
 import { access, mkdir, readdir, readFile, readlink, rmdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { userInfo } from "node:os";
 import { randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
+import { CGROUP_SKIP_NOTE, markCgroupGated } from "./test-support/cgroup-gate.js";
 import { SshOffloadGuest } from "./offload-ssh.js";
 import { OffloadLifecycle } from "./offload-lifecycle.js";
 import { commandDigest } from "./offload-journal.js";
@@ -41,6 +42,12 @@ afterEach(async () => {
   await ssh?.cleanup();
   if (parent) await rmdir(parent).catch(() => undefined);
 }, 15_000);
+// Without delegated cgroup v2 these tests report as skipped, not passed. The
+// gate tag lets the cgroup gate reporter list what ran and what did not.
+async function requireDelegation(ctx: TestContext): Promise<void> {
+  markCgroupGated(ctx);
+  ctx.skip(!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated, CGROUP_SKIP_NOTE);
+}
 async function identity(command: OffloadCommand) {
   const boot = await guest.bootId(ssh.session.sandboxId);
   const lifecycle = new OffloadLifecycle(guest, Date.now, { set: (cb, ms) => setTimeout(cb, ms), clear: (h) => clearTimeout(h as NodeJS.Timeout) });
@@ -79,8 +86,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       .rejects.toThrow();
   }, 20_000);
 
-  it("renews guest interest with a bounded deadline and rejects arbitrary extensions", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("renews guest interest with a bounded deadline and rejects arbitrary extensions", async (ctx) => {
+    await requireDelegation(ctx);
     const { full } = await identity(cmd());
     const renewed = { ...full, heartbeatDeadline: Date.now() + 30_000 };
     await guest.heartbeat(ssh.session.sandboxId, renewed);
@@ -88,8 +95,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     await expect(guest.heartbeat(ssh.session.sandboxId, { ...renewed, heartbeatDeadline: Date.now() + 60_000 })).rejects.toThrow();
   }, 15_000);
 
-  it("rejects stale boot/group identities before signalling any process", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("rejects stale boot/group identities before signalling any process", async (ctx) => {
+    await requireDelegation(ctx);
     const { full } = await identity(cmd());
     await expect(guest.kill(ssh.session.sandboxId, { ...full, guestBootId: "rebooted" })).rejects.toThrow();
     await expect(guest.term(ssh.session.sandboxId, { ...full, processGroupId: full.processGroupId + 1 })).rejects.toThrow();
@@ -97,8 +104,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     await expect.poll(() => guest.verifyEmpty(ssh.session.sandboxId, full)).toBe(true);
   }, 15_000);
 
-  it("cancels a TERM-resistant subtree without touching the shared SSH master", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("cancels a TERM-resistant subtree without touching the shared SSH master", async (ctx) => {
+    await requireDelegation(ctx);
     const marker = path.join(ssh.root, "ignoring-term");
     guest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
       stateRoot: ssh.root, workspace: async () => ssh.root, executable: "python3", path: "/usr/bin:/bin",
@@ -113,8 +120,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     expect(ssh.session.master?.exitCode).toBe(null);
   }, 20_000);
 
-  it("holds uncertainty rather than polling forever after a lost guest supervisor", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("holds uncertainty rather than polling forever after a lost guest supervisor", async (ctx) => {
+    await requireDelegation(ctx);
     const command = cmd();
     const { full } = await identity(command);
     await guest.armDeadline(ssh.session.sandboxId, full);
@@ -126,8 +133,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       .rejects.toThrow();
   }, 15_000);
 
-  it("fails closed on output overflow rather than publishing a truncated success receipt", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("fails closed on output overflow rather than publishing a truncated success receipt", async (ctx) => {
+    await requireDelegation(ctx);
     guest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
       stateRoot: ssh.root, workspace: async () => ssh.root, executable: "python3", path: "/usr/bin:/bin",
       args: () => ["-c", "import sys; sys.stdout.buffer.write(b'x' * 1100000)"] });
@@ -139,8 +146,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     expect(await guest.receipt(full)).toBe(null);
   }, 15_000);
 
-  it("records timeout when the outside watchdog kills before the supervisor observes expiry", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("records timeout when the outside watchdog kills before the supervisor observes expiry", async (ctx) => {
+    await requireDelegation(ctx);
     guest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
       stateRoot: ssh.root, workspace: async () => ssh.root, executable: "python3",
       args: () => ["-c", "import os,time; os.close(1); os.close(2); time.sleep(60)"] });
@@ -174,8 +181,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     expect(await guest.receipt(full)).toMatchObject({ result: { exitCode: 124 } });
   }, 15_000);
 
-  it("guest watchdog kills detached descendants without a host cancellation timer", async () => {
-    if (!(await guest.preflight(ssh.session.sandboxId, cmd())).cgroupV2Delegated) return;
+  it("guest watchdog kills detached descendants without a host cancellation timer", async (ctx) => {
+    await requireDelegation(ctx);
     const marker = path.join(ssh.root, "payload-started");
     guest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
       stateRoot: ssh.root, workspace: async () => ssh.root, executable: "python3", args: () => ["-c",
