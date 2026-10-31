@@ -54,6 +54,27 @@ def member_parts(name):
     return [p for p in parts if p not in ('', '.')]
 
 
+def confined_link(parts, linkname):
+    # The receiver root is freshly created, so every entry below it came from
+    # this archive. A link that may only climb (leading ..) within its own
+    # depth and then descend can never resolve outside the root, even through
+    # other links held to the same rule.
+    if not linkname or linkname.startswith('/') or '\x00' in linkname:
+        return False
+    climb = 0
+    descended = False
+    for part in linkname.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if descended:
+                return False
+            climb += 1
+        else:
+            descended = True
+    return climb <= len(parts) - 1
+
+
 def excluded(name):
     # Match Execute's TAR_SKIP_RUNTIME_DIR for directory contents. An explicit
     # runtime asset root still works because its relative root name is '.'.
@@ -132,12 +153,13 @@ class BoundedTarInfo(tarfile.TarInfo):
         return super()._proc_member(archive)
 
 
-def receive():
+def receive(confine):
     target = absolute(mapping['targetPath'])
     parent = directory_fd(target[:-1], create=True)
     root = None
     scratch = None
     directories = []
+    refused_links = set()
     files = 0
     byte_count = 0
     single = mapping['kind'] == 'file'
@@ -174,6 +196,22 @@ def receive():
                             raise ValueError('invalid tar root')
                         directories.append(([], member.mode & 0o777))
                         continue
+                    # The sender never emits an excluded path or anything below
+                    # one; a hostile sender must not land them in the target.
+                    if any(excluded('/'.join(parts[:depth])) for depth in range(1, len(parts) + 1)):
+                        continue
+                    # The sender never emits a member below a symlink, so one
+                    # under a dropped link is hostile rather than a lost path.
+                    if any(tuple(parts[:depth]) in refused_links for depth in range(1, len(parts))):
+                        raise ValueError('tar member below a refused symlink')
+                    # Guest workspaces hold absolute links (a venv's bin/python),
+                    # so drop a link that leaves the target instead of failing
+                    # the whole sync; it is never created on the host.
+                    if confine and member.issym() and not confined_link(parts, member.linkname):
+                        if len(refused_links) >= MAX_DIRECTORIES:
+                            raise ValueError('too many refused tar symlinks')
+                        refused_links.add(tuple(parts))
+                        continue
                     fd_parent = directory_fd(parts[:-1], create=True, base=root)
                     name = parts[-1]
                 try:
@@ -187,8 +225,9 @@ def receive():
                             raise ValueError('too many tar directories')
                         directories.append((parts, member.mode & 0o777))
                     elif member.issym():
-                        # Preserve links, including external leaf links, but never open
-                        # one as a parent. Every subsequent parent walk uses NOFOLLOW.
+                        # Preserve links, never opening one as a parent: every
+                        # parent walk uses NOFOLLOW. A confined (host) receiver
+                        # has already dropped links that leave the target.
                         os.symlink(member.linkname, name, dir_fd=fd_parent)
                     elif member.isfile():
                         mode = mapping.get('mode')
@@ -275,7 +314,8 @@ if mode is not None and (not isinstance(mode, int) or isinstance(mode, bool) or 
 if sys.argv[1] == 'send':
     send()
 elif sys.argv[1] == 'receive':
-    receive()
+    # The host receives guest-produced archives: confine their links.
+    receive(sys.argv[3:] == ['confined'])
 elif sys.argv[1] == 'preflight':
     preflight()
 else:
