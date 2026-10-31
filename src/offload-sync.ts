@@ -170,6 +170,43 @@ function isExcluded(relPosix: string, isDir: boolean, parsed: ParsedExcludes): b
   return parsed.fileGlobs.some((re) => re.test(base));
 }
 
+const DEFAULT_PARSED_EXCLUDES = parseExcludes(DEFAULT_SYNC_EXCLUDES);
+const MAX_CWD_PROBE_ENTRIES = 5_000;
+
+/**
+ * True when a workspace-relative directory will exist in a default-excludes
+ * snapshot of root: no segment is excluded or a symlink, and it holds at least
+ * one synced entry (the snapshot carries files, not empty directories). A
+ * directory too large to probe within the bound counts as absent.
+ */
+export async function snapshotHasDirectory(root: string, cwdRelative: string): Promise<boolean> {
+  const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
+  if (segments.length === 0) return true;
+  const rel = segments.join("/");
+  if (isExcluded(rel, true, DEFAULT_PARSED_EXCLUDES)) return false;
+  for (let depth = 1; depth <= segments.length; depth += 1) {
+    const st = await fsp.lstat(path.join(root, ...segments.slice(0, depth))).catch(() => null);
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+  }
+  let seen = 0;
+  const stack = [rel];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    const entries = await fsp.readdir(path.join(root, dir), { withFileTypes: true }).catch(() => null);
+    if (!entries) return false;
+    for (const entry of entries) {
+      if (++seen > MAX_CWD_PROBE_ENTRIES) return false;
+      const entryRel = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!isExcluded(entryRel, true, DEFAULT_PARSED_EXCLUDES)) stack.push(entryRel);
+      } else if ((entry.isFile() || entry.isSymbolicLink()) && !isExcluded(entryRel, false, DEFAULT_PARSED_EXCLUDES)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Resolve a manifest-relative path inside a root, rejecting traversal and absolute paths. */
 function resolveWithin(root: string, rel: string): string {
   if (rel === "" || path.isAbsolute(rel)) {

@@ -57,6 +57,6 @@ jobs:
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           lycheeVersion: v0.24.2
-          args: --include-fragments --no-progress --accept 200,429 README.md CHANGELOG.md 'docs/**/*.md'
+          args: --include-fragments --no-progress --accept '100..=103,200..=299,429' README.md CHANGELOG.md 'docs/**/*.md'
         env:
           GITHUB_TOKEN: ${{ github.token }}

@@ -5,6 +5,8 @@
 // unknown signatures run local first and record. Rust keeps its existing
 // behaviour and is never gated here.
 
+import path from "node:path";
+
 export interface DurationSample {
   /** Wall-clock seconds for one local or remote run. */
   seconds: number;
@@ -26,12 +28,15 @@ export function durationKey(repoId: string, profileId: string, signature: string
 }
 
 /**
- * Normalized command signature: tool + runner + exact argv. Single-test
- * selections naturally form their own signatures (they stay unknown/local),
- * so no fuzzy normalization that could promote a short command to remote.
+ * Normalized command signature: tool + runner + exact argv + run directory.
+ * Single-test selections naturally form their own signatures (they stay
+ * unknown/local), so no fuzzy normalization that could promote a short command
+ * to remote. The workspace root keeps the original three-part encoding, so
+ * history recorded before the directory was part of the key stays valid.
  */
-export function normalizeSignature(tool: string, runner: string, argv: string[]): string {
-  return JSON.stringify([tool, runner, argv]);
+export function normalizeSignature(tool: string, runner: string, argv: string[], cwdRelative = "."): string {
+  const cwd = path.posix.normalize(cwdRelative).replace(/\/+$/, "") || ".";
+  return cwd === "." ? JSON.stringify([tool, runner, argv]) : JSON.stringify([tool, runner, argv, cwd]);
 }
 
 function isSample(value: unknown): value is DurationSample {

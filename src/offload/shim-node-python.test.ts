@@ -14,6 +14,7 @@ function setup(tool: typeof NODE_SHIM, script: string, env: Record<string, strin
     env: {
       PATH: "/opt/boat-offload/bin:/usr/local/bin:/usr/bin",
       PAPERCLIP_WORKSPACE_ID: WS,
+      PAPERCLIP_WORKSPACE_CWD: "/work/repo",
       BOAT_OFFLOAD: "1",
       ...env,
     },
@@ -36,6 +37,8 @@ function setup(tool: typeof NODE_SHIM, script: string, env: Record<string, strin
     onSignal: () => {},
     randomId: () => CMD,
     findExecutable: (dir: string, name: string) => (dir !== "/opt/boat-offload/bin" ? `/usr/local/bin/${name}` : null),
+    cwd: () => "/work/repo",
+    canonicalDir: (p: string) => p,
     readToolchains: () => [],
     spawn: vi.fn(async () => {
       clock.t += 240_000;

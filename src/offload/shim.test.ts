@@ -15,6 +15,7 @@ function setup(env: Record<string, string | undefined> = {}) {
     env: {
       PATH: "/opt/boat-offload/bin:/usr/local/cargo/bin:/usr/bin",
       PAPERCLIP_WORKSPACE_ID: WS,
+      PAPERCLIP_WORKSPACE_CWD: "/work/repo",
       ...env,
     },
     http: {
@@ -30,6 +31,8 @@ function setup(env: Record<string, string | undefined> = {}) {
     onSignal: () => {},
     randomId: () => CMD,
     findExecutable: (dir: string, name: string) => (dir !== "/opt/boat-offload/bin" && name === "cargo" ? REAL_CARGO : null),
+    cwd: () => "/work/repo",
+    canonicalDir: (p: string) => p,
     readToolchains: () => ["stable", "1.88.0"],
     spawn: vi.fn(async () => ({ code: 0 as number | null, signal: null as string | null })),
   };
@@ -162,6 +165,51 @@ describe("passthrough (invoked as cargo)", () => {
     expect(t.deps.spawn).not.toHaveBeenCalled();
   });
 
+  function remoteEligible(t: ReturnType<typeof setup>) {
+    const bodies: Array<{ dryRun?: boolean; cwdRelative?: string }> = [];
+    (t.deps.http.post as ReturnType<typeof vi.fn>).mockImplementation(async (_p: string, body: { dryRun?: boolean }) => {
+      bodies.push(body);
+      if (body.dryRun === true) return { ok: true, status: 200, json: { version: 1, commandId: CMD, mode: "remote_candidate", reason: "eligible", profileId: "rust-public-1" } };
+      return { ok: true, status: 202, json: { version: 1, commandId: CMD, state: "queued", remoteStarted: false, fallbackSafe: false, eventsCursor: 0 } };
+    });
+    (t.deps.http.get as ReturnType<typeof vi.fn>).mockImplementation(async () => ({ ok: true, status: 200, json: completed(0) }));
+    return bodies;
+  }
+
+  it("submits cwdRelative \".\" from the workspace root", async () => {
+    const t = setup({ BOAT_OFFLOAD: "1" });
+    const bodies = remoteEligible(t);
+    expect(await shimMain(asCargo, ["test", "--locked"], t.deps)).toBe(0);
+    expect(bodies.map((b) => b.cwdRelative)).toEqual([".", "."]);
+  });
+
+  it("submits the caller's directory relative to the real workspace root", async () => {
+    const t = setup({ BOAT_OFFLOAD: "1", PAPERCLIP_WORKSPACE_CWD: "/link/repo" });
+    t.deps.cwd = () => "/link/repo/crates/foo";
+    t.deps.canonicalDir = (p) => p.replace(/^\/link\//, "/work/");
+    const bodies = remoteEligible(t);
+    expect(await shimMain(asCargo, ["test", "--locked"], t.deps)).toBe(0);
+    expect(bodies.map((b) => b.cwdRelative)).toEqual(["crates/foo", "crates/foo"]);
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+  });
+
+  it("runs local with no broker call from outside the workspace or without a resolvable root", async () => {
+    const variants: Array<(t: ReturnType<typeof setup>) => void> = [
+      (t) => { t.deps.cwd = () => "/work/other"; },
+      (t) => { t.deps.cwd = () => "/work"; },
+      (t) => { delete t.deps.env.PAPERCLIP_WORKSPACE_CWD; },
+      (t) => { t.deps.canonicalDir = () => null; },
+    ];
+    for (const vary of variants) {
+      const t = setup({ BOAT_OFFLOAD: "1" });
+      remoteEligible(t);
+      vary(t);
+      expect(await shimMain(asCargo, ["test", "--locked"], t.deps)).toBe(0);
+      expect(t.deps.http.post).not.toHaveBeenCalled();
+      expect(t.deps.spawn).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it("runs local when the server classifies local, with no submit", async () => {
     const t = setup({ BOAT_OFFLOAD: "1" });
     (t.deps.http.post as ReturnType<typeof vi.fn>).mockImplementation(async () => (
@@ -282,6 +330,14 @@ describe("diagnostic (invoked as boat-offload-cargo)", () => {
     const exit = await shimMain(SHIM, ["--dry-run", "--", "test"], t.deps);
     expect(exit).toBe(0);
     expect(t.stdoutText()).toMatch(/local/);
+    expect(t.deps.http.post).not.toHaveBeenCalled();
+  });
+
+  it("diagnostic dry-run outside the workspace reports local with the reason", async () => {
+    const t = setup({ BOAT_OFFLOAD: "1" });
+    t.deps.cwd = () => "/tmp";
+    expect(await shimMain(SHIM, ["--dry-run", "--json", "--", "test"], t.deps)).toBe(0);
+    expect(JSON.parse(t.stdoutText())).toMatchObject({ version: 1, commandId: CMD, mode: "local", reason: "cwd outside workspace" });
     expect(t.deps.http.post).not.toHaveBeenCalled();
   });
 
