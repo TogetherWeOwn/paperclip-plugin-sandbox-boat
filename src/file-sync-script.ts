@@ -159,6 +159,7 @@ def receive(confine):
     root = None
     scratch = None
     directories = []
+    refused_links = set()
     files = 0
     byte_count = 0
     single = mapping['kind'] == 'file'
@@ -199,8 +200,18 @@ def receive(confine):
                     # one; a hostile sender must not land them in the target.
                     if any(excluded('/'.join(parts[:depth])) for depth in range(1, len(parts) + 1)):
                         continue
+                    # The sender never emits a member below a symlink, so one
+                    # under a dropped link is hostile rather than a lost path.
+                    if any(tuple(parts[:depth]) in refused_links for depth in range(1, len(parts))):
+                        raise ValueError('tar member below a refused symlink')
+                    # Guest workspaces hold absolute links (a venv's bin/python),
+                    # so drop a link that leaves the target instead of failing
+                    # the whole sync; it is never created on the host.
                     if confine and member.issym() and not confined_link(parts, member.linkname):
-                        raise ValueError('tar symlink escapes its target')
+                        if len(refused_links) >= MAX_DIRECTORIES:
+                            raise ValueError('too many refused tar symlinks')
+                        refused_links.add(tuple(parts))
+                        continue
                     fd_parent = directory_fd(parts[:-1], create=True, base=root)
                     name = parts[-1]
                 try:
@@ -216,7 +227,7 @@ def receive(confine):
                     elif member.issym():
                         # Preserve links, never opening one as a parent: every
                         # parent walk uses NOFOLLOW. A confined (host) receiver
-                        # has already refused links that leave the target.
+                        # has already dropped links that leave the target.
                         os.symlink(member.linkname, name, dir_fd=fd_parent)
                     elif member.isfile():
                         mode = mapping.get('mode')

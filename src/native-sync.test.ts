@@ -674,14 +674,23 @@ describe("outbound untrusted archive boundary (when using tar)", () => {
     return { run, target };
   }
 
-  for (const [attack, link] of [["absolute", "/etc"], ["parent", "../outside-sentinel"], ["climb after descent", "sub/../.."], ["nested parent", "a/../../x"]] as const) {
-    it(`refuses a ${attack} symlink target from the guest archive`, async () => {
-      const { run, target } = await receiveHostile([{ name: "pivot", link }]);
-      await expect(run).rejects.toThrow();
+  for (const [attack, link] of [["absolute", "/etc"], ["parent", "../outside-sentinel"], ["climb after descent", "sub/../.."], ["nested parent", "a/../../x"], ["venv interpreter", "/usr/bin/python3"]] as const) {
+    it(`drops a ${attack} symlink target from the guest archive and syncs the rest`, async () => {
+      const { run, target } = await receiveHostile([{ name: "pivot", link }, { name: "after", body: "after" }]);
+      await run;
       expect(existsSync(ssh.archiveInjected)).toBe(true);
-      expect(existsSync(path.join(target, "pivot"))).toBe(false);
+      await expect(lstat(path.join(target, "pivot"))).rejects.toThrow();
+      expect(await readFile(path.join(target, "safe"), "utf8")).toBe("safe");
+      expect(await readFile(path.join(target, "after"), "utf8")).toBe("after");
     }, TIMEOUT);
   }
+
+  it("rejects a member below a dropped symlink instead of landing it as a real directory", async () => {
+    const { run, target } = await receiveHostile([{ name: "pivot", link: "/" }, { name: "pivot/etc/planted", body: "CORRUPT" }]);
+    await expect(run).rejects.toThrow();
+    expect(existsSync(ssh.archiveInjected)).toBe(true);
+    await expect(lstat(path.join(target, "pivot"))).rejects.toThrow();
+  }, TIMEOUT);
 
   it("keeps symlinks that stay inside the target", async () => {
     const { run, target } = await receiveHostile([
