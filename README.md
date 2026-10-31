@@ -779,6 +779,8 @@ A list you set replaces the built-in one, so start from the table above and add 
 
 The worker must resolve `@paperclipai/plugin-sdk` from the host's own SDK. That is what the bundled providers do.
 
+Each tagged release has this staged package attached to its GitHub Release, with a `.sha256` file. To install one, or to cut a release, see [docs/releasing.md](docs/releasing.md).
+
 Stage the package with `scripts/stage-package.sh`. It builds from one pushed commit, never from the working tree:
 
 ```sh
