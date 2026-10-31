@@ -9,6 +9,8 @@
 ### Fixed
 
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
+* The monthly offload VM-hour cap now counts commands that have started but not finished. A running command counted zero until it finished, so concurrent commands near the cap were all admitted and overshot it. Its reserved job-plus-tail envelope now counts until its interval is recorded, then only the recorded time counts.
+* A failed auto-stop extension (`maybeExtend`) no longer leaves its warm reservation unsettled. A definitive provider refusal releases the compute hold; any other failure marks it ambiguous for receipt reconciliation.
 * Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
 
 ## 0.2.3

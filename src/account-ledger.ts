@@ -177,14 +177,19 @@ function monthUsageSeconds(doc: AccountDoc, companyId: string, nowMs: number): n
   return totalMs / 1000;
 }
 
-/** Pending reservation envelopes for one company: prevents monthly-cap burst overshoot. */
+/**
+ * Reserved envelopes for one company's commands whose time is not yet in
+ * monthUsageSeconds: pending starts and started-but-unfinished commands. Once
+ * finished()/failed()/terminal() record an interval or open tail, the row's
+ * own time counts instead, so nothing is counted twice.
+ */
 function pendingCapSeconds(doc: AccountDoc, companyId: string): number {
   const byUsage = new Map(doc.usage.map((row) => [row.usageRecordId, row]));
   let total = 0;
   for (const intent of doc.intents) {
-    if (intent.status === "rejected" || intent.settledAt != null) continue;
-    const company = intent.usageId ? byUsage.get(intent.usageId)?.companyId : undefined;
-    if (company !== companyId) continue;
+    if (intent.status === "rejected" || intent.status === "stopped") continue;
+    const row = intent.usageId ? byUsage.get(intent.usageId) : undefined;
+    if (row?.companyId !== companyId || row.intervals.length > 0 || row.tailSince != null) continue;
     total += intent.jobSeconds + intent.tailSeconds;
   }
   return total;

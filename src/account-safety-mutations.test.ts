@@ -3,6 +3,7 @@ import { AccountLedger } from "./account-ledger.js";
 import type { AccountUsageRow, AdmissionRequest } from "./account-ledger.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig } from "./config.js";
+import { responseError } from "./test-support/fake-boat.js";
 import { EPOCH, advance, command, fixture, limits, starts } from "./test-support/account-admission.fixture.js";
 
 let f: ReturnType<typeof fixture>;
@@ -35,6 +36,23 @@ describe("review safety mutation pins", () => {
     expect(f.boat.callsOf("update")).toHaveLength(updates);
     expect(f.boat.boxes.get(id)!.archiveAfter).toEqual(oldDeadline);
     expect(journal().intents).toEqual(intents);
+    expect(JSON.stringify(f.logs)).toContain("could not extend the auto-stop deadline");
+  });
+
+  it.each([[422, "rejected"], [500, "ambiguous"]])("settles the warm hold when a TTL extension update fails (%i)", async (status, settled) => {
+    const manager = f.manager();
+    const lease = await f.acquire(manager, "extension-fails", { autoStopMinutes: 1 });
+    const id = lease.providerLeaseId!;
+    await advance(31_000);
+    f.boat.update = async () => { throw responseError(status, { code: "synthetic_update_failure" }); };
+    const before = journal().intents.length;
+    await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), id);
+    const intents = journal().intents;
+    expect(intents).toHaveLength(before + 1);
+    const warm = intents.at(-1)!;
+    expect(warm).toMatchObject({ operation: "warm", sandboxId: id, status: settled });
+    // A definitive refusal frees the compute hold for later admissions.
+    if (settled === "rejected") expect(warm).toMatchObject({ compute: 0, settledAt: expect.any(Number) });
     expect(JSON.stringify(f.logs)).toContain("could not extend the auto-stop deadline");
   });
 
