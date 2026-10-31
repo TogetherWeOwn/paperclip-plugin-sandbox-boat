@@ -67,6 +67,19 @@ describe("classifyCargo", () => {
     expect(classifyCargo(["-Z", "next-lockfile-bump", "build"], PROFILE).mode).toBe("local");
   });
 
+  it("keeps path-bearing overrides local, matching the executor's refusal", () => {
+    for (const argv of [
+      ["check", "--manifest-path", "/home/ubuntu/build/two-bot-next/Cargo.toml", "-p", "two-bot"],
+      ["test", "--manifest-path=crates/bot/Cargo.toml"],
+      ["build", "--target-dir", "/tmp/t"],
+      ["-C", "crates/bot", "check"],
+    ]) {
+      expect(classifyCargo(argv, PROFILE)).toMatchObject({ mode: "local", reason: expect.stringMatching(/^path-bearing option /) });
+    }
+    // Test-binary args after `--` are not Cargo options.
+    expect(classifyCargo(["test", "--", "--target-dir"], PROFILE).mode).toBe("remote_candidate");
+  });
+
   it("keeps an uninstalled toolchain local", () => {
     const result = classifyCargo(["+nightly-2026-01-01", "build"], PROFILE);
     expect(result.mode).toBe("local");

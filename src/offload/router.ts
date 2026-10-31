@@ -26,6 +26,7 @@ const LLVM_COV_MODES = new Set(["test", "nextest", "run"]);
 // Anything else before the subcommand is unrecognized and stays local.
 const GLOBAL_FLAGS = new Set(["--verbose", "-v", "--quiet", "-q", "--frozen", "--locked", "--offline"]);
 const GLOBAL_VALUE_FLAGS = new Set(["--color"]);
+const CARGO_PATH_FLAG_RE = /^(--(manifest-path|target-dir|out-dir|artifact-dir|lockfile-path)|-C)(=|$)/;
 const LOCAL_HELP_VERSION = new Set(["-h", "--help", "-V", "--version", "help", "version"]);
 
 function isCompoundShell(argv: string[]): boolean {
@@ -377,6 +378,10 @@ export function classifyCargo(argv: string[], profile: CargoProfile): CargoClass
   if (cargoSide.some((arg) => arg === "-Z" || arg.startsWith("-Z"))) {
     return local(profile, "unstable -Z flags stay local");
   }
+  // The executor refuses every path-bearing override rather than rewrite host
+  // paths; classify them local up front so dry-run agrees with dispatch.
+  const pathFlag = cargoSide.find((arg) => CARGO_PATH_FLAG_RE.test(arg));
+  if (pathFlag !== undefined) return local(profile, `path-bearing option ${pathFlag.split("=")[0]} stays local`);
 
   let rest = [...cargoSide];
   let toolchain: string | null = null;

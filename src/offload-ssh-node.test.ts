@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SshOffloadGuest } from "./offload-ssh.js";
+import { profileGuestEnv } from "./offload-ssh-runtime.js";
 import type { OffloadCommand } from "./offload.js";
 
 function command(over: Partial<OffloadCommand> = {}): OffloadCommand {
@@ -38,6 +39,7 @@ function stubGuest() {
     cgroupParent: "/sys/fs/cgroup",
     workspace: async () => "/tmp/work",
     allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
+    profileEnv: profileGuestEnv,
   });
   return { guest, ssh, seen };
 }
@@ -66,6 +68,18 @@ describe("node/python guest prepare", () => {
     await expect(guest.prepare("vm-1", command({ tool: "cargo", runner: "cargo", profileId: "rust-public-1",
       argv: ["test"], env: { RUSTFLAGS: "-D warnings" } })))
       .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+  });
+
+  it("applies the server-owned rust-public-1 build env under the request env", async () => {
+    const { guest, seen } = stubGuest();
+    await guest.prepare("vm-1", command({ tool: "cargo", runner: "cargo", profileId: "rust-public-1",
+      argv: ["test", "--offline", "--locked"], env: { CARGO_TERM_COLOR: "never" } }));
+    expect((seen[0] as { env: Record<string, string> }).env).toEqual({
+      CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0", CARGO_TERM_COLOR: "never",
+    });
+    // Node commands never pick up the cargo profile env.
+    await guest.prepare("vm-1", command());
+    expect((seen[1] as { env: Record<string, string> }).env).toEqual({});
   });
 
   it("runs a uv python command inside the checkout venv with only VIRTUAL_ENV set", async () => {

@@ -9,6 +9,7 @@ import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDura
 import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
+import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
 import { bodyTooLarge, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
 /** The refusal path must answer the same documented 409 as submit() for a reused ID. */
@@ -50,6 +51,19 @@ export interface ServerProfile {
   toolchains: string[];
   allowRustflags: boolean;
   runners?: string[];
+  /** Toolchain components the guest template installs (cargo only). */
+  components?: string[];
+  /**
+   * Server-owned guest build env, applied under the validated request env.
+   * Host env is never forwarded: these keep remote builds at local parity.
+   */
+  env?: Record<string, string>;
+  /**
+   * Cargo features that compile host-service tests (cargo only). A test run
+   * enabling one, `--all-features`, or `#[ignore]`d tests stays local: those
+   * tests reach a database by a host-only name with no env to detect.
+   */
+  serviceFeatures?: string[];
 }
 
 export interface OffloadSettings {
@@ -79,13 +93,27 @@ export interface RouteResponse {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** v1 built-in server profile: public-source, secret-free Rust builds/tests. */
+/**
+ * v1 built-in server profile: public-source, secret-free Rust builds/tests.
+ * Toolchain 1.98.1 with clippy is two-bot-next's pin (rust-toolchain.toml);
+ * the guest template must install exactly these. The env mirrors the lean
+ * build settings two-bot-next's scripts/cargo_cache.py sets for local Cargo.
+ * Its host target/scratch paths are deliberately absent: the guest owns those.
+ * two-bot-next's `db` feature and `#[ignore]`d tests need agent-testdb.
+ */
 export const V1_PROFILE: ServerProfile = {
   id: "rust-public-1",
   tool: "cargo",
-  toolchains: ["stable", "1.88.0"],
+  toolchains: ["stable", "1.98.1"],
   allowRustflags: false,
   runners: ["cargo"],
+  components: ["clippy"],
+  env: {
+    CARGO_INCREMENTAL: "0",
+    CARGO_PROFILE_DEV_DEBUG: "0",
+    CARGO_PROFILE_TEST_DEBUG: "0",
+  },
+  serviceFeatures: ["db"],
 };
 
 /** Node test/e2e/build profile: npm/pnpm/yarn scripts and test binaries. */
@@ -156,7 +184,56 @@ function profileFor(host: OffloadRouteHost, tool: OffloadTool): ServerProfile | 
 export function classifyRequest(profile: ServerProfile, tool: OffloadTool, runner: string, argv: string[]): CargoClassification {
   if (tool === "node") return classifyNode(runner, argv, profile);
   if (tool === "python") return classifyPython(runner, argv, profile);
-  return classifyCargo(argv, { id: profile.id, toolchains: profile.toolchains });
+  const classification = classifyCargo(argv, { id: profile.id, toolchains: profile.toolchains });
+  if (classification.mode === "remote_candidate" && classification.subcommand === "clippy"
+    && profile.components && !profile.components.includes("clippy")) {
+    return { mode: "local", reason: "clippy is not installed on the profile", profileId: profile.id, subcommand: "clippy" };
+  }
+  if (classification.mode === "remote_candidate" && TEST_RUNNING.has(classification.subcommand ?? "")) {
+    const reason = serviceTestReason(argv, profile.serviceFeatures ?? []);
+    if (reason !== null) return { mode: "local", reason, profileId: profile.id, subcommand: classification.subcommand };
+  }
+  return classification;
+}
+
+/** Subcommands that execute tests; build/check/clippy only compile. */
+const TEST_RUNNING = new Set(["test", "nextest", "llvm-cov"]);
+
+/** Why a test run would reach a host service, or null. */
+function serviceTestReason(argv: string[], serviceFeatures: string[]): string | null {
+  const dashDash = argv.indexOf("--");
+  const cargoSide = dashDash >= 0 ? argv.slice(0, dashDash) : argv;
+  const binarySide = dashDash >= 0 ? argv.slice(dashDash + 1) : [];
+  if (binarySide.some((arg) => arg === "--ignored" || arg === "--include-ignored")
+    || cargoSide.some((arg) => arg === "--run-ignored" || arg.startsWith("--run-ignored="))) {
+    return "ignored tests may need host services; stays local";
+  }
+  if (cargoSide.includes("--all-features")) return "--all-features may enable host-service tests; stays local";
+  for (let i = 0; i < cargoSide.length; i++) {
+    const arg = cargoSide[i]!;
+    let value: string | undefined;
+    if (arg === "--features" || arg === "-F") value = cargoSide[i + 1];
+    else if (arg.startsWith("--features=")) value = arg.slice("--features=".length);
+    else if (arg.startsWith("-F") && arg.length > 2) value = arg.slice(2);
+    if (value === undefined) continue;
+    for (const feature of value.split(/[\s,]+/).filter(Boolean)) {
+      const name = feature.slice(feature.lastIndexOf("/") + 1);
+      if (serviceFeatures.includes(name)) return `feature ${feature} enables host-service tests; stays local`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Cargo workload decision including the workspace toolchain file. An explicit
+ * `+toolchain` already passed the profile check and overrides the file.
+ */
+export async function classifyCargoWorkspace(profile: ServerProfile, argv: string[], root: string | null): Promise<CargoClassification> {
+  const classification = classifyRequest(profile, "cargo", "cargo", argv);
+  if (classification.mode === "local" || root === null || argv[0]?.startsWith("+")) return classification;
+  const mismatch = toolchainPinMismatch(await readToolchainPin(root), profile.toolchains);
+  if (mismatch === null) return classification;
+  return { mode: "local", reason: mismatch, profileId: profile.id, subcommand: classification.subcommand };
 }
 
 export function canonicalRepoId(workspace: { repoUrl: string | null; projectId: string }): string {
@@ -229,7 +306,7 @@ export async function handleExec(
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.
-    const classification = await decideRemote(host, settings, canonicalRepoId(workspace), profile, tool, runner, request.argv);
+    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
     return {
       status: 200,
       body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: profile.id },
@@ -243,7 +320,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const classification = await decideRemote(host, settings, canonicalRepoId(workspace), profile, tool, runner, request.argv);
+  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv);
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
@@ -265,19 +342,21 @@ function toolOfBody(body: unknown): OffloadTool | null {
 
 /**
  * Workload decision: classifier first, then the Node/Python duration gate.
- * Rust keeps its existing behaviour ( classifier verdict, no duration gate).
+ * Rust is never duration-gated; it checks the workspace toolchain pin instead.
  */
 async function decideRemote(
   host: OffloadRouteHost,
   settings: OffloadSettings,
-  repoId: string,
+  workspace: OffloadWorkspaceMeta,
   profile: ServerProfile,
   tool: OffloadTool,
   runner: string,
   argv: string[],
 ): Promise<CargoClassification> {
+  if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd);
+  const repoId = canonicalRepoId(workspace);
   const classification = classifyRequest(profile, tool, runner, argv);
-  if (classification.mode === "local" || tool === "cargo") return classification;
+  if (classification.mode === "local") return classification;
   if (!host.durations) {
     return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
   }

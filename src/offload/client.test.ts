@@ -80,7 +80,7 @@ describe("submit and env", () => {
     t.request.processEnv = {
       CARGO_TERM_COLOR: "never",
       RUST_BACKTRACE: "full",
-      DATABASE_URL: "postgres://secret",
+      AWS_SECRET_ACCESS_KEY: "secret-canary",
       GITHUB_TOKEN: "canary",
       RUST_LOG: "debug",
     };
@@ -119,6 +119,30 @@ describe("submit and env", () => {
     expect(exit).toBe(0);
     expect(t.deps.runLocal).toHaveBeenCalledTimes(1);
     expect(t.http.post).not.toHaveBeenCalled();
+  });
+
+  it("stays local, with no broker call, when host-service env is set", async () => {
+    // two-bot-next DB tests SKIP without TWO_TEST_DATABASE_URL: a remote run
+    // would pass with less coverage, so presence alone keeps the command local.
+    for (const key of ["TWO_TEST_DATABASE_URL", "TWO_ROLES_TEST_DATABASE_URL", "TEST_DATABASE_URL", "DATABASE_URL", "PGHOST", "PGOPTIONS", "REDIS_URL",
+      "MEMBER_TESTDB", "TWO_LFG_TESTDB_CI", "TICKET_TEST_DB_HOST"]) {
+      for (const tool of ["cargo", "node", "python"] as const) {
+        const t = setup();
+        t.request.tool = tool;
+        t.request.processEnv = { [key]: "postgres://agent-testdb@localhost/two" };
+        expect(await runDryRun(t.request, t.deps)).toEqual({ mode: "local", reason: `${key} set; host-service workloads stay local`, profileId: "" });
+        expect(await runOffload(t.request, t.deps)).toBe(0);
+        expect(t.deps.runLocal).toHaveBeenCalledTimes(1);
+        expect(t.http.post).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("ignores empty or lookalike service env keys", async () => {
+    const t = setup();
+    t.request.processEnv = { TWO_TEST_DATABASE_URL: "", DATABASE_URL_FILE: "/x", PGDATA: "/var/lib/pg", SQLX_OFFLINE: "true", TESTDBX: "1", DB_HOST: "x" };
+    t.http.post.mockImplementation(async () => ({ ok: true, status: 200, json: { version: 1, commandId: CMD, mode: "remote_candidate", reason: "eligible", profileId: "rust-public-1" } }));
+    expect((await runDryRun(t.request, t.deps)).mode).toBe("remote_candidate");
   });
 });
 

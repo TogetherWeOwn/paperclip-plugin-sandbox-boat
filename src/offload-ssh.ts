@@ -19,6 +19,8 @@ export interface SshOffloadGuestDeps {
   args?: (command: OffloadCommand) => string[];
   /** Per-command nonsecret env allowlist; defaults to the cargo pair. */
   allowedEnv?: (command: OffloadCommand) => string[];
+  /** Server-owned profile build env, applied under the validated request env. */
+  profileEnv?: (command: OffloadCommand) => Record<string, string>;
   path?: string;
   /** Guest checkout root when the source plans a uv (uv.lock) install, else null. */
   uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
@@ -70,7 +72,7 @@ export class SshOffloadGuest implements GuestController {
     }
     const cwd = await this.deps.workspace(sandboxId, command);
     let executable = command.runner ?? command.executable ?? this.deps.executable ?? "cargo";
-    let preparedEnv: Record<string, string> = { ...(command.env ?? {}) };
+    let preparedEnv: Record<string, string> = { ...(this.deps.profileEnv?.(command) ?? {}), ...(command.env ?? {}) };
     let guestPath = this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
     // A uv (uv.lock) install lands in a checkout-local .venv that the guest
     // never activates: run the interpreter from the venv and activate it for

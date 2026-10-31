@@ -87,16 +87,40 @@ export async function reportDuration(request: ShimRequest, deps: ClientDeps, dur
 }
 
 /**
+ * Host-service env: a command that sees one of these talks to a database or
+ * cache the guest cannot reach (`localhost` there is not the host), and tests
+ * that skip without it would pass remotely with less coverage. Values never
+ * travel; presence alone keeps the command local. Covers two-bot-next's
+ * `TWO_*TEST_DATABASE_URL` family and test-DB selectors (`MEMBER_TESTDB`,
+ * `TWO_LFG_TESTDB_CI`, `TICKET_TEST_DB_HOST`), sqlx's `DATABASE_URL` and
+ * libpq's `PG*`.
+ */
+const SERVICE_ENV_RE = /(^|_)(DATABASE|REDIS)_URL$|(^|_)TESTDB(_|$)|_DB_HOST$|^PG(HOST|HOSTADDR|PORT|USER|PASSWORD|PASSFILE|DATABASE|SERVICE|SERVICEFILE|OPTIONS|SSLMODE)$/;
+
+/** First non-empty host-service env key, or null. */
+export function serviceEnvKey(processEnv: ShimRequest["processEnv"]): string | null {
+  for (const [key, value] of Object.entries(processEnv)) {
+    if (value != null && value !== "" && SERVICE_ENV_RE.test(key)) return key;
+  }
+  return null;
+}
+
+/**
  * Build the request env from the process env. Only allowlisted keys travel;
  * RUSTFLAGS/RUSTDOCFLAGS stay local in v1 (the server profile cannot validate
- * them yet), and invalid enum values are omitted rather than sent as a 400.
- * Node/Python commands travel with an empty env.
+ * them yet), host-service env stays local for every tool, and invalid enum
+ * values are omitted rather than sent as a 400. Node/Python commands travel
+ * with an empty env. Build settings for parity come from the server profile.
  */
-export function buildEnv(processEnv: ShimRequest["processEnv"], tool: "cargo" | "node" | "python" = "cargo"): { local: true } | { local: false; env: Record<string, string> } {
+export function buildEnv(processEnv: ShimRequest["processEnv"], tool: "cargo" | "node" | "python" = "cargo"): { local: true; reason: string } | { local: false; env: Record<string, string> } {
+  const service = serviceEnvKey(processEnv);
+  if (service !== null) return { local: true, reason: `${service} set; host-service workloads stay local` };
   if (tool !== "cargo") return { local: false, env: {} };
   const rustflags = processEnv.RUSTFLAGS;
   const rustdocflags = processEnv.RUSTDOCFLAGS;
-  if ((rustflags != null && rustflags !== "") || (rustdocflags != null && rustdocflags !== "")) return { local: true };
+  if ((rustflags != null && rustflags !== "") || (rustdocflags != null && rustdocflags !== "")) {
+    return { local: true, reason: "RUSTFLAGS/RUSTDOCFLAGS set; profile cannot validate them yet" };
+  }
   const env: Record<string, string> = {};
   const termColor = processEnv.CARGO_TERM_COLOR;
   if (termColor !== undefined && TERM_COLOR.has(termColor)) env.CARGO_TERM_COLOR = termColor;
@@ -139,7 +163,7 @@ function asError(json: unknown): OffloadErrorEnvelope | null {
 export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise<DryRunResult> {
   const tool = request.tool ?? "cargo";
   const env = buildEnv(request.processEnv, tool);
-  if (env.local) return { mode: "local", reason: "RUSTFLAGS/RUSTDOCFLAGS set; profile cannot validate them yet", profileId: "" };
+  if (env.local) return { mode: "local", reason: env.reason, profileId: "" };
   const commandId = deps.randomId();
   const response = await deps.http.post("/offload/exec", {
     version: OFFLOAD_VERSION,
