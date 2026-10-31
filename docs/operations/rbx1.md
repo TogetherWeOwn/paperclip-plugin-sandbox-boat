@@ -55,12 +55,12 @@ src/scripts/stage-release.sh "$PWD"/sandbox-boat-X.Y.Z-*.tgz /home/ubuntu/.paper
 
 `stage-release.sh` checks the `.sha256`, checks that the tarball holds only the one package directory and its one SDK link, and checks `package.json` and `.source-commit` against the file name. It then points the SDK link at the path above, makes the package read-only, and moves it in under its own name. With no third argument it uses `$PAPERCLIP_HOME/cli/current/...`.
 
-To build from source instead, give the SDK path as the third argument:
+To build from source instead, give the SDK path as the third argument. `stage-package.sh` needs `origin/main`, which the shallow tag clone above lacks, so build from a full clone. The subshell keeps your shell in the temp dir for the later `src/scripts/...` steps:
 
 ```sh
-git fetch origin
-scripts/stage-package.sh <commit on main> /home/ubuntu/.paperclip/plugin-packages \
-  /home/ubuntu/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk
+(git clone -q https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat build && cd build \
+  && scripts/stage-package.sh <commit on main> /home/ubuntu/.paperclip/plugin-packages \
+       /home/ubuntu/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk)
 ```
 
 Check it before installing. Do not go on unless the last line prints `ready`:
@@ -224,6 +224,11 @@ Each step stands alone and takes effect on the next command. Stop at the first o
    ```sh
    # No credential in any argument: the password goes into a private pgpass
    # file, the rest into PG* variables, and psql gets no connection string.
+   # The subshell scopes the cleanup trap: an interrupt still removes the pgpass
+   # file, and nothing stays armed in your login shell.
+   (
+   trap 'rm -f "$PGPASSFILE"' EXIT
+   trap 'exit 1' INT TERM
    export PGPASSFILE=$(mktemp)
    POOL="from plugin_state, jsonb_array_elements(value_json->'vms') vm where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool'"
    if pg=$(node -e '
@@ -249,7 +254,7 @@ Each step stands alone and takes effect on the next command. Stop at the first o
    else
      echo "STOP: the inventory failed, or a pool VM is still busy (${busy:-?}); wait and run it again" >&2
    fi
-   rm -f "$PGPASSFILE"
+   )
    ```
 
 4. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Never add `?purge=true` before step 5 is done: it deletes the plugin's state, the only record of the pool VM ids.
