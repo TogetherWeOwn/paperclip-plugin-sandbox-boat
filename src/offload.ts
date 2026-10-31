@@ -734,7 +734,7 @@ export class OffloadExecutor {
     const ledger = this.ledger!;
     // Monthly VM-hour cap, when configured, is enforced atomically with
     // admission inside the ledger lock: fail closed on telemetry errors and
-    // count pending envelopes so concurrent claims cannot burst past the cap.
+    // count pending and running envelopes so concurrent claims cannot burst past the cap.
     const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
     // Fund the provider-enforced TTL envelope, not the raw timeout: create,
     // resume and warm update all clamp the deadline to whole seconds with a
