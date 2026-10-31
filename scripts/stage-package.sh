@@ -6,7 +6,10 @@
 # Usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]
 #   The package lands in <root>/sandbox-boat-<version>-<short sha>.
 #   <host plugin-sdk path> is where the Paperclip server sees its own SDK
-#   (default /app/packages/plugins/sdk, as in the Paperclip container).
+#   (default /app/packages/plugins/sdk, as in the Paperclip container). On a
+#   native npm install give the path through the CLI's `current` link, e.g.
+#   ~/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk: upgrades
+#   re-point `current` and prune old installs/npm/<version> payloads.
 #   sudo is used only for the final move when <root> is not writable.
 #
 # It refuses:
@@ -23,6 +26,7 @@
 #     a build that links it into /tmp (Paperclip refuses that link and fails
 #     every run), or one that does not make every command's tar skip
 #     .paperclip-runtime members;
+#   - a host SDK path inside a versioned Paperclip install (cli/installs/);
 #   - a destination that already exists.
 set -eu
 
@@ -31,6 +35,12 @@ ENV_FILE_FIX=0721a3af3f7f417f2cebafb30d3212d5c1182656
 commit=${1:?usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]}
 root=${2:?usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]}
 host_sdk=${3:-/app/packages/plugins/sdk}
+case "$host_sdk" in
+  */cli/installs/*)
+    echo "stage-package: $host_sdk is inside one versioned Paperclip install; link through cli/current instead (the next upgrade prunes it)." >&2
+    exit 1
+    ;;
+esac
 
 repo=$(git rev-parse --show-toplevel)
 sha=$(git -C "$repo" rev-parse --verify --quiet "$commit^{commit}") || {
@@ -76,6 +86,8 @@ git -C "$repo" archive "$sha" | tar -x -C "$work/src"
 
 pkg="$work/pkg"
 cp -R "$work/src/dist" "$work/src/package.json" "$work/src/README.md" "$work/src/LICENSE" "$pkg/"
+# The offload shims (package.json "files"); commits before them have no bin.
+if [ -d "$work/src/bin" ]; then cp -R "$work/src/bin" "$pkg/"; fi
 # docs/ is absent on the oldest supported commits.
 if [ -d "$work/src/docs" ]; then cp -R "$work/src/docs" "$pkg/"; fi
 mkdir -p "$pkg/node_modules/@boatdev" "$pkg/node_modules/@paperclipai"

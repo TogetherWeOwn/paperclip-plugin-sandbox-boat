@@ -1,6 +1,6 @@
 # Operations
 
-Enabling, smoke procedures, rollback, budget and caps. Install steps are in the [README](../README.md#install-on-a-paperclip-host); every config key is in [Configuration](configuration.md).
+Enabling, smoke procedures, rollback, budget and caps. Install steps are in the [README](../README.md#install-on-a-paperclip-host); every config key is in [Configuration](configuration.md). The host-specific install, config, shim and rollback runbook for rbx1 is [operations/rbx1.md](operations/rbx1.md).
 
 ## Enabling the executor bridge
 

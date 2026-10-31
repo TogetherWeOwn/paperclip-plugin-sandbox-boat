@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+* `scripts/stage-release.sh` stages a downloaded release tarball on a host that is not the Paperclip container. It checks the `.sha256` and the tarball's contents, then re-points its plugin-sdk link at the host's SDK (default `$PAPERCLIP_HOME/cli/current/...`, which follows Paperclip upgrades). `scripts/install-offload-shims.sh` points a shim dir's `cargo` at a staged package. [docs/operations/rbx1.md](docs/operations/rbx1.md) is the install, config, two-bot-next shim and rollback runbook for rbx1.
+
 ### Changed
 
 * Docs: the README is split into `docs/` (`configuration.md`, `operations.md`, `security.md`, `offload.md`, `development.md`, `design/`). The ADR moved to `docs/design/adr/`. The staged package now ships `docs/`. CI checks internal doc links and anchors with lychee, and reports external links without blocking.
@@ -9,6 +13,7 @@
 
 ### Fixed
 
+* Staged packages now include `bin/` (the offload shims, already in `package.json` `files`). Before, `stage-package.sh` left it out, so no staged package or release tarball (including `v0.2.3`) had a shim to install. `stage-package.sh` and `stage-release.sh` refuse a host SDK path inside a versioned Paperclip install (`cli/installs/`), which the next upgrade prunes.
 * Offload state is now reclaimed. Executor journal tombstones are deleted 30 days after their run ends, even when the host reports no termination time (the sweep records when it first saw the run end) and after a worker restart (a per-company pool registry lets the sweep reach pools no command loads again). The broker expires terminal records after the 24 h result retention even if they are never read again, deletes tombstones 30 days later, and drops a run's command count once none of its commands remain. Host staging dirs (`offloadArtifactRoot/command-*`) are removed when a command fails before its transport starts, and the sweep reclaims staged returns and uploads kept for reconciliation after 7 days.
 * Offloaded commands now run from the caller's directory. The shim submitted `cwdRelative: "."` regardless of where it was invoked, so `cd crates/foo && cargo test` ran (and reported) the workspace-root command. It now sends the caller's cwd relative to the real `PAPERCLIP_WORKSPACE_CWD` root (both realpath'd); a cwd outside the workspace, or no resolvable root, runs locally (`--dry-run` reports the reason). Cargo honours the toolchain file nearest the run directory, and a Node/Python sub-project with its own lockfile stays local.
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.

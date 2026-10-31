@@ -28,4 +28,4 @@ sha256sum -c sandbox-boat-X.Y.Z-*.tgz.sha256
 tar -xzf sandbox-boat-X.Y.Z-*.tgz -C <plugin packages root>
 ```
 
-The tarball holds the same read-only directory that `stage-package.sh` stages. Its `node_modules/@paperclipai/plugin-sdk` links to `/app/packages/plugins/sdk`, the SDK path inside the Paperclip container. Then install it as described in the README's [Install on a Paperclip host](../README.md#install-on-a-paperclip-host).
+The tarball holds the same read-only directory that `stage-package.sh` stages. Its `node_modules/@paperclipai/plugin-sdk` links to `/app/packages/plugins/sdk`, the SDK path inside the Paperclip container. On any other host, stage it with `scripts/stage-release.sh <tarball> <plugin packages root> [<host plugin-sdk path>]` instead of `tar -x`. It checks the `.sha256` and re-points that link at the host's SDK (see [operations/rbx1.md](operations/rbx1.md)). Then install it as described in the README's [Install on a Paperclip host](../README.md#install-on-a-paperclip-host).
