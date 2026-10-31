@@ -191,7 +191,8 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     const { full } = await identity(command);
     expect(await guest.armDeadline(ssh.session.sandboxId, full)).toEqual({ verified: true, outsideCommandCgroup: true });
     const pending = guest.runCommand(ssh.session.sandboxId, command, { identity: full, output: async () => {} });
-    await expect.poll(() => readFile(marker, "utf8").catch(() => null)).toBe("");
+    // The default 1s poll is shorter than SSH dispatch plus python startup on a CI runner.
+    await expect.poll(() => readFile(marker, "utf8").catch(() => null), { timeout: 5_000 }).toBe("");
     expect(await pending).toMatchObject({ exitCode: 124 });
     await expect.poll(() => guest.verifyEmpty(ssh.session.sandboxId, full), { timeout: 5_000 }).toBe(true);
   }, 15_000);
