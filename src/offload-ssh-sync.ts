@@ -232,18 +232,22 @@ export class SshOffloadSync implements OffloadSync {
   async collectGarbage(): Promise<void> {
     const cutoff = this.now() - ARTIFACT_RETENTION_MS;
     for (const [id, upload] of this.uploads) if (upload.at < cutoff) this.uploads.delete(id);
-    const live = new Set([...this.uploads.values()].map((upload) => upload.scratch));
-    const entries = await readdir(this.deps.artifactRoot).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return [] as string[];
-      throw error;
-    });
-    for (const name of entries) {
-      if (!name.startsWith("command-")) continue;
-      const dir = path.join(this.deps.artifactRoot, name);
-      if (live.has(dir)) continue;
-      const info = await lstat(dir).catch(() => null);
-      if (!info?.isDirectory() || info.mtimeMs >= cutoff) continue;
-      await rm(dir, { recursive: true, force: true });
-    }
+    await sweepArtifactRoot(this.deps.artifactRoot, cutoff, new Set([...this.uploads.values()].map((upload) => upload.scratch)));
+  }
+}
+
+/** Remove command-* scratch dirs under an artifact root last modified before cutoff, except live ones. */
+export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, live: ReadonlySet<string> = new Set()): Promise<void> {
+  const entries = await readdir(artifactRoot).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [] as string[];
+    throw error;
+  });
+  for (const name of entries) {
+    if (!name.startsWith("command-")) continue;
+    const dir = path.join(artifactRoot, name);
+    if (live.has(dir)) continue;
+    const info = await lstat(dir).catch(() => null);
+    if (!info?.isDirectory() || info.mtimeMs >= cutoff) continue;
+    await rm(dir, { recursive: true, force: true });
   }
 }

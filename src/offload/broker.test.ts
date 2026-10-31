@@ -604,6 +604,35 @@ describe("retention", () => {
     expect([...store.data.keys()].filter((key) => key !== "offload.retention")).toEqual([]);
   });
 
+  it("a failed index write strands nothing: the retry dispatches and an orphaned entry is pruned", async () => {
+    const { broker, backend, clock, store } = setup();
+    const realSet = store.set.bind(store);
+    store.set = async (key, value) => {
+      if (key === "offload.retention") throw new Error("index write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(), PRINCIPAL)).rejects.toThrow("index write lost");
+    expect(persisted(store)).toBeUndefined();
+    expect(await store.get(`offload.run.${RUN}.count`)).toBeNull();
+    store.set = realSet;
+    expect((await broker.submit(submitFor(), PRINCIPAL)).status).toBe(202);
+    expect(backend.starts).toHaveLength(1);
+    expect(persisted(store)).toMatchObject({ state: "queued" });
+
+    // An index entry whose record write then failed is pruned, not kept forever.
+    const ORPHAN = "0f6b7c38-6c0e-4c1b-9a4e-2f1f3c1e9b11";
+    store.set = async (key, value) => {
+      if (key === `offload.cmd.${ORPHAN}`) throw new Error("record write lost");
+      await realSet(key, value);
+    };
+    await expect(broker.submit(submitFor(ORPHAN), PRINCIPAL)).rejects.toThrow("record write lost");
+    store.set = realSet;
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[ORPHAN]).toBe(RUN);
+    clock.t += HOUR;
+    await broker.collectGarbage();
+    expect((await store.get("offload.retention") as { commands: Record<string, string> }).commands[ORPHAN]).toBeUndefined();
+  });
+
   it("never expires an unresolved command or its run count", async () => {
     const { broker, backend, clock, store } = setup();
     await broker.submit(submitFor(), PRINCIPAL);

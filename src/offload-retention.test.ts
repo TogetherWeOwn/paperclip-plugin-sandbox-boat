@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -15,7 +15,7 @@ import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugi
 
 const DAY = 86_400_000;
 
-describe("journal releases the host upload on every non-transport failure", () => {
+describe("journal releases the host upload only on a failure before transport", () => {
   let dir: string;
   let state: DiskState;
   beforeEach(async () => {
@@ -48,11 +48,11 @@ describe("journal releases the host upload on every non-transport failure", () =
     });
   }
 
-  it.each(["collect", "stage"] as const)("discards after a %s failure", async (phase) => {
+  it.each(["collect", "stage"] as const)("keeps the upload after a post-exit %s failure for recovery", async (phase) => {
     const { journal, discard } = journalWith({ [phase]: async () => { throw new Error(`${phase} failed`); } });
     const cmd = lifecycleCommand(`fail-${phase}`);
-    await attempt(journal, cmd);
-    expect(discard).toHaveBeenCalledWith("vm", cmd);
+    expect(await attempt(journal, cmd)).toMatchObject({ status: "unknown", fallbackSafe: false });
+    expect(discard).not.toHaveBeenCalled();
   });
 
   it("discards after a pre-start failure", async () => {
@@ -147,5 +147,29 @@ describe("stock runtime journal retention", () => {
     vi.setSystemTime(Date.now() + 2 * DAY);
     await runtime.sweep();
     expect(journalKeys()).toEqual([]);
+  }, 30_000);
+
+  it("reaches a finished pool's tombstones and staging dirs after a restart, with no command resolving it again", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const executor = (await runtime.resolve(command(), config))!;
+    const cmd = command();
+    await executor.start(cmd);
+    await expect.poll(async () => (await executor.readOutput(companyId, runId, cmd.commandId)).state,
+      { timeout: 15_000 }).toMatch(/^(completed|not_started)$/);
+    const staged = path.join(config.offloadArtifactRoot as string, "command-left-behind");
+    await mkdir(staged, { recursive: true });
+    await runtime.shutdown();
+
+    // A fresh worker: the run's binding and every in-memory pool are gone.
+    runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only" });
+    vi.setSystemTime(Date.now() + 2 * DAY);
+    await runtime.sweep([companyId]);
+    expect(harness.state.get(journalKeys()[0]!)).toMatchObject({ tombstone: true, runTerminalSeenAt: expect.any(Number) });
+    vi.setSystemTime(Date.now() + 31 * DAY);
+    await runtime.sweep([companyId]);
+    expect(journalKeys()).toEqual([]);
+    expect(await stat(staged).catch((error: NodeJS.ErrnoException) => error.code)).toBe("ENOENT");
+    // Nothing of the pool is left to expire: the registry forgets it.
+    expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" })).toEqual({});
   }, 30_000);
 });

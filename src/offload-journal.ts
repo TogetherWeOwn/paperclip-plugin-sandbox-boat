@@ -67,7 +67,7 @@ export interface OffloadSync {
   // Collection is adapter-owned data; orchestration passes it to stage intact.
   collect(sandboxId: string, command: OffloadCommand): Promise<unknown>;
   stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
-  // Drop the host-side upload after a failed command; never throws.
+  // Drop the host-side upload after a command failed before transport; never throws.
   discard?(sandboxId: string, command: OffloadCommand): Promise<void>;
 }
 
@@ -370,9 +370,11 @@ export class OffloadJournal {
     // cancellation can fence spawn, but need not abort an already-running push.
     if (record.state === "not_started" || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
     await this.deps.sync.push(sandboxId, command);
-    // A transport failure keeps the upload: receipt reconciliation may still
-    // collect from it. Every other failure ends the command's use of it.
-    let transporting = false;
+    // Once the transport is invoked the guest may have run: a later failure,
+    // transport or collect/stage alike, keeps the upload (and any partially
+    // staged return) for receipt reconciliation; the retention sweep reclaims
+    // it. Only a failure before transport ends the command's use of it.
+    let transported = false;
     try {
       const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
       if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
@@ -388,9 +390,8 @@ export class OffloadJournal {
         this.lifecycle?.discard(identity);
         throw error;
       }
-      transporting = true;
+      transported = true;
       const result = await transport(sandboxId, command, identity);
-      transporting = false;
       // The legacy transport resolves at exit, not at spawn. Do not claim a
       // running acknowledgement until it actually returns evidence of execution.
       await this.transition(record, async () => {
@@ -400,7 +401,7 @@ export class OffloadJournal {
       const syncBack = await this.syncOut(sandboxId, command);
       return { ...result, ...(syncBack ? { syncBack } : {}) };
     } catch (error) {
-      if (!transporting) await this.deps.sync.discard?.(sandboxId, command);
+      if (!transported) await this.deps.sync.discard?.(sandboxId, command);
       throw error;
     }
   }

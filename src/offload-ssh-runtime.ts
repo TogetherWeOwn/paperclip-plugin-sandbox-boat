@@ -9,7 +9,7 @@ import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugi
 import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./config.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
-import type { OffloadStore } from "./offload-journal.js";
+import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
 import { planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
@@ -19,7 +19,7 @@ import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
-import { SshOffloadSync } from "./offload-ssh-sync.js";
+import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
 import { DEFAULT_SYNC_EXCLUDES } from "./offload-sync.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
@@ -183,9 +183,17 @@ function journalStore(state: StateClientLike, companyId: string, poolId: string)
   };
 }
 
+/** Every pool a company ever ran, so retention reaches pools no live command resolves again (e.g. after a restart). */
+type PoolRegistry = Record<string, { artifactRoot: string; seenAt: number }>;
+const poolRegistryScope = (companyId: string) =>
+  ({ scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" });
+
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
-  private readonly pools = new Map<string, { executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
+  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
+  /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
+  private readonly retiredSweeps = new Map<string, Promise<void>>();
+  private registryTail: Promise<unknown> = Promise.resolve();
   private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
@@ -257,7 +265,11 @@ export class SshOffloadRuntime {
     // it must keep ownership of VMs already recorded under this pool so they
     // are retired through the normal stop path. The executor keys VM reuse on
     // the template instead (compatibilityKey).
-    const existing = this.pools.get(poolId);
+    let existing = this.pools.get(poolId);
+    if (!existing && this.retiredSweeps.has(poolId)) {
+      await this.retiredSweeps.get(poolId);
+      existing = this.pools.get(poolId);
+    }
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
       return existing.executor;
@@ -328,15 +340,50 @@ export class SshOffloadRuntime {
       journalStore: journalStore(this.deps.state, command.companyId, poolId),
       guestReceipts: { bootId: (vm) => guest.bootId(vm), read: (identity) => guest.receipt(identity) },
       resolveRunState: async (companyId, runId) => ({
-        permanentlyTerminal: this.closed || ![...this.bindings.values()].some((entry) => entry.companyId === companyId && entry.runId === runId && Date.now() - entry.seenAt < 24 * 60 * 60_000),
-        terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
+        permanentlyTerminal: this.runEnded(companyId, runId), terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
       }),
       sync: { push: (vm, cmd) => sync.push(vm, cmd),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd) },
     });
-    this.pools.set(poolId, { executor, guest, sync });
+    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
+    // Bookkeeping only: a lost write is retried by the next sweep while the pool is loaded.
+    await this.updateRegistry(command.companyId, (registry) => {
+      registry[poolId] = { artifactRoot: settings.offloadArtifactRoot as string, seenAt: Date.now() };
+    }).catch(() => undefined);
     return executor;
+  }
+
+  private runEnded(companyId: string, runId: string): boolean {
+    return this.closed || ![...this.bindings.values()].some((entry) => entry.companyId === companyId && entry.runId === runId && Date.now() - entry.seenAt < 24 * 60 * 60_000);
+  }
+
+  private updateRegistry(companyId: string, change: (registry: PoolRegistry) => void | Promise<void>): Promise<void> {
+    const pending = this.registryTail.then(async () => {
+      const raw = await this.deps.state.get(poolRegistryScope(companyId));
+      const registry: PoolRegistry = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as PoolRegistry) } : {};
+      await change(registry);
+      await this.deps.state.set(poolRegistryScope(companyId), registry);
+    });
+    this.registryTail = pending.catch(() => undefined);
+    return pending;
+  }
+
+  /**
+   * Retention for a registered pool that is not loaded: its journal's
+   * tombstones age out exactly as a loaded pool's would. The journal is never
+   * executed, so only collectGarbage is reachable. Returns true once the
+   * journal is empty.
+   */
+  private async collectRetiredPool(companyId: string, poolId: string, seenAt: number): Promise<boolean> {
+    const store = journalStore(this.deps.state, companyId, poolId);
+    const inert = async () => { throw new Error("Retired offload pool is not executable"); };
+    const journal = new OffloadJournal({ journalStore: store, guestReceipts: { read: inert },
+      resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
+        tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
+      sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
+    await journal.collectGarbage();
+    return (await store.list("")).length === 0;
   }
 
   private confined(command: BackendCommand, tool: "cargo" | "node" | "python"): boolean {
@@ -368,13 +415,39 @@ export class SshOffloadRuntime {
     return true;
   }
 
-  async sweep(): Promise<void> {
+  /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */
+  async sweep(companyIds: Iterable<string> = []): Promise<void> {
     const outcomes = await Promise.allSettled([...this.pools.values()].map(async ({ executor, sync }) => {
       await executor.sweep();
       await executor.collectGarbage();
       await sync.collectGarbage();
     }));
-    if (outcomes.some((outcome) => outcome.status === "rejected")) throw new Error("Offload pool sweep unverified");
+    const companies = new Set([...companyIds, ...[...this.pools.values()].map((pool) => pool.companyId)]);
+    const retired = await Promise.allSettled([...companies].map((companyId) => this.updateRegistry(companyId, async (registry) => {
+      const roots = new Set<string>();
+      for (const [poolId, entry] of Object.entries(registry)) {
+        if (this.pools.has(poolId)) {
+          const loaded = this.pools.get(poolId)!;
+          registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now() };
+          continue;
+        }
+        if (!entry || typeof entry.artifactRoot !== "string" || !Number.isFinite(entry.seenAt)) { delete registry[poolId]; continue; }
+        const task = this.collectRetiredPool(companyId, poolId, entry.seenAt);
+        this.retiredSweeps.set(poolId, task.then(() => undefined, () => undefined));
+        try {
+          const empty = await task;
+          roots.add(entry.artifactRoot);
+          // Forget the pool once nothing of it is left to expire.
+          if (empty && Date.now() - entry.seenAt >= ARTIFACT_RETENTION_MS) delete registry[poolId];
+        } finally {
+          this.retiredSweeps.delete(poolId);
+        }
+      }
+      // A loaded pool's own sweep covers its root and spares its live uploads.
+      const loadedRoots = new Set([...this.pools.values()].map((pool) => pool.artifactRoot));
+      for (const root of roots) if (!loadedRoots.has(root)) await sweepArtifactRoot(root, Date.now() - ARTIFACT_RETENTION_MS);
+    })));
+    if ([...outcomes, ...retired].some((outcome) => outcome.status === "rejected")) throw new Error("Offload pool sweep unverified");
   }
 
   async shutdown(): Promise<void> {

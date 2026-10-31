@@ -271,6 +271,9 @@ export class OffloadBroker {
       const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
       if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return;
       const now = this.now();
+      // Index first: a failed index write leaves no record, and an indexed
+      // command without a record is simply pruned by the sweep.
+      await this.track(request.commandId, principal.runId, now);
       await this.save({
         version: 1,
         commandId: request.commandId,
@@ -293,7 +296,6 @@ export class OffloadBroker {
         terminalAt: now,
       });
       await this.store.set(countKey(principal.runId), count + 1);
-      await this.track(request.commandId, principal.runId, now);
     });
   }
 
@@ -453,10 +455,11 @@ export class OffloadBroker {
         createdAt: now,
         terminalAt: null,
       };
-      // Persist intent before any external effect.
+      // Persist intent before any external effect. Index first, as in
+      // recordRefusal: an index failure must not strand an undispatched record.
+      await this.track(request.commandId, principal.runId, now);
       await this.save(record);
       await this.store.set(countKey(principal.runId), count + 1);
-      await this.track(request.commandId, principal.runId, now);
       this.known.add(request.commandId);
 
       const sink = this.sinkFor(request.commandId);
