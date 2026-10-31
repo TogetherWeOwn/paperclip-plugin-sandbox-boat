@@ -4,12 +4,21 @@ on:
   pull_request:
   push:
     branches: [main]
+  merge_group:
 
 permissions:
   contents: read
 
+# A newer push to the same PR supersedes the old run; main keeps every run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
+    # Required status check on main. Renaming this changes the check context
+    # and blocks every merge until the ruleset is updated to match.
+    name: check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
