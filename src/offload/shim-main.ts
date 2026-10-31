@@ -28,6 +28,10 @@ export interface ShimDeps {
   readToolchains: () => string[];
   /** Optional: resolve symlinks so a candidate that is the shim itself is never used as the real executable. */
   realpath?: (p: string) => string;
+  /** The shim process's working directory. */
+  cwd: () => string;
+  /** Strict realpath for the workspace/cwd check: null when the path cannot be resolved. */
+  canonicalDir: (p: string) => string | null;
   /** `onSpawn` hands the caller a way to signal the child so termination is forwarded, not dropped. */
   spawn: (exe: string, argv: string[], env: Record<string, string>, options?: SpawnOptions) => Promise<SpawnResult>;
 }
@@ -137,6 +141,18 @@ function resolveRealExe(shimDir: string, scriptPath: string, pathEnv: string, ex
     return hit;
   }
   return null;
+}
+
+/** The caller's cwd relative to the workspace root (posix), or why it cannot be offloaded. */
+function workspaceRelativeCwd(deps: Pick<ShimDeps, "env" | "cwd" | "canonicalDir">): { cwd: string } | { reason: string } {
+  const rootEnv = deps.env.PAPERCLIP_WORKSPACE_CWD;
+  const root = rootEnv ? deps.canonicalDir(rootEnv) : null;
+  if (!root) return { reason: "no workspace root" };
+  const here = deps.canonicalDir(deps.cwd());
+  if (!here) return { reason: "cwd unresolvable" };
+  const rel = path.relative(root, here);
+  if (path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`)) return { reason: "cwd outside workspace" };
+  return { cwd: rel === "" ? "." : rel.split(path.sep).join("/") };
 }
 
 function fallbackEnv(env: ShimDeps["env"], shimDir: string): Record<string, string> {
@@ -252,13 +268,24 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     }
     return runLocal(toolArgv);
   }
+  // Remote runs execute in the same workspace-relative directory as the caller;
+  // a cwd outside the workspace (or no resolvable root) stays local.
+  const located = workspaceRelativeCwd(deps);
+  if ("reason" in located) {
+    if (diagnostic && dryRun) {
+      const envelope = { version: OFFLOAD_VERSION, commandId: deps.randomId(), mode: "local", reason: located.reason, profileId: "" };
+      writeStdout(json ? `${JSON.stringify(envelope)}\n` : `mode: local (${located.reason})\n`);
+      return 0;
+    }
+    return runLocal(toolArgv);
+  }
 
   const commandId = deps.randomId();
   const request: ShimRequest = {
     tool: tool.tool,
     runner,
     argv: toolArgv,
-    cwdRelative: ".",
+    cwdRelative: located.cwd,
     executionWorkspaceId: workspaceId!,
     queueTimeoutMs: parseQueueTimeoutMs(deps.env.BOAT_OFFLOAD_QUEUE_TIMEOUT_MS),
     timeoutMs: parseCommandTimeoutMs(deps.env.BOAT_OFFLOAD_TIMEOUT_MS),

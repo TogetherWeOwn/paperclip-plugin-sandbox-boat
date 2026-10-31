@@ -1,8 +1,8 @@
 // Workspace toolchain pin. rustup honours `rust-toolchain.toml` (or the legacy
 // `rust-toolchain`) in the synced source, so a pin the server profile does not
 // install would make the guest download a toolchain, or build with a different
-// compiler than the host. Only the workspace root is read: the shim always
-// submits cwdRelative ".".
+// compiler than the host. The nearest file from the run directory
+// (cwdRelative) up to the workspace root wins, as with rustup.
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";

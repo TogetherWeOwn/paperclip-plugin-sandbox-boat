@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -196,11 +196,11 @@ describe("rust-public-1 profile parity", () => {
     for (const [name, text] of Object.entries(files)) writeFileSync(path.join(root, name), text);
     return root;
   }
-  async function dryRun(root: string, argv: string[]) {
+  async function dryRun(root: string, argv: string[], cwdRelative = ".") {
     const t = setup();
     t.host.profile = V1_PROFILE;
     t.workspaces.set(WS, { repoUrl: "https://github.com/TogetherWeOwn/two-bot-next", projectId: "proj-1", projectWorkspaceId: "pws-1", path: root, cwd: root });
-    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv, dryRun: true }) }, t.host);
+    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv, dryRun: true, cwdRelative }) }, t.host);
     expect(response.status).toBe(200);
     return response.body as { mode: string; reason: string };
   }
@@ -236,6 +236,14 @@ describe("rust-public-1 profile parity", () => {
       .toBe("remote_candidate");
     // An explicit installed +toolchain overrides the file, as rustup does.
     expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["+1.98.1", "check"])).mode).toBe("remote_candidate");
+  });
+
+  it("uses the toolchain file nearest the run directory", async () => {
+    const root = workspaceWith({ "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN });
+    mkdirSync(path.join(root, "crates", "foo", "src"), { recursive: true });
+    writeFileSync(path.join(root, "crates", "foo", "rust-toolchain"), "1.99.0");
+    expect((await dryRun(root, ["check"], "crates")).mode).toBe("remote_candidate");
+    expect(await dryRun(root, ["check"], "crates/foo/src")).toMatchObject({ mode: "local", reason: "rust-toolchain pins 1.99.0, not installed on the profile" });
   });
 
   it("keeps test runs that reach agent-testdb without any env local", async () => {
