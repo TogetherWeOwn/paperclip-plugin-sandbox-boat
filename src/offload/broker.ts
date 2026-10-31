@@ -1,5 +1,5 @@
 // Offload command broker: journal, incremental output, heartbeat and cancel.
-// Design: docs/adr/0001-heavy-command-offload.md. Routes delegate here after
+// Design: docs/design/adr/0001-heavy-command-offload.md. Routes delegate here after
 // host authentication; the shim polls here. Remote execution itself is an
 // injected OffloadBackend; the executor adapter is explicitly opt-in. Without
 // an installed lifecycle executor, the plugin never dispatches.

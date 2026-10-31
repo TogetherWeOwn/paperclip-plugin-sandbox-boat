@@ -34,3 +34,29 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: shellcheck scripts/*.sh
+      # Internal links and #anchors in the docs. Blocking: a moved heading or
+      # file must update every link to it. No network.
+      - name: Check internal doc links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: --offline --include-fragments --no-progress README.md CHANGELOG.md 'docs/**/*.md'
+          jobSummary: false
+
+  links-external:
+    # Not a required check, and report-only: a third-party outage must not
+    # red CI.
+    name: links-external
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check external doc links
+        # Report-only: failures show in the job summary, the job stays green.
+        continue-on-error: true
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: --include-fragments --no-progress --accept 200,429 README.md CHANGELOG.md 'docs/**/*.md'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

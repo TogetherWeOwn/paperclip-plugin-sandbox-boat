@@ -75,7 +75,7 @@ git -C "$repo" archive "$sha" | tar -x -C "$work/src"
 )
 
 pkg="$work/pkg"
-cp -R "$work/src/dist" "$work/src/package.json" "$work/src/README.md" "$work/src/LICENSE" "$pkg/"
+cp -R "$work/src/dist" "$work/src/package.json" "$work/src/README.md" "$work/src/docs" "$work/src/LICENSE" "$pkg/"
 mkdir -p "$pkg/node_modules/@boatdev" "$pkg/node_modules/@paperclipai"
 cp -R "$work/src/node_modules/@boatdev/sdk" "$pkg/node_modules/@boatdev/sdk"
 # Resolve the SDK the server itself runs, like the bundled providers do.

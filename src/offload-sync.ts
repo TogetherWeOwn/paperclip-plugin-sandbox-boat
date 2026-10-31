@@ -1,5 +1,5 @@
 // Delta workspace sync for offloaded heavy commands.
-// Design: docs/adr/0001-heavy-command-offload.md, "Sync and returned writes".
+// Design: docs/design/adr/0001-heavy-command-offload.md, "Sync and returned writes".
 //
 // Before each command the broker freezes an immutable source snapshot, plans a
 // content-hash delta against the previous upload, and pushes only changed

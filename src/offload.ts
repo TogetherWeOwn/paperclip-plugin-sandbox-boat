@@ -1,5 +1,5 @@
 // v1 offload executor: one heavy command on a shared pool VM.
-// Design: docs/adr/0001-heavy-command-offload.md.
+// Design: docs/design/adr/0001-heavy-command-offload.md.
 //
 // Scope: warm pick, resume/create up to maxOffloadVms, FIFO queue, idle stop
 // after C with generation-guarded timers, start/compute budget fallback to
