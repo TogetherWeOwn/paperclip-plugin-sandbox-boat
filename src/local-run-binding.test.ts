@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -72,7 +72,7 @@ describe("plugin wiring", () => {
   async function setup(config: Record<string, unknown>, configGet?: () => Promise<Record<string, unknown>>) {
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-run-"));
     const harness = createFakeContext({
-      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId }]]),
+      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId }]]),
       workspaces: new Map([[workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: dir, cwd: dir }]]),
     });
     harness.secrets.set(secretId, "scoped-key");
@@ -143,9 +143,11 @@ describe("plugin wiring", () => {
     };
     const pending = harness.emit("agent.run.started", started);
     await writing;
-    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    // The terminal event queues behind the in-flight write (same per-run lock), then removes it.
+    const ending = harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
     release();
-    await pending;
+    await Promise.all([pending, ending]);
     harness.ctx.state.set = originalSet;
     expect((await exec(runId)).status).toBe(403);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
@@ -181,13 +183,14 @@ describe("plugin wiring", () => {
     try {
       const pending = harness.emit("agent.run.started", started);
       await writing;
-      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+      const realizing = plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
         config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
         workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
           environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
           source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      await new Promise((resolve) => setTimeout(resolve, 10));
       release();
-      await pending;
+      await Promise.all([pending, realizing]);
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
       const saved = [...harness.state.entries()].find(([key]) => key.includes("boat-offload-workspaces"))?.[1] as { workspace?: { path?: string } };
       expect(saved?.workspace?.path).toBe(nativeSource);
@@ -236,6 +239,112 @@ describe("plugin wiring", () => {
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     } finally {
       await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  const workspaceBindings = (harness: Awaited<ReturnType<typeof setup>>) =>
+    [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
+  const restart = async (harness: Awaited<ReturnType<typeof setup>>) => {
+    await plugin.definition.onShutdown?.();
+    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => enabled } } as never);
+  };
+
+  it("refuses a run whose owner is unknown: a started event without an agent", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", { companyId, payload: { runId, issueId, status: "running" } });
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("refuses a bound run that this worker never saw start", async () => {
+    await setup(enabled);
+    await (await import("./plugin.js")).currentManager().rememberOffloadWorkspace((await localRunRealization(started, localRunSettings(enabled), host()))!);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a restarted worker keeps the persisted owner: the owner is admitted, another agent is not", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    await restart(harness);
+    expect((await exec(runId)).status).toBe(200);
+    const other = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
+      actor: { actorType: "agent", actorId: randomUUID(), agentId: randomUUID(), runId }, params: {}, query: {},
+      body: { version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId, argv: ["test"], cwdRelative: ".", env: {},
+        queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true } } as never);
+    expect(other.status).toBe(403);
+  });
+
+  it("a run still active after more than a day keeps its owner across a restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const harness = await setup(enabled);
+      await harness.emit("agent.run.started", started);
+      vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+      await restart(harness);
+      expect((await exec(runId)).status).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a terminal event forgets the run's persisted workspace bindings and owner after a worker restart", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    expect(workspaceBindings(harness)).toHaveLength(1);
+    await restart(harness); // nothing about the run in memory
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    expect(workspaceBindings(harness)).toEqual([]);
+    expect([...harness.state.keys()].some((key) => key.includes("boat-offload-run"))).toBe(false);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a finished run stays refused after a restart even when deleting its owner record fails", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    const originalDelete = harness.ctx.state.delete;
+    harness.ctx.state.delete = async (input: { namespace?: string }) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalDelete(input as never);
+    };
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    harness.ctx.state.delete = originalDelete;
+    await restart(harness);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a finished run stays refused after a restart when every write of its owner record fails", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    const { delete: originalDelete, set: originalSet } = harness.ctx.state;
+    harness.ctx.state.delete = async (input: { namespace?: string }) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalDelete(input as never);
+    };
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-runs") throw new Error("state unavailable");
+      return originalSet(input, value);
+    };
+    await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+    harness.ctx.state.delete = originalDelete;
+    harness.ctx.state.set = originalSet;
+    // The host no longer shows the run on its issue.
+    harness.issues.set(issueId, { status: "done", executionWorkspaceId: workspaceId, executionRunId: null });
+    await restart(harness);
+    expect((await exec(runId)).status).toBe(403);
+  });
+
+  it("a restarted worker trusts the saved owner of a run without an issue for a day", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const harness = await setup(enabled);
+      await harness.emit("agent.run.started", { companyId, payload: { runId, issueId: null, agentId, status: "running" } });
+      await restart(harness);
+      const manager = () => import("./plugin.js").then((module) => module.currentManager());
+      expect(await (await manager()).localRunOwnedBy(companyId, runId, agentId)).toBe(true);
+      vi.setSystemTime(Date.now() + 25 * 60 * 60_000);
+      await restart(harness);
+      expect(await (await manager()).localRunOwnedBy(companyId, runId, agentId)).toBe(false);
+    } finally {
+      vi.useRealTimers();
     }
   });
 

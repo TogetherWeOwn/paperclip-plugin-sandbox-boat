@@ -265,7 +265,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
       const reply = await host.call<{ status: number; body: { detail?: string } }>("handleApiRequest",
         { ...scopedRouteInput({ routeKey }, spoofed, execBody()), params: { commandId: randomUUID() } }, companyId);
       expect(reply.status, routeKey).toBe(403);
-      expect(reply.body.detail, routeKey).toBe("run belongs to another agent");
+      expect(reply.body.detail, routeKey).toBe("run is not known to belong to this agent");
     }
   }, TIMEOUT);
 

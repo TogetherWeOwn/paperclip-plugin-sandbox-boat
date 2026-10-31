@@ -60,6 +60,8 @@ const plugin = definePlugin({
           const issue = await ctx.issues.get(issueId, companyId);
           return issue ? {
             status: issue.status,
+            executionRunId: issue.executionRunId ?? null,
+            checkoutRunId: issue.checkoutRunId ?? null,
             ...(Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings")
               ? { executionWorkspaceSettings: issue.executionWorkspaceSettings } : {}),
           } : null;
@@ -99,12 +101,14 @@ const plugin = definePlugin({
     };
     ctx.events.on("agent.run.started", async (event) => {
       const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown; agentId?: unknown };
-      if (typeof payload.runId !== "string" || typeof payload.issueId !== "string") return;
-      // Record every started run before reading settings: the record grants nothing, and a
-      // transient config failure here stays recoverable on the run's first offload request.
+      if (typeof payload.runId !== "string") return;
+      // Record every started run, with or without an issue, before reading settings: its owner
+      // gates every offload route (whole-run leases too), and a transient config failure here
+      // stays recoverable on the run's first offload request. Only a run on an issue binds locally.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
-      if (!requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId, agentId)) return;
-      await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
+      const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
+      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId)) || !issueId) return;
+      await bindLocalRun!(event.companyId, payload.runId, issueId);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
       ctx.events.on(done, async (event) => {
@@ -135,11 +139,12 @@ const plugin = definePlugin({
       return { status: 200, body: await boat.usageSummary(input.companyId, { refresh }) };
     }
     if (input.routeKey === "sweep") {
-      return { status: 200, body: await boat.sweep("api", { force: true }) };
+      // Acts on and reports only the caller's company; the scheduled job sweeps every company.
+      return { status: 200, body: await boat.sweep("api", { force: true, companyId: input.companyId }) };
     }
     if (input.routeKey.startsWith("offload_") && input.actor.actorType === "agent" && input.actor.runId
-      && boat.localRunHeldByOtherAgent(input.companyId, input.actor.runId, input.actor.agentId)) {
-      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run belongs to another agent", { commandId: null }) };
+      && !(await boat.localRunOwnedBy(input.companyId, input.actor.runId, input.actor.agentId))) {
+      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run is not known to belong to this agent", { commandId: null }) };
     }
     if (input.routeKey === "offload_exec") {
       await bindOnFirstRequest(boat, input);
