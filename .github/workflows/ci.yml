@@ -19,7 +19,9 @@ jobs:
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
     name: check
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, where native-sync timing tests fail.
+    # Move up deliberately once the suite passes on the new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
