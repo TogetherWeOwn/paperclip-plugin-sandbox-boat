@@ -31,11 +31,17 @@ jobs:
       contents: write # create the release; GITHUB_TOKEN only
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        # Explicit bash adds pipefail, so a failed build cannot hide behind a pipe.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           # stage-package.sh needs origin/main and the tag's history.
           fetch-depth: 0
+          # npm ci runs dependency scripts; keep the write token out of .git/config.
+          persist-credentials: false
       # No npm cache: a release build should not restore state other runs saved.
       - uses: actions/setup-node@v4
         with:
@@ -52,6 +58,7 @@ jobs:
           sha=$(git rev-parse "refs/tags/$TAG^{commit}")
           mkdir "$RUNNER_TEMP/packages" "$RUNNER_TEMP/assets"
           dir=$(scripts/stage-package.sh "$sha" "$RUNNER_TEMP/packages" | tail -n 1)
+          test -d "$dir"
           name=$(basename "$dir")
           # Fixed order, owners and mtimes, so the same commit gives the same bytes.
           tar --sort=name --owner=0 --group=0 --numeric-owner \
@@ -64,7 +71,10 @@ jobs:
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         # Fails when a release for the tag already exists: assets are never replaced.
         run: |
-          gh release create "$TAG" "$RUNNER_TEMP"/assets/* \
+          prerelease=()
+          [[ $TAG == *-* ]] && prerelease=(--prerelease)
+          gh release create "$TAG" "$RUNNER_TEMP"/assets/* "${prerelease[@]}" \
             --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
