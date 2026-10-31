@@ -332,7 +332,7 @@ export class BoatVmManager {
   }
 
   /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
-  private readonly localRuns = new Map<string, { issueId: string; workspaces: Set<string> }>();
+  private readonly localRuns = new Map<string, { issueId: string; agentId: string | null; workspaces: Set<string> }>();
   /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
   private readonly endedLocalRuns = new Map<string, number>();
   /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
@@ -348,13 +348,20 @@ export class BoatVmManager {
     return JSON.stringify([companyId, runId]);
   }
 
-  /** Record a started local run. Returns false for a run that already ended. */
-  startLocalRun(companyId: string, runId: string, issueId: string): boolean {
+  /** Record a started local run and the agent the host started it for. Returns false for a run that already ended. */
+  startLocalRun(companyId: string, runId: string, issueId: string, agentId: string | null = null): boolean {
     const id = this.localRunKey(companyId, runId);
     this.pruneLocalRunState();
     if (this.endedLocalRuns.has(id)) return false;
-    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, workspaces: new Set() });
+    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId, workspaces: new Set() });
     return true;
+  }
+
+  /** True when a live run was started for a different agent. Agent API keys carry the run id
+   * from an unsigned header, so the run id alone does not prove the caller owns the run. */
+  localRunHeldByOtherAgent(companyId: string, runId: string, agentId: string | null | undefined): boolean {
+    const owner = this.localRuns.get(this.localRunKey(companyId, runId))?.agentId;
+    return typeof owner === "string" && owner !== agentId;
   }
 
   /** Issue of a live (started, not ended) local run, or null. */
