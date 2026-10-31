@@ -164,16 +164,19 @@ Then set two env entries on the **two-bot-next project**. Paperclip adds a proje
 ```sh
 SERVER_PID=$(pgrep -o -f 'paperclipai/dist/index.js run --instance default')
 SERVER_PATH=$(tr '\0' '\n' < "/proc/$SERVER_PID/environ" | sed -n 's/^PATH=//p')
-# An empty value would leave runs with only the shim and Cargo dirs on PATH.
-[ -n "$SERVER_PATH" ] && echo "$SERVER_PATH" || echo 'STOP: no server PATH; do not send the PATCH'
 PROJECT_ID=<two-bot-next project id>   # GET /api/companies/$CID/projects
-curl -fsS -X PATCH "$PAPERCLIP/api/projects/$PROJECT_ID" \
-  -H "Authorization: Bearer $BOARD_TOKEN" -H 'content-type: application/json' -d @- <<EOF
+# An empty value would leave runs with only the shim and Cargo dirs on PATH.
+if [ -n "$SERVER_PATH" ]; then
+  curl -fsS -X PATCH "$PAPERCLIP/api/projects/$PROJECT_ID" \
+    -H "Authorization: Bearer $BOARD_TOKEN" -H 'content-type: application/json' -d @- <<EOF
 {"env":{
   "BOAT_OFFLOAD": {"type": "plain", "value": "1"},
   "PATH": {"type": "plain", "value": "/home/ubuntu/.paperclip/boat-offload/bin:/home/ubuntu/.cargo/bin:$SERVER_PATH"}
 }}
 EOF
+else
+  echo 'STOP: no server PATH found; the project env was not changed' >&2
+fi
 ```
 
 `PATCH` replaces the project's whole `env`. If it already has entries, include them. two-bot-next has none today.
@@ -209,16 +212,29 @@ Each step stands alone and takes effect on the next command. Stop at the first o
 
 1. **Shim off:** set the project env `BOAT_OFFLOAD` to `0`, or remove the entry. From the next run, the shim runs local Cargo with no broker call. `cargo_cache.py` and its local path are unchanged.
 2. **Flags off:** save the company plugin config with `offloadExecutorEnabled`, `offloadGuestTransportEnabled` and `offloadLocalRunsEnabled` set to `false`. New commands stay local. Commands in flight settle, and their receipts and staged artifacts are kept.
-3. **Record the plugin's VMs**, while the plugin still runs. These ids are the VMs to delete in step 5:
+3. **Record the plugin's VMs** before the uninstall. The plugin keeps two kinds, in different places, and both go into `boat-vms-to-delete.txt` for step 5:
 
-   ```sh
-   curl -fsS -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
-     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const v of JSON.parse(s).vms)if(v.status!=="deleted")console.log(v.sandboxId,v.sandboxName,v.status)})' \
-     | tee boat-vms-to-delete.txt
-   ```
+   * card VMs (whole-run leases), named `paperclip-<hash>`. The `usage` route lists them:
 
-4. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Add `?purge=true` only to delete the plugin's state too.
-5. **Delete VMs:** delete each id in `boat-vms-to-delete.txt` with `boat delete <id> --yes`. Then list the account's VMs with the boat CLI to check that none of those ids are left; a stopped VM still holds disk. A name prefix does not prove the plugin owns a VM. Do not delete a `paperclip-*` VM that is not in the file: report it on the card for a human decision.
+     ```sh
+     curl -fsS -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
+       | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const v of JSON.parse(s).vms)if(v.status!=="deleted")console.log(v.sandboxId)})' \
+       | tee boat-vms-to-delete.txt
+     ```
+
+   * offload pool VMs. These are created **without a name**, so a `paperclip-*` filter never finds them. Their ids are only in the plugin's instance state (`boat-offload-pool`), which no route lists. Read them from the Paperclip database (read-only):
+
+     ```sh
+     DB=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/home/ubuntu/.paperclip/instances/default/config.json","utf8")).database.connectionString)')
+     psql "$DB" -At -v ON_ERROR_STOP=1 -c "select vm->>'sandboxId' from plugin_state, jsonb_array_elements(value_json->'vms') vm
+       where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool' and vm->>'sandboxId' <> ''" \
+       | tee -a boat-vms-to-delete.txt
+     ```
+
+   Do not print `$DB`: it holds the database password.
+
+4. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Never add `?purge=true` before step 5 is done: it deletes the plugin's state, the only record of the pool VM ids.
+5. **Delete VMs:** delete each id in `boat-vms-to-delete.txt` with `boat delete <id> --yes`. Then list the account's VMs with the boat CLI to check that none of those ids are left; a stopped VM still holds disk. A name does not prove the plugin owns a VM. Do not delete any VM that is not in the file, `paperclip-*` or unnamed: report it on the card for a human decision.
 6. **Clean up the host:** remove `BOAT_OFFLOAD` and `PATH` from the two-bot-next project env, delete the shim dir, and, after reviewing the artifact root, delete it. Delete the package directory as in step 7.
 
 Keep the steps in this order. Turning the shim or flags off first means no new command can start a VM while you delete them.
