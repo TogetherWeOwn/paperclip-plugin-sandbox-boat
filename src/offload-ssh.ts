@@ -48,7 +48,7 @@ export class SshOffloadGuest implements GuestController {
       { stdin: Readable.from([JSON.stringify(input)]), timeoutMs: 15_000, maxOutputBytes: 128 * 1024 });
     // Guest diagnostics may contain source or environment bytes. Never reflect
     // them into public broker errors/logs and never interpret SSH 255 as no start.
-    if (result.exitCode !== 0 || result.timedOut || result.signal) throw offloadError("OFFLOAD_GUEST_TRANSPORT_UNKNOWN");
+    if (result.exitCode !== 0 || result.timedOut || result.signal) { if (process.env.DEBUG_GUEST) console.error("GUESTFAIL", action, result.exitCode, result.timedOut, result.signal, result.stderr.slice(-400)); throw offloadError("OFFLOAD_GUEST_TRANSPORT_UNKNOWN"); }
     try { return JSON.parse(result.stdout) as T; } catch { throw offloadError("OFFLOAD_GUEST_TRANSPORT_UNKNOWN"); }
   }
 

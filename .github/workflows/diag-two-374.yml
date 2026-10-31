@@ -1,0 +1,27 @@
+name: diag-two-374
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+        rep: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+      - run: python3 --version && ssh -V && nproc
+      - run: npm ci
+      - name: stress prepare under delegated cgroup
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          for i in $(seq 30); do systemctl --user is-system-running && break; sleep 1; done || true
+          systemd-run --user --scope --quiet -p Delegate=yes env DEBUG_GUEST=1 N=100 npx vitest run src/zz-stress.test.ts
