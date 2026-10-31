@@ -32,5 +32,10 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # The runner has no delegated cgroup v2, so npm test skips the
+      # cgroup-gated cleanup and watchdog tests. Run them again where they
+      # cannot skip.
+      - name: cgroup-gated tests under delegated cgroup v2
+        run: scripts/ci-delegated-cgroup-tests.sh
       - run: npm run build
       - run: shellcheck scripts/*.sh

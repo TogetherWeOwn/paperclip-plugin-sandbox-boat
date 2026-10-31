@@ -85,8 +85,13 @@ describe("stock concrete executor factory", () => {
       repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: source, cwd: source,
     }]]) });
     setBoatApiFactoryForTests(() => boat as unknown as BoatApiLike);
+    // The route has no runner field, so the broker defaults it to cargo and the
+    // guest resolves that on its PATH. Stub cargo instead of overriding the executable.
+    const bin = path.join(ssh.root, "stub-bin");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
     setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session,
-      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", args: () => ["-c", "printf stock-worker"], path: "/usr/bin:/bin" } } });
+      guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
     await plugin.definition.onEnvironmentRealizeWorkspace!(native());
     const cmd = command();
@@ -102,6 +107,8 @@ describe("stock concrete executor factory", () => {
     }, { timeout: 15_000 }).toBe(true);
     if (process.env.PAPERCLIP_TEST_CGROUP_REQUIRED === "1") {
       expect(body).toMatchObject({ state: "completed", result: { exitCode: 0 } });
+      expect((body.events as Array<{ dataBase64: string }>).map((e) => Buffer.from(e.dataBase64, "base64").toString()).join(""))
+        .toBe("stock-worker");
     } else expect(["completed", "not_started"]).toContain(body.state);
     expect(boat.calls.some((call) => call.method === "create")).toBe(true);
   }, 20_000);
