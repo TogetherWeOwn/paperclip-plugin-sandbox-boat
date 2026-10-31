@@ -217,21 +217,29 @@ Each step stands alone and takes effect on the next command. Stop at the first o
    * card VMs (whole-run leases), named `paperclip-<hash>`. The `usage` route lists them;
    * offload pool VMs. These are created **without a name**, so a `paperclip-*` filter never finds them. Their ids are only in the plugin's instance state (`boat-offload-pool`), which no route lists, so they are read from the Paperclip database (read-only).
 
-   Both reads must succeed. No pipes, so a failed read cannot pass for an empty one. Go on to step 4 only if the last line printed is `recorded`:
+   Run this after step 2. Work admitted before the flags went off can still create or use a pool VM, so the inventory refuses while any pool VM is busy or any pool entry has no VM id yet (a create in flight). It also stops if either read fails: there are no pipes, so a failed read cannot pass for an empty one. Re-run it until the last line printed is `recorded`, then go on to step 4:
 
    ```sh
-   DB=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/home/ubuntu/.paperclip/instances/default/config.json","utf8")).database.connectionString)')
+   # The password goes into a private pgpass file, never into psql's arguments.
+   export PGPASSFILE=$(mktemp)
+   DB=$(node -e '
+     const fs = require("fs");
+     const u = new URL(JSON.parse(fs.readFileSync("/home/ubuntu/.paperclip/instances/default/config.json", "utf8")).database.connectionString);
+     fs.writeFileSync(process.env.PGPASSFILE, `*:*:*:*:${decodeURIComponent(u.password).replace(/[\\:]/g, "\\$&")}\n`, { mode: 0o600 });
+     u.password = "";
+     console.log(u.href)')
+   POOL="from plugin_state, jsonb_array_elements(value_json->'vms') vm where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool'"
    if curl -fsS -o usage.json -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID/api/usage?companyId=$CID" \
      && node -e 'for (const v of JSON.parse(require("fs").readFileSync("usage.json","utf8")).vms) if (v.status !== "deleted") console.log(v.sandboxId)' > card-vms.txt \
-     && psql "$DB" -At -v ON_ERROR_STOP=1 -o pool-vms.txt -c "select vm->>'sandboxId' from plugin_state, jsonb_array_elements(value_json->'vms') vm
-          where plugin_id = '$PLUGIN_ID' and namespace = 'boat-offload-pool' and vm->>'sandboxId' <> ''"; then
+     && pending=$(psql "$DB" -At -v ON_ERROR_STOP=1 -c "select count(*) $POOL and (vm->>'sandboxId' = '' or vm->>'busy' = 'true')") \
+     && [ "$pending" = 0 ] \
+     && psql "$DB" -At -v ON_ERROR_STOP=1 -o pool-vms.txt -c "select vm->>'sandboxId' $POOL"; then
      cat card-vms.txt pool-vms.txt > boat-vms-to-delete.txt && cat boat-vms-to-delete.txt && echo recorded
    else
-     echo 'STOP: the VM inventory failed; do not uninstall' >&2
+     echo "STOP: the inventory failed, or offload work is still in flight (${pending:-?} busy or unnamed pool entries); wait and run it again" >&2
    fi
+   rm -f "$PGPASSFILE"
    ```
-
-   Do not print `$DB`: it holds the database password.
 
 4. **Uninstall:** wait until no offload command is running. Then uninstall from the Plugins page, or call `curl -fsS -X DELETE -H "Authorization: Bearer $BOARD_TOKEN" "$PAPERCLIP/api/plugins/$PLUGIN_ID"`. Never add `?purge=true` before step 5 is done: it deletes the plugin's state, the only record of the pool VM ids.
 5. **Delete VMs:** delete each id in `boat-vms-to-delete.txt` with `boat delete <id> --yes`. Then list the account's VMs with the boat CLI to check that none of those ids are left; a stopped VM still holds disk. A name does not prove the plugin owns a VM. Do not delete any VM that is not in the file, `paperclip-*` or unnamed: report it on the card for a human decision.
