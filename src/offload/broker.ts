@@ -1,5 +1,5 @@
 // Offload command broker: journal, incremental output, heartbeat and cancel.
-// Design: docs/adr/0001-heavy-command-offload.md. Routes delegate here after
+// Design: docs/design/adr/0001-heavy-command-offload.md. Routes delegate here after
 // host authentication; the shim polls here. Remote execution itself is an
 // injected OffloadBackend; the executor adapter is explicitly opt-in. Without
 // an installed lifecycle executor, the plugin never dispatches.
@@ -135,12 +135,24 @@ interface Tombstone {
   runId: string;
   digest: string;
   outcome: OffloadCommandState;
+  /** Absent on tombstones written before retention: the sweep stamps one. */
+  expiresAt?: number;
+}
+
+/** Every command and run this broker journaled, so retention can enumerate keys the store cannot list. */
+interface RetentionIndex {
+  version: 1;
+  commands: Record<string, string>;
+  runs: Record<string, number>;
 }
 
 const TERMINAL: ReadonlySet<OffloadCommandState> = new Set(["completed", "not_started", "cancelled", "failed"]);
 const cmdKey = (commandId: string) => `offload.cmd.${commandId}`;
 const countKey = (runId: string) => `offload.run.${runId}.count`;
 const tombKey = (commandId: string) => `offload.tomb.${commandId}`;
+const INDEX_KEY = "offload.retention";
+/** An expired commandId refuses reuse this long; a run's count outlives its last command by as much. */
+export const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60_000;
 
 function digestOf(request: OffloadSubmitRequest): string {
   return JSON.stringify({
@@ -259,6 +271,9 @@ export class OffloadBroker {
       const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
       if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return;
       const now = this.now();
+      // Index first: a failed index write leaves no record, and an indexed
+      // command without a record is simply pruned by the sweep.
+      await this.track(request.commandId, principal.runId, now);
       await this.save({
         version: 1,
         commandId: request.commandId,
@@ -298,10 +313,7 @@ export class OffloadBroker {
       return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId }) };
     }
     if (TERMINAL.has(record.state) && record.terminalAt !== null && record.terminalAt + OFFLOAD_BOUNDS.resultRetentionMs < this.now()) {
-      const tomb: Tombstone = { commandId, runId: record.runId, digest: record.digest, outcome: record.state };
-      await this.store.set(tombKey(commandId), tomb);
-      await this.store.delete(cmdKey(commandId));
-      this.handles.delete(commandId);
+      await this.expire(record);
       return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "result retention elapsed", { commandId, remoteStarted: record.remoteStarted }) };
     }
     // Never expire an unresolved command; a missing handle after a restart is
@@ -312,6 +324,76 @@ export class OffloadBroker {
     }
     this.trackLive(record);
     return record;
+  }
+
+  /** Replace a retention-elapsed terminal record with its bounded tombstone. */
+  private async expire(record: JournalRecord): Promise<void> {
+    const tomb: Tombstone = { commandId: record.commandId, runId: record.runId, digest: record.digest, outcome: record.state,
+      expiresAt: this.now() + TOMBSTONE_RETENTION_MS };
+    await this.store.set(tombKey(record.commandId), tomb);
+    await this.store.delete(cmdKey(record.commandId));
+    this.handles.delete(record.commandId);
+  }
+
+  private async readIndex(): Promise<RetentionIndex> {
+    const raw = (await this.store.get(INDEX_KEY)) as RetentionIndex | null;
+    return raw && raw.version === 1 ? raw : { version: 1, commands: {}, runs: {} };
+  }
+
+  private async track(commandId: string, runId: string, at: number): Promise<void> {
+    await this.chain(INDEX_KEY, async () => {
+      const index = await this.readIndex();
+      index.commands[commandId] = runId;
+      index.runs[runId] = Math.max(index.runs[runId] ?? 0, at);
+      await this.store.set(INDEX_KEY, index);
+    });
+  }
+
+  /**
+   * Retention sweep: tombstone terminal records past result retention even if
+   * never read again, delete tombstones past their own retention, and drop a
+   * run's command count once none of its commands remain and the run has been
+   * idle for the tombstone window. Unresolved commands are never touched.
+   */
+  async collectGarbage(): Promise<void> {
+    const index = await this.chain(INDEX_KEY, () => this.readIndex());
+    for (const [commandId, runId] of Object.entries(index.commands)) {
+      await this.chain(`run:${runId}`, () => this.chain(`cmd:${commandId}`, async () => {
+        const now = this.now();
+        const record = await this.load(commandId);
+        if (record) {
+          if (TERMINAL.has(record.state) && record.terminalAt !== null && record.terminalAt + OFFLOAD_BOUNDS.resultRetentionMs < now) {
+            await this.expire(record);
+          }
+          return;
+        }
+        const tomb = (await this.store.get(tombKey(commandId))) as Tombstone | null;
+        if (tomb && typeof tomb.expiresAt !== "number") {
+          await this.store.set(tombKey(commandId), { ...tomb, expiresAt: now + TOMBSTONE_RETENTION_MS });
+          return;
+        }
+        if (tomb && now < tomb.expiresAt!) return;
+        if (tomb) await this.store.delete(tombKey(commandId));
+        // Unindex under the run lock: a retried submit of this ID re-tracks it
+        // only after, never between this check and the prune.
+        await this.chain(INDEX_KEY, async () => {
+          const current = await this.readIndex();
+          delete current.commands[commandId];
+          await this.store.set(INDEX_KEY, current);
+        });
+      }));
+    }
+    await this.chain(INDEX_KEY, async () => {
+      const current = await this.readIndex();
+      const referenced = new Set(Object.values(current.commands));
+      const now = this.now();
+      for (const [runId, at] of Object.entries(current.runs)) {
+        if (referenced.has(runId) || now < at + TOMBSTONE_RETENTION_MS) continue;
+        await this.store.delete(countKey(runId));
+        delete current.runs[runId];
+      }
+      await this.store.set(INDEX_KEY, current);
+    });
   }
 
   private trackLive(record: JournalRecord): void {
@@ -376,7 +458,9 @@ export class OffloadBroker {
         createdAt: now,
         terminalAt: null,
       };
-      // Persist intent before any external effect.
+      // Persist intent before any external effect. Index first, as in
+      // recordRefusal: an index failure must not strand an undispatched record.
+      await this.track(request.commandId, principal.runId, now);
       await this.save(record);
       await this.store.set(countKey(principal.runId), count + 1);
       this.known.add(request.commandId);

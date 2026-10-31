@@ -447,3 +447,98 @@ describe("dry run", () => {
     await expect(runDryRun(t.request, t.deps)).rejects.toThrow("OFFLOAD_INVALID_REQUEST");
   });
 });
+
+describe("auth and gone answers after the submit", () => {
+  const accepted = { ok: true, status: 202, json: { version: 1, commandId: CMD, state: "queued", remoteStarted: false, fallbackSafe: false, eventsCursor: 0 } };
+
+  it("stops polling on a 401, 403, 410 or 400 read, without a local rerun", async () => {
+    for (const [status, expected] of [[401, 77], [403, 77], [410, 75], [400, 64]] as const) {
+      const t = setup();
+      t.http.post.mockImplementation(async () => accepted);
+      t.http.get.mockImplementation(async () => ({ ok: true, status, json: {} }));
+      expect(await runOffload(t.request, t.deps)).toBe(expected);
+      expect(t.http.get).toHaveBeenCalledTimes(1);
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+    }
+  });
+
+  it("stops on a heartbeat answered 410 or 401 while reads fail", async () => {
+    for (const [status, expected] of [[410, 75], [401, 77], [403, 77]] as const) {
+      const t = setup();
+      t.http.post.mockImplementation(async (path: string) => (path === "/offload/exec" ? accepted : { ok: true, status, json: {} }));
+      t.http.get.mockImplementation(async () => ({ ok: true, status: 503, json: {} }));
+      expect(await runOffload(t.request, t.deps)).toBe(expected);
+      expect(t.http.post.mock.calls.map(([path]) => path)).toEqual(["/offload/exec", `/offload/commands/${CMD}/heartbeat`]);
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps polling through a thrown heartbeat", async () => {
+    const t = setup();
+    let beats = 0;
+    t.http.post.mockImplementation(async (path: string) => {
+      if (path === "/offload/exec") return accepted;
+      beats += 1;
+      if (beats === 1) throw new Error("socket hang up");
+      return { ok: true, status: 410, json: {} };
+    });
+    t.http.get.mockImplementation(async () => ({ ok: true, status: 503, json: {} }));
+    expect(await runOffload(t.request, t.deps)).toBe(75);
+    expect(beats).toBe(2);
+  });
+
+  it("cancels and exits 75 when the command outlives its timeout plus a minute", async () => {
+    const t = setup();
+    t.request.timeoutMs = 5_000;
+    t.http.post.mockImplementation(async (path: string) => (path === "/offload/exec" ? accepted : { ok: true, status: 200, json: {} }));
+    t.http.get.mockImplementation(async () => ({ ok: true, status: 503, json: {} }));
+    expect(await runOffload(t.request, t.deps)).toBe(75);
+    expect(t.http.post.mock.calls.map(([path]) => path)).toContain(`/offload/commands/${CMD}/cancel`);
+    expect(t.deps.reportUnknown).toHaveBeenCalledWith({ commandId: CMD });
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+    const slept = t.sleeps.reduce((a, b) => a + b, 0);
+    expect(slept).toBeGreaterThanOrEqual(65_000);
+    expect(slept).toBeLessThan(67_000);
+  });
+
+  it("ends an ambiguous-submit recovery on a 410 or auth read", async () => {
+    for (const [status, expected] of [[410, 75], [401, 77], [403, 77]] as const) {
+      const t = setup();
+      t.http.post.mockImplementation(async () => ({ ok: false as const, error: "timeout" }));
+      t.http.get.mockImplementation(async () => ({ ok: true, status, json: {} }));
+      expect(await runOffload(t.request, t.deps)).toBe(expected);
+      expect(t.http.get).toHaveBeenCalledTimes(1);
+      expect(t.deps.reportUnknown).not.toHaveBeenCalled();
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+    }
+  });
+
+  it("maps a submit answer without an error envelope by status, never to a local rerun", async () => {
+    for (const [status, expected] of [[401, 77], [403, 77], [410, 75], [404, 64], [422, 64]] as const) {
+      const t = setup();
+      t.http.post.mockImplementation(async () => ({ ok: true, status, json: { message: "proxy page" } }));
+      expect(await runOffload(t.request, t.deps)).toBe(expected);
+      expect(t.http.get).not.toHaveBeenCalled();
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+    }
+  });
+
+  it("reconciles a 5xx submit without an envelope, or a structured 503 without a never-started guarantee", async () => {
+    for (const json of [{ message: "bad gateway" }, errorBody("OFFLOAD_UNAVAILABLE", { remoteStarted: null, fallbackSafe: false, retryable: true })]) {
+      const t = setup();
+      t.http.post.mockImplementation(async () => ({ ok: true, status: 503, json }));
+      t.http.get.mockImplementation(async () => ({ ok: true, status: 410, json: {} }));
+      expect(await runOffload(t.request, t.deps)).toBe(75);
+      expect(t.http.get).toHaveBeenCalledWith(`/offload/commands/${CMD}?after=0`);
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+    }
+  });
+
+  it("recovers when a duplicate-submit 200 carries an unreadable view", async () => {
+    const t = setup();
+    t.http.post.mockImplementation(async () => ({ ok: true, status: 200, json: { garbage: true } }));
+    t.http.get.mockImplementation(async () => ({ ok: true, status: 401, json: {} }));
+    expect(await runOffload(t.request, t.deps)).toBe(77);
+    expect(t.http.get).toHaveBeenCalledTimes(1);
+  });
+});

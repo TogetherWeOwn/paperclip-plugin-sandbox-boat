@@ -76,6 +76,23 @@ async function readIfFile(root: string, rel: string): Promise<Buffer | null> {
 }
 
 /**
+ * A lockfile in a directory between the run directory (inclusive) and the
+ * source root (exclusive): a separately locked sub-project whose dependencies
+ * the root install would not provide, so the command stays local.
+ */
+export async function nestedLockfile(sourceRoot: string, cwdRelative: string, tool?: string): Promise<string | null> {
+  const files = tool === "python" ? [...PYTHON_LOCKFILES.map((entry) => entry.file), "requirements.txt"] : NODE_LOCKFILES.map((entry) => entry.file);
+  const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
+  for (let depth = segments.length; depth > 0; depth--) {
+    for (const file of files) {
+      const rel = path.posix.join(...segments.slice(0, depth), file);
+      if (await readIfFile(sourceRoot, rel) !== null) return rel;
+    }
+  }
+  return null;
+}
+
+/**
  * Plan guest installs from the source root's lockfiles. Returns null when
  * there is nothing to install from (no lockfile, unlocked manifest only, or
  * ambiguous competing lockfiles): the command stays local. Pass the tool so

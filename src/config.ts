@@ -186,9 +186,21 @@ export function isSecretRef(value: string): boolean {
   return UUID_SECRET_REF_RE.test(value);
 }
 
+/**
+ * Whether the host-level keys (BOAT_API_KEY, BOAT_READONLY_KEY) may be sent to
+ * this config's apiBase. Only the default boat API gets them: apiBase is an
+ * ordinary environment field, so a foreign base must bring its own key.
+ */
+export function hostKeysAllowed(config: BoatDriverConfig): boolean {
+  return config.apiBase === DEFAULT_API_BASE;
+}
+
+const FOREIGN_API_BASE_KEY_ERROR = `apiBase other than ${DEFAULT_API_BASE} needs its own apiKey in config: the host BOAT_API_KEY is only sent to the default boat API.`;
+
 /** The ops key: config first, then the host-level BOAT_API_KEY fallback (same pattern as exe-dev's EXE_API_KEY). */
 export function resolveApiKey(config: BoatDriverConfig): string {
   if (config.apiKey) return config.apiKey;
+  if (!hostKeysAllowed(config)) throw new Error(FOREIGN_API_BASE_KEY_ERROR);
   const fromEnv = process.env.BOAT_API_KEY?.trim() ?? "";
   if (!fromEnv) throw new Error("boat environments need an API key in config (apiKey) or BOAT_API_KEY on the host.");
   return fromEnv;
@@ -196,8 +208,9 @@ export function resolveApiKey(config: BoatDriverConfig): string {
 
 /** Read-only key for cost reads when configured; otherwise the ops key. */
 export function resolveCostApiKey(config: BoatDriverConfig): string {
-  const fromEnv = process.env.BOAT_READONLY_KEY?.trim();
-  return config.costApiKey ?? (fromEnv ? fromEnv : resolveApiKey(config));
+  if (config.costApiKey) return config.costApiKey;
+  const fromEnv = hostKeysAllowed(config) ? process.env.BOAT_READONLY_KEY?.trim() : undefined;
+  return fromEnv ? fromEnv : resolveApiKey(config);
 }
 
 export function validateDriverConfig(config: BoatDriverConfig, raw: Record<string, unknown>): {
@@ -210,7 +223,9 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (rawSize && !(BOAT_SIZES as readonly string[]).includes(rawSize.toLowerCase())) {
     errors.push(`size must be one of ${BOAT_SIZES.join(", ")}.`);
   }
-  if (!config.apiKey && !process.env.BOAT_API_KEY?.trim()) {
+  if (!config.apiKey && !hostKeysAllowed(config)) {
+    errors.push(FOREIGN_API_BASE_KEY_ERROR);
+  } else if (!config.apiKey && !process.env.BOAT_API_KEY?.trim()) {
     errors.push("boat environments need an API key in config (apiKey) or BOAT_API_KEY on the host.");
   }
   try {
