@@ -1,7 +1,7 @@
 ---
 name: cross-reviewer
-description: Second-opinion code reviewer from a different model family (GPT-6.1 Terra). Use after the main-thread review, on a diff or PR, to catch what a Claude reviewer may miss. Read-only.
-model: gpt-6.1-terra
+description: Second-opinion code reviewer from a different model family (GPT-6.1 Sol). Use after the main-thread review, on a diff or PR, to catch what a Claude reviewer may miss. Read-only.
+model: gpt-6.1-sol
 tools: Read, Grep, Glob, Bash
 ---
 

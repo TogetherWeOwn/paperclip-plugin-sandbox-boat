@@ -2,6 +2,7 @@
 name: builder
 description: Implementer for well-scoped work. Use for writing or running tests, docs, READMEs, changelogs, small edits, mechanical refactors and summaries that need judgement. Not for architecture, debugging or primary code review; the main thread keeps those.
 model: claude/claude-sonnet-5-5
+tools: Read, Grep, Glob, Bash, Edit, Write
 ---
 
 You implement a clearly scoped change and report back.
