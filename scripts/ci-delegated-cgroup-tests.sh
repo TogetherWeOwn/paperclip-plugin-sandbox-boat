@@ -15,7 +15,8 @@ sudo loginctl enable-linger "$(id -un)"
 XDG_RUNTIME_DIR=/run/user/$uid
 export XDG_RUNTIME_DIR
 i=0
-until systemctl --user is-system-running --wait >/dev/null 2>&1 || [ "$(systemctl --user is-system-running 2>/dev/null)" = degraded ]; do
+# Poll without --wait, which can block past this loop's 30 second bound.
+until state=$(systemctl --user is-system-running 2>/dev/null) || [ "$state" = degraded ]; do
   i=$((i + 1))
   if [ "$i" -ge 30 ]; then
     echo "ci-delegated-cgroup-tests: user@$uid.service did not start" >&2

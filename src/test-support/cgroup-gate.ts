@@ -10,6 +10,11 @@ declare module "vitest" {
   }
 }
 
+// Pass as the test options of every gated test. Tagging at declaration keeps a
+// gated test visible to the reporter even when it is skipped before its
+// callback runs (it.skip or a name filter).
+export const CGROUP_GATED = { meta: { cgroupGated: true } } as const;
+
 export function markCgroupGated(ctx: TestContext): void {
   ctx.task.meta.cgroupGated = true;
 }
