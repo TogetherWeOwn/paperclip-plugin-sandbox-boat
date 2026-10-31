@@ -162,6 +162,20 @@ describe("handleReport", () => {
     expect(next.body).toMatchObject({ mode: "remote_candidate" });
   });
 
+  it("keeps duration history per run directory", async () => {
+    const t = setup();
+    const report = await handleReport({
+      actor: ACTOR,
+      companyId: COMPANY,
+      body: { executionWorkspaceId: WS, tool: "node", runner: "npm", argv: ["run", "test"], cwdRelative: "packages/slow", durationSeconds: 240 },
+    }, t.host);
+    expect(report).toMatchObject({ status: 200 });
+    const root = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host);
+    expect(root.body).toMatchObject({ mode: "local" });
+    const slow = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ cwdRelative: "packages/slow" }) }, t.host);
+    expect(slow.body).toMatchObject({ mode: "remote_candidate" });
+  });
+
   it("rejects bad reports", async () => {
     const t = setup();
     const base = { executionWorkspaceId: WS, tool: "node", runner: "npm", argv: ["run", "test"], durationSeconds: 240 };
@@ -171,6 +185,8 @@ describe("handleReport", () => {
       { ...base, argv: [] },
       { ...base, durationSeconds: -1 },
       { ...base, executionWorkspaceId: "not-a-uuid" },
+      { ...base, cwdRelative: "../outside" },
+      { ...base, cwdRelative: 7 },
     ]) {
       expect((await handleReport({ actor: ACTOR, companyId: COMPANY, body }, t.host)).status).toBe(400);
     }

@@ -14,6 +14,7 @@ import { runStreamProcess, type SshManager, type SshSession } from "./ssh.js";
 import {
   buildRsyncPushArgs,
   DEFAULT_SYNC_EXCLUDES,
+  isDefaultSyncExcluded,
   renderFilesFromList,
   SyncError,
   type GuestFileState,
@@ -38,6 +39,48 @@ export function assertMirrorRel(rel: string): void {
     || rel.split("/").some((part) => part === "" || part === "." || part === "..")) {
     throw new SyncError("SYNC_TRAVERSAL", `refusing path outside the guest mirror: ${JSON.stringify(rel)}`);
   }
+}
+
+/** Same bound as the guest scan script and host manifest capture. */
+export const MAX_GUEST_SCAN_ENTRIES = 100_000;
+
+/**
+ * The scan result is guest output: re-check what our own script promises
+ * before any key reaches a host path. Bad names or shapes fail closed;
+ * default-excluded names (runtime state, secrets) are dropped, never collected.
+ */
+export function validateGuestScan(raw: unknown): Map<string, GuestFileState> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new SyncError("SYNC_GUEST_READ", "Offload guest scan returned a non-object result.");
+  }
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length > MAX_GUEST_SCAN_ENTRIES) {
+    throw new SyncError("SYNC_GUEST_READ", "Offload guest scan exceeded its entry limit.");
+  }
+  const out = new Map<string, GuestFileState>();
+  for (const [rel, value] of entries) {
+    assertMirrorRel(rel);
+    if (isDefaultSyncExcluded(rel)) continue;
+    out.set(rel, guestFileState(rel, value));
+  }
+  return out;
+}
+
+function guestFileState(rel: string, value: unknown): GuestFileState {
+  const bad = () => new SyncError("SYNC_GUEST_READ", `Offload guest scan returned an invalid entry for ${JSON.stringify(rel)}.`);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw bad();
+  const { size, mtimeMs, sha256, symlink, escaping } = value as Record<string, unknown>;
+  if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) throw bad();
+  if (typeof mtimeMs !== "number" || !Number.isFinite(mtimeMs)) throw bad();
+  if (escaping !== undefined && escaping !== true) throw bad();
+  if (escaping) {
+    if (sha256 !== "" || symlink !== undefined) throw bad();
+    return { size, mtimeMs, sha256: "", escaping: true };
+  }
+  if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) throw bad();
+  if (symlink === undefined) return { size, mtimeMs, sha256 };
+  if (typeof symlink !== "string" || symlink === "" || symlink.includes("\0")) throw bad();
+  return { size, mtimeMs, sha256, symlink };
 }
 
 function assertGuestDir(guestDir: string): void {
@@ -463,8 +506,7 @@ export class SshGuestStore implements GuestStore {
   }
 
   async scan(guestDir: string): Promise<Map<string, GuestFileState>> {
-    const result = await this.inspect<Record<string, GuestFileState>>("scan", null, 16 * 1024 * 1024, guestDir);
-    return new Map(Object.entries(result));
+    return validateGuestScan(await this.inspect<unknown>("scan", null, 16 * 1024 * 1024, guestDir));
   }
 
   async readBounded(guestDir: string, relPath: string, maxBytes: number): Promise<Buffer | null> {

@@ -6,7 +6,7 @@ import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
-import plugin, { setManagerOverridesForTests } from "./plugin.js";
+import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { BoatApiLike } from "./boat-client.js";
@@ -85,12 +85,19 @@ describe("stock concrete executor factory", () => {
       repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: source, cwd: source,
     }]]) });
     setBoatApiFactoryForTests(() => boat as unknown as BoatApiLike);
+    // The route has no runner field, so the broker defaults it to cargo and the
+    // guest resolves that on its PATH. Stub cargo instead of overriding the executable.
+    const bin = path.join(ssh.root, "stub-bin");
+    await mkdir(bin);
+    await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
     setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session,
-      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", args: () => ["-c", "printf stock-worker"], path: "/usr/bin:/bin" } } });
+      guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
     await plugin.definition.onEnvironmentRealizeWorkspace!(native());
     const cmd = command();
-    const actor = { actorType: "agent", actorId: randomUUID(), runId };
+    const agentId = randomUUID();
+    const actor = { actorType: "agent", actorId: agentId, agentId, runId };
+    await currentManager().startLocalRun(companyId, runId, randomUUID(), agentId);
     await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor, params: {}, query: {},
       body: { version: 1, commandId: cmd.commandId, executionWorkspaceId, argv: cmd.argv, cwdRelative: ".", env: {},
         queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: false } } as never);
@@ -102,6 +109,8 @@ describe("stock concrete executor factory", () => {
     }, { timeout: 15_000 }).toBe(true);
     if (process.env.PAPERCLIP_TEST_CGROUP_REQUIRED === "1") {
       expect(body).toMatchObject({ state: "completed", result: { exitCode: 0 } });
+      expect((body.events as Array<{ dataBase64: string }>).map((e) => Buffer.from(e.dataBase64, "base64").toString()).join(""))
+        .toBe("stock-worker");
     } else expect(["completed", "not_started"]).toContain(body.state);
     expect(boat.calls.some((call) => call.method === "create")).toBe(true);
   }, 20_000);
@@ -193,6 +202,27 @@ describe("stock concrete executor factory", () => {
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
     expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps a command local when its directory would be absent from the guest mirror", async () => {
+    await mkdir(path.join(source, "scratch"));
+    await mkdir(path.join(source, "crates/foo/target"), { recursive: true });
+    await writeFile(path.join(source, "crates/foo/target/out"), "build output");
+    await mkdir(path.join(source, "secrets"));
+    await writeFile(path.join(source, "secrets/.env"), "DO_NOT_UPLOAD=secret");
+    for (const cwdRelative of ["scratch", "crates/foo/target", "missing", "secrets"]) {
+      expect(await runtime.resolve({ ...command(), cwdRelative }, config)).toBe(null);
+    }
+    expect(boat.calls).toHaveLength(0);
+    await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
+    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config)).not.toBe(null);
+  });
+  it("keeps a node command in a separately locked sub-project local", async () => {
+    await writeFile(path.join(source, "package-lock.json"), "{}");
+    await mkdir(path.join(source, "tools/app"), { recursive: true });
+    await writeFile(path.join(source, "tools/app/package-lock.json"), "{}");
+    const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"], cwdRelative: "tools/app" } as BackendCommand;
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps python local when uv auth config is present", async () => {

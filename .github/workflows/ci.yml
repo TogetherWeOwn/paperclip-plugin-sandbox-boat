@@ -15,22 +15,75 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
-    # Required status check on main. Renaming this changes the check context
-    # and blocks every merge until the ruleset is updated to match.
-    name: check
-    # Pinned: ubuntu-latest moved to 26.04, where native-sync timing tests fail.
-    # Move up deliberately once the suite passes on the new image.
-    runs-on: ubuntu-24.04
+  test:
+    # Python 3.14 on 26.04, 3.12 on 24.04: the sync helper runs on both.
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
+      - name: Toolchain versions
+        run: |
+          grep PRETTY_NAME /etc/os-release
+          uname -r
+          python3 --version
+          tar --version | head -n 1
+          ls -l "$(command -v cat)"
+          cat --version | head -n 1
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # The runner has no delegated cgroup v2, so npm test skips the
+      # cgroup-gated cleanup and watchdog tests. Run them again where they
+      # cannot skip.
+      - name: cgroup-gated tests under delegated cgroup v2
+        run: scripts/ci-delegated-cgroup-tests.sh
       - run: npm run build
       - run: shellcheck scripts/*.sh
+      # Internal links and #anchors in the docs. Blocking: a moved heading or
+      # file must update every link to it. No network.
+      - name: Check internal doc links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: --offline --include-fragments --no-progress README.md CHANGELOG.md 'docs/**/*.md'
+          jobSummary: false
+
+  check:
+    # Required status check on main. Renaming this changes the check context
+    # and blocks every merge until the ruleset is updated to match. It gates on
+    # every matrix leg, so neither image can regress unnoticed.
+    name: check
+    needs: test
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every test leg to pass
+        run: test "${{ needs.test.result }}" = success
+
+  links-external:
+    # Not a required check, and report-only: a third-party outage must not
+    # red CI.
+    name: links-external
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check external doc links
+        # Report-only: failures show in the job summary, the job stays green.
+        continue-on-error: true
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          lycheeVersion: v0.24.2
+          args: --include-fragments --no-progress --accept '100..=103,200..=299,429' README.md CHANGELOG.md 'docs/**/*.md'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

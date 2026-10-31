@@ -5,7 +5,7 @@ This is the procedure for one host, rbx1, and one pilot repository, two-bot-next
 Writing this procedure installed nothing. Run it only after the owner has:
 
 * renewed the boat plan (named snapshots need a paid plan);
-* stored the scoped keys as company secrets `BOAT_CI_API_KEY` and `BOAT_READONLY_API_KEY`, with the account settings in the README's [boat account settings](../../README.md#boat-account-settings);
+* stored the scoped keys as company secrets `BOAT_CI_API_KEY` and `BOAT_READONLY_API_KEY`, with the account settings in [boat account settings](../security.md#boat-account-settings);
 * approved the install with the capabilities below, and the spend caps.
 
 ## The host

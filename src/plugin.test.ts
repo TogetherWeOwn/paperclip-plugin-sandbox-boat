@@ -1818,6 +1818,31 @@ describe("idle sweep", () => {
     expect(report.skipped).toBe("no_config_seen");
   });
 
+  it("an API sweep acts on and reports only the caller's company; the scheduled sweep covers every company", async () => {
+    const OTHER = "55555555-5555-4555-8555-555555555555";
+    const mine = await acquire("run-1");
+    const theirs = await acquire("run-2", { companyId: OTHER, environmentId: "66666666-6666-4666-8666-666666666666" });
+    // Both leases idle beyond staleLeaseMinutes.
+    clock.t += 21 * 60 * 1000;
+    // The other company's state turns unreadable: its error must not reach this company's caller.
+    const originalGet = harness.ctx.state.get;
+    const otherReads: string[] = [];
+    harness.ctx.state.get = async (input: { scopeId?: string; namespace?: string; stateKey: string; scopeKind: string }) => {
+      if (input.scopeId === OTHER) otherReads.push(`${input.namespace}/${input.stateKey}`);
+      if (input.scopeId === OTHER && input.namespace === "boat-sandbox" && input.stateKey === "vms") throw new Error(`state of ${OTHER} unavailable`);
+      return originalGet(input as never);
+    };
+    const reply = await plugin.definition.onApiRequest!({ routeKey: "sweep", method: "POST", path: "/sweep", params: {}, query: {},
+      body: { companyId: COMPANY }, actor: { actorType: "user", actorId: "board-user", userId: "board-user" }, companyId: COMPANY, headers: {} } as never);
+    harness.ctx.state.get = originalGet;
+    expect(otherReads).toEqual([]); // a scoped sweep never reads another company's state
+    expect(reply).toMatchObject({ status: 200, body: { stopped: [mine.providerLeaseId], deleted: [], forgotten: [], errors: [] } });
+    expect(JSON.stringify(reply.body)).not.toContain(theirs.providerLeaseId!);
+    expect(JSON.stringify(reply.body)).not.toContain(OTHER);
+    expect(fake.boxes.get(theirs.providerLeaseId!)?.state).not.toBe("archived");
+    expect((await currentManager().sweep("test", { force: true })).stopped).toEqual([theirs.providerLeaseId]);
+  });
+
   it("runs from the scheduled job", async () => {
     await acquire("run-1");
     await harness.jobs.get(SWEEP_JOB_KEY)!({ jobKey: SWEEP_JOB_KEY, runId: "j1", trigger: "schedule", scheduledAt: new Date().toISOString() });
@@ -2097,7 +2122,19 @@ describe("offload API routes", () => {
 
   async function seedWorkspace(): Promise<void> {
     await currentManager().rememberOffloadWorkspace(nativeWorkspaceParams(COMPANY, RUN_ID, WORKSPACE));
+    await currentManager().startLocalRun(COMPANY, RUN_ID, "issue-offload-1", "agent-1");
   }
+
+  const workspaceBindings = () => [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
+
+  it.each(["release", "destroy"])("a %s of the run's lease forgets its whole-run workspace bindings", async (end) => {
+    const lease = await acquire(RUN_ID);
+    await seedWorkspace();
+    expect(workspaceBindings()).toHaveLength(1);
+    if (end === "release") await release(lease);
+    else await plugin.definition.onEnvironmentDestroyLease!({ ...base(), providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never);
+    expect(workspaceBindings()).toEqual([]);
+  });
 
   function apiInput(routeKey: string, extra: Record<string, unknown> = {}) {
     return {
@@ -2107,7 +2144,7 @@ describe("offload API routes", () => {
       params: {},
       query: {},
       body: null,
-      actor: { actorType: "agent", actorId: "agent-1", runId: RUN_ID },
+      actor: { actorType: "agent", actorId: "agent-1", agentId: "agent-1", runId: RUN_ID },
       companyId: COMPANY,
       headers: {},
       ...extra,

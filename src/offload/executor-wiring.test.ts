@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import plugin, { setManagerOverridesForTests } from "../plugin.js";
+import plugin, { currentManager, setManagerOverridesForTests } from "../plugin.js";
 import manifest from "../manifest.js";
 import { BoatVmManager } from "../vm-manager.js";
 import { createFakeContext, inHostInvocation } from "../test-support/harness.js";
@@ -12,7 +12,7 @@ const companyId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const runId = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
 const commandId = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
 const workspaceId = "b9d0e6ac-a14e-4440-a324-7dcdd758be08";
-const actor = { actorType: "agent" as const, actorId: runId, runId };
+const actor = { actorType: "agent" as const, actorId: "agent-a", agentId: "agent-a", runId };
 const body = { version: 1, commandId, executionWorkspaceId: workspaceId, cwdRelative: ".",
   argv: ["test", "--locked"], env: { CARGO_TERM_COLOR: "never" }, queueTimeoutMs: 30_000, timeoutMs: 120_000, dryRun: false };
 const terminal: OffloadReadView = { version: 1, commandId, state: "not_started", remoteStarted: false,
@@ -119,6 +119,7 @@ describe("executor opt-in wiring", () => {
     const get = vi.fn(async () => ({ offloadExecutorEnabled: true }));
     setManagerOverridesForTests({ offloadExecutor: t.resolveExecutor });
     await plugin.definition.setup({ ...t.harness.ctx, config: { get } } as never);
+    await currentManager().startLocalRun(companyId, runId, "issue-a", "agent-a");
     await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor, body, params: {}, query: {} } as never);
     await until(() => vi.mocked(t.executor.start).mock.calls.length === 1);
     expect(get).toHaveBeenCalledWith(companyId);

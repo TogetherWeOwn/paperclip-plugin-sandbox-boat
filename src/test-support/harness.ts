@@ -249,6 +249,8 @@ export interface FakeIssue {
   status: string;
   executionWorkspaceId?: string | null;
   executionWorkspaceSettings?: Record<string, unknown> | null;
+  executionRunId?: string | null;
+  checkoutRunId?: string | null;
 }
 
 export function createFakeContext(
@@ -285,6 +287,8 @@ export function createFakeContext(
       },
     },
     logger: { info: log("info"), warn: log("warn"), error: log("error"), debug: log("debug") },
+    // The host always has a config client; an unconfigured company reads as {}.
+    config: { get: async (_companyId?: string): Promise<Record<string, unknown>> => ({}) },
     issues: {
       get: async (issueId: string, _companyId?: string) => issues.get(issueId) ?? null,
     },

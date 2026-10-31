@@ -106,13 +106,16 @@ describe("monthly cap counts pending reservations", () => {
     const monthStart = Date.UTC(2026, 9, 1);
     await state.set({ scopeKind: "instance", namespace: "boat-account", stateKey: hashed }, {
       version: 1, observation: null, countedResumeUntil: null,
-      intents: [{ intentId: "pending-1", status: "reserved", settledAt: null, usageId: "a", jobSeconds: 3_000, tailSeconds: 600,
+      intents: [{ intentId: "pending-1", status: "reserved", settledAt: null, usageId: "pending-1", jobSeconds: 3_000, tailSeconds: 600,
         operation: "create", size: "default", createdAt: new Date(EPOCH).toISOString() }],
       usage: [{ usageRecordId: "a", poolId: "p", kind: "command", commandId: "a", runId: "r", cardId: "c",
         repoId: "repo", sandboxId: "vm-1", seconds: 0, dollars: 0, meterProvenance: "provider",
         observedStartsDelta: null, intervals: [
           { since: new Date(monthStart).toISOString(), until: new Date(monthStart + 1_800_000).toISOString(), phase: "command" },
-        ], tailSince: null, companyId: "co-1" }],
+        ], tailSince: null, companyId: "co-1" },
+      { usageRecordId: "pending-1", poolId: "p", kind: "command", commandId: "pending-1", runId: "r", cardId: "c",
+        repoId: "repo", sandboxId: null, seconds: 0, dollars: 0, meterProvenance: "pending",
+        observedStartsDelta: null, intervals: [], tailSince: null, companyId: "co-1" }],
     });
     const ledger = new AccountLedger(state, "acct", () => EPOCH);
     const api = { limits: async () => { throw new Error("no provider in unit test"); } } as never;
@@ -120,6 +123,40 @@ describe("monthly cap counts pending reservations", () => {
     await expect(ledger.reserve(api, { operation: "create", size: "default", jobSeconds: 60, tailSeconds: 0,
       maxActive: 10, maxStartsPerDay: 100, minComputeHoursLeft: 0,
       monthlyCap: { companyId: "co-1", nowMs: EPOCH, capHours: 1 } })).rejects.toThrow(/monthly offload VM-hour cap/);
+  });
+});
+
+describe("monthly cap counts running commands", () => {
+  it("refuses a second command while the first is running near the cap, and counts it once after it finishes", async () => {
+    const ledger = new AccountLedger(f.state, f.accountId, () => Date.now());
+    const api = f.boat as never;
+    const request = (id: string, jobSeconds: number) => ({ operation: "create" as const, size: "default" as const, jobSeconds, tailSeconds: 600,
+      maxActive: 10, maxStartsPerDay: 70, minComputeHoursLeft: 0, poolId: "cap-running",
+      command: { commandId: id, runId: `run-${id}`, cardId: "card", repoId: "repo", companyId: "co-1" },
+      monthlyCap: { companyId: "co-1", nowMs: Date.now(), capHours: 1 } });
+    // 3000 s job + 600 s tail: the first command's envelope reaches the 1 h cap.
+    const first = await ledger.reserve(api, request("first", 3_000));
+    await ledger.started(api, first, "vm-running");
+    await expect(ledger.reserve(api, request("second", 60))).rejects.toThrow(/monthly offload VM-hour cap/);
+    await advance(60_000);
+    await ledger.finished(first, false);
+    // Finished: only the recorded interval and open tail count, not the envelope as well.
+    await expect(ledger.reserve(api, { ...request("third", 60), monthlyCap: { companyId: "co-1", nowMs: Date.now(), capHours: 1 } }))
+      .resolves.toMatchObject({ id: expect.any(String) });
+  });
+
+  it("keeps an uncertain start's remaining envelope until a terminal receipt", async () => {
+    const ledger = new AccountLedger(f.state, f.accountId, () => Date.now());
+    const api = f.boat as never;
+    const request = (id: string, jobSeconds: number) => ({ operation: "create" as const, size: "default" as const, jobSeconds, tailSeconds: 600,
+      maxActive: 10, maxStartsPerDay: 70, minComputeHoursLeft: 0, poolId: "cap-uncertain",
+      command: { commandId: id, runId: `run-${id}`, cardId: "card", repoId: "repo", companyId: "co-1" },
+      monthlyCap: { companyId: "co-1", nowMs: Date.now(), capHours: 1 } });
+    const first = await ledger.reserve(api, request("first", 3_000));
+    await advance(7_000);
+    // The reply was lost: the VM may be running, so 7 s of interval must not free the 3600 s hold.
+    await ledger.failed(first, false);
+    await expect(ledger.reserve(api, request("second", 60))).rejects.toThrow(/monthly offload VM-hour cap/);
   });
 });
 

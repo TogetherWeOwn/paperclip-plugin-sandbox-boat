@@ -174,7 +174,10 @@ def supervise(root):
         selector.register(pipe, selectors.EVENT_READ, stream)
     bytes_written = 0
     started = time.monotonic()
-    fixed_deadline = started + request['timeoutMs'] / 1000
+    # The same instant the watchdog enforces. Anchoring at 'started' instead
+    # lags it by this setup, so a watchdog KILL inside that lag was reported
+    # as a payload signal (137) rather than a timeout.
+    fixed_deadline = started + max(0, (identity['guestDeadline'] - int(time.time() * 1000)) / 1000)
     cancelled = False
     overflow = False
     with (root / 'output').open('x') as output:

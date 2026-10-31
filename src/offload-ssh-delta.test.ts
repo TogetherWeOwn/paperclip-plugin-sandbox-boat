@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SshOffloadSync } from "./offload-ssh-sync.js";
+import { ARTIFACT_RETENTION_MS, SshOffloadSync } from "./offload-ssh-sync.js";
 import {
   hashManifest,
   MIRROR_MARKER_RELPATH,
@@ -96,9 +96,10 @@ interface Setup {
   guest: StubGuest;
   refreshSession: ReturnType<typeof vi.fn>;
   sessionFor: (sandboxId: string) => unknown;
+  artifactRoot: string;
 }
 
-function setup(root: string, guest: StubGuest = stubGuest()): Setup {
+function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number): Setup {
   const spawns: SpawnCall[] = [];
   const spawn = vi.fn(async (cmd: string, args: string[], opts: { stdin: Readable; timeoutMs: number }) => {
     spawns.push({ command: cmd, args, stdin: await readAll(opts.stdin) });
@@ -173,16 +174,18 @@ function setup(root: string, guest: StubGuest = stubGuest()): Setup {
     return { exitCode: 0, timedOut: false, signal: null, stdout: "", stderr: "" };
   });
   const ssh = { runStream, ensureKey: async () => ({ privateKeyPath: "/test/id_ed25519", publicKey: "test" }) };
+  const artifactRoot = temp("boat-delta-artifacts-");
   const sync = new SshOffloadSync({
     ssh: ssh as never,
     session: async (sandboxId: string) => sessionFor(sandboxId) as never,
     refreshSession: refreshSession as never,
     sourceRoot: async () => root,
-    artifactRoot: temp("boat-delta-artifacts-"),
+    artifactRoot,
     workRoot: "/tmp/boat-test",
     spawn: spawn as never,
+    now,
   });
-  return { sync, ssh, spawn, spawns, guest, refreshSession, sessionFor };
+  return { sync, ssh, spawn, spawns, guest, refreshSession, sessionFor, artifactRoot };
 }
 
 function filesFromStdin(stdin: string): string[] {
@@ -697,5 +700,72 @@ describe("mirror scripts executed locally", () => {
     const linked = path.join(dir, "linked");
     symlinkSync(mirror, linked);
     expect(runScript(MIRROR_WIPE_SCRIPT, [linked]).exitCode).not.toBe(0);
+  });
+});
+
+describe("host staging retention", () => {
+  const scratchDirs = (root: string) => readdirSync(root).filter((name) => name.startsWith("command-"));
+
+  it("discard removes the scratch dir and the upload, so a later collect holds", async () => {
+    const { sync, artifactRoot } = setup(source({ "a.txt": "a" }));
+    const cmd = command();
+    await sync.push("vm-1", cmd);
+    expect(scratchDirs(artifactRoot)).toHaveLength(1);
+    await sync.discard("vm-1", cmd);
+    expect(scratchDirs(artifactRoot)).toEqual([]);
+    await expect(sync.collect("vm-1", cmd)).rejects.toThrow(/Missing frozen offload manifest/);
+    await sync.discard("vm-1", cmd); // idempotent
+  });
+
+  it("a staged return keeps its artifact for review and drops the upload", async () => {
+    const { sync, artifactRoot } = setup(source({ "a.txt": "a" }));
+    const cmd = command();
+    await sync.push("vm-1", cmd);
+    const staged = await sync.stage("vm-1", cmd, await sync.collect("vm-1", cmd));
+    expect(staged.artifactId).toMatch(new RegExp(`^${artifactRoot}/command-`));
+    expect(scratchDirs(artifactRoot)).toHaveLength(1);
+    // The artifact is not live: once aged past the window the sweep reclaims it.
+    const past = new Date(Date.now() - ARTIFACT_RETENTION_MS - 60_000);
+    utimesSync(path.dirname(staged.artifactId!), past, past);
+    await sync.collectGarbage();
+    expect(scratchDirs(artifactRoot)).toEqual([]);
+  });
+
+  it("the sweep removes command dirs older than the artifact window and forgets stale uploads", async () => {
+    const clock = { t: Date.now() };
+    const { sync, artifactRoot } = setup(source({ "a.txt": "a" }), stubGuest(), () => clock.t);
+    const old = path.join(artifactRoot, "command-old");
+    mkdirSync(path.join(old, "returned"), { recursive: true });
+    writeFileSync(path.join(old, "returned", "manifest.json"), "{}");
+    const past = new Date(clock.t - ARTIFACT_RETENTION_MS - 60_000);
+    utimesSync(old, past, past);
+    const fresh = path.join(artifactRoot, "command-fresh");
+    mkdirSync(fresh);
+    const other = path.join(artifactRoot, "not-ours");
+    mkdirSync(other);
+    utimesSync(other, past, past);
+    const pending = command();
+    await sync.push("vm-1", pending);
+    const [live] = scratchDirs(artifactRoot).filter((name) => !["command-old", "command-fresh"].includes(name));
+
+    await sync.collectGarbage();
+    expect(scratchDirs(artifactRoot).sort()).toEqual(["command-fresh", live].sort());
+    expect(readdirSync(artifactRoot)).toContain("not-ours");
+    await expect(sync.collect("vm-1", pending)).resolves.toBeDefined();
+
+    // An upload stranded by a failed transport is forgotten after the window,
+    // and its scratch dir goes with the next pass once it has aged too.
+    clock.t += ARTIFACT_RETENTION_MS + 60_000;
+    const aged = new Date(clock.t - ARTIFACT_RETENTION_MS - 1_000);
+    utimesSync(path.join(artifactRoot, live!), aged, aged);
+    await sync.collectGarbage();
+    await expect(sync.collect("vm-1", pending)).rejects.toThrow(/Missing frozen offload manifest/);
+    expect(scratchDirs(artifactRoot)).not.toContain(live);
+  });
+
+  it("tolerates a missing artifact root", async () => {
+    const { sync, artifactRoot } = setup(source({ "a.txt": "a" }));
+    rmSync(artifactRoot, { recursive: true, force: true });
+    await expect(sync.collectGarbage()).resolves.toBeUndefined();
   });
 });

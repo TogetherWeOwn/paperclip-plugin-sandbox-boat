@@ -1,5 +1,5 @@
 // Delta workspace sync for offloaded heavy commands.
-// Design: docs/adr/0001-heavy-command-offload.md, "Sync and returned writes".
+// Design: docs/design/adr/0001-heavy-command-offload.md, "Sync and returned writes".
 //
 // Before each command the broker freezes an immutable source snapshot, plans a
 // content-hash delta against the previous upload, and pushes only changed
@@ -168,6 +168,49 @@ function isExcluded(relPosix: string, isDir: boolean, parsed: ParsedExcludes): b
   const base = segments[segments.length - 1]!;
   if (parsed.exactFiles.has(base)) return true;
   return parsed.fileGlobs.some((re) => re.test(base));
+}
+
+const DEFAULT_PARSED_EXCLUDES = parseExcludes(DEFAULT_SYNC_EXCLUDES);
+
+/** True when a guest-reported file or link path falls under DEFAULT_SYNC_EXCLUDES. */
+export function isDefaultSyncExcluded(relPosix: string): boolean {
+  return isExcluded(relPosix, false, DEFAULT_PARSED_EXCLUDES);
+}
+
+const MAX_CWD_PROBE_ENTRIES = 5_000;
+
+/**
+ * True when a workspace-relative directory will exist in a default-excludes
+ * snapshot of root: no segment is excluded or a symlink, and it holds at least
+ * one synced entry (the snapshot carries files, not empty directories). A
+ * directory too large to probe within the bound counts as absent.
+ */
+export async function snapshotHasDirectory(root: string, cwdRelative: string): Promise<boolean> {
+  const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
+  if (segments.length === 0) return true;
+  const rel = segments.join("/");
+  if (isExcluded(rel, true, DEFAULT_PARSED_EXCLUDES)) return false;
+  for (let depth = 1; depth <= segments.length; depth += 1) {
+    const st = await fsp.lstat(path.join(root, ...segments.slice(0, depth))).catch(() => null);
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+  }
+  let seen = 0;
+  const stack = [rel];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    const entries = await fsp.readdir(path.join(root, dir), { withFileTypes: true }).catch(() => null);
+    if (!entries) return false;
+    for (const entry of entries) {
+      if (++seen > MAX_CWD_PROBE_ENTRIES) return false;
+      const entryRel = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!isExcluded(entryRel, true, DEFAULT_PARSED_EXCLUDES)) stack.push(entryRel);
+      } else if ((entry.isFile() || entry.isSymbolicLink()) && !isExcluded(entryRel, false, DEFAULT_PARSED_EXCLUDES)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Resolve a manifest-relative path inside a root, rejecting traversal and absolute paths. */
@@ -969,11 +1012,48 @@ function isConflict(change: StagedChange): boolean {
   return change.liveSha256 !== change.baselineSha256;
 }
 
-async function liveHash(liveRoot: string, rel: string): Promise<string | null> {
-  const abs = resolveWithin(liveRoot, rel);
+/**
+ * Hash the live copy of a guest-named path. The name came from the guest, so a
+ * symlinked live parent is never walked through (reported "non-regular"), the
+ * leaf is opened O_NOFOLLOW, and bytes are streamed under the capture budget:
+ * anything larger is reported "oversized" without being read whole.
+ */
+export async function liveHash(liveRoot: string, rel: string, maxBytes = DEFAULT_MAX_BYTES): Promise<string | null> {
+  let abs: string;
+  try {
+    abs = await resolveContained(liveRoot, rel);
+  } catch (error) {
+    if (error instanceof SyncError && error.code === "SYNC_TRAVERSAL") return "non-regular";
+    throw error;
+  }
   const st = await fsp.lstat(abs).catch(() => null);
   if (!st) return null;
   if (st.isSymbolicLink()) return symlinkHash(await fsp.readlink(abs));
   if (!st.isFile()) return "non-regular";
-  return sha256Hex(await fsp.readFile(abs));
+  if (st.size > maxBytes) return "oversized";
+  let handle: fsp.FileHandle;
+  try {
+    handle = await fsp.open(abs, O_RDONLY | O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP") return "non-regular";
+    throw error;
+  }
+  try {
+    if (!(await handle.stat()).isFile()) return "non-regular";
+    const digest = createHash("sha256");
+    const chunk = Buffer.alloc(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) return "oversized";
+      digest.update(chunk.subarray(0, bytesRead));
+    }
+    return digest.digest("hex");
+  } finally {
+    await handle.close();
+  }
 }

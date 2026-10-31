@@ -41,7 +41,8 @@ async function transfer(context: SyncContext, direction: "in" | "out", file: Plu
   const localAction = direction === "in" ? "send" : "receive";
   const remoteAction = direction === "in" ? "receive" : "send";
   const pipe = new PassThrough({ highWaterMark: 64 * 1024 });
-  const local = runStreamProcess("python3", ["-c", FILE_SYNC_SCRIPT, localAction, mapping], {
+  // The host-side receiver handles guest-produced archives: confine their links.
+  const local = runStreamProcess("python3", ["-c", FILE_SYNC_SCRIPT, localAction, mapping, ...(direction === "out" ? ["confined"] : [])], {
     timeoutMs: context.timeoutMs,
     ...(direction === "in" ? { stdout: pipe } : { stdin: pipe }),
   });
