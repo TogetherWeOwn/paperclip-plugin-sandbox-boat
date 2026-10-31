@@ -8,6 +8,7 @@
 
 ### Fixed
 
+* Offload state is now reclaimed. Executor journal tombstones are deleted 30 days after their run ends, even when the host reports no termination time (the sweep records when it first saw the run end). The broker expires terminal records after the 24 h result retention even if they are never read again, deletes tombstones 30 days later, and drops a run's command count once none of its commands remain. Host staging dirs (`offloadArtifactRoot/command-*`) are removed when a command fails after push, and the sweep reclaims staged returns and stranded uploads after 7 days.
 * Host-service workloads no longer classify as remote. Any command run with a database/cache env set stays local before any broker call (`*DATABASE_URL`, `*REDIS_URL`, libpq `PG*`, `*TESTDB*`, `*_DB_HOST`; presence only, values never travel). Two-bot-next DB tests skip without that env, so a remote run would have passed with less coverage. Cargo test runs that include ignored tests, use `--all-features` or enable the profile's `db` service feature also stay local: those tests reach `agent-testdb` with no env to detect.
 * Path-bearing Cargo options (`--manifest-path`, `--target-dir`, `--out-dir`, `--artifact-dir`, `--lockfile-path`, `-C`) now classify as local, so a dry run agrees with the executor, which already refused them.
 
