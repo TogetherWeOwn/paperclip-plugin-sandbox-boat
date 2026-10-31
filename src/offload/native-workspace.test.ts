@@ -69,6 +69,13 @@ describe("native workspace binding", () => {
     expect(await submit()).toMatchObject({ status: 200 });
   });
 
+  it("admits the owner of a whole-run realization whose run started without an issue", async () => {
+    const t = await setup(undefined, false);
+    await t.emit("agent.run.started", { companyId, payload: { runId, agentId: "agent-a", issueId: null } });
+    await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+    expect(await submit()).toMatchObject({ status: 200 });
+  });
+
   it("does not bind another run or company to a known workspace", async () => {
     await setup();
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());

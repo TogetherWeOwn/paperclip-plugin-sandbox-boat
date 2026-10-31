@@ -99,12 +99,14 @@ const plugin = definePlugin({
     };
     ctx.events.on("agent.run.started", async (event) => {
       const payload = (event.payload ?? {}) as { runId?: unknown; issueId?: unknown; agentId?: unknown };
-      if (typeof payload.runId !== "string" || typeof payload.issueId !== "string") return;
-      // Record every started run before reading settings: the record grants nothing, and a
-      // transient config failure here stays recoverable on the run's first offload request.
+      if (typeof payload.runId !== "string") return;
+      // Record every started run, with or without an issue, before reading settings: its owner
+      // gates every offload route (whole-run leases too), and a transient config failure here
+      // stays recoverable on the run's first offload request. Only a run on an issue binds locally.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
-      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, payload.issueId, agentId))) return;
-      await bindLocalRun!(event.companyId, payload.runId, payload.issueId);
+      const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
+      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId)) || !issueId) return;
+      await bindLocalRun!(event.companyId, payload.runId, issueId);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
       ctx.events.on(done, async (event) => {

@@ -332,7 +332,7 @@ export class BoatVmManager {
   }
 
   /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
-  private readonly localRuns = new Map<string, { issueId: string; agentId: string | null }>();
+  private readonly localRuns = new Map<string, { issueId: string | null; agentId: string | null }>();
   /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
   private readonly endedLocalRuns = new Map<string, number>();
   /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
@@ -354,7 +354,7 @@ export class BoatVmManager {
   }
 
   /** Record a started local run and the agent the host started it for. Returns false for a run that already ended. */
-  async startLocalRun(companyId: string, runId: string, issueId: string, agentId: string | null = null): Promise<boolean> {
+  async startLocalRun(companyId: string, runId: string, issueId: string | null, agentId: string | null = null): Promise<boolean> {
     const id = this.localRunKey(companyId, runId);
     this.pruneLocalRunState();
     if (this.endedLocalRuns.has(id)) return false;
@@ -385,11 +385,11 @@ export class BoatVmManager {
       | { version?: unknown; companyId?: unknown; runId?: unknown; issueId?: unknown; agentId?: unknown }
       | null;
     if (saved?.version !== 1 || saved.companyId !== companyId || saved.runId !== runId
-      || typeof saved.agentId !== "string" || typeof saved.issueId !== "string") return false;
+      || typeof saved.agentId !== "string" || (saved.issueId !== null && typeof saved.issueId !== "string")) return false;
     // Rehydrate after a restart, unless the terminal event arrived during the read.
     if (this.endedLocalRuns.has(id)) return false;
     if (live) live.agentId = saved.agentId;
-    else this.localRuns.set(id, { issueId: saved.issueId, agentId: saved.agentId });
+    else this.localRuns.set(id, { issueId: saved.issueId as string | null, agentId: saved.agentId });
     return saved.agentId === agentId;
   }
 
