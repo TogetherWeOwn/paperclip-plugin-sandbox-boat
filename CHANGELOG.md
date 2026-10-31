@@ -4,6 +4,7 @@
 
 ### Changed
 
+* Docs: the README is split into `docs/` (`configuration.md`, `operations.md`, `security.md`, `offload.md`, `development.md`, `design/`). The ADR moved to `docs/design/adr/`. The staged package now ships `docs/`. CI checks internal doc links and anchors with lychee, and reports external links without blocking.
 * `rust-public-1` now pins toolchain `1.98.1` (replacing `1.88.0`) with clippy, matching two-bot-next. Its server-owned guest build env (`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`) gives remote Cargo the same lean settings as `scripts/cargo_cache.py`, and no host env is forwarded. A workspace toolchain file pinning an uninstalled channel stays local; the native backend re-reads it from the host-owned source.
 
 ### Fixed
