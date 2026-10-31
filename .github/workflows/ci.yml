@@ -15,12 +15,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
-    # Required status check on main. Renaming this changes the check context
-    # and blocks every merge until the ruleset is updated to match. Only the
-    # 26.04 leg is named `check`; the 24.04 leg keeps the previous image green
-    # (Python 3.12 there, 3.14 on 26.04: the sync helper runs on both).
-    name: ${{ matrix.os == 'ubuntu-26.04' && 'check' || format('check ({0})', matrix.os) }}
+  test:
+    # Python 3.14 on 26.04, 3.12 on 24.04: the sync helper runs on both.
+    name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -46,3 +43,16 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: shellcheck scripts/*.sh
+
+  check:
+    # Required status check on main. Renaming this changes the check context
+    # and blocks every merge until the ruleset is updated to match. It gates on
+    # every matrix leg, so neither image can regress unnoticed.
+    name: check
+    needs: test
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every test leg to pass
+        run: test "${{ needs.test.result }}" = success
