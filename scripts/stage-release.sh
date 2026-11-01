@@ -71,6 +71,17 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 
+# Links are checked on the listing first: a hardlink unpacks as a plain file,
+# so the find check on the unpacked tree below cannot see it. tar -t verbose
+# mode strings start with the member type: l for a symlink, h for a hardlink
+# (the same test as scripts/check-tarball-links.sh).
+links=$(tar -tvzf "$tarball" | awk '$1 ~ /^[lh]/')
+if [ -n "$links" ]; then
+  echo "stage-release: $file holds a link; the package must be plain files and directories" >&2
+  printf '%s\n' "$links" >&2
+  exit 1
+fi
+
 # GNU tar refuses members with .. and strips a leading /; what it unpacks is
 # then checked before anything reaches the root.
 tar -xzf "$tarball" -C "$work" --no-same-owner --no-same-permissions

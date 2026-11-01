@@ -96,7 +96,7 @@ describe("stage-release.sh", () => {
     mkdirSync(root);
     const r = sh(dir, stageRelease, [tgz, root]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("holds a link or special file");
+    expect(r.stderr).toContain("holds a link;");
     expect(existsSync(path.join(root, NAME))).toBe(false);
   });
 
@@ -107,7 +107,18 @@ describe("stage-release.sh", () => {
     mkdirSync(root);
     const r = sh(dir, stageRelease, [tgz, root]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("holds a link or special file");
+    expect(r.stderr).toContain("holds a link;");
+    expect(existsSync(path.join(root, NAME))).toBe(false);
+  });
+
+  it.skipIf(win)("refuses a tarball with a hardlink, which unpacks as a plain file", () => {
+    const dir = scratch();
+    const tgz = release(dir, { link: "hard" });
+    const root = path.join(dir, "root");
+    mkdirSync(root);
+    const r = sh(dir, stageRelease, [tgz, root]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("holds a link");
     expect(existsSync(path.join(root, NAME))).toBe(false);
   });
 
