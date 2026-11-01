@@ -64,7 +64,10 @@ describe("probeDir / probeFileExists", () => {
     writeFileSync(path.join(root, "real", "package-lock.json"), "{}");
     await expect(probeFileExists(path.join(root, "real", "package-lock.json"))).resolves.toBe(true);
     symlinkSync(path.join(root, "real", "package-lock.json"), path.join(root, "lock-link.json"));
-    await expect(probeFileExists(path.join(root, "lock-link.json"))).resolves.toBe(false);
+    // Existence is a blocker signal, not a read: any directory entry counts,
+    // including a symlink, without following or opening it.
+    await expect(probeFileExists(path.join(root, "lock-link.json"))).resolves.toBe(true);
+    await expect(probeFileExists(path.join(root, "real", "absent.json"))).resolves.toBe(false);
   });
 });
 
@@ -152,6 +155,20 @@ describe("lockfile probes (host safety)", () => {
     const root = workspace();
     symlinkSync(workspace(), path.join(root, "link"));
     await expect(nestedLockfile(root, "link", "node")).resolves.toBe("link");
+  });
+
+  it("an unreadable lockfile does not silently select another installer in the same ecosystem", async () => {
+    const root = workspace();
+    symlinkSync("/dev/zero", path.join(root, "package-lock.json"));
+    writeFileSync(path.join(root, "yarn.lock"), "# yarn lockfile v1\n");
+    await expect(planDependencies(root, "node")).resolves.toBeNull();
+  });
+
+  it("nestedLockfile treats a symlinked nested lockfile as present", async () => {
+    const root = workspace();
+    mkdirSync(path.join(root, "sub"), { recursive: true });
+    symlinkSync(outsideSparse(2), path.join(root, "sub", "package-lock.json"));
+    await expect(nestedLockfile(root, "sub", "node")).resolves.toBe("sub/package-lock.json");
   });
 
   it("a symlinked lockfile at the root does not shadow a real one in the other ecosystem", async () => {

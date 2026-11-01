@@ -46,12 +46,19 @@ export async function readProbeFile(abs: string, maxBytes: number): Promise<Prob
   }
 }
 
-/** Existence of a regular probe file, without opening it or following links. */
+/**
+ * Existence of any directory entry at the path, without opening it or
+ * following links. Callers use this as a blocker signal ("something is
+ * there, stay local"), not as a read: a symlink, FIFO or any other entry
+ * counts as present. Only a genuinely absent path is false; any other
+ * lstat failure cannot prove absence, so it fails closed as present.
+ */
 export async function probeFileExists(abs: string): Promise<boolean> {
   try {
-    return (await lstat(abs)).isFile();
-  } catch {
-    return false;
+    await lstat(abs);
+    return true;
+  } catch (error) {
+    return !isMissing(error);
   }
 }
 
