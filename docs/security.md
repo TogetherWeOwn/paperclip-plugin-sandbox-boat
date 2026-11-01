@@ -122,11 +122,14 @@ hostile and bounds it before anything is written:
   1000000), counting files, directories, symlinks and dropped members alike;
   parent directories a member implies count against the same 100000-directory
   budget as explicit ones, and no member path may exceed 256 components.
-* **Disk reserve**: before each member, `statvfs` must show that writing it
+* **Disk reserve**: before each created member (file, directory or symlink),
+  `statvfs` must show that writing it
   still leaves `syncOutDiskReserveBytes` free (default 10 GiB) and at least
   5% of the filesystem, plus 8192 free inodes. These defaults are sized for a
   legitimately large workspace sync — build output included — while making it
   impossible for one archive to fill the filesystem Paperclip itself runs on.
+* Data after the tar end marker is drained only up to 1 MiB of record
+  padding; more fails the receive instead of holding the sync open.
 * A refusal (or any other receive failure) removes the partially received
   tree, so refused bytes never stay on the host. Directory modes from the
   guest are restored with owner `rwx` forced on, so a synced tree can always

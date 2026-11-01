@@ -25,6 +25,9 @@ DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024
 DEFAULT_MAX_FILES = 200000
 DEFAULT_DISK_RESERVE = 10 * 1024 * 1024 * 1024
 MIN_FREE_INODES = 8192
+# After the tar end marker only record padding is legitimate (one 10 KiB
+# record from our sender); 1 MiB is generous headroom, not a data channel.
+MAX_TRAILING = 1024 * 1024
 mapping = json.loads(sys.argv[2])
 
 
@@ -222,7 +225,10 @@ def receive(confine):
         reserve = max(total // 20, disk_reserve)
         if fs.f_bavail * fs.f_frsize - size < reserve:
             raise ValueError('tar disk reserve would be breached')
-        if fs.f_favail and fs.f_favail <= MIN_FREE_INODES:
+        # Gate on f_files (whether the filesystem reports inodes at all),
+        # not on f_favail: an f_favail of 0 is the exhausted case, not
+        # "unreported".
+        if fs.f_files and fs.f_favail <= MIN_FREE_INODES:
             raise ValueError('tar inode reserve would be breached')
 
     def directory_mode(member):
@@ -289,6 +295,11 @@ def receive(confine):
                             raise ValueError('too many refused tar symlinks')
                         refused_links.add(tuple(parts))
                         continue
+                    # Every created member - directory, symlink or file -
+                    # must leave the byte/disk/inode budget intact. Check
+                    # before opening the parent walk, so not even the
+                    # directories this member implies are created first.
+                    check_member_bytes(member.size if member.isfile() else 0)
                     fd_parent = directory_fd(parts[:-1], create=True, base=root)
                     name = parts[-1]
                 try:
@@ -346,8 +357,16 @@ def receive(confine):
         # tarfile stops at its end marker, before the transport necessarily
         # reaches EOF. Drain record padding before committing/closing stdin so
         # the sender's last bounded write cannot race a closed receiver pipe.
-        while sys.stdin.buffer.read(CHUNK):
-            pass
+        # Bound the drain: endless trailing bytes must fail the receive (and
+        # drop the tree), not hold the sync open until the outer timeout.
+        trailing = 0
+        while True:
+            chunk = sys.stdin.buffer.read(CHUNK)
+            if not chunk:
+                break
+            trailing += len(chunk)
+            if trailing > MAX_TRAILING:
+                raise ValueError('trailing data after tar end marker exceeds limit')
         if single:
             if files != 1:
                 raise ValueError('single-file archive is empty')

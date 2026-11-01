@@ -190,6 +190,34 @@ print(json.dumps({"code": proc.returncode, "stderr": stderr.decode("utf8", "repl
     expect(existsSync(target)).toBe(false);
   });
 
+  it("refuses a directory member that would breach the disk reserve", async () => {
+    const { code, stderr } = await run({ diskReserveBytes: 2 ** 50 },
+      Buffer.concat([member({ name: "sub", type: "5" }), END]));
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("tar disk reserve would be breached");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("refuses a symlink member that would breach the disk reserve", async () => {
+    const { code, stderr } = await run({ diskReserveBytes: 2 ** 50 },
+      Buffer.concat([member({ name: "link", type: "2", link: "x" }), END]));
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("tar disk reserve would be breached");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("rejects unbounded trailing data after the tar end marker and removes the target", async () => {
+    const archive = Buffer.concat([
+      member({ name: "x", body: Buffer.from("x") }),
+      END,
+      Buffer.alloc(4 * 1024 * 1024, 1),
+    ]);
+    const { code, stderr } = await run({}, archive);
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("trailing data after tar end marker exceeds limit");
+    expect(existsSync(target)).toBe(false);
+  });
+
   it("rejects a member path deeper than 256 components", async () => {
     const deep = Array.from({ length: 257 }, () => "a").join("/");
     const { code, stderr } = await run({}, Buffer.concat([member({ name: deep, body: Buffer.from("x") }), END]));
