@@ -148,13 +148,16 @@ default VM:
    stays local. VM reuse is keyed on the source id apart from snapshot and
    stock keys, and `templateSnapshot` wins when both are set.
 
-   A cargo `--offline` command cannot download missing crates, so the guest
-   primes its cargo cache with `cargo fetch --locked` (plus the profile's
-   validated `+toolchain` selector when the invocation carries one) before the
-   command's supervisor exists; a failing fetch fails the prepare and the
-   command runs locally instead. A source tree whose cargo config points at a
-   private registry, a source replacement, or stored credentials stays local
-   too, because the guest fetch could not satisfy it.
+   A cargo `--offline` command (or `--frozen`, which implies offline) cannot
+   download missing crates, so the guest primes its cargo cache with
+   `cargo fetch --locked` (plus the profile's validated `+toolchain` selector
+   when the invocation carries one) before the command's supervisor exists; a
+   failing fetch fails the prepare and the command runs locally instead. The
+   fetch never invokes registry credential providers — the guest pins the
+   provider list empty with a CLI `--config` override — and runs in its own
+   session so a hung fetch is group-killed at its fence. A source tree whose
+   cargo config points at a private registry, a source replacement, or stored
+   credentials stays local too, because the guest fetch could not satisfy it.
 
 ## Smoke procedures
 

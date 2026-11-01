@@ -2,7 +2,7 @@
 // The detached supervisor/watchdog stays OUTSIDE the command cgroup. State and
 // output are private, bounded and ephemeral (/tmp, never a Boat snapshot).
 export const OFFLOAD_SSH_SCRIPT = String.raw`
-import base64, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
+import base64, contextlib, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
 
 MAX_OUTPUT = 1048576
 BOOT = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -311,13 +311,26 @@ def rpc(action, data):
                     or any(char.isspace() or char in ';&|$(){}[]<>' + chr(96) for char in toolchain)):
                 raise ValueError('invalid toolchain selector')
             fetch_argv.append(toolchain)
-        fetch_argv += ['fetch', '--locked']
+        # Registry credentials stay out of priming entirely: the CLI --config
+        # override outranks every config file, so no credential-provider
+        # program can run during fetch even if a config defining one reached
+        # the guest. Sources needing one stay local host-side anyway.
+        fetch_argv += ['fetch', '--locked', '--config',
+            'registry.global-credential-providers=[]']
         environment = {'PATH': data['path'], 'HOME': os.environ.get('HOME', '/tmp')}
-        completed = subprocess.run(fetch_argv,
-            cwd=canonical(data['cwd']), env=environment,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=540)
-        return {'exitCode': completed.returncode}
+        # No command cgroup exists yet, so containment is the process group:
+        # run fetch in its own session and kill the whole group at the fence,
+        # so a hung child cannot outlive the prepare.
+        child = subprocess.Popen(fetch_argv,
+            cwd=canonical(data['cwd']), env=environment, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            return {'exitCode': child.wait(timeout=540)}
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            raise
     if action == 'prepare':
         return prepare(data)
     root = pathlib.Path(canonical(data['root']))

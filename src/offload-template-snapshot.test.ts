@@ -42,6 +42,10 @@ describe("offload pool templateSnapshot", () => {
     expect(plain.compatibilityKey(cmd)).toBe(legacy);
     expect(tmpl.compatibilityKey(cmd)).not.toBe(legacy);
     expect(tmpl.compatibilityKey(cmd)).toContain("paperclip-offload-delegated-v1");
+    // The snapshot key keeps the exact layout 0.2.4 persisted, so an upgrade
+    // with an unchanged snapshot reuses its recorded VMs instead of retiring
+    // every warm machine once.
+    expect(tmpl.compatibilityKey(cmd)).toBe(JSON.stringify([...JSON.parse(legacy), "paperclip-offload-delegated-v1"]));
   });
 
   it("does not reuse a VM booted from another image after the template changes", async () => {

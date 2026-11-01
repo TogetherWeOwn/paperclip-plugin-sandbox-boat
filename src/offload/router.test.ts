@@ -120,6 +120,14 @@ describe("cargo-side argv helpers", () => {
     expect(isCargoOffline(["test"])).toBe(false);
   });
 
+  it("treats cargo --frozen as offline for priming and stay-local decisions", () => {
+    // --frozen is --locked plus --offline: a cold guest cache must prime (or
+    // fall back) exactly like --offline, never fail remotely on a missing crate.
+    expect(isCargoOffline(["test", "--frozen"])).toBe(true);
+    expect(isCargoOffline(["--frozen", "test"])).toBe(true);
+    expect(isCargoOffline(["test", "--", "--frozen"])).toBe(false);
+  });
+
   it("validates a leading rustup toolchain selector against the profile", () => {
     expect(cargoToolchain(["+stable", "test", "--offline"], PROFILE.toolchains)).toBe("+stable");
     // A toolchain-looking arg after `--` belongs to the test binary.

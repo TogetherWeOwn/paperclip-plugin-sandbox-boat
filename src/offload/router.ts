@@ -41,9 +41,12 @@ export function cargoSideArgv(argv: string[]): string[] {
   return dashDash >= 0 ? argv.slice(0, dashDash) : argv;
 }
 
-/** Whether this invocation asks Cargo itself for offline mode. */
+/** Whether this invocation asks Cargo itself for offline mode. `--frozen`
+ * implies it (locked plus offline), so frozen commands prime and stay-local
+ * on private registries exactly like offline ones. */
 export function isCargoOffline(argv: string[]): boolean {
-  return cargoSideArgv(argv).includes("--offline");
+  const cargo = cargoSideArgv(argv);
+  return cargo.includes("--offline") || cargo.includes("--frozen");
 }
 
 /** A validated leading rustup toolchain selector (`+stable`), or null. */

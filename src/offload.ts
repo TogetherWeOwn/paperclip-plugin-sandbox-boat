@@ -583,11 +583,13 @@ export class OffloadExecutor {
   private compatibilityKey(command: OffloadCommand): string {
     // A VM booted from another guest image is never reused; it is retired like
     // any incompatible idle VM. Without a template the key is unchanged, so VMs
-    // recorded before templates existed stay reusable. Template selections use
-    // tagged pairs, so a snapshot literally named `fork:...` still cannot match
-    // a forked source id.
+    // recorded before templates existed stay reusable. The snapshot key also
+    // keeps its original bare-string layout, so an upgrade with an unchanged
+    // snapshot reuses its recorded VMs. Only the fork key (new, nothing
+    // persisted) is a tagged pair, so a snapshot named to collide can never
+    // produce it.
     const base = [command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null];
-    if (this.config.templateSnapshot) return JSON.stringify([...base, ["snapshot", this.config.templateSnapshot]]);
+    if (this.config.templateSnapshot) return JSON.stringify([...base, this.config.templateSnapshot]);
     if (this.config.templateSourceSandboxId) return JSON.stringify([...base, ["fork", this.config.templateSourceSandboxId]]);
     return JSON.stringify(base);
   }

@@ -168,7 +168,7 @@ describe("guest cargo cache priming", () => {
     const fetched = fetchFixture(0);
     expect(fetched).not.toHaveProperty("error");
     expect(fetched.result).toEqual({ exitCode: 0 });
-    expect(fetched.argv).toBe("fetch\n--locked\n");
+    expect(fetched.argv).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
     expect(fetched.pwd).toBe(`cwd:${fetched.cwd}\n`);
   });
 
@@ -176,14 +176,14 @@ describe("guest cargo cache priming", () => {
     const fetched = fetchFixture(3);
     expect(fetched).not.toHaveProperty("error");
     expect(fetched.result).toEqual({ exitCode: 3 });
-    expect(fetched.argv).toBe("fetch\n--locked\n");
+    expect(fetched.argv).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
   });
 
   it("preserves a validated toolchain selector ahead of fetch", () => {
     const fetched = fetchFixture(0, "+stable");
     expect(fetched).not.toHaveProperty("error");
     expect(fetched.result).toEqual({ exitCode: 0 });
-    expect(fetched.argv).toBe("+stable\nfetch\n--locked\n");
+    expect(fetched.argv).toBe("+stable\nfetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
     expect(fetched.pwd).toBe(`cwd:${fetched.cwd}\n`);
   });
 

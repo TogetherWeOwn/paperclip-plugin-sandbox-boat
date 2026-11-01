@@ -106,7 +106,20 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       const { priming, stub } = await primingGuest(3, "fail");
       try {
         await expect(priming.prepare(ssh.session.sandboxId, offline)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
-        expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n");
+        expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+      } finally {
+        await priming.shutdown();
+      }
+    }
+    // --frozen is --locked plus --offline, so it primes the same way.
+    {
+      const frozen = cmd();
+      frozen.tool = "cargo";
+      frozen.argv = ["test", "--frozen"];
+      const { priming, stub } = await primingGuest(3, "frozen");
+      try {
+        await expect(priming.prepare(ssh.session.sandboxId, frozen)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+        expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
       } finally {
         await priming.shutdown();
       }
@@ -118,7 +131,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       const identity = await priming.prepare(ssh.session.sandboxId, offline);
       expect(identity.cgroupPath.startsWith(`${parent}/`)).toBe(true);
       // The host-validated toolchain selector travels into the fixed fetch argv.
-      expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("+stable\nfetch\n--locked\n");
+      expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("+stable\nfetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
     } finally {
       await priming.shutdown();
     }

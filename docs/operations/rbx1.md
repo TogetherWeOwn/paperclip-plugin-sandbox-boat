@@ -128,8 +128,8 @@ curl -fsS -X POST "$PAPERCLIP/api/plugins/$PLUGIN_ID/config" \
   "offloadLocalApiKeySecretRef": {"type": "secret_ref", "secretId": "$SECRET_ID"},
   "offloadLocalDriverConfig": {
     "size": "default",
-    "templateSnapshot": "<named snapshot from the guest template>",
-    "templateSourceSandboxId": "<archived template sandbox id, when named snapshots are unavailable>",
+    "templateSnapshot": "<named snapshot from the guest template; set exactly one of the two template fields>",
+    "templateSourceSandboxId": "<archived template sandbox id; on the trial, set only this field and omit templateSnapshot>",
     "maxOffloadVms": 2,
     "offloadIdleStopSeconds": 15
   },
