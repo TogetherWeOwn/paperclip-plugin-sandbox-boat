@@ -3,13 +3,17 @@
 # plugin packages root. It never builds from the working tree, so a stale or
 # uncommitted dist cannot end up on a host.
 #
-# Usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]
+# Usage: scripts/stage-package.sh <commit> <plugin packages root>
 #   The package lands in <root>/sandbox-boat-<version>-<short sha>.
-#   <host plugin-sdk path> is where the Paperclip server sees its own SDK
-#   (default /app/packages/plugins/sdk, as in the Paperclip container). On a
-#   native npm install give the path through the CLI's `current` link, e.g.
-#   ~/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk: upgrades
-#   re-point `current` and prune old installs/npm/<version> payloads.
+#   The package is self-contained: it carries real copies of its runtime
+#   dependencies (@boatdev/sdk, @paperclipai/plugin-sdk, @paperclipai/shared
+#   and zod) under node_modules. A local-path install runs the package in
+#   place and installs nothing for it, so the worker resolves those copies by
+#   the usual node_modules walk. The plugin-sdk copy is the pinned version in
+#   package.json `dependencies`, the one the build and the host-contract
+#   tests ran against. No host SDK path is baked in and nothing is symlinked:
+#   an absolute link made every tarball before 0.2.6 unloadable off the host
+#   that built it.
 #   sudo is used only for the final move when <root> is not writable.
 #
 # It refuses:
@@ -26,21 +30,19 @@
 #     a build that links it into /tmp (Paperclip refuses that link and fails
 #     every run), or one that does not make every command's tar skip
 #     .paperclip-runtime members;
-#   - a host SDK path inside a versioned Paperclip install (cli/installs/);
+#   - a package that holds a symlink, or whose dist/index.js does not import
+#     cleanly from the staged node_modules alone;
 #   - a destination that already exists.
 set -eu
 
 ENV_FILE_FIX=0721a3af3f7f417f2cebafb30d3212d5c1182656
 
-commit=${1:?usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]}
-root=${2:?usage: scripts/stage-package.sh <commit> <plugin packages root> [<host plugin-sdk path>]}
-host_sdk=${3:-/app/packages/plugins/sdk}
-case "$host_sdk" in
-  */cli/installs/*)
-    echo "stage-package: $host_sdk is inside one versioned Paperclip install; link through cli/current instead (the next upgrade prunes it)." >&2
-    exit 1
-    ;;
-esac
+commit=${1:?usage: scripts/stage-package.sh <commit> <plugin packages root>}
+root=${2:?usage: scripts/stage-package.sh <commit> <plugin packages root>}
+if [ $# -gt 2 ]; then
+  echo "stage-package: unexpected argument: $3 (the package bundles its pinned plugin-sdk; there is no host SDK path to give)" >&2
+  exit 1
+fi
 
 repo=$(git rev-parse --show-toplevel)
 sha=$(git -C "$repo" rev-parse --verify --quiet "$commit^{commit}") || {
@@ -92,9 +94,34 @@ if [ -d "$work/src/bin" ]; then cp -R "$work/src/bin" "$pkg/"; fi
 if [ -d "$work/src/docs" ]; then cp -R "$work/src/docs" "$pkg/"; fi
 mkdir -p "$pkg/node_modules/@boatdev" "$pkg/node_modules/@paperclipai"
 cp -R "$work/src/node_modules/@boatdev/sdk" "$pkg/node_modules/@boatdev/sdk"
-# Resolve the SDK the server itself runs, like the bundled providers do.
-ln -s "$host_sdk" "$pkg/node_modules/@paperclipai/plugin-sdk"
+# The plugin-sdk is a pinned runtime dependency now, not a peer the host has
+# to supply: copy the real package the build used, with the runtime
+# dependencies its entry point loads (@paperclipai/shared, zod). @boatdev/sdk
+# has none. The import check below runs the whole dist graph against only
+# these copies, so a missing transitive dep refuses the package instead of
+# failing on the host at worker start.
+cp -R "$work/src/node_modules/@paperclipai/plugin-sdk" "$pkg/node_modules/@paperclipai/plugin-sdk"
+# Present at the top level unless npm nested them under the SDK (the SDK copy
+# above carries its nested deps with it); the import check is the arbiter.
+if [ -d "$work/src/node_modules/@paperclipai/shared" ]; then cp -R "$work/src/node_modules/@paperclipai/shared" "$pkg/node_modules/@paperclipai/shared"; fi
+if [ -d "$work/src/node_modules/zod" ]; then cp -R "$work/src/node_modules/zod" "$pkg/node_modules/zod"; fi
 echo "$sha" > "$pkg/.source-commit"
+
+# No link may leave the package: a tarball of it has to load on any host.
+# There is no reason for a link at all, so refuse any.
+if [ -n "$(find "$pkg" -type l -print -quit)" ]; then
+  echo "stage-package: the staged package holds a symlink; refusing." >&2
+  find "$pkg" -type l >&2
+  exit 1
+fi
+# The worker's module graph must resolve from the staged node_modules alone.
+# dist/index.js pulls in the plugin, the SDK and @boatdev/sdk without
+# starting the worker host, so importing it here (pkg has no node_modules
+# ancestor in the work dir) proves the copies above are the whole runtime set.
+if ! node --input-type=module -e 'await import(process.argv[1])' "$pkg/dist/index.js"; then
+  echo "stage-package: dist/index.js does not import from the staged node_modules alone; refusing." >&2
+  exit 1
+fi
 
 # The env file must never be named inside the workspace again.
 if grep -rqF '.paperclip-boat-env-' "$pkg/dist"; then

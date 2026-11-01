@@ -68,6 +68,12 @@ jobs:
           sha256sum "$name.tgz" > "$name.tgz.sha256"
           sha256sum -c "$name.tgz.sha256"
 
+      # A tarball with a link in it once shipped an absolute plugin-sdk symlink
+      # to the build host's SDK path and could not load anywhere else. The
+      # package is plain files and directories; fail the release otherwise.
+      - name: Check the tarball holds no links
+        run: scripts/check-tarball-links.sh "$RUNNER_TEMP"/assets/*.tgz
+
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

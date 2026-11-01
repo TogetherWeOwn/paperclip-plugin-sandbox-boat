@@ -1,63 +1,33 @@
 #!/bin/sh
 # Stage a downloaded GitHub Release tarball, read-only, in a plugin packages
-# root, with its plugin-sdk link pointed at this host's own SDK. The tarball
-# links the SDK to /app/packages/plugins/sdk (the Paperclip container); a
-# native npm install keeps it elsewhere.
+# root. The package is self-contained (its node_modules holds real copies of
+# the pinned @paperclipai/plugin-sdk and the other runtime dependencies), so
+# there is nothing host-specific to adjust on the way in: this script only
+# verifies the tarball and lands it read-only. Plain `tar -xzf` into the root
+# works too; the script adds the checks below. (Tarballs before 0.2.6 are
+# refused here: they carry an absolute plugin-sdk symlink to the build host's
+# SDK. Stage those with the stage-release.sh of their own tag.)
 #
-# Usage: scripts/stage-release.sh <tarball> <plugin packages root> [<host plugin-sdk path>]
+# Usage: scripts/stage-release.sh <tarball> <plugin packages root>
 #   <tarball> is sandbox-boat-<version>-<short sha>.tgz, with its .sha256 file
 #   next to it (gh release download fetches both).
 #   The package lands in <root>/sandbox-boat-<version>-<short sha>.
-#   <host plugin-sdk path> defaults to the first that exists of
-#   $PAPERCLIP_HOME/cli/current/node_modules/@paperclipai/plugin-sdk
-#   ($PAPERCLIP_HOME defaults to ~/.paperclip) and /app/packages/plugins/sdk.
-#   The link keeps the path as given: through cli/current it follows Paperclip
-#   upgrades, which re-point `current` and prune old installs/npm/<version>.
 #   sudo is used only for the final move when <root> is not writable.
 #
 # It refuses:
 #   - a tarball whose .sha256 is missing or does not match;
 #   - a tarball that is not one sandbox-boat-<version>-<sha> directory, holds
-#     anything but files, directories and the one plugin-sdk link, or whose
-#     package.json version or .source-commit disagree with its name;
-#   - a host SDK path that is not a @paperclipai/plugin-sdk package, or that is
-#     inside a versioned Paperclip install (cli/installs/);
+#     anything but files and directories (no links: one parked the SDK on the
+#     build host's path until 0.2.6), has no bundled plugin-sdk package, or
+#     whose package.json version or .source-commit disagree with its name;
 #   - a destination that already exists.
 set -eu
 
-usage='usage: scripts/stage-release.sh <tarball> <plugin packages root> [<host plugin-sdk path>]'
+usage='usage: scripts/stage-release.sh <tarball> <plugin packages root>'
 tarball=${1:?$usage}
 root=${2:?$usage}
-
-if [ $# -ge 3 ]; then
-  host_sdk=$3
-else
-  home_sdk="${PAPERCLIP_HOME:-$HOME/.paperclip}/cli/current/node_modules/@paperclipai/plugin-sdk"
-  if [ -d "$home_sdk" ]; then
-    host_sdk=$home_sdk
-  elif [ -d /app/packages/plugins/sdk ]; then
-    host_sdk=/app/packages/plugins/sdk
-  else
-    echo "stage-release: no host plugin-sdk at $home_sdk or /app/packages/plugins/sdk; pass its path." >&2
-    exit 1
-  fi
-fi
-case "$host_sdk" in
-  /*) ;;
-  *)
-    echo "stage-release: host SDK path must be absolute: $host_sdk" >&2
-    exit 1
-    ;;
-esac
-case "$host_sdk" in
-  */cli/installs/*)
-    echo "stage-release: $host_sdk is inside one versioned Paperclip install; link through cli/current instead (the next upgrade prunes it)." >&2
-    exit 1
-    ;;
-esac
-sdk_name=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).name)}catch{}' "$host_sdk/package.json")
-if [ "$sdk_name" != "@paperclipai/plugin-sdk" ]; then
-  echo "stage-release: $host_sdk is not a @paperclipai/plugin-sdk package" >&2
+if [ $# -gt 2 ]; then
+  echo "stage-release: unexpected argument: $3 (the package bundles its pinned plugin-sdk; there is no host SDK path to give)" >&2
   exit 1
 fi
 
@@ -111,9 +81,15 @@ if [ "$top" != "$work/$name" ] || [ ! -d "$work/$name" ] || [ -L "$work/$name" ]
 fi
 pkg="$work/$name"
 chmod -R u+w "$pkg"
-link="$pkg/node_modules/@paperclipai/plugin-sdk"
-if [ -n "$(find "$pkg" ! -type f ! -type d ! -path "$link")" ] || [ ! -L "$link" ]; then
-  echo "stage-release: $file holds a link or special file other than node_modules/@paperclipai/plugin-sdk" >&2
+if [ -n "$(find "$pkg" ! -type f ! -type d)" ]; then
+  echo "stage-release: $file holds a link or special file; the package must be plain files and directories" >&2
+  find "$pkg" ! -type f ! -type d >&2
+  exit 1
+fi
+sdk_pkg="$pkg/node_modules/@paperclipai/plugin-sdk/package.json"
+sdk_name=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).name)}catch{}' "$sdk_pkg")
+if [ "$sdk_name" != "@paperclipai/plugin-sdk" ]; then
+  echo "stage-release: $file carries no bundled @paperclipai/plugin-sdk under node_modules; it cannot load as a local-path install" >&2
   exit 1
 fi
 version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$pkg/package.json")
@@ -136,9 +112,6 @@ fi
 if [ ! -d "$pkg/bin" ]; then
   echo "stage-release: warning: $name has no bin/ (built before stage-package.sh shipped the offload shims); it cannot serve as a shim dir." >&2
 fi
-
-rm "$link"
-ln -s "$host_sdk" "$link"
 
 # Same order as stage-package.sh: copy next to the destination, rename in one
 # step, make it read-only last. mktemp gives the partial copy a name nobody can
