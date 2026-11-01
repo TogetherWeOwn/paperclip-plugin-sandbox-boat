@@ -72,6 +72,11 @@ describe("readBudget", () => {
     expect(snapshot).toMatchObject({ activeSandboxes: 1, maxActiveSandboxes: 100, computeHoursLeft: 2 });
   });
 
+  it("prefers the trial consumption counter when the trial reports one", () => {
+    const snapshot = readBudget(trialLimits({ creditUsedSeconds: 3600, trialComputeUsedSeconds: 7200 }));
+    expect(snapshot.computeHoursLeft).toBe(23);
+  });
+
   it("uses the smaller of the trial cap and the balance", () => {
     expect(readBudget(trialLimits({ creditBalanceSeconds: 1800 })).computeHoursLeft).toBe(0.5);
   });
@@ -100,6 +105,10 @@ describe("config", () => {
       templateSnapshot: null,
       managedGithub: false,
       modelProxyKeyFingerprint: null,
+      templateSourceSandboxId: null,
+    });
+    expect(parseDriverConfig({ templateSourceSandboxId: "bx_archived1" })).toMatchObject({
+      templateSourceSandboxId: "bx_archived1",
     });
   });
 

@@ -33,6 +33,29 @@ function isCompoundShell(argv: string[]): boolean {
   return argv.some((arg) => SHELL_TOKENS.has(arg) || SHELL_INLINE_RE.test(arg));
 }
 
+/** Cargo-side argv: everything before a bare `--` belongs to Cargo. Args after
+ * it belong to the test binary and must never change the host's stay-local or
+ * cache-priming decisions. */
+export function cargoSideArgv(argv: string[]): string[] {
+  const dashDash = argv.indexOf("--");
+  return dashDash >= 0 ? argv.slice(0, dashDash) : argv;
+}
+
+/** Whether this invocation asks Cargo itself for offline mode. `--frozen`
+ * implies it (locked plus offline), so frozen commands prime and stay-local
+ * on private registries exactly like offline ones. */
+export function isCargoOffline(argv: string[]): boolean {
+  const cargo = cargoSideArgv(argv);
+  return cargo.includes("--offline") || cargo.includes("--frozen");
+}
+
+/** A validated leading rustup toolchain selector (`+stable`), or null. */
+export function cargoToolchain(argv: string[], toolchains: readonly string[]): string | null {
+  const first = cargoSideArgv(argv)[0];
+  if (!first?.startsWith("+") || first.length < 2) return null;
+  return toolchains.includes(first.slice(1)) ? first : null;
+}
+
 function local(profile: { id: string }, reason: string, subcommand: string | null = null, runner?: string): CargoClassification {
   return { mode: "local", reason, profileId: profile.id, subcommand, ...(runner === undefined ? {} : { runner }) };
 }
@@ -370,8 +393,7 @@ export function classifyCargo(argv: string[], profile: CargoProfile): CargoClass
   if (isCompoundShell(argv)) return local(profile, "compound shell text stays local", null);
 
   // Only cargo-side args count: after a bare `--`, args belong to the test binary.
-  const dashDash = argv.indexOf("--");
-  const cargoSide = dashDash >= 0 ? argv.slice(0, dashDash) : argv;
+  const cargoSide = cargoSideArgv(argv);
   if (cargoSide.some((arg) => arg === "--config" || arg.startsWith("--config="))) {
     return local(profile, "unrecognized --config override stays local");
   }

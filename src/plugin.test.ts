@@ -2224,7 +2224,8 @@ describe("offload API routes", () => {
     const unknownWs = await plugin.definition.onApiRequest!(
       apiInput("offload_exec", { body: submitBody({ executionWorkspaceId: "00000000-0000-4000-8000-000000000099" }) }) as never,
     );
-    expect(unknownWs.status).toBe(403);
+    expect(unknownWs.status).toBe(503);
+    expect(unknownWs.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
   });
 
   it("dry-runs through the dispatch with no journal effect", async () => {

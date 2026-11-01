@@ -275,7 +275,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId: null }) }, companyId);
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(host.calls.some((entry) => entry.method === "issues.get")).toBe(false);
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(403);
+    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
   }, TIMEOUT);
 
   it("(3) a workspace with no local cwd (provider ref only) binds nothing", async () => {
@@ -294,7 +294,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
     await host.until(() => host.logs.includes("boat: local-run offload binding skipped"), "binding skip");
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(403);
+    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
   }, TIMEOUT);
 
   it("(2) host reads stay inside the event's company: a cross-company issue is invisible", async () => {

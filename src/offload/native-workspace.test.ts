@@ -45,10 +45,11 @@ async function submit(extra: Record<string, unknown> = {}) {
 afterEach(async () => { await plugin.definition.onShutdown?.(); setManagerOverridesForTests({}); });
 
 describe("native workspace binding", () => {
-  it("pins the capability set: 0.2.2 plus the three local-run binding reads", () => {
+  it("pins the capability set: 0.2.2 plus the five local-run binding reads", () => {
     expect([...manifest.capabilities].sort()).toEqual([
       "environment.drivers.register", "plugin.state.read", "plugin.state.write",
       "jobs.schedule", "api.routes.register", "issues.read",
+      "projects.read", "project.workspaces.read",
       "events.subscribe", "execution.workspaces.read", "secrets.read-ref",
     ].sort());
   });
@@ -117,7 +118,7 @@ describe("native workspace binding", () => {
     const params = nativeWorkspace(override);
     if (Object.keys(override).length === 0) params.workspace.metadata = {} as never;
     await plugin.definition.onEnvironmentRealizeWorkspace!(params);
-    expect(await submit()).toMatchObject({ status: 403 });
+    expect(await submit()).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
 
   it("uses the current native run identity, not stale reusable-lease metadata", async () => {
@@ -133,7 +134,7 @@ describe("native workspace binding", () => {
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
     const [key, value] = [...t.state.entries()].find(([key]) => key.includes("boat-offload-workspaces"))!;
     t.state.set(key, { ...(value as Record<string, unknown>), [field]: "wrong" });
-    expect(await submit()).toMatchObject({ status: 403 });
+    expect(await submit()).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
 
   it("does not break whole-run realization when optional offload state is unavailable", async () => {
@@ -141,14 +142,14 @@ describe("native workspace binding", () => {
     await setup({ ...t.ctx.state, set: async () => { throw new Error("state unavailable"); } });
     expect(await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace()))
       .toMatchObject({ cwd: "/home/user/paperclip-workspace" });
-    expect(await submit()).toMatchObject({ status: 403 });
+    expect(await submit()).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
 
   it("never accepts a root or repo supplied in the offload body", async () => {
     await setup();
     expect(await submit({ body: { ...body, path: "/work/public-rust", repoUrl: "https://github.com/example/public-rust" } }))
       .toMatchObject({ status: 400 });
-    expect(await submit()).toMatchObject({ status: 403 });
+    expect(await submit()).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
 
   it("keeps normal submits default-off with a durable safe-fallback receipt", async () => {
