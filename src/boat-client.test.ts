@@ -59,6 +59,28 @@ describe("boat API request timeouts", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
+  it("bounds a response body that stalls after its headers arrive", async () => {
+    // Headers resolve at once; the body never produces a byte. Both transports
+    // error a body read when the request signal aborts (the SDK's http2-fetch
+    // closes the HTTP/2 stream on abort, which errors its body stream; the
+    // global fetch does the same). This pins that the wrapper's timeout
+    // signal stays armed after the fetch promise resolves, instead of being
+    // cancelled once headers arrive.
+    const fetchApi = async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            init?.signal?.addEventListener("abort", () => controller.error(init.signal?.reason), { once: true });
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    const api = createSdkBoatApi({ apiKey: "k", apiBase, fetchApi, requestTimeoutMs: 40 });
+    const started = Date.now();
+    await expect(api.get({ sandboxId: "bx_timeout01" })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
   it("passes a fast response through with a live (unaborted) signal attached", async () => {
     let seenSignal: AbortSignal | null | undefined;
     const fetchApi = async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {

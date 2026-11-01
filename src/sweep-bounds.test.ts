@@ -13,6 +13,7 @@ vi.mock("node:child_process", async () => {
 
 import { createSdkBoatApi, setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
+import { parseDriverConfig } from "./config.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext } from "./test-support/harness.js";
@@ -25,14 +26,14 @@ let ssh: FakeSsh;
 let clock: number;
 let harness: ReturnType<typeof createFakeContext>;
 
-async function acquireAndRun() {
+async function acquireAndRun(runId = "run-1", issueId = "issue-sweep-bounds") {
   const lease = await plugin.definition.onEnvironmentAcquireLease!({
     companyId,
     environmentId,
     driverKey: "boat",
     config: baseConfig,
-    runId: "run-1",
-    issueId: "issue-sweep-bounds",
+    runId,
+    issueId,
   });
   await currentManager().sweepInFlight();
   const ran = await plugin.definition.onEnvironmentExecute!({
@@ -41,6 +42,27 @@ async function acquireAndRun() {
   });
   expect(ran.exitCode).toBe(0);
   return lease;
+}
+
+/**
+ * Block every read of the offload brokers' journal state: collectGarbage (and
+ * any pool upkeep reading the same namespace) never settles until released.
+ */
+function blockOffloadReads() {
+  const state = harness.ctx.state as unknown as {
+    get: (input: { namespace?: string }) => Promise<unknown>;
+  };
+  const originalGet = state.get.bind(harness.ctx.state);
+  const blocked: Array<() => void> = [];
+  state.get = (input) =>
+    input.namespace === "boat-offload"
+      ? new Promise<unknown>((resolve) => blocked.push(() => void originalGet(input).then(resolve)))
+      : originalGet(input);
+  return () => {
+    // Release the blocked reads so the broker chains settle and shutdown can drain.
+    state.get = originalGet;
+    for (const release of blocked) release();
+  };
 }
 
 beforeEach(async () => {
@@ -53,8 +75,9 @@ beforeEach(async () => {
   setManagerOverridesForTests({
     now: () => clock,
     sleep: async (ms) => { clock += ms; },
-    sweepDeadlineMs: 400,
+    sweepDeadlineMs: 1_000,
     offloadUpkeepTimeoutMs: 50,
+    sweepVmTimeoutMs: 200,
   });
   harness = createFakeContext();
   await plugin.definition.setup(harness.ctx as never);
@@ -95,17 +118,7 @@ describe("sweep bounds", () => {
 
   it("still stops idle whole-run VMs when broker garbage collection is blocked", async () => {
     const lease = await acquireAndRun();
-    // Block every read of the offload broker's journal state: collectGarbage
-    // (and any pool upkeep reading the same namespace) never settles.
-    const state = harness.ctx.state as unknown as {
-      get: (input: { namespace?: string }) => Promise<unknown>;
-    };
-    const originalGet = state.get.bind(harness.ctx.state);
-    const blocked: Array<() => void> = [];
-    state.get = (input) =>
-      input.namespace === "boat-offload"
-        ? new Promise<unknown>((resolve) => blocked.push(() => void originalGet(input).then(resolve)))
-        : originalGet(input);
+    const releaseReads = blockOffloadReads();
 
     clock += 21 * 60_000; // past idle/stale thresholds, command long finished
     const started = Date.now();
@@ -113,9 +126,50 @@ describe("sweep bounds", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(report.stopped).toEqual([lease.providerLeaseId]);
     expect(report.errors).toContain("offload broker retention unverified");
-    // Release the blocked reads so the broker chain settles and shutdown can drain.
-    state.get = originalGet;
-    for (const release of blocked) release();
+    releaseReads();
+  });
+
+  it("bounds all blocked broker upkeep collectively so many companies cannot starve VM stops", async () => {
+    const lease = await acquireAndRun();
+    // Register many more companies whose broker GCs will all block. A bound
+    // per company, awaited in sequence, would spend 25+ × 50 ms of upkeep
+    // before any VM is examined — past the 1 s sweep deadline — and every
+    // later sweep would repeat the same sequence without reaching VM stops.
+    for (let i = 0; i < 25; i++) {
+      currentManager().rememberConfig(`company-upkeep-${i}`, `environment-upkeep-${i}`, parseDriverConfig(baseConfig));
+    }
+    const releaseReads = blockOffloadReads();
+
+    clock += 21 * 60_000;
+    const started = Date.now();
+    const report = await currentManager().sweep("schedule", { force: true });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(report.stopped).toEqual([lease.providerLeaseId]);
+    expect(report.errors.filter((entry) => entry === "offload broker retention unverified")).toHaveLength(26);
+    releaseReads();
+  });
+
+  it("skips a VM whose locked stop never settles and still stops later VMs", async () => {
+    const stuck = await acquireAndRun("run-stuck", "issue-sweep-stuck");
+    const later = await acquireAndRun("run-later", "issue-sweep-later");
+    // The first VM's stop hangs inside its card lock forever (a provider or
+    // state call that never settles). The abandoned work keeps that lock, so
+    // the sweep must give up on this VM within the per-VM bound and move on —
+    // in this pass and in later passes — instead of queueing on the lock.
+    const originalStop = fake.stop.bind(fake);
+    fake.stop = (async (args: Record<string, unknown>) =>
+      String(args.sandboxId) === stuck.providerLeaseId ? new Promise<never>(() => {}) : originalStop(args)) as typeof fake.stop;
+
+    clock += 21 * 60_000;
+    const started = Date.now();
+    const report = await currentManager().sweep("schedule", { force: true });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(report.stopped).toEqual([later.providerLeaseId]);
+    expect(report.errors.some((entry) => entry.includes(String(stuck.providerLeaseId)))).toBe(true);
+
+    const second = await currentManager().sweep("schedule", { force: true });
+    expect(second.stopped).toEqual([]);
+    expect(second.errors.some((entry) => entry.includes(String(stuck.providerLeaseId)))).toBe(true);
   });
 
   it("rejects at the sweep deadline when a provider call hangs, then sweeps cleanly", async () => {
@@ -123,7 +177,7 @@ describe("sweep bounds", () => {
     const original = fake.sandboxes.bind(fake);
     fake.sandboxes = (async () => new Promise<never>(() => {})) as typeof fake.sandboxes;
     const started = Date.now();
-    await expect(currentManager().sweep("schedule", { force: true })).rejects.toThrow(/did not settle within 400 ms/);
+    await expect(currentManager().sweep("schedule", { force: true })).rejects.toThrow(/did not settle within 1000 ms/);
     expect(Date.now() - started).toBeLessThan(5_000);
 
     fake.sandboxes = original as typeof fake.sandboxes;
