@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -43,7 +45,7 @@ beforeEach(async () => {
     offloadAllowedRepos: ["repo:https://github.com/example/public"] };
   boat = new FakeBoat({ now: Date.now });
   const harness = createFakeContext();
-  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
     boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
     guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
   runtime.remember(native());
@@ -90,7 +92,7 @@ describe("stock concrete executor factory", () => {
     const bin = path.join(ssh.root, "stub-bin");
     await mkdir(bin);
     await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
-    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session,
+    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked,
       guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
     await plugin.definition.onEnvironmentRealizeWorkspace!(native());
@@ -128,6 +130,44 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: [] })).toBe(null);
     expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: ["repo:another"] })).toBe(null);
     expect(boat.calls).toHaveLength(0);
+  });
+  // Real-git admission (no trackedFiles seam): the default listing gates resolve().
+  function realGitRuntime(): SshOffloadRuntime {
+    const harness = createFakeContext();
+    const rt = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
+    rt.remember(native());
+    return rt;
+  }
+  function gitIn(dir: string, ...args: string[]): void {
+    execFileSync("git", ["-C", dir, ...args], { stdio: "pipe" });
+  }
+  it("keeps a non-git source local: resolve returns null and no VM is spent", async () => {
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps a workspace with a tracked fake AWS key local", async () => {
+    gitIn(source, "init", "-q", ".");
+    await writeFile(path.join(source, "config.rs"), 'const K: &str = "AKIAIOSFODNN7EXAMPLE";\n');
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "config.rs");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("admits a clean git work tree with only tracked files syncable", async () => {
+    gitIn(source, "init", "-q", ".");
+    await writeFile(path.join(source, ".dev.vars"), "CF_API_TOKEN=untracked\n");
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).not.toBe(null);
+    } finally { await rt.shutdown(); }
   });
   it("binds only native company/run/workspace metadata and rejects path-bearing cargo escapes", async () => {
     expect(await runtime.resolve({ ...command(), runId: "another-run" }, config)).toBe(null);
