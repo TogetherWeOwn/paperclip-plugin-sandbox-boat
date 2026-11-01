@@ -75,7 +75,13 @@ Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
 `.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,
 are never synced and keep commands local. Symlinked config is never followed:
 a symlinked `pyproject.toml` stays local without reading its target, and
-regular `pyproject.toml` files are read bounded at 256 KiB. Only an empty env
+regular `pyproject.toml` files are read bounded at 256 KiB. The same rule
+covers every host-side workspace probe: toolchain pins (`rust-toolchain*`,
+bounded at 16 KiB) and lockfiles (bounded at 32 MiB) are opened no-follow and
+must be regular files under real directories — a symlink, FIFO, device,
+oversized file or symlinked run directory is unreadable and the command stays
+local, so a hostile checkout cannot make the worker buffer or block on
+host files outside the workspace. Only an empty env
 travels with Node/Python requests except `VIRTUAL_ENV` for `uv.lock` venv
 commands; secret-free env policy, public allow-listed
 repositories and cwd/argv confinement apply unchanged.

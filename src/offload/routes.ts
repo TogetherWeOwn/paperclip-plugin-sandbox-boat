@@ -11,6 +11,7 @@ import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDura
 import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
+import { probeDir } from "./probe-file.js";
 import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
 import { bodyTooLarge, cwdProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
@@ -237,7 +238,12 @@ export async function classifyCargoWorkspace(profile: ServerProfile, argv: strin
   const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
   let pin = await readToolchainPin(root);
   for (let depth = segments.length; depth > 0; depth--) {
-    const nested = await readToolchainPin(path.join(root, ...segments.slice(0, depth)));
+    // A symlinked run-directory prefix would lead the probe outside the
+    // workspace: unreadable, so the command stays local.
+    const dir = await probeDir(root, segments.slice(0, depth));
+    if (dir.kind === "unreadable") { pin = { kind: "unreadable", file: "rust-toolchain" }; break; }
+    if (dir.kind === "missing") continue;
+    const nested = await readToolchainPin(dir.dir);
     if (nested.kind !== "none") { pin = nested; break; }
   }
   const mismatch = toolchainPinMismatch(pin, profile.toolchains);

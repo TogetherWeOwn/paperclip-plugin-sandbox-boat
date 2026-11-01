@@ -9,8 +9,8 @@
 // requirements.txt stays local like a missing lockfile.
 
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { probeDir, probeFileExists, readProbeFile } from "./probe-file.js";
 
 export interface DepInstall {
   /** Lockfile relative path, e.g. package-lock.json. */
@@ -64,15 +64,15 @@ function isPinnedRequirements(bytes: Buffer): boolean {
   return true;
 }
 
+/** Lockfiles above this stay local: the bytes are hashed in worker memory. */
+const MAX_LOCKFILE_BYTES = 32 * 1024 * 1024;
+
+/** Lockfile bytes, or null when absent or not safely readable. Lockfiles are
+ * repo-controlled, so reads are no-follow with a size cap (probe-file.ts): a
+ * symlinked, non-regular or oversized lockfile plans nothing. */
 async function readIfFile(root: string, rel: string): Promise<Buffer | null> {
-  const abs = path.join(root, rel);
-  try {
-    const info = await stat(abs);
-    if (!info.isFile()) return null;
-    return await readFile(abs);
-  } catch {
-    return null;
-  }
+  const probe = await readProbeFile(path.join(root, rel), MAX_LOCKFILE_BYTES);
+  return probe.kind === "ok" ? probe.bytes : null;
 }
 
 /**
@@ -84,9 +84,14 @@ export async function nestedLockfile(sourceRoot: string, cwdRelative: string, to
   const files = tool === "python" ? [...PYTHON_LOCKFILES.map((entry) => entry.file), "requirements.txt"] : NODE_LOCKFILES.map((entry) => entry.file);
   const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
   for (let depth = segments.length; depth > 0; depth--) {
+    const prefix = segments.slice(0, depth);
+    // Existence only, never a read. A symlinked prefix cannot be probed
+    // safely, so fail closed: report the prefix itself as the blocker.
+    const dir = await probeDir(sourceRoot, prefix);
+    if (dir.kind === "unreadable") return path.posix.join(...prefix);
+    if (dir.kind === "missing") continue;
     for (const file of files) {
-      const rel = path.posix.join(...segments.slice(0, depth), file);
-      if (await readIfFile(sourceRoot, rel) !== null) return rel;
+      if (await probeFileExists(path.join(dir.dir, file))) return path.posix.join(...prefix, file);
     }
   }
   return null;
