@@ -115,6 +115,38 @@ describe("handleExec", () => {
     expect(t.starts.length).toBe(1);
   });
 
+  it("never answers fallbackSafe for an ID accepted while its workspace lookup was in flight", async () => {
+    const t = setup(new RemoteBackend());
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let lookups = 0;
+    const racingHost = {
+      ...t.host,
+      workspaces: {
+        get: async (id: string) => {
+          lookups += 1;
+          // The first request's lookup is slow and misses; the binding is
+          // visible by the time the concurrent retry looks it up.
+          if (lookups === 1) { await gate; return null; }
+          return t.workspaces.get(id) ?? null;
+        },
+      },
+    };
+    const first = handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, racingHost);
+    // The retry is accepted and starts while the first request still waits.
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, racingHost)).status).toBe(202);
+    expect(await t.host.broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0)).toMatchObject({
+      status: 200, body: { state: "running", remoteStarted: true, fallbackSafe: false },
+    });
+    release();
+    // The early journal check saw an unused ID, so the stale lookup must not
+    // turn into a fallback-safe 503 over the running command.
+    const raced = await first;
+    expect(raced.status).toBe(200);
+    expect(raced.body).toMatchObject({ state: "running", remoteStarted: true, fallbackSafe: false });
+    expect(t.starts.length).toBe(1);
+  });
+
   it("answers 409 when a lost binding resubmits the same ID with a different payload", async () => {
     const t = setup(new RemoteBackend());
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);

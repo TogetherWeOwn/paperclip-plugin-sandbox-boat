@@ -154,7 +154,17 @@ export async function hasCargoRegistryAuth(sourceRoot: string, cwdRelative: stri
     } catch {
       // Fall through to the parent below.
     }
-    for (const name of [".cargo/config.toml", ".cargo/config"]) {
+    // The .cargo component gets the same check: O_NOFOLLOW below guards only
+    // the final component, so a symlinked .cargo would redirect the scan
+    // outside the source root. A missing one holds no config at this level.
+    let cargoDir = null;
+    try {
+      cargoDir = await lstat(path.join(dir, ".cargo"));
+    } catch {
+      // No .cargo here; keep scanning parents.
+    }
+    if (cargoDir !== null && (cargoDir.isSymbolicLink() || !cargoDir.isDirectory())) return true;
+    for (const name of cargoDir === null ? [] : [".cargo/config.toml", ".cargo/config"]) {
       const abs = path.join(dir, name);
       let info;
       try {

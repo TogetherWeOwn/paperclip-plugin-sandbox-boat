@@ -258,18 +258,25 @@ export class OffloadBroker {
    * past the bound the refusal still stands, deterministically, without a
    * receipt. Never starts the backend.
    */
-  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<void> {
-    await this.chain(`run:${principal.runId}`, async () => {
+  /**
+   * Journal a deterministic never-started refusal. Returns null when this
+   * call journaled (or the journal is full, so nothing can be claimed). When
+   * the journal already knows the ID — a concurrent acceptance won the race
+   * with the caller's pre-check — returns that record's verdict instead, so
+   * the caller never answers fallback-safe over a started command.
+   */
+  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<BrokerResponse | null> {
+    return this.chain(`run:${principal.runId}`, async () => {
       const digest = digestOf(request);
       const existing = await this.load(request.commandId);
       if (existing) {
         if (existing.digest !== digest) {
           throw Object.assign(new Error(`OFFLOAD_IDEMPOTENCY_CONFLICT: commandId ${request.commandId} was already accepted with a different payload.`), { code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
         }
-        return;
+        return this.existingResponse(existing, digest, principal);
       }
       const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
-      if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return;
+      if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return null;
       const now = this.now();
       // Index first: a failed index write leaves no record, and an indexed
       // command without a record is simply pruned by the sweep.
@@ -296,6 +303,7 @@ export class OffloadBroker {
         terminalAt: now,
       });
       await this.store.set(countKey(principal.runId), count + 1);
+      return null;
     });
   }
 

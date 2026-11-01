@@ -22,8 +22,9 @@ async function recordRefusalOrConflict(
   reason: string,
 ): Promise<{ status: number; body: unknown } | null> {
   try {
-    await broker.recordRefusal(request, principal, reason);
-    return null;
+    // Non-null: the journal already knew this ID (a concurrent acceptance),
+    // so its verdict replaces the caller's fallback-safe refusal.
+    return await broker.recordRefusal(request, principal, reason);
   } catch (error) {
     if ((error as { code?: string }).code !== "OFFLOAD_IDEMPOTENCY_CONFLICT") throw error;
     return {
@@ -316,6 +317,14 @@ export async function handleExec(
   }
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
+    if (!request.dryRun) {
+      // The lookup above is async and the early journal check has released
+      // the run serialization: this ID may have been accepted while the
+      // lookup was in flight. Re-consult the journal so the fallback-safe
+      // answer below never covers a started command.
+      const raced = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+      if (raced) return raced;
+    }
     // Never-bound or unknown workspace: the run has no offload source, so the
     // shim must fall back locally, never fail the build. Not journaled, so the
     // same command ID submits cleanly once the workspace resolves. Other-agent

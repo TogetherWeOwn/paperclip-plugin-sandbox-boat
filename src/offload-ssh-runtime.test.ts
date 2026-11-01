@@ -302,6 +302,28 @@ describe("templateSnapshot pool wiring", () => {
     expect(a.poolId).toBe(legacyPoolId());
     expect(boat.calls).toHaveLength(0);
   });
+  it("pushes a changed or cleared fork source to the reused executor", async () => {
+    const view = async () => (await runtime.resolve(command(), config))! as unknown as
+      { poolId: string; config: { templateSourceSandboxId: string | null } };
+    const first = native();
+    first.config = { ...first.config, templateSourceSandboxId: "bx_archived-a" };
+    runtime.remember(first);
+    const a = await view();
+    expect(a.config.templateSourceSandboxId).toBe("bx_archived-a");
+    // A later binding with a different source updates the cached executor
+    // instead of leaving it forking from the stale sandbox.
+    const second = native();
+    second.config = { ...second.config, templateSourceSandboxId: "bx_archived-b" };
+    runtime.remember(second);
+    const b = await view();
+    expect(b).toBe(a);
+    expect(b.poolId).toBe(legacyPoolId());
+    expect(b.config.templateSourceSandboxId).toBe("bx_archived-b");
+    // Clearing the setting pushes null to the same executor.
+    runtime.remember(native());
+    expect((await view()).config.templateSourceSandboxId).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
 });
 
 describe("offline cargo registry guard", () => {
@@ -391,6 +413,18 @@ describe("hasCargoRegistryAuth", () => {
     expect(await hasCargoRegistryAuth(dir, "link")).toBe(true);
     expect(await hasCargoRegistryAuth(dir, "link/sub")).toBe(true);
     expect(await hasCargoRegistryAuth(dir, "real/sub")).toBe(false);
+  });
+  it("fails closed on a symlinked .cargo directory", async () => {
+    const dir = path.join(source, "scan");
+    const outside = path.join(source, "outside");
+    await mkdir(path.join(dir, "sub"), { recursive: true });
+    await mkdir(outside, { recursive: true });
+    // A clean config behind the link must not clear the scan: O_NOFOLLOW only
+    // guards the final component, so the .cargo link itself is the escape.
+    await writeFile(path.join(outside, "config.toml"), "[build]\njobs = 4\n");
+    await symlink(outside, path.join(dir, ".cargo"));
+    expect(await hasCargoRegistryAuth(dir, "sub")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
   });
   it("fails closed when nesting exhausts the walk budget", async () => {
     const dir = path.join(source, "scan");
