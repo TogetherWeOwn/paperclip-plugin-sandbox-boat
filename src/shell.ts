@@ -583,7 +583,7 @@ sys.exit(code if code >= 0 else 128 - code)
 export function wrapRemoteCommand(command: string, runId: string, managed = false): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
   const record = managed ? remoteRunRecord(runId) : "";
-  return `exec env ${unset} python3 -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
 }
 
 function remoteRunRecord(runId: string): string {
@@ -640,7 +640,7 @@ with open_run_record(filename) as record:
 /** Revoke admission or stop the registered group, without needing channel output. */
 export function cancelRemoteCommand(runId: string): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
-  return `exec env ${unset} python3 -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
 }
 
 function isMarkerLine(line: string, prefix: string): boolean {
