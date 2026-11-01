@@ -51,6 +51,17 @@ describe("listTrackedFiles", () => {
     expect([...(await listTrackedFiles(root))!].sort()).toEqual([".gitignore", "src/lib.rs"]);
   });
 
+  it("ignores hostile GIT_* worker env when listing", async () => {
+    const root = gitRepo();
+    const decoy = gitRepo({ "decoy.txt": "x\n" });
+    const saved = { ...process.env };
+    Object.assign(process.env, { GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy,
+      GIT_INDEX_FILE: path.join(decoy, ".git/index"), GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.worktree", GIT_CONFIG_VALUE_0: decoy });
+    try { expect([...(await listTrackedFiles(root))!].sort()).toEqual([".gitignore", "src/lib.rs"]); }
+    finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
+  });
+
   it("returns null for a non-git source so the command stays local", async () => {
     const root = makeTemp();
     writeTree(root, { "src/lib.rs": "pub fn f() {}\n" });

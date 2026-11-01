@@ -35,13 +35,12 @@ const GIT_MAX_BUFFER = 32 * 1024 * 1024;
  * `git -C <source> ls-files` semantics for a subdirectory checkout too.
  */
 export async function listTrackedFiles(sourceRoot: string): Promise<Set<string> | null> {
-  // A stray GIT_DIR/GIT_INDEX_FILE in the worker env must not redirect the
-  // listing to a different repository or index than the bound source.
-  const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_INDEX_FILE;
-  delete env.GIT_OBJECT_DIRECTORY;
+  // No GIT_* variable from the worker env (GIT_DIR, GIT_INDEX_FILE, the
+  // GIT_CONFIG_COUNT override family, ...) may redirect the listing to a
+  // different repository, index or configuration than the bound source.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of Object.keys(env)) if (name.startsWith("GIT_")) delete env[name];
+  env.GIT_OPTIONAL_LOCKS = "0";
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync(

@@ -169,6 +169,17 @@ describe("stock concrete executor factory", () => {
       expect(await rt.resolve(command(), config)).not.toBe(null);
     } finally { await rt.shutdown(); }
   });
+  it("keeps cargo local when a tracked secret-bearing file would be withheld from sync", async () => {
+    gitIn(source, "init", "-q", ".");
+    await mkdir(path.join(source, "tests/fixtures"), { recursive: true });
+    await writeFile(path.join(source, "tests/fixtures/ca.pem"), "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/ca.pem");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
   it("binds only native company/run/workspace metadata and rejects path-bearing cargo escapes", async () => {
     expect(await runtime.resolve({ ...command(), runId: "another-run" }, config)).toBe(null);
     expect(await runtime.resolve({ ...command(), argv: ["test", "--manifest-path=/etc/Cargo.toml"] }, config)).toBe(null);
@@ -256,6 +267,8 @@ describe("stock concrete executor factory", () => {
     expect(boat.calls).toHaveLength(0);
     await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
     expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config)).not.toBe(null);
+    expect(await runtime.resolve({ ...command(), cwdRelative: "./crates/foo" }, config)).not.toBe(null);
+    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo/." }, config)).not.toBe(null);
   });
   it("keeps a node command in a separately locked sub-project local", async () => {
     await writeFile(path.join(source, "package-lock.json"), "{}");

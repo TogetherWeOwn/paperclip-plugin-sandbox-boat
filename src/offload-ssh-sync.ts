@@ -121,10 +121,14 @@ export class SshOffloadSync implements OffloadSync {
       verification = await store.verifyMirror(guestDir, planned);
     }
     // A wipe removes the marker with the rest of the mirror: treat it as gone.
-    const marker = verification.suspect === null ? verification.marker : null;
+    let marker = verification.suspect === null ? verification.marker : null;
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
     if (verification.suspect !== null) await store.wipeMirror(guestDir);
+    // A marker without a stored manifest predates this worker (restart or
+    // upgrade): the mirror may hold files no current admission would send,
+    // and no delta base exists to prune them. Wipe before the full resync.
+    else if (stored === null && marker !== null) { await store.wipeMirror(guestDir); marker = null; }
     // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
     // snapshot), removed checkout-local installs too; the install must run again.
     if (marker === null) this.installed.delete(`mirror:${sandboxId}:${guestDir}`);

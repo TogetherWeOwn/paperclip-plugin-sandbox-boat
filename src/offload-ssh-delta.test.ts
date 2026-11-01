@@ -299,6 +299,16 @@ describe("delta push over stub SSH", () => {
     expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
   });
 
+  it("wipes a mirror that predates this worker before the full resync", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest } = setup(root);
+    const dir = sync.directory(command());
+    setMarker(guest, "vm-1", dir, { version: 1, mirrorKey: "old", manifestHash: "0".repeat(64) });
+    await sync.push("vm-1", command());
+    expect(guest.wipes).toEqual([{ vm: "vm-1", dir }]);
+    expect(filesFromStdin(spawns[0]!.stdin)).toEqual(["a.txt"]);
+  });
+
   it("falls back to a full upload when the guest marker disagrees with host state", async () => {
     const root = source({ "a.txt": "a" });
     const { sync, spawns, guest } = setup(root);

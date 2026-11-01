@@ -279,7 +279,14 @@ export class SshOffloadRuntime {
     if (!tracked || tracked.size === 0) return null;
     const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel));
     if (syncable.length === 0) return null;
-    if (command.cwdRelative !== "." && !syncable.some((rel) => rel.startsWith(`${command.cwdRelative}/`))) return null;
+    // A tracked secret-bearing name (a public test cert, a .docker/ context)
+    // is withheld from sync, so the guest tree would silently lack a file the
+    // build may read: stay local for every tool, cargo included.
+    if ([...tracked].some((rel) => { const parts = rel.split("/");
+      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) return null;
+    // Git lists normalized paths: "./src" or "src/." name the same directory.
+    const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
+    if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) return null;
     if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
