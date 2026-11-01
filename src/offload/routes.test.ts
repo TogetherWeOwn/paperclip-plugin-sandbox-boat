@@ -40,7 +40,14 @@ class MapStore implements OffloadJournalStore {
   }
 }
 
-function setup(backend: OffloadBackend = new NeverDispatchBackend()) {
+class RemoteBackend implements OffloadBackend {
+  start(cmd: Parameters<OffloadBackend["start"]>[0], sink: OffloadOutputSink) {
+    sink.started();
+    return { done: new Promise<void>(() => {}), cancel: async () => {} };
+  }
+}
+
+function setup(backend: OffloadBackend = new NeverDispatchBackend(), now: () => number = () => Date.parse("2026-10-23T10:00:00Z")) {
   const store = new MapStore();
   const starts: { sink: OffloadOutputSink }[] = [];
   const tracking = {
@@ -49,7 +56,7 @@ function setup(backend: OffloadBackend = new NeverDispatchBackend()) {
       return backend.start(cmd, sink);
     },
   };
-  const broker = new OffloadBroker({ store, backend: tracking, now: () => Date.parse("2026-10-23T10:00:00Z") });
+  const broker = new OffloadBroker({ store, backend: tracking, now });
   const workspaces = new Map<string, { repoUrl: string | null; projectId: string; projectWorkspaceId: string | null; path: string | null; cwd: string | null }>();
   workspaces.set(WS, { repoUrl: "https://github.com/TogetherWeOwn/two-bot-next", projectId: "proj-1", projectWorkspaceId: "pws-1", path: "/work/two-bot-next", cwd: "/work/two-bot-next" });
   const host: OffloadRouteHost = {
@@ -81,17 +88,90 @@ describe("handleExec", () => {
     expect(t.starts.length).toBe(0);
   });
 
-  it("denies an unknown workspace before acceptance", async () => {
+  it("falls back locally for an unknown workspace before acceptance", async () => {
     const t = setup();
     const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, {
       ...t.host,
       workspaces: { get: async () => null },
     });
-    expect(response.status).toBe(403);
-    expect(response.body).toMatchObject({ code: "OFFLOAD_FORBIDDEN" });
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
     expect(t.starts.length).toBe(0);
     // Nothing journaled: the same ID submits cleanly once the workspace resolves.
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+  });
+
+  it("returns the journal verdict when the workspace binding disappears after acceptance", async () => {
+    const t = setup(new RemoteBackend());
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+    // Flush the backend's started callback through the journal before the binding disappears.
+    expect(await t.host.broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0)).toMatchObject({
+      status: 200, body: { state: "running", remoteStarted: true, fallbackSafe: false },
+    });
+    t.workspaces.delete(WS);
+    const retry = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host);
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ state: "running", remoteStarted: true, fallbackSafe: false });
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("never answers fallbackSafe for an ID accepted while its workspace lookup was in flight", async () => {
+    const t = setup(new RemoteBackend());
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let lookups = 0;
+    const racingHost = {
+      ...t.host,
+      workspaces: {
+        get: async (id: string) => {
+          lookups += 1;
+          // The first request's lookup is slow and misses; the binding is
+          // visible by the time the concurrent retry looks it up.
+          if (lookups === 1) { await gate; return null; }
+          return t.workspaces.get(id) ?? null;
+        },
+      },
+    };
+    const first = handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, racingHost);
+    // The retry is accepted and starts while the first request still waits.
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, racingHost)).status).toBe(202);
+    expect(await t.host.broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0)).toMatchObject({
+      status: 200, body: { state: "running", remoteStarted: true, fallbackSafe: false },
+    });
+    release();
+    // The early journal check saw an unused ID, so the stale lookup must not
+    // turn into a fallback-safe 503 over the running command.
+    const raced = await first;
+    expect(raced.status).toBe(200);
+    expect(raced.body).toMatchObject({ state: "running", remoteStarted: true, fallbackSafe: false });
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("answers 409 when a lost binding resubmits the same ID with a different payload", async () => {
+    const t = setup(new RemoteBackend());
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+    expect(await t.host.broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0)).toMatchObject({
+      status: 200, body: { state: "running" },
+    });
+    t.workspaces.delete(WS);
+    const retry = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ argv: ["build", "--locked"] }) }, t.host);
+    expect(retry.status).toBe(409);
+    expect(retry.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("answers 410 instead of 503 when an expired ID resubmits after the binding disappears", async () => {
+    let now = Date.parse("2026-10-23T10:00:00Z");
+    const t = setup(new NeverDispatchBackend(), () => now);
+    // The backend refuses before any spawn, journaling a terminal never-started receipt.
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host)).status).toBe(202);
+    now += 25 * 60 * 60_000;
+    await t.host.broker.collectGarbage();
+    t.workspaces.delete(WS);
+    const retry = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host);
+    expect(retry.status).toBe(410);
+    expect(retry.body).toMatchObject({ code: "OFFLOAD_RESULT_EXPIRED" });
+    expect(t.starts.length).toBe(1);
   });
 
   it("returns unavailable with a never-started receipt when confinement is unsupported", async () => {
@@ -181,7 +261,7 @@ describe("handleExec", () => {
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ dryRun: true, version: 9 }) }, t.host)).status).toBe(400);
     expect(
       (await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ dryRun: true }) }, { ...t.host, workspaces: { get: async () => null } })).status,
-    ).toBe(403);
+    ).toBe(503);
   });
 });
 

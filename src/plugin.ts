@@ -85,13 +85,24 @@ const plugin = definePlugin({
       if (!settings.enabled) return false;
       const params = await localRunRealization({ companyId, payload: { runId, issueId } }, settings, {
         issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
+        // The live issue shape leaves executionWorkspaceId null; the shim then
+        // reports the project workspace id, so bind that host-owned workspace.
+        issueProjectWorkspace: async (id, company) => {
+          const workspace = await ctx.projects.getWorkspaceForIssue(id, company);
+          return workspace ? {
+            id: typeof workspace.id === "string" ? workspace.id : "",
+            projectId: typeof workspace.projectId === "string" ? workspace.projectId : "",
+            path: typeof workspace.path === "string" ? workspace.path : null,
+            repoUrl: typeof workspace.repoUrl === "string" ? workspace.repoUrl : null,
+          } : null;
+        },
         workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
         apiKey: async (secretRef, company) => await ctx.secrets.resolve(secretRef as never, { companyId: company, configPath: "offloadLocalApiKeySecretRef" }),
       }).catch((error: unknown) => {
         ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
         return null;
       });
-      // A failed state write leaves the run unbound and retryable; the route answers 403, never a 500.
+      // A failed state write leaves the run unbound and retryable; the route answers 503 (local fallback), never a 500.
       const bound = params ? await requireManager().rememberLocalRun(params).catch((error: unknown) => {
         ctx.logger.warn("boat: local-run offload binding not persisted", { error: error instanceof Error ? error.message : String(error) });
         return false;

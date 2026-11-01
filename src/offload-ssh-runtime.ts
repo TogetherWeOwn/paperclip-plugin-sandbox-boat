@@ -13,7 +13,7 @@ import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
-import { classifyNode, classifyPython } from "./offload/router.js";
+import { cargoToolchain, classifyNode, classifyPython, isCargoOffline } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
@@ -33,7 +33,7 @@ export interface SshOffloadRuntimeDeps {
   // Boundary test seams: real SSH is still used, not an injected guest mock.
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
-  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot">;
+  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain">;
   /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   trackedFiles?: TrackedFilesFn;
 }
@@ -144,6 +144,88 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
     }
   }
   return false;
+}
+
+/** Cargo config that an --offline guest fetch from crates.io could not satisfy.
+ * A `[registries.*]` table, a source replacement, or a stored credential/token
+ * means the lockfile's deps may need private auth, so the command stays local.
+ * Symlinked configs are never read; an unreadable or over-limit file also stays
+ * local. Only host-authored source roots are scanned, never agent input. */
+const CARGO_REGISTRY_AUTH_MARKERS = [/^\s*\[registries[\s.\]]/m, /^\s*replace-with\s*=/m, /credential-provider/i, /^\s*token\s*=/m];
+const MAX_CARGO_CONFIG_BYTES = 64 * 1024;
+const MAX_CARGO_CONFIG_DEPTH = 32;
+
+export async function hasCargoRegistryAuth(sourceRoot: string, cwdRelative: string): Promise<boolean> {
+  // Cargo discovers config from the command directory upward, so walk from the
+  // cwd to the source root; the step cap bounds hostile nesting depth. Fail
+  // closed throughout: an escaping cwd, a symlinked ancestor, or an exhausted
+  // depth budget all keep the command local.
+  const root = path.normalize(sourceRoot);
+  const normalized = path.normalize(cwdRelative);
+  // Route validation already rejects backslashes; the scan stays unreachable
+  // for them by refusing them too, so a Windows-style escape never scans sideways.
+  if (path.isAbsolute(normalized) || normalized.includes("\\") || normalized.split(path.sep).includes("..")) return true;
+  let dir = normalized === "." ? root : path.join(root, normalized);
+  for (let steps = 0; ; steps += 1) {
+    // Ancestor directories are host-authored; a symlinked one could redirect
+    // the scan outside the source root, so never descend through one. A
+    // missing directory holds no config; keep scanning its parents.
+    try {
+      if ((await lstat(dir)).isSymbolicLink()) return true;
+    } catch {
+      // Fall through to the parent below.
+    }
+    // The .cargo component gets the same check: O_NOFOLLOW below guards only
+    // the final component, so a symlinked .cargo would redirect the scan
+    // outside the source root. A missing one holds no config at this level.
+    let cargoDir = null;
+    try {
+      cargoDir = await lstat(path.join(dir, ".cargo"));
+    } catch {
+      // No .cargo here; keep scanning parents.
+    }
+    if (cargoDir !== null && (cargoDir.isSymbolicLink() || !cargoDir.isDirectory())) return true;
+    for (const name of cargoDir === null ? [] : [".cargo/config.toml", ".cargo/config"]) {
+      const abs = path.join(dir, name);
+      let info;
+      try {
+        info = await lstat(abs);
+      } catch {
+        continue;
+      }
+      if (info.isSymbolicLink() || !info.isFile() || info.size > MAX_CARGO_CONFIG_BYTES) return true;
+      let handle;
+      try {
+        handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      } catch {
+        return true;
+      }
+      try {
+        const target = await handle.stat();
+        if (target.isSymbolicLink() || !target.isFile() || target.size > MAX_CARGO_CONFIG_BYTES) return true;
+        const buf = Buffer.alloc(MAX_CARGO_CONFIG_BYTES + 1);
+        let off = 0;
+        for (;;) {
+          const { bytesRead } = await handle.read(buf, off, buf.length - off);
+          if (bytesRead === 0) break;
+          off += bytesRead;
+          if (off > MAX_CARGO_CONFIG_BYTES) return true;
+        }
+        const text = buf.subarray(0, off).toString("utf8");
+        if (CARGO_REGISTRY_AUTH_MARKERS.some((marker) => marker.test(text))) return true;
+      } catch {
+        return true;
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    }
+    if (dir === root) return false;
+    // Reaching the step cap below the source root means an adversary-deep (or
+    // cyclic) tree the scan cannot fully cover: stay local.
+    if (steps >= MAX_CARGO_CONFIG_DEPTH) return true;
+    dir = path.dirname(dir);
+    if (dir !== root && path.relative(root, dir).startsWith("..")) return true;
+  }
 }
 
 /** Profile by id; unknown ids never resolve. */
@@ -288,6 +370,12 @@ export class SshOffloadRuntime {
     const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
     if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) return null;
     if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) return null;
+    // An --offline build cannot download missing crates: a private-registry
+    // config in the source would fail the guest fetch, so the command stays
+    // local. This is prepare-time's stay-local decision; the guest cannot see
+    // the host source once the command is admitted.
+    if (tool === "cargo" && isCargoOffline(command.argv)
+      && await hasCargoRegistryAuth(binding.source, command.cwdRelative).catch(() => true)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
@@ -304,10 +392,10 @@ export class SshOffloadRuntime {
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]))
       .digest("hex").slice(0, 24);
-    // templateSnapshot is deliberately NOT part of the pool identity: changing
-    // it must keep ownership of VMs already recorded under this pool so they
-    // are retired through the normal stop path. The executor keys VM reuse on
-    // the template instead (compatibilityKey).
+    // Neither template selection is deliberately part of the pool identity:
+    // changing it must keep ownership of VMs already recorded under this pool
+    // so they are retired through the normal stop path. The executor keys VM
+    // reuse on the template instead (compatibilityKey).
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
@@ -315,6 +403,7 @@ export class SshOffloadRuntime {
     }
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
+      existing.executor.setTemplateSourceSandboxId(binding.config.templateSourceSandboxId ?? null);
       return existing.executor;
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
@@ -354,6 +443,7 @@ export class SshOffloadRuntime {
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       profileEnv: profileGuestEnv,
       uvVenvRoot,
+      cargoToolchain: (cmd) => cargoToolchain(cmd.argv, profile.toolchains),
       ...this.deps.guestOptions });
     // Sync-in begins every reservation, including resumed VMs. Sessions stay
     // cached across warm commands; push refreshes a stale session once through
@@ -364,7 +454,8 @@ export class SshOffloadRuntime {
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
         offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
-        templateSnapshot: binding.config.templateSnapshot ?? null },
+        templateSnapshot: binding.config.templateSnapshot ?? null,
+        templateSourceSandboxId: binding.config.templateSourceSandboxId ?? null },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is

@@ -64,7 +64,9 @@ builds the same payload from host-owned data only:
 1. the `agent.run.started` domain event gives the run id and its issue id;
 2. `ctx.issues.get` gives the issue's `executionWorkspaceId`;
 3. `ctx.executionWorkspaces.get` gives that workspace's local `path`, repository
-   and project;
+   and project — or, when the live issue shape leaves the execution workspace
+   id null, `ctx.projects.getWorkspaceForIssue` gives the issue's project
+   workspace instead, whose id is what the shim reports;
 4. `offloadLocalApiKeySecretRef` (a Paperclip secret) gives the scoped boat key,
    resolved per binding and never stored; `offloadLocalEnvironmentId` and
    `offloadLocalDriverConfig` give the pool identity and settings.
@@ -76,8 +78,10 @@ realization for the same run and workspace. `agent.run.finished`, `failed` and
 `cancelled` drop the executor binding and the persisted workspace record, and fence
 the run: a late or slow start handler cannot bind it again. A missing host fact (no
 execution workspace, no local path, no secret) leaves the run unbound, and its
-commands get 403 before dispatch. This adds three capabilities to the 0.2.2
-set: `events.subscribe`, `execution.workspaces.read` and `secrets.read-ref`; the
+own commands fall back locally (503) before dispatch; other-agent runs keep the
+403. This adds five capabilities to the 0.2.2
+set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
+`projects.read` and `project.workspaces.read`; the
 upgrade needs board approval of that capability change.
 
 A custom host integration can still call
@@ -136,6 +140,27 @@ default VM:
    image is retired through the normal stop path. Adding `rsync` to an existing
    template therefore means saving under a NEW snapshot name and updating
    `templateSnapshot`, so pre-rsync VMs are retired instead of served.
+
+   On the free trial named snapshots are blocked, so stop the template VM
+   (archived, never deleted) and set the driver `templateSourceSandboxId` to
+   its sandbox id instead. Offload pool VMs then fork from it, with the same
+   refusal semantics: a missing source is a refused start and the command
+   stays local. VM reuse is keyed on the source id apart from snapshot and
+   stock keys, and `templateSnapshot` wins when both are set.
+
+   A cargo `--offline` command (or `--frozen`, which implies offline) cannot
+   download missing crates, so the guest primes its cargo cache with
+   `cargo fetch --locked` (plus the profile's validated `+toolchain` selector
+   when the invocation carries one) before the command's supervisor exists; a
+   failing fetch fails the prepare and the command runs locally instead. The
+   fetch never invokes registry credential providers: cargo merges
+   array-valued config, so a CLI override cannot clear an inherited
+   provider, and the guest instead refuses to prime at all when any config
+   cargo would load names one (the prepare then fails and the command runs
+   locally). It also runs in its own session so a hung fetch is group-killed
+   at its fence. A source tree whose
+   cargo config points at a private registry, a source replacement, or stored
+   credentials stays local too, because the guest fetch could not satisfy it.
 
 ## Smoke procedures
 

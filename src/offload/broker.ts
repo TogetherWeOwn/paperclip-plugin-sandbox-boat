@@ -258,18 +258,25 @@ export class OffloadBroker {
    * past the bound the refusal still stands, deterministically, without a
    * receipt. Never starts the backend.
    */
-  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<void> {
-    await this.chain(`run:${principal.runId}`, async () => {
+  /**
+   * Journal a deterministic never-started refusal. Returns null when this
+   * call journaled (or the journal is full, so nothing can be claimed). When
+   * the journal already knows the ID — a concurrent acceptance won the race
+   * with the caller's pre-check — returns that record's verdict instead, so
+   * the caller never answers fallback-safe over a started command.
+   */
+  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<BrokerResponse | null> {
+    return this.chain(`run:${principal.runId}`, async () => {
       const digest = digestOf(request);
       const existing = await this.load(request.commandId);
       if (existing) {
         if (existing.digest !== digest) {
           throw Object.assign(new Error(`OFFLOAD_IDEMPOTENCY_CONFLICT: commandId ${request.commandId} was already accepted with a different payload.`), { code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
         }
-        return;
+        return this.existingResponse(existing, digest, principal);
       }
       const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
-      if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return;
+      if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return null;
       const now = this.now();
       // Index first: a failed index write leaves no record, and an indexed
       // command without a record is simply pruned by the sweep.
@@ -296,6 +303,7 @@ export class OffloadBroker {
         terminalAt: now,
       });
       await this.store.set(countKey(principal.runId), count + 1);
+      return null;
     });
   }
 
@@ -401,28 +409,53 @@ export class OffloadBroker {
     else this.known.add(record.commandId);
   }
 
+  private async existingResponse(existing: JournalRecord, digest: string, principal: BrokerAuth): Promise<BrokerResponse> {
+    if (existing.digest !== digest) {
+      return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: existing.commandId }) };
+    }
+    if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
+      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: existing.commandId }) };
+    }
+    // Same orphan hold as resolve(): after a restart a live record has no
+    // handle, so hold for reconciliation instead of replaying live state
+    // where a sweep could expire it into a fallback-safe receipt.
+    if (!TERMINAL.has(existing.state) && existing.state !== "unknown" && !this.handles.has(existing.commandId)) {
+      existing.state = "unknown";
+      await this.save(existing);
+    }
+    this.trackLive(existing);
+    return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };
+  }
+
+  /**
+   * A pre-acceptance refusal must not claim a command never started when the
+   * journal already knows that ID. A missing binding is not proof of a clean
+   * ID: the workspace record can disappear after acceptance (for example when
+   * a run's bindings are forgotten while its command is still remote). Return
+   * the journal's verdict for a known ID, or null when this ID is still unused.
+   * Nothing is journaled for an unknown ID.
+   */
+  async existingSubmission(request: OffloadSubmitRequest, principal: BrokerAuth): Promise<BrokerResponse | null> {
+    return this.chain(`run:${principal.runId}`, async () => {
+      const digest = digestOf(request);
+      const existing = await this.load(request.commandId);
+      if (!existing) {
+        const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
+        if (tomb) {
+          return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "commandId already expired; never remint an ID", { commandId: request.commandId }) };
+        }
+        return null;
+      }
+      return this.existingResponse(existing, digest, principal);
+    });
+  }
+
   async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<BrokerResponse> {
     // Serialized per run so the 512-command admission bound cannot race.
     return this.chain(`run:${principal.runId}`, async () => {
       const digest = digestOf(request);
       const existing = await this.load(request.commandId);
-      if (existing) {
-        if (existing.digest !== digest) {
-          return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: request.commandId }) };
-        }
-        if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
-          return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: request.commandId }) };
-        }
-        // Same orphan hold as resolve(): after a restart a live record has no
-        // handle, so hold for reconciliation instead of replaying live state
-        // where a sweep could expire it into a fallback-safe receipt.
-        if (!TERMINAL.has(existing.state) && existing.state !== "unknown" && !this.handles.has(existing.commandId)) {
-          existing.state = "unknown";
-          await this.save(existing);
-        }
-        this.trackLive(existing);
-        return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };
-      }
+      if (existing) return this.existingResponse(existing, digest, principal);
       const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
       if (tomb) {
         return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "commandId already expired; never remint an ID", { commandId: request.commandId }) };
