@@ -247,24 +247,41 @@ export class SshManager {
   async run(
     session: SshSession,
     remoteCommand: string,
-    options: { stdin?: string; timeoutMs: number },
+    options: { stdin?: string; timeoutMs: number; maxOutputBytes?: number },
   ): Promise<SshExecutionResult> {
-    const key = await this.ensureKey();
-    const args = [
-      "-T",
-      "-o",
-      `ControlPath=${session.controlPath}`,
-      "-o",
-      "ControlMaster=no",
-      ...commonSshOptions(session, key.privateKeyPath),
-      `${session.endpoint.user}@${session.endpoint.host}`,
-      remoteCommand,
-    ];
-    return await runProcess("ssh", args, { stdin: options.stdin, timeoutMs: options.timeoutMs });
+    // Same supervised path as runStream: an unsupervised multiplexed slave
+    // never ends on timeout, because killing the local ssh client leaves the
+    // master holding the channel until the remote job exits on its own. The
+    // supervisor wrap + bounded cancel in runSupervised make timeoutMs real
+    // for execute, scrub, prepareRemote and env staging alike. Output stays
+    // uncapped unless the caller bounds it, matching run()'s prior contract
+    // (whole-run execute returns the command's full stdout to the host).
+    return await this.runSupervised(session, remoteCommand, {
+      stdin: options.stdin != null ? Readable.from([options.stdin]) : undefined,
+      timeoutMs: options.timeoutMs,
+      maxOutputBytes: options.maxOutputBytes ?? null,
+      // run()'s old contract: a command that exits without reading its stdin
+      // (or an ssh that never connects) reports its own status — 3, or 255 —
+      // never a thrown EPIPE that would bypass callers' status handling.
+      tolerateStdinClose: true,
+    }, false);
   }
 
   /** Binary transport over the same pinned connection; run() remains control-only. */
   async runStream(session: SshSession, remoteCommand: string, options: StreamProcessOptions): Promise<SshExecutionResult> {
+    return await this.runSupervised(session, remoteCommand, options);
+  }
+
+  private async runSupervised(
+    session: SshSession,
+    remoteCommand: string,
+    options: StreamProcessOptions,
+    // runStream's binary callers treat a failed remote cleanup as a failed
+    // transfer. run() callers expect a result object (exit code, timedOut)
+    // and branch on it — execute, env staging and the scrub status mapping
+    // would all be bypassed by a cleanup throw — so run() logs and returns.
+    cleanupFailureThrows = true,
+  ): Promise<SshExecutionResult> {
     const key = await this.ensureKey();
     const slave = (command: string) => [
       "-T", "-o", `ControlPath=${session.controlPath}`, "-o", "ControlMaster=no",
@@ -292,7 +309,7 @@ export class SshManager {
         this.logger.warn("boat: remote command cleanup failed; remote work may still be running", {
           sandboxId: session.sandboxId, reason: (error as Error).message,
         });
-        if (result && !result.timedOut && result.exitCode === 0) throw error;
+        if (cleanupFailureThrows && result && !result.timedOut && result.exitCode === 0) throw error;
       }
     }
   }
@@ -373,21 +390,36 @@ export function sleep(ms: number): Promise<void> {
 export interface StreamProcessOptions {
   stdin?: Readable;
   stdout?: Writable;
-  maxOutputBytes?: number;
+  /** Control-output cap per stream. `null` collects without a cap (run() only). */
+  maxOutputBytes?: number | null;
   timeoutMs: number;
   /** Fixed working directory and environment instead of inheriting the worker's. */
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * Spawn in its own process group and signal the whole group on abort.
+   * For children that fork their own transport (rsync spawns ssh): killing
+   * only the parent orphans the transport, which keeps the inherited stderr
+   * pipe — and the remote channel — open past the timeout.
+   */
+  killProcessGroup?: boolean;
+  /**
+   * An early-closed child stdin is not a failure: the child's own status is
+   * the result. Only for in-memory stdin (run()'s string), whose source
+   * cannot fail on its own; binary callers keep stdin delivery strict.
+   */
+  tolerateStdinClose?: boolean;
 }
 
 /** Backpressured binary IO, bounded control output, and cleanup on either pipe's failure. */
 export async function runStreamProcess(command: string, args: string[], options: StreamProcessOptions): Promise<SshExecutionResult> {
-  const cap = options.maxOutputBytes ?? 256 * 1024;
-  if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+  const cap = options.maxOutputBytes === null ? Number.POSITIVE_INFINITY : (options.maxOutputBytes ?? 256 * 1024);
+  if ((cap !== Number.POSITIVE_INFINITY && (!Number.isSafeInteger(cap) || cap < 0)) || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error("Invalid streaming process limits.");
   }
   const child = spawn(command, args, {
     stdio: ["pipe", "pipe", "pipe"],
+    detached: options.killProcessGroup === true,
     ...(options.cwd ? { cwd: options.cwd } : {}),
     ...(options.env ? { env: options.env } : {}),
   });
@@ -395,7 +427,34 @@ export async function runStreamProcess(command: string, args: string[], options:
   let timedOut = false;
   let closed = false;
   let killTimer: NodeJS.Timeout | undefined;
+  let forceTimer: NodeJS.Timeout | undefined;
   let signalled = false;
+  let exited: { code: number | null; signal: string | null } | undefined;
+  let finishCompletion: (result: { code: number | null; signal: string | null }) => void = () => undefined;
+  const groupAlive = (): boolean => {
+    if (!options.killProcessGroup || child.pid == null) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+  const signalChild = (signal: NodeJS.Signals) => {
+    if (options.killProcessGroup && child.pid != null) {
+      try {
+        process.kill(-child.pid, signal);
+        return;
+      } catch {
+        // Group already gone (or never formed): fall back to the child.
+      }
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      // already gone
+    }
+  };
   const abort = (error: Error) => {
     failure ??= error;
     options.stdin?.destroy(error);
@@ -408,8 +467,18 @@ export async function runStreamProcess(command: string, args: string[], options:
     // payload before its own SIGTERM cleanup (staging-scratch unlink) runs.
     if (!closed && !signalled) {
       signalled = true;
-      child.kill("SIGTERM");
-      killTimer ??= setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
+      signalChild("SIGTERM");
+      killTimer ??= setTimeout(() => signalChild("SIGKILL"), SIGKILL_GRACE_MS);
+      killTimer.unref?.();
+      // Last resort: a grandchild can hold a stdio pipe after the child is
+      // dead, so 'close' may never fire. Once SIGKILL has had its grace,
+      // detach both streams and settle with whatever exit we observed
+      // instead of waiting for the remote side to let go.
+      forceTimer ??= setTimeout(() => {
+        child.stdout.destroy();
+        detachStderr();
+        finishCompletion(exited ?? { code: null, signal: null });
+      }, SIGKILL_GRACE_MS * 2);
     }
   };
   // A multiplexed ssh slave's stderr stays open until its remote job ends,
@@ -417,21 +486,38 @@ export async function runStreamProcess(command: string, args: string[], options:
   // stderr from its pipeline without an error: already-buffered bytes (the
   // cancellation marker) survive, the collector ends cleanly, and close —
   // which only needs the exit plus drained stdio — resolves promptly.
-  // Non-ssh children are unaffected: their stderr ends with the process.
+  // The same holds for any aborted child whose grandchildren inherit the
+  // stderr pipe (rsync's ssh transport): detach on exit whenever we are
+  // aborting, not only for ssh itself. A clean, normally-exiting non-ssh
+  // child keeps its stderr until EOF so trailing diagnostics survive.
   let stderrDetached = false;
   const detachStderr = () => {
-    if (command !== "ssh" || stderrDetached) return;
+    if (stderrDetached) return;
     stderrDetached = true;
     child.stderr.unpipe();
     child.stderr.destroy();
   };
-  child.once("exit", detachStderr);
+  child.once("exit", (code, signal) => {
+    exited = { code, signal };
+    if (command === "ssh" || timedOut || failure !== undefined) detachStderr();
+    if (timedOut || failure !== undefined) child.stdout.destroy();
+  });
   const completion = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    let settled = false;
+    finishCompletion = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     child.once("error", (error) => abort(error));
     child.once("close", (code, signal) => {
       closed = true;
-      if (killTimer) clearTimeout(killTimer);
-      resolve({ code, signal });
+      // The direct child's close does not prove its process group is empty:
+      // a SIGTERM-ignoring descendant must still receive the SIGKILL
+      // escalation. Keep the bounded timer (unref'd) while the group lives.
+      if (killTimer && !(options.killProcessGroup && signalled && groupAlive())) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      finishCompletion({ code, signal });
     });
   });
   const timer = setTimeout(() => {
@@ -449,6 +535,7 @@ export async function runStreamProcess(command: string, args: string[], options:
     } });
   }
   // Observe every pipe immediately: waiting for exit first deadlocks a full pipe.
+  const stdinPipe = pipeline(options.stdin ?? Readable.from([]), child.stdin);
   const pipes = [
     pipeline(child.stdout, options.stdout ?? collector(stdout)),
     // The detach destroys stderr before its EOF whenever the slave exits
@@ -456,7 +543,9 @@ export async function runStreamProcess(command: string, args: string[], options:
     pipeline(child.stderr, collector(stderr)).catch((error: NodeJS.ErrnoException) => {
       if (!stderrDetached || error.code !== "ERR_STREAM_PREMATURE_CLOSE") throw error;
     }),
-    pipeline(options.stdin ?? Readable.from([]), child.stdin),
+    // With tolerateStdinClose, an EPIPE here just means the child stopped
+    // reading (it exited, or ssh never connected): its status is the result.
+    options.tolerateStdinClose ? stdinPipe.catch(() => undefined) : stdinPipe,
   ];
   for (const pipe of pipes) void pipe.catch((error: Error) => abort(error));
   try {
@@ -467,7 +556,10 @@ export async function runStreamProcess(command: string, args: string[], options:
       stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
   } finally {
     clearTimeout(timer);
-    if (killTimer) clearTimeout(killTimer);
+    // Same rule as the close handler: never cancel a pending group SIGKILL
+    // while the group is still alive; the timer is unref'd and one-shot.
+    if (killTimer && !(options.killProcessGroup && signalled && groupAlive())) clearTimeout(killTimer);
+    if (forceTimer) clearTimeout(forceTimer);
   }
 }
 
@@ -479,34 +571,66 @@ export async function runProcess(
 ): Promise<SshExecutionResult> {
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    // Collect raw bytes and decode once at the end: decoding each chunk on
+    // its own corrupts a multi-byte UTF-8 sequence split across pipe reads.
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
     let timedOut = false;
+    let settled = false;
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let killTimer: NodeJS.Timeout | null = null;
+    let forceTimer: NodeJS.Timeout | null = null;
+    const clearTimers = () => {
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+    };
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve({
+        exitCode: timedOut ? null : code,
+        signal: signal ?? null,
+        timedOut,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    };
     const timer =
       options.timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
             child.kill("SIGTERM");
             killTimer = setTimeout(() => child.kill("SIGKILL"), SIGKILL_GRACE_MS);
+            // 'close' waits for stdio EOF, which a grandchild inheriting the
+            // pipes (or a multiplexed channel the master still holds) can
+            // postpone indefinitely. After SIGKILL's grace, settle without it.
+            forceTimer = setTimeout(() => finish(exited?.code ?? null, exited?.signal ?? null), SIGKILL_GRACE_MS * 2);
           }, options.timeoutMs)
         : null;
-    child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout.push(Buffer.from(chunk));
     });
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr.push(Buffer.from(chunk));
     });
     child.on("error", (error) => {
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
+      if (settled) return;
+      settled = true;
+      clearTimers();
       reject(error);
     });
-    child.on("close", (code, signal) => {
-      if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      resolve({ exitCode: timedOut ? null : code, signal: signal ?? null, timedOut, stdout, stderr });
+    child.on("exit", (code, signal) => {
+      exited = { code, signal };
+      // The child is dead; only inherited pipes can still hold 'close' back.
+      // Give buffered output one grace period to drain, then settle on the
+      // exit we already have instead of waiting for someone else's EOF.
+      forceTimer ??= setTimeout(() => finish(code, signal), SIGKILL_GRACE_MS);
     });
+    child.on("close", (code, signal) => finish(code, signal));
     if (options.stdin != null && child.stdin) {
       child.stdin.on("error", () => undefined);
       child.stdin.write(options.stdin);

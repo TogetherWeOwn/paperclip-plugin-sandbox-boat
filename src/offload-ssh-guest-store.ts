@@ -307,6 +307,69 @@ os.replace(tmp, target)
 print(json.dumps({'ok': True}))
 `;
 
+// After a failed or timed-out push the local rsync is dead, but its guest
+// receiver can still be running over the shared master: it holds no local
+// handle we can kill. Before the mirror lock is released, terminate any
+// guest rsync process whose command line names this mirror, so a stalled
+// receiver cannot resume and overwrite a newer push's files.
+export const MIRROR_KILL_STALLED_RSYNC_SCRIPT = String.raw`
+# boat-offload-mirror-kill-rsync v1
+import json, os, signal, sys, time
+mirror = json.load(sys.stdin)[0]
+if not isinstance(mirror, str) or not mirror.startswith('/'):
+    raise ValueError('invalid mirror path')
+me = os.getpid()
+my_group = os.getpgrp()
+
+def targets():
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            raw = open(f'/proc/{pid}/cmdline', 'rb').read()
+        except OSError:
+            continue
+        argv = [part.decode('utf-8', 'surrogateescape') for part in raw.split(b'\0') if part]
+        if not argv:
+            continue
+        joined = '\0'.join(argv)
+        # The receiver may be rsync itself or the login shell sshd ran it
+        # through (sh -c '... rsync --server ... <mirror>'): match the
+        # --server marker anywhere in the joined command line.
+        if mirror in joined and (os.path.basename(argv[0]) == 'rsync' or '--server' in joined):
+            try:
+                found.append((pid, os.getpgid(pid)))
+            except OSError:
+                found.append((pid, pid))
+    return found
+
+def hit(pid, pgid, sig):
+    if pgid > 1 and pgid != my_group:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+initial = targets()
+for pid, pgid in initial:
+    hit(pid, pgid, signal.SIGTERM)
+deadline = time.monotonic() + 1.0
+while time.monotonic() < deadline and targets():
+    time.sleep(0.02)
+for pid, pgid in targets():
+    hit(pid, pgid, signal.SIGKILL)
+print(json.dumps({'ok': True, 'killed': len(initial)}))
+`;
+
 // Wipe a suspect mirror whole. Only the caller-selected mirror path is removed,
 // never a parent or cache, and never through a link at the mirror path itself.
 export const MIRROR_WIPE_SCRIPT = String.raw`
@@ -433,7 +496,10 @@ export type SpawnFn = (
 ) => Promise<SpawnResult>;
 
 async function defaultSpawn(command: string, args: string[], opts: { stdin: Readable; timeoutMs: number }): Promise<SpawnResult> {
-  const result = await runStreamProcess(command, args, { stdin: opts.stdin, timeoutMs: opts.timeoutMs });
+  // rsync forks ssh as its transport; signalling rsync alone orphans that
+  // ssh client, which keeps the remote channel (and this push, and the
+  // mirror lock around it) alive past the timeout. Kill the whole group.
+  const result = await runStreamProcess(command, args, { stdin: opts.stdin, timeoutMs: opts.timeoutMs, killProcessGroup: true });
   return { exitCode: result.exitCode, signal: result.signal, timedOut: result.timedOut };
 }
 
@@ -487,6 +553,12 @@ export class SshGuestStore implements GuestStore {
       timeoutMs: RSYNC_TIMEOUT_MS,
     });
     if (result.exitCode !== 0 || result.timedOut || result.signal) {
+      // The push is dead locally, but a stalled guest receiver may still be
+      // writing into this mirror. Kill it before throwing: the caller holds
+      // the mirror lock until this settles, so no newer push can race it.
+      // A failed kill leaves the next push's verify/wipe as the backstop and
+      // must not replace the push failure itself.
+      await this.runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [guestDir], 15_000).catch(() => undefined);
       throw new Error(
         `Offload delta push failed (exit=${result.exitCode}, signal=${result.signal}, timedOut=${result.timedOut}).`,
       );

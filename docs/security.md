@@ -8,6 +8,7 @@
 * An ephemeral ed25519 key is made per worker process with `ssh-keygen`. It is never stored.
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
 * The tunnel binds to `127.0.0.1` inside the VM only. Nothing is published.
+* Every remote command (execute, scrub, env staging, sync helpers) runs under a supervised process group with a hard timeout: at `timeoutMs` the local call returns `timedOut` and the remote group is cancelled over a fresh channel, without signalling the shared control master. A guest that stalls a channel — a foreground `sleep`, a background job holding stderr, a wedged `rsync --server` — cannot hold the call (or the offload mirror lock) past its deadline; the rsync push additionally kills its whole local process group so its ssh transport cannot outlive it.
 
 ## Run env allowlist
 

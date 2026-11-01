@@ -127,7 +127,11 @@ default VM:
 4. Install `rsync` on the template VM. Delta push shells out to the worker
    host's `rsync` over the pinned SSH transport, and the guest side needs the
    `rsync` binary too; without either end the push fails and the command stays
-   local. The worker host needs `rsync` installed as well.
+   local. The worker host needs `rsync` installed as well. A guest-side
+   `rsync` that stalls (or is replaced by repo code that ran in the VM)
+   cannot wedge the push: it is bounded by a fixed timeout, and on expiry
+   the push fails, its ssh transport is killed with it, and the per-mirror
+   lock is released for the next command.
 5. Reboot, then run the preflight with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
    `true`.

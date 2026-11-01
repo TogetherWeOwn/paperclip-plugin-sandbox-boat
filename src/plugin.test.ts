@@ -339,7 +339,7 @@ describe("AcquireLease", () => {
     expect(scrubAt).toBeGreaterThan(timeline.indexOf("resume"));
     expect(timeline.indexOf("stop", scrubAt)).toBeGreaterThan(scrubAt);
     expect(ssh.runtimeSecrets.get(sandboxId)).toBe(0);
-    expect(unquoteShDashC(ssh.scrubs(sandboxId).at(-1)!.args.at(-1)!)).toContain("'/srv/ws-other'");
+    expect(unquoteShDashC(ssh.scrubs(sandboxId).at(-1)!.remoteCommand)).toContain("'/srv/ws-other'");
     // The scrub verified the disk, so the card keeps its VM, stopped.
     expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
     expect(fake.boxes.get(sandboxId)?.state).toBe("archived");
@@ -639,9 +639,9 @@ describe("Execute", () => {
     }
 
     // Staged over stdin into a fresh 0700 directory under /tmp, which no boat snapshot saves.
-    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
+    const staging = calls.find((call) => call.remoteCommand.includes("umask 077 && mkdir -m 700"));
     expect(staging?.stdin).toContain(`export ANTHROPIC_AUTH_TOKEN='${SECRET}';`);
-    const stagingCommand = staging!.args.at(-1)!;
+    const stagingCommand = staging!.remoteCommand;
     const dirMatch = stagingCommand.match(/mkdir -m 700 '(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/);
     expect(dirMatch).not.toBeNull();
     const envDir = dirMatch![1];
@@ -654,9 +654,9 @@ describe("Execute", () => {
     expect(envFile.startsWith("/home/")).toBe(false);
 
     // The script sources the file, removes it, and only then runs the payload.
-    const run = calls.find((call) => call.args.at(-1)!.startsWith(PAYLOAD_PREFIX) && call.args.at(-1)!.includes("claude"));
+    const run = calls.find((call) => call.remoteCommand.startsWith(PAYLOAD_PREFIX) && call.remoteCommand.includes("claude"));
     expect(run).toBeDefined();
-    const script = unquoteShDashC(run!.args.at(-1)!);
+    const script = unquoteShDashC(run!.remoteCommand);
     expect(script).not.toContain(".paperclip-boat-env-");
     const cdAt = script.indexOf(`cd '${cwd}'`);
     const sourceAt = script.indexOf(`. '${envFile}'`);
@@ -671,7 +671,7 @@ describe("Execute", () => {
     // The login shell execs env, which drops boat's credentials and execs the sh that runs the
     // script: the payload's parent shell never had ASCII_TOKEN in its environ, and it waits for the
     // payload, so the payload's exit status (128+n for a signal) reaches ssh.
-    expect(run!.args.at(-1)!.startsWith(`${PAYLOAD_PREFIX}'`)).toBe(true);
+    expect(run!.remoteCommand.startsWith(`${PAYLOAD_PREFIX}'`)).toBe(true);
     expect(script).toContain("&& 'claude' '-p' 'hello'; rc=$?;");
     expect(script).not.toContain("exec 'claude'");
     expect(script).toContain(`rmdir '${envDir}'`);
@@ -699,9 +699,11 @@ describe("Execute", () => {
     ssh.handler = (remoteCommand) => (remoteCommand.startsWith(PAYLOAD_PREFIX) ? { code: 255, stderr: "Connection reset" } : undefined);
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(255);
-    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    const commands = ssh.spawned.slice(before).map((call) => call.remoteCommand);
     const envDir = commands.find((command) => command.includes("mkdir -m 700"))!.match(/'(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/)![1];
-    expect(commands.at(-1)).toBe(`rm -f '${envDir}/env.sh'; rmdir '${envDir}' 2>/dev/null`);
+    // The removal is the last payload command (each supervised run's own
+    // cancel housekeeping follows it on the wire and is not a payload).
+    expect(commands.findLast((command) => command.startsWith("rm -f"))).toBe(`rm -f '${envDir}/env.sh'; rmdir '${envDir}' 2>/dev/null`);
   });
 
   it("removes the staged env file when staging fails part way", async () => {
@@ -711,9 +713,9 @@ describe("Execute", () => {
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
-    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    const commands = ssh.spawned.slice(before).map((call) => call.remoteCommand);
     expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
-    expect(commands.at(-1)).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
+    expect(commands.findLast((command) => command.startsWith("rm -f"))).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
   });
 
   it("extends the auto-stop deadline while a command runs once less than half of it is left", async () => {
@@ -818,11 +820,11 @@ describe("run env allowlist (incident TOG-37420)", () => {
       env,
     } as never);
     const calls = ssh.spawned.slice(before);
-    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
-    const run = calls.find((call) => call.args.at(-1)!.startsWith(PAYLOAD_PREFIX) && call.args.at(-1)!.includes("'claude'"));
+    const staging = calls.find((call) => call.remoteCommand.includes("umask 077 && mkdir -m 700"));
+    const run = calls.find((call) => call.remoteCommand.startsWith(PAYLOAD_PREFIX) && call.remoteCommand.includes("'claude'"));
     // Every caller checks what the script and argv do not contain, so a missed payload must fail here.
     expect(run).toBeDefined();
-    return { result, staged: staging?.stdin ?? "", script: unquoteShDashC(run!.args.at(-1)!) };
+    return { result, staged: staging?.stdin ?? "", script: unquoteShDashC(run!.remoteCommand) };
   }
 
   it("routes an agent's host-side model proxy address through the tunnel", async () => {
@@ -978,7 +980,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "claude", args: ["-v"] } as never);
-    const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("'claude'"))!.args.at(-1)!);
+    const bare = unquoteShDashC(ssh.spawned.slice(before).find((call) => call.remoteCommand.includes("'claude'"))!.remoteCommand);
     expect(bare).toMatch(/&& unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS="--exclude=\.paperclip-runtime\$\{TAR_OPTIONS:\+ \$TAR_OPTIONS\}" && 'claude' '-v'; rc=\$\?; exit \$rc$/);
     // Every Execute (Paperclip's sync commands included) tells GNU tar to leave .paperclip-runtime alone, so the host's runtime files are not unpacked over the run's.
     expect(script.indexOf('export TAR_OPTIONS="--exclude=.paperclip-runtime')).toBeGreaterThan(unsetAt);
@@ -987,13 +989,13 @@ describe("run env allowlist (incident TOG-37420)", () => {
 
   it("removes boat's ASCII_TOKEN line from ~/.bashrc when it sets up a VM and after resuming one for a command", async () => {
     const lease = await acquire("run-1");
-    const setup = ssh.execs().find((call) => call.args.at(-1)!.includes('"$d" "$s"'));
-    expect(setup!.args.at(-1)).toContain("ASCII_TOKEN=/d");
+    const setup = ssh.execs().find((call) => call.remoteCommand.includes('"$d" "$s"'));
+    expect(setup!.remoteCommand).toContain("ASCII_TOKEN=/d");
     await currentManager().shutdown();
     fake.boxes.get(lease.providerLeaseId!)!.state = "archived";
     const before = ssh.spawned.length;
     await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
-    const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
+    const commands = ssh.spawned.slice(before).map((call) => call.remoteCommand);
     const scrubAt = commands.findIndex((command) => command.includes("ASCII_TOKEN=/d"));
     const payloadAt = commands.findIndex((command) => command.includes("'true'"));
     expect(scrubAt).toBeGreaterThan(-1);
@@ -1194,7 +1196,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
   function lastScrubScript(sandboxId: string): string {
     const scrubs = ssh.scrubs(sandboxId);
     expect(scrubs.length).toBeGreaterThan(0);
-    return unquoteShDashC(scrubs.at(-1)!.args.at(-1)!);
+    return unquoteShDashC(scrubs.at(-1)!.remoteCommand);
   }
 
   /** Paperclip synced the run's mcp-config asset into the VM. */
@@ -1516,7 +1518,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     expect(runtimeDir).toBe("/home/user/paperclip-workspace/.paperclip-runtime");
     expect(links()).toEqual([{ root: "/home/user/paperclip-workspace", runtimeDir }]);
     // After the setup step, before acquire returns (Paperclip syncs the runtime assets after that).
-    const commands = ssh.execs().map((call) => call.args.at(-1)!);
+    const commands = ssh.execs().map((call) => call.remoteCommand);
     expect(commands.findIndex((command) => command.includes('"$d" "$s"'))).toBeLessThan(commands.findIndex((command) => command.includes("paperclip-boat-runtime")));
     expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
     await release(first);
@@ -1544,7 +1546,7 @@ describe("run JWT in Paperclip's MCP config on the VM disk", () => {
     const before = ssh.execs().length;
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true" } as never);
     expect(result.exitCode).toBe(0);
-    const commands = ssh.execs().slice(before).map((call) => call.args.at(-1)!);
+    const commands = ssh.execs().slice(before).map((call) => call.remoteCommand);
     const linkAt = commands.findIndex((command) => command.includes("paperclip-boat-runtime"));
     expect(linkAt).toBeGreaterThan(-1);
     expect(commands.findIndex((command) => command.startsWith(PAYLOAD_PREFIX))).toBeGreaterThan(linkAt);
@@ -1748,8 +1750,8 @@ describe("ResumeLease and RealizeWorkspace", () => {
       metadata: { provider: "boat", remoteCwd: "/home/user/paperclip-workspace", runtimeDir: "/home/user/paperclip-workspace/.paperclip-runtime" },
     });
     // One command makes the workspace and its .paperclip-runtime, and puts the rule into ~/.boatignore.
-    expect(ssh.execs().at(-1)!.args.at(-1)).toContain('mkdir -p "$root"');
-    expect(ssh.execs().at(-1)!.args.at(-1)).toContain("paperclip-boat-runtime");
+    expect(ssh.links().at(-1)!.remoteCommand).toContain('mkdir -p "$root"');
+    expect(ssh.links().at(-1)!.remoteCommand).toContain("paperclip-boat-runtime");
   });
 });
 
