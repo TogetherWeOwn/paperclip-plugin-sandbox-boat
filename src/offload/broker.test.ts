@@ -173,6 +173,17 @@ describe("recordRefusal", () => {
     expect((again.body as OffloadReadResponse).state).toBe("not_started");
     expect(backend.starts.length).toBe(0);
   });
+
+  it("returns the accepted command's verdict instead of journaling a refusal over it", async () => {
+    const { broker, backend } = setup();
+    expect((await broker.submit(submitFor(), PRINCIPAL)).status).toBe(202);
+    // A route whose pre-check raced this acceptance must learn the journal
+    // already knows the ID, so it never answers fallback-safe over it.
+    const raced = await broker.recordRefusal(submitFor(), PRINCIPAL, "incompatible workload");
+    expect(raced?.status).toBe(200);
+    expect((raced?.body as OffloadReadResponse).state).not.toBe("not_started");
+    expect(backend.starts.length).toBe(1);
+  });
 });
 
 describe("read", () => {

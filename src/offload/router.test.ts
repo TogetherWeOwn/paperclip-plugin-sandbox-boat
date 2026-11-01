@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyCargo, type CargoProfile } from "./router.js";
+import { cargoSideArgv, cargoToolchain, classifyCargo, isCargoOffline, type CargoProfile } from "./router.js";
 
 const PROFILE: CargoProfile = { id: "rust-public-1", toolchains: ["stable", "1.88.0"] };
 
@@ -104,5 +104,36 @@ describe("classifyCargo", () => {
 
   it("keeps empty argv local", () => {
     expect(classifyCargo([], PROFILE).mode).toBe("local");
+  });
+});
+
+describe("cargo-side argv helpers", () => {
+  it("treats args after a bare -- as test-binary args", () => {
+    expect(cargoSideArgv(["test", "--", "--offline"])).toEqual(["test"]);
+    expect(cargoSideArgv(["test", "--offline"])).toEqual(["test", "--offline"]);
+    expect(cargoSideArgv([])).toEqual([]);
+  });
+
+  it("detects cargo --offline but not a test binary's --offline", () => {
+    expect(isCargoOffline(["test", "--offline"])).toBe(true);
+    expect(isCargoOffline(["test", "--", "--offline"])).toBe(false);
+    expect(isCargoOffline(["test"])).toBe(false);
+  });
+
+  it("treats cargo --frozen as offline for priming and stay-local decisions", () => {
+    // --frozen is --locked plus --offline: a cold guest cache must prime (or
+    // fall back) exactly like --offline, never fail remotely on a missing crate.
+    expect(isCargoOffline(["test", "--frozen"])).toBe(true);
+    expect(isCargoOffline(["--frozen", "test"])).toBe(true);
+    expect(isCargoOffline(["test", "--", "--frozen"])).toBe(false);
+  });
+
+  it("validates a leading rustup toolchain selector against the profile", () => {
+    expect(cargoToolchain(["+stable", "test", "--offline"], PROFILE.toolchains)).toBe("+stable");
+    // A toolchain-looking arg after `--` belongs to the test binary.
+    expect(cargoToolchain(["test", "--", "+stable"], PROFILE.toolchains)).toBe(null);
+    expect(cargoToolchain(["+nightly-2026-01-01", "build"], PROFILE.toolchains)).toBe(null);
+    expect(cargoToolchain(["test"], PROFILE.toolchains)).toBe(null);
+    expect(cargoToolchain([], PROFILE.toolchains)).toBe(null);
   });
 });

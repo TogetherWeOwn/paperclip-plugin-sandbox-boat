@@ -10,7 +10,8 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `size` | `small` | Fallback when this task class has no measurements. Existing explicitly configured sizes remain the fallback (set `default` for heavy builds); measured data takes precedence. |
 | `taskClass` | `default` | Class to look up in `sizeCostTable`. Acquire can override with `executionWorkspaceSettings.boatTaskClass`. |
 | `sizeCostTable` | `{}` | Completed-job measurements by class and size; cheapest computed cost wins. Refresh weekly as in [Operations](operations.md#weekly-refresh-from-the-pilot-cost-log). |
-| `templateSnapshot` | none | A named snapshot to create new card VMs from. |
+| `templateSnapshot` | none | A named snapshot to create new card VMs from. Wins over `templateSourceSandboxId` when both are set. |
+| `templateSourceSandboxId` | none | An archived sandbox id whose image new pool VMs fork from when `templateSnapshot` is unset (named snapshots are blocked on the trial). Blank: create from the base environment. |
 | `autoStopMinutes` | 120 | The trial allows at most 120. |
 | `idleStopMinutes` | 5 | |
 | `staleLeaseMinutes` | 20 | |

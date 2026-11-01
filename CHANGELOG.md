@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.5
+
+### Added
+
+* Live-shape local-run binding: when the issue's `executionWorkspaceId` is null, the plugin binds the issue's project workspace from `ctx.projects.getWorkspaceForIssue`, keyed on the project workspace id the shim reports. This needs the new `projects.read` and `project.workspaces.read` capabilities; isolated workspaces keep binding the execution workspace exactly as before.
+* Fork-based pool boot: driver `templateSourceSandboxId` forks new pool VMs from an archived template sandbox when `templateSnapshot` is unset (named snapshots are blocked on the trial). The named snapshot wins when both are set, and forked VMs get their own reuse key.
+* Offline cargo priming: before a remote `--offline` build, the guest runs `cargo fetch --locked` in the command directory; a failing fetch fails the prepare so the command falls back locally. Sources whose `.cargo` config names a private registry, a source replacement or stored credentials stay local at resolve time.
+* The budget guard prefers the trial consumption counter when the trial reports one.
+
+### Changed
+
+* A never-bound or unknown execution workspace answers 503 `OFFLOAD_UNAVAILABLE` (`remoteStarted: false`, `fallbackSafe: true`) instead of 403, so the shim falls back locally; nothing is journaled, so the same command ID submits cleanly once the workspace resolves. Runs owned by another agent keep the 403.
+
 ## 0.2.4
 
 ### Added

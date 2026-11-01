@@ -22,8 +22,9 @@ async function recordRefusalOrConflict(
   reason: string,
 ): Promise<{ status: number; body: unknown } | null> {
   try {
-    await broker.recordRefusal(request, principal, reason);
-    return null;
+    // Non-null: the journal already knew this ID (a concurrent acceptance),
+    // so its verdict replaces the caller's fallback-safe refusal.
+    return await broker.recordRefusal(request, principal, reason);
   } catch (error) {
     if ((error as { code?: string }).code !== "OFFLOAD_IDEMPOTENCY_CONFLICT") throw error;
     return {
@@ -296,6 +297,13 @@ export async function handleExec(
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
   const request = validated.value;
+  if (!request.dryRun) {
+    // A lost workspace binding is not proof that this ID never started. Consult
+    // the journal before any unjournaled 503 below; an unknown ID still returns
+    // null here and journals nothing.
+    const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+    if (known) return known;
+  }
   const tool = request.tool ?? profileTool(profile);
   const runner = request.runner ?? defaultRunnerFor(tool);
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
@@ -309,7 +317,22 @@ export async function handleExec(
   }
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
-    return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: request.commandId }) };
+    if (!request.dryRun) {
+      // The lookup above is async and the early journal check has released
+      // the run serialization: this ID may have been accepted while the
+      // lookup was in flight. Re-consult the journal so the fallback-safe
+      // answer below never covers a started command.
+      const raced = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+      if (raced) return raced;
+    }
+    // Never-bound or unknown workspace: the run has no offload source, so the
+    // shim must fall back locally, never fail the build. Not journaled, so the
+    // same command ID submits cleanly once the workspace resolves. Other-agent
+    // runs keep the 403 in plugin.ts; this path carries no agent identity claim.
+    return {
+      status: 503,
+      body: offloadError("OFFLOAD_UNAVAILABLE", "unknown execution workspace; running local", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
+    };
   }
   const principal = principalFor(input.companyId, runId, workspace, profile);
   if (request.dryRun) {
