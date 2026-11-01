@@ -1,7 +1,9 @@
 // The lifecycle of boat VMs for Paperclip runs, built for the lowest cost:
-//   - one VM per card (execution workspace, else issue), kept stopped between
-//     runs so its checkout and build caches stay on disk (docs.boat.dev
-//     platform guide, "Pattern 3: stop and resume around usage");
+//   - one VM per card and agent (execution workspace, else issue, scoped to
+//     the run's principal), kept stopped between runs so its checkout and
+//     build caches stay on disk (docs.boat.dev platform guide, "Pattern 3:
+//     stop and resume around usage"). A disk is never handed to a different
+//     agent: it keeps whatever an earlier run planted in it;
 //   - a VM runs only while a run holds it: release stops it at once (billing
 //     stops at the stop), and a sweep stops anything that idles;
 //   - auto-stop is boat's deadline safety net, extended only while a command
@@ -186,6 +188,10 @@ interface SandboxView {
   createdAt: string | null;
   updatedAt: string | null;
   stopStatus: string | null;
+  /** The boat environment the VM is pinned to, or null (a noEnv VM, or boat did not report one). */
+  environment: string | null;
+  /** True while the VM still holds its creator's logins; null when boat does not report it. */
+  holdsCreatorLogins: boolean | null;
 }
 
 interface CachedConfig {
@@ -195,14 +201,58 @@ interface CachedConfig {
   seenAt: number;
 }
 
+/**
+ * The key a card's VM is stored and named under, scoped to the run's
+ * principal. A resumed or still-running disk keeps whatever an earlier run
+ * planted in it (shell hooks in ~/.bashrc, toolchain shims in ~/bin): guest
+ * code has root, so no staging trick makes another agent's disk safe to hand
+ * new credentials to. Folding the agent into the key makes the state lookup
+ * and the deterministic sandbox name differ per agent, so a different agent
+ * on the same card creates a fresh VM and can never resume, reuse or adopt
+ * by name a disk that is not its own. Only a digest of the agent id enters
+ * the key (keys ride in lease metadata and VM names are derived from them).
+ * With no agent id from the host the principal is unknown, so the run gets
+ * a per-run VM that release deletes: an unnamed principal never inherits a
+ * disk, and never leaves one for the next unnamed run.
+ */
 export function resolveVmKey(params: {
   executionWorkspaceId?: string | null;
   issueId?: string | null;
   runId: string;
+  agentId?: string | null;
 }): { key: string; kind: VmKeyKind } {
-  if (params.executionWorkspaceId) return { key: `ew:${params.executionWorkspaceId}`, kind: "executionWorkspace" };
-  if (params.issueId) return { key: `issue:${params.issueId}`, kind: "issue" };
+  const principal = typeof params.agentId === "string" && params.agentId.trim().length > 0
+    ? createHash("sha256").update(params.agentId.trim()).digest("hex").slice(0, 16)
+    : null;
+  if (principal && params.executionWorkspaceId) return { key: `ew:${params.executionWorkspaceId}:a:${principal}`, kind: "executionWorkspace" };
+  if (principal && params.issueId) return { key: `issue:${params.issueId}:a:${principal}`, kind: "issue" };
   return { key: `run:${params.runId}`, kind: "run" };
+}
+
+/**
+ * Why this VM must not be handed out under the configured env policy, or
+ * null. `noEnv` is one-way on resume, so a *stopped* conflicting VM can be
+ * made conforming by resuming it with the policy asserted; a *running* one
+ * already holds the account's logins in reach of the guest and can never be
+ * reuse_running. A non-null different boat environment is the same leak in
+ * the other direction: the VM holds an environment the operator did not
+ * choose for this lease.
+ */
+function envPolicyConflict(config: BoatDriverConfig, sandbox: SandboxView): string | null {
+  if (config.noEnv && sandbox.holdsCreatorLogins === true) return "it still holds its creator's logins while noEnv is on";
+  if (config.noEnv && sandbox.environment != null) return `it is attached to boat environment "${sandbox.environment}" while noEnv is on`;
+  if (config.boatEnvironment && sandbox.environment != null && sandbox.environment !== config.boatEnvironment) {
+    return `it is attached to boat environment "${sandbox.environment}", not the configured "${config.boatEnvironment}"`;
+  }
+  return null;
+}
+
+/** The env policy every resume re-asserts, so turning noEnv (or the boat environment) on later reaches existing card VMs too. */
+function resumeEnvPolicy(config: BoatDriverConfig): { noEnv?: true; environment?: string } {
+  return {
+    ...(config.noEnv ? { noEnv: true as const } : {}),
+    ...(config.boatEnvironment ? { environment: config.boatEnvironment } : {}),
+  };
 }
 
 /** Deterministic sandbox name: the mapping survives a lost plugin state. */
@@ -235,6 +285,8 @@ function toView(raw: unknown): SandboxView | null {
     createdAt: iso(sandbox.createdAt),
     updatedAt: iso(sandbox.updatedAt),
     stopStatus: stop && typeof stop.status === "string" ? stop.status : null,
+    environment: typeof sandbox.environment === "string" && sandbox.environment.length > 0 ? sandbox.environment : null,
+    holdsCreatorLogins: typeof sandbox.holdsCreatorLogins === "boolean" ? sandbox.holdsCreatorLogins : null,
   };
 }
 
@@ -669,9 +721,20 @@ export class BoatVmManager {
     return views;
   }
 
-  private async findSandboxByName(api: BoatApiLike, name: string): Promise<SandboxView | null> {
+  private async findSandboxByName(api: BoatApiLike, name: string, config: BoatDriverConfig, recordedIds: ReadonlySet<string>): Promise<SandboxView | null> {
     const all = await this.listSandboxes(api);
-    const matches = all.filter((sandbox) => sandbox.name === name && !sandbox.dataExpiredAt && sandbox.state !== "cancelled");
+    // A same-named VM this plugin has no record of is adopted only when it
+    // already conforms to the env policy: its provenance is unknown (a lost
+    // state document, a hand-made VM), so a conflicting one is never resumed
+    // or reused just because the name collides. Recorded VMs are handled by
+    // acquire's own conflict path (resume re-asserts the policy).
+    const matches = all.filter(
+      (sandbox) =>
+        sandbox.name === name &&
+        !sandbox.dataExpiredAt &&
+        sandbox.state !== "cancelled" &&
+        (recordedIds.has(sandbox.id) || envPolicyConflict(config, sandbox) == null),
+    );
     if (matches.length === 0) return null;
     // Prefer one that is already up (no start needed), then the newest.
     matches.sort((a, b) => {
@@ -1286,13 +1349,81 @@ export class BoatVmManager {
       const doc = await this.store.read(params.companyId);
       const existing = doc.vms[key] && doc.vms[key].status !== "deleted" ? doc.vms[key] : null;
       let sandbox = existing ? await this.getSandbox(api, existing.sandboxId) : null;
-      if (!sandbox && kind !== "run") sandbox = await this.findSandboxByName(api, name);
+      if (!sandbox && kind !== "run") {
+        const recordedIds = new Set(Object.values(doc.vms).map((record) => record.sandboxId));
+        sandbox = await this.findSandboxByName(api, name, config, recordedIds);
+      }
       if (sandbox?.state === "archiving") {
         // A stop (auto-stop, the sweep, or a stop from another worker) is still
         // saving the disk. boat refuses a resume until it ends, so wait for it.
         sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
       }
       if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
+      // The key scopes this lookup to the run's agent; this is the backstop
+      // for a record the scoping did not write (older state, a hand edit): a
+      // disk recorded for another agent is never resumed or reused here, and
+      // a fresh VM replaces it under this key (upsert tombstones the old one).
+      if (sandbox && existing && existing.sandboxId === sandbox.id && existing.principalAgentId && params.agentId && existing.principalAgentId !== params.agentId) {
+        this.logger.warn("boat: the card's recorded VM belongs to a different agent; creating a fresh VM instead of handing over its disk", {
+          vmKey: key,
+          runId: params.runId,
+          sandboxId: sandbox.id,
+        });
+        sandbox = null;
+      }
+      // Env policy is asserted on resume below, which fixes a stopped VM.
+      // A running VM that conflicts already exposes what the policy withholds,
+      // so it is never reuse_running: a recorded one no other run holds is
+      // scrubbed, stopped and resumed with the policy asserted; one another
+      // run may hold (or that is unrecorded) is left to its holder and this
+      // run creates a fresh VM.
+      if (sandbox && UP_STATES.has(sandbox.state)) {
+        const conflict = envPolicyConflict(config, sandbox);
+        if (conflict) {
+          const recorded = existing && existing.sandboxId === sandbox.id ? existing : null;
+          const othersActive = recorded ? recorded.activeRunIds.filter((id) => id !== params.runId).length : 0;
+          if (recorded && othersActive === 0) {
+            this.logger.warn("boat: the card's running VM conflicts with the env policy; stopping it so the resume re-asserts the policy", {
+              vmKey: key,
+              runId: params.runId,
+              sandboxId: sandbox.id,
+              conflict,
+            });
+            await this.scrubRuntimeSecrets({
+              api,
+              config,
+              sandboxId: sandbox.id,
+              roots: this.runtimeRoots(config, sandbox.id, null, recorded),
+              before: "stop",
+              connect: true,
+            });
+            await this.ssh.closeSession(sandbox.id).catch(() => undefined);
+            const stopped = await this.stopAndConfirm(config, sandbox.id, config.stopConfirmTimeoutMs);
+            if (!stopped) {
+              await this.store
+                .update(params.companyId, (state) => {
+                  const record = findBySandboxId(state, sandbox!.id);
+                  if (record) record.status = "stopping";
+                })
+                .catch(() => undefined);
+              throw new BoatProviderError(
+                "BOAT_ENV_POLICY_CONFLICT",
+                `the card's running VM ${sandbox.id} conflicts with the env policy (${conflict}) and boat did not confirm its stop, so it cannot be resumed under the policy. Nothing was handed out; the sweep retries the stop.`,
+              );
+            }
+            sandbox = await this.getSandbox(api, sandbox.id);
+            if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
+          } else {
+            this.logger.warn("boat: a running VM conflicts with the env policy and another run may hold it; creating a fresh VM instead of reusing it", {
+              vmKey: key,
+              runId: params.runId,
+              sandboxId: sandbox.id,
+              conflict,
+            });
+            sandbox = null;
+          }
+        }
+      }
 
       const runningSize = sandbox && sandbox.state !== "archived" ? requireBoatSize(sandbox.type) : undefined;
       const sizeChoice = selectSize(config, taskClass, runningSize);
@@ -1323,7 +1454,7 @@ export class BoatVmManager {
               const response = await this.startCall(
                 "resume",
                 config,
-                () => api.resume({ sandboxId: target.id, failFast: config.failFast, ttlSeconds, ...sizeChange }),
+                () => api.resume({ sandboxId: target.id, failFast: config.failFast, ttlSeconds, ...resumeEnvPolicy(config), ...sizeChange }),
                 async () => {
                   const now = await this.getSandbox(api, target.id);
                   return !!now && UP_STATES.has(now.state);
@@ -1546,7 +1677,11 @@ export class BoatVmManager {
             lifetimeUsage: null,
             sessions: [],
             deletedAt: null,
+            principalAgentId: input.params.agentId ?? null,
           };
+    // The first named principal owns the disk for life; acquire refuses a
+    // mismatch before it gets here, so this never reassigns one.
+    if (record.principalAgentId == null && input.params.agentId) record.principalAgentId = input.params.agentId;
     record.status = input.startKind === "reuse_running" ? "running" : "starting";
     record.size = input.config.size;
     record.issueId = input.params.issueId ?? record.issueId;
@@ -1605,6 +1740,21 @@ export class BoatVmManager {
     if (sandbox?.state === "archiving") sandbox = await this.waitUntilStopped(api, sandbox, config.stopConfirmTimeoutMs);
     if (!sandbox || sandbox.dataExpiredAt || sandbox.state === "cancelled") {
       return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
+    }
+    // A running VM that conflicts with the env policy is not handed back for
+    // a new run window. Reporting the lease expired makes the host acquire
+    // instead, where the recorded, idle VM is stopped and resumed with the
+    // policy asserted. A stopped one needs no special case: liveSession's
+    // resume re-asserts the policy.
+    if (UP_STATES.has(sandbox.state)) {
+      const conflict = envPolicyConflict(config, sandbox);
+      if (conflict) {
+        this.logger.warn("boat: the lease's running VM conflicts with the env policy; reporting the lease expired instead of resuming it", {
+          sandboxId: sandbox.id,
+          conflict,
+        });
+        return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
+      }
     }
     const sandboxId = sandbox.id;
     this.sandboxCompany.set(sandboxId, params.companyId);
@@ -1676,6 +1826,19 @@ export class BoatVmManager {
         throw new BoatProviderError("BOAT_VM_GONE", `boat VM ${sandboxId} no longer exists; the run must acquire a new lease.`);
       }
       const resumed = !UP_STATES.has(sandbox.state);
+      if (!resumed) {
+        // A reconnect must not quietly serve a running VM the current env
+        // policy would never hand out (the operator turned noEnv on after
+        // the lease started). Fail closed; the next acquire stops and
+        // resumes it under the policy, or creates a fresh VM.
+        const conflict = envPolicyConflict(config, sandbox);
+        if (conflict) {
+          throw new BoatProviderError(
+            "BOAT_ENV_POLICY_CONFLICT",
+            `boat VM ${sandboxId} conflicts with the env policy (${conflict}); refusing to run against it. The run must acquire a new lease.`,
+          );
+        }
+      }
       if (resumed) {
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
         const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
@@ -1688,6 +1851,7 @@ export class BoatVmManager {
               sandboxId,
               failFast: config.failFast,
               ttlSeconds: this.ttlSeconds(config, this.hardDeadlines.get(sandboxId) ?? null),
+              ...resumeEnvPolicy(config),
               ...(size !== sandbox.type && sandbox.state === "archived" ? { type: size } : {}),
             }),
           async () => {
@@ -1921,7 +2085,15 @@ export class BoatVmManager {
       // a forced stop of a VM that another run on the card still holds, and a
       // scrub that found nothing left but could not search the whole disk
       // (incomplete: unverified, but no evidence to destroy the card's work on).
-      const deleting = snapshot?.keyKind === "run" && mode === "release" && params.resourceDisposition !== "stop_and_retain";
+      // A run-keyed VM can never be reused, and an operator who set
+      // deleteCardVmOnRelease wants no disk to outlive its run either: both
+      // are deleted here (once no other run holds the card VM; the early
+      // return above already handled a plain release with holders left, and
+      // a forced stop keeps the disk for them).
+      const deleting =
+        mode === "release" &&
+        params.resourceDisposition !== "stop_and_retain" &&
+        (snapshot?.keyKind === "run" || (config.deleteCardVmOnRelease && snapshot != null && snapshot.othersActive === 0));
       const keep: KeptDiskReason | null =
         mode === "stop"
           ? "stop_lease"
@@ -1958,7 +2130,10 @@ export class BoatVmManager {
         await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch(() => undefined);
         await this.deleteSandbox(api, sandboxId);
         await this.markDeleted(params.companyId, sandboxId);
-        this.logger.info("boat: deleted per-run VM on release", { sandboxId, runId });
+        this.logger.info(
+          snapshot?.keyKind === "run" ? "boat: deleted per-run VM on release" : "boat: deleted card VM on release (deleteCardVmOnRelease)",
+          { sandboxId, runId },
+        );
         return { providerLeaseId: sandboxId, state: "destroyed" };
       }
 

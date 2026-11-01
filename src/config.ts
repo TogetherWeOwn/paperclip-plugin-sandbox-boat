@@ -41,6 +41,16 @@ export interface BoatDriverConfig {
   sshConnectTimeoutSec: number;
   remoteWorkspaceDir: string | null;
   allowPaidNamedSnapshots: boolean;
+  /**
+   * Delete a card VM on release instead of stopping it for resume, once no
+   * other run holds it. A stopped disk keeps the last run's checkout and
+   * whatever else it wrote outside Paperclip's runtime assets, so this is
+   * the only setting that starts every run on a fresh disk. Off by default:
+   * stop-and-resume per card is the plugin's cost model, and no host signal
+   * marks a card's work as untrusted at acquire time. Environments that run
+   * untrusted, public or PR-branch work should set it to true.
+   */
+  deleteCardVmOnRelease: boolean;
   maxOffloadVms: number;
   offloadIdleStopSeconds: number;
   /**
@@ -80,6 +90,7 @@ export const CONFIG_DEFAULTS = {
   tunnelTargetPort: 8317,
   sshConnectTimeoutSec: 15,
   allowPaidNamedSnapshots: false,
+  deleteCardVmOnRelease: false,
   reuseLease: false,
   maxOffloadVms: 4,
   offloadIdleStopSeconds: 15,
@@ -150,6 +161,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     sshConnectTimeoutSec: Math.trunc(num(raw.sshConnectTimeoutSec, CONFIG_DEFAULTS.sshConnectTimeoutSec)),
     remoteWorkspaceDir: str(raw.remoteWorkspaceDir),
     allowPaidNamedSnapshots: bool(raw.allowPaidNamedSnapshots, CONFIG_DEFAULTS.allowPaidNamedSnapshots),
+    deleteCardVmOnRelease: bool(raw.deleteCardVmOnRelease, CONFIG_DEFAULTS.deleteCardVmOnRelease),
     maxOffloadVms: Math.trunc(num(raw.maxOffloadVms, CONFIG_DEFAULTS.maxOffloadVms)),
     offloadIdleStopSeconds: num(raw.offloadIdleStopSeconds, CONFIG_DEFAULTS.offloadIdleStopSeconds),
     reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),

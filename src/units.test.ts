@@ -937,9 +937,23 @@ describe("ssh endpoint", () => {
 });
 
 describe("keys and names", () => {
-  it("keys a VM to the execution workspace, then the issue, then the run", () => {
-    expect(resolveVmKey({ executionWorkspaceId: "ew1", issueId: "i1", runId: "r1" })).toEqual({ key: "ew:ew1", kind: "executionWorkspace" });
-    expect(resolveVmKey({ issueId: "i1", runId: "r1" })).toEqual({ key: "issue:i1", kind: "issue" });
+  it("keys a VM to the execution workspace, then the issue, then the run, always scoped to the run's agent", () => {
+    const ew = resolveVmKey({ executionWorkspaceId: "ew1", issueId: "i1", runId: "r1", agentId: "agent-a" });
+    expect(ew.kind).toBe("executionWorkspace");
+    expect(ew.key).toMatch(/^ew:ew1:a:[0-9a-f]{16}$/);
+    expect(ew.key).not.toContain("agent-a");
+    const issue = resolveVmKey({ issueId: "i1", runId: "r1", agentId: "agent-a" });
+    expect(issue.kind).toBe("issue");
+    expect(issue.key).toMatch(/^issue:i1:a:[0-9a-f]{16}$/);
+    // The same card under another principal keys (and so names) a different VM.
+    expect(resolveVmKey({ executionWorkspaceId: "ew1", issueId: "i1", runId: "r2", agentId: "agent-b" }).key).not.toBe(ew.key);
+    expect(resolveVmKey({ executionWorkspaceId: "ew1", issueId: "i1", runId: "r2", agentId: "agent-a" }).key).toBe(ew.key);
+    expect(resolveVmKey({ runId: "r1", agentId: "agent-a" })).toEqual({ key: "run:r1", kind: "run" });
+  });
+
+  it("an acquire without an agent gets a per-run VM, never a shared card VM", () => {
+    expect(resolveVmKey({ executionWorkspaceId: "ew1", issueId: "i1", runId: "r1" })).toEqual({ key: "run:r1", kind: "run" });
+    expect(resolveVmKey({ issueId: "i1", runId: "r1", agentId: "  " })).toEqual({ key: "run:r1", kind: "run" });
     expect(resolveVmKey({ runId: "r1" })).toEqual({ key: "run:r1", kind: "run" });
   });
 
@@ -974,9 +988,9 @@ describe("shell", () => {
     const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
     const script = buildLoginShellScript({ command: "node", args: ["x.js"], cwd: "/w", remoteEnv: stage });
     expect(script).toContain(
-      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS=\"--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}\" && 'node' 'x.js'; rc=$?; rm -f '/tmp/e/env.sh'; rmdir '/tmp/e' 2>/dev/null; exit $rc",
+      "cd '/w' && if [ -f '/tmp/e/env.sh' ]; then . '/tmp/e/env.sh'; fi && { /bin/rm -f '/tmp/e/env.sh'; /bin/rmdir '/tmp/e' 2>/dev/null || true; } && unset ASCII_TOKEN BOAT_ID && export TAR_OPTIONS=\"--exclude=.paperclip-runtime${TAR_OPTIONS:+ $TAR_OPTIONS}\" && 'node' 'x.js'; rc=$?; /bin/rm -f '/tmp/e/env.sh'; /bin/rmdir '/tmp/e' 2>/dev/null; exit $rc",
     );
-    expect(script.indexOf("rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
+    expect(script.indexOf("/bin/rm -f '/tmp/e/env.sh'")).toBeLessThan(script.indexOf("'node' 'x.js'"));
     // The payload runs as a child of the script's shell, never as its last command, so no shell execs it.
     expect(script).not.toContain("exec 'node'");
     expect(buildLoginShellScript({ command: "node", args: ["x.js"], remoteEnv: null }).endsWith(
@@ -984,6 +998,16 @@ describe("shell", () => {
     )).toBe(true);
     // That shell is started by env without boat's credentials.
     expect(buildRemoteCommand("true")).toBe("exec env -u ASCII_TOKEN -u BOAT_ID sh -c 'true'");
+  });
+
+  it("stages env through the remote-command wrapper with absolute tools, never in sshd's shell", () => {
+    const stage: RemoteEnvStage = { dir: "/tmp/e", path: "/tmp/e/env.sh" };
+    const command = stageRemoteEnvCommand(stage);
+    expect(command.startsWith("exec env -u ASCII_TOKEN -u BOAT_ID sh -c ")).toBe(true);
+    expect(command).toContain("/bin/mkdir -m 700 ");
+    expect(command).toContain("/bin/cat > ");
+    expect(command).toContain("/bin/chmod 600 ");
+    expect(command).not.toMatch(/(^|[^/\w])cat >/);
   });
 
   describe("in a real shell", () => {
@@ -1016,6 +1040,33 @@ describe("shell", () => {
       expect(run.stdout).toBe(`secret=s3cr3t 'x'\nfile=gone\ncwd=${cwd}\n`);
       expect(run.status).toBe(7);
       expect(existsSync(dir)).toBe(false);
+    });
+
+    it("a cat/rm planted in the guest's shell hooks receives nothing from staging and cannot keep the env file", () => {
+      root = mkdtempSync(path.join(tmpdir(), "pcb-shell-"));
+      const leak = path.join(root, "leak");
+      // The hook an earlier run on this disk plants: every later shell that
+      // sources it tees stdin (the staged secrets) aside and fakes removal.
+      writeFileSync(
+        path.join(root, ".bashrc"),
+        `cat(){ tee -a ${shellQuote(leak)}; }\nrm(){ :; }\n`,
+      );
+      writeFileSync(path.join(root, ".profile"), `cat(){ tee -a ${shellQuote(leak)}; }\nrm(){ :; }\n`);
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, BASH_ENV: path.join(root, ".bashrc") };
+      const dir = path.join(root, "stage");
+      const stage = { dir, path: path.join(dir, "env.sh") };
+      // Staging as sshd would run it: through the login shell (bash, which
+      // sources BASH_ENV), not a bare sh.
+      execFileSync("bash", ["-c", stageRemoteEnvCommand(stage)], { input: buildRemoteEnvFileContents([["PCB_SECRET", "s3cr3t"]]), env });
+      expect(readFileSync(stage.path, "utf8")).toContain("PCB_SECRET");
+      const run = spawnSync(
+        "bash",
+        ["-c", buildRemoteCommand(buildLoginShellScript({ command: "sh", args: ["-c", 'test -e "$1" && echo file=present || echo file=gone', "payload", stage.path], cwd: root, remoteEnv: stage }))],
+        { env, encoding: "utf8" },
+      );
+      expect(`${run.stdout}\n${run.stderr}`).toContain("file=gone");
+      expect(run.status).toBe(0);
+      expect(existsSync(leak)).toBe(false);
     });
 
     it("the fallback removes the file when the script stops before the payload", () => {

@@ -9,6 +9,18 @@
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
 * The tunnel binds to `127.0.0.1` inside the VM only. Nothing is published.
 
+## VM reuse boundary
+
+A card VM's disk is only ever handed to one agent, under one env policy:
+
+* The VM key — and with it the sandbox name and the state record — includes a digest of the acquiring agent's id. A different agent's run on the same card creates its own VM; it never resumes or shares the first agent's disk. An acquire that names no agent gets a per-run VM, deleted on release: an unknown principal never gets a shared disk.
+* Every resume re-asserts the env policy — `noEnv: true`, or the configured `boatEnvironment` — on acquire, on a resumed lease and when a lease reconnects to a VM that stopped mid-lease.
+* A running VM that contradicts the policy (it still holds its creator's logins, or is attached to an environment while `noEnv` is on) is never reused as-is. When no other run holds it, the plugin stops it (after the runtime-secret scrub) and resumes it under the policy; otherwise the run gets a fresh VM. A same-named VM the plugin has no record of is adopted only if it already matches the policy.
+
+The boundary is host-side because the guest cannot provide it: the agent has root in the VM, so anything planted in the guest (`~/.bashrc` hooks, PATH trojans) can run before any in-guest cleanup. Env staging is still hardened against casual interception — it runs through the same `env -u … sh -c` wrapper as payloads, with absolute `/bin/cat`, `/bin/mkdir` and `/bin/chmod`, and the env file is removed with absolute paths before the payload starts — but that is defense in depth only; it would not make sharing a disk between principals safe, so the plugin never does that.
+
+Within one agent, runs *do* share the card disk, so a run can still meet hooks its own agent's earlier runs left behind. For untrusted work (public repositories, third-party PR branches), set `deleteCardVmOnRelease` so every run starts from a clean create.
+
 ## Run env allowlist
 
 ### Why

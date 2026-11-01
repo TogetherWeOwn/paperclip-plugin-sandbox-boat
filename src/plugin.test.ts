@@ -20,12 +20,16 @@ import { FakeSsh, createFakeContext, inHostInvocation, scriptOfShDashC } from ".
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatProviderError } from "./errors.js";
 import { nativeWorkspaceParams } from "./test-support/native-workspace.js";
+import { stageRemoteEnvCommand } from "./shell.js";
+import { resolveVmKey } from "./vm-manager.js";
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const ENV = "22222222-2222-4222-8222-222222222222";
 const WORKSPACE = "33333333-3333-4333-8333-333333333333";
 const ISSUE = "44444444-4444-4444-8444-444444444444";
 const SECRET = "sk-super-secret-value-9f8e7d";
+/** The principal-scoped state key of the card VM acquire() creates (agent-1 on WORKSPACE). */
+const VM_KEY = resolveVmKey({ executionWorkspaceId: WORKSPACE, issueId: ISSUE, runId: "key", agentId: "agent-1" }).key;
 
 const baseConfig = { apiKey: "boat_test_key_not_real", tunnelTargetHost: "cliproxy" };
 
@@ -495,7 +499,7 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
     const afterRelease = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
       vms: Record<string, { status: string; activeRunIds: string[] }>;
     };
-    expect(afterRelease.vms[`ew:${WORKSPACE}`]).toMatchObject({ status: "stopping", activeRunIds: [] });
+    expect(afterRelease.vms[VM_KEY]).toMatchObject({ status: "stopping", activeRunIds: [] });
     // 65s later boat confirms the save; the sweep confirms it and the next run reuses the VM.
     clock.t += 65_000;
     fake.boxes.get(sandboxId)!.state = "archived";
@@ -504,7 +508,7 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
     const afterSweep = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as {
       vms: Record<string, { status: string }>;
     };
-    expect(afterSweep.vms[`ew:${WORKSPACE}`].status).toBe("stopped");
+    expect(afterSweep.vms[VM_KEY].status).toBe("stopped");
     const second = await acquire("run-2");
     expect(second.providerLeaseId).toBe(sandboxId);
     expect(fake.callsOf("create")).toHaveLength(1);
@@ -539,7 +543,7 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
       vms: Record<string, { status: string }>;
     };
     // Marked stopping so the sweep retries the stop without waiting for idle thresholds.
-    expect(afterRelease.vms[`ew:${WORKSPACE}`].status).toBe("stopping");
+    expect(afterRelease.vms[VM_KEY].status).toBe("stopping");
     const second = await acquire("run-2", { executionWorkspaceId: "55555555-5555-4555-8555-555555555555" });
     await expect(
       plugin.definition.onEnvironmentStopLease!({
@@ -612,6 +616,8 @@ describe("ReleaseLease / StopLease / DestroyLease", () => {
 
 /** How Execute sends a payload script: the login shell execs env, which drops boat's credentials and execs sh. */
 const PAYLOAD_PREFIX = "exec env -u ASCII_TOKEN -u BOAT_ID sh -c ";
+/** The payload command, as opposed to the env-staging command, which goes through the same remote wrapper. */
+const isPayloadCommand = (command: string) => command.startsWith(PAYLOAD_PREFIX) && !command.includes("/bin/mkdir -m 700");
 
 /** The script inside `sh -c '<script>'` or `exec env -u ... sh -c '<script>'`, undoing shellQuote. */
 function unquoteShDashC(remoteCommand: string): string {
@@ -639,14 +645,14 @@ describe("Execute", () => {
     }
 
     // Staged over stdin into a fresh 0700 directory under /tmp, which no boat snapshot saves.
-    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
+    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && /bin/mkdir -m 700"));
     expect(staging?.stdin).toContain(`export ANTHROPIC_AUTH_TOKEN='${SECRET}';`);
     const stagingCommand = staging!.args.at(-1)!;
-    const dirMatch = stagingCommand.match(/mkdir -m 700 '(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/);
+    const dirMatch = stagingCommand.match(/(\/tmp\/paperclip-boat-env-[0-9a-f]{32})/);
     expect(dirMatch).not.toBeNull();
     const envDir = dirMatch![1];
     const envFile = `${envDir}/env.sh`;
-    expect(stagingCommand).toBe(`umask 077 && mkdir -m 700 '${envDir}' && cat > '${envFile}' && chmod 600 '${envFile}'`);
+    expect(stagingCommand).toBe(stageRemoteEnvCommand({ dir: envDir, path: envFile }));
 
     // Never inside the workspace (the git checkout, saved in every boat snapshot).
     const cwd = "/home/user/paperclip-workspace";
@@ -682,7 +688,8 @@ describe("Execute", () => {
     const lease = await acquire("run-1");
     const dirs: string[] = [];
     ssh.handler = (remoteCommand) => {
-      const match = remoteCommand.match(/mkdir -m 700 '([^']+)'/);
+      if (!remoteCommand.includes("/bin/mkdir -m 700")) return undefined;
+      const match = remoteCommand.match(/(\/tmp\/paperclip-boat-env-[0-9a-f]{32})/);
       if (match) dirs.push(match[1]);
       return undefined;
     };
@@ -696,12 +703,12 @@ describe("Execute", () => {
   it("removes the staged env file itself when ssh fails before the script could, and the VM is still up", async () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
-    ssh.handler = (remoteCommand) => (remoteCommand.startsWith(PAYLOAD_PREFIX) ? { code: 255, stderr: "Connection reset" } : undefined);
+    ssh.handler = (remoteCommand) => (isPayloadCommand(remoteCommand) ? { code: 255, stderr: "Connection reset" } : undefined);
     const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
     expect(result.exitCode).toBe(255);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
     const envDir = commands.find((command) => command.includes("mkdir -m 700"))!.match(/'(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/)![1];
-    expect(commands.at(-1)).toBe(`rm -f '${envDir}/env.sh'; rmdir '${envDir}' 2>/dev/null`);
+    expect(commands.at(-1)).toBe(`/bin/rm -f '${envDir}/env.sh'; /bin/rmdir '${envDir}' 2>/dev/null`);
   });
 
   it("removes the staged env file when staging fails part way", async () => {
@@ -712,8 +719,8 @@ describe("Execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
-    expect(commands.some((command) => command.startsWith(PAYLOAD_PREFIX))).toBe(false);
-    expect(commands.at(-1)).toMatch(/^rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; rmdir /);
+    expect(commands.some(isPayloadCommand)).toBe(false);
+    expect(commands.at(-1)).toMatch(/^\/bin\/rm -f '\/tmp\/paperclip-boat-env-[0-9a-f]{32}\/env\.sh'; \/bin\/rmdir /);
   });
 
   it("extends the auto-stop deadline while a command runs once less than half of it is left", async () => {
@@ -818,7 +825,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
       env,
     } as never);
     const calls = ssh.spawned.slice(before);
-    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
+    const staging = calls.find((call) => call.args.at(-1)!.includes("umask 077 && /bin/mkdir -m 700"));
     const run = calls.find((call) => call.args.at(-1)!.startsWith(PAYLOAD_PREFIX) && call.args.at(-1)!.includes("'claude'"));
     // Every caller checks what the script and argv do not contain, so a missed payload must fail here.
     expect(run).toBeDefined();
@@ -1888,7 +1895,7 @@ describe("idle sweep", () => {
     expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
     expect(fake.boxes.get(sandboxId)?.state).toBe("ready");
     const doc = harness.state.get(`company|${COMPANY}|boat-sandbox|vms`) as { vms: Record<string, { sandboxId: string; status: string; activeRunIds: string[] }> };
-    expect(doc.vms[`ew:${WORKSPACE}`]).toMatchObject({ sandboxId, status: "running", activeRunIds: ["run-2"] });
+    expect(doc.vms[VM_KEY]).toMatchObject({ sandboxId, status: "running", activeRunIds: ["run-2"] });
     // Once the run releases it and it is untouched again, the sweep still cleans it up.
     await release(second);
     clock.t += 8 * 24 * 3600 * 1000;
