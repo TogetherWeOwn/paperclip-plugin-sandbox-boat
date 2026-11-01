@@ -18,6 +18,7 @@ export interface BoatDriverConfig {
   taskClass: string;
   sizeCostTable: SizeCostTable;
   templateSnapshot: string | null;
+  templateSourceSandboxId: string | null;
   boatEnvironment: string | null;
   noEnv: boolean;
   /** Retain provider command/process telemetry for newly created VMs. */
@@ -128,6 +129,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     taskClass: parseTaskClass(raw.taskClass),
     sizeCostTable: parseSizeCostTable(raw.sizeCostTable),
     templateSnapshot: str(raw.templateSnapshot),
+    templateSourceSandboxId: str(raw.templateSourceSandboxId),
     boatEnvironment: str(raw.boatEnvironment),
     noEnv: bool(raw.noEnv, CONFIG_DEFAULTS.noEnv),
     monitoring: bool(raw.monitoring, CONFIG_DEFAULTS.monitoring),

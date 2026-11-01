@@ -253,14 +253,25 @@ export interface FakeIssue {
   checkoutRunId?: string | null;
 }
 
+export interface FakeProjectWorkspace {
+  id: string;
+  projectId: string;
+  name?: string;
+  path?: string | null;
+  repoUrl?: string | null;
+  [key: string]: unknown;
+}
+
 export function createFakeContext(
-  options: { issues?: Map<string, FakeIssue>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta> } = {},
+  options: { issues?: Map<string, FakeIssue>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta>;
+    projectWorkspaces?: Map<string, FakeProjectWorkspace> } = {},
 ) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
   const issues = options.issues ?? new Map<string, FakeIssue>();
   const workspaces = options.workspaces ?? new Map<string, FakeWorkspaceMeta>();
+  const projectWorkspaces = options.projectWorkspaces ?? new Map<string, FakeProjectWorkspace>();
   const events = new Map<string, Array<(event: unknown) => Promise<void>>>();
   const secrets = new Map<string, string>();
   const keyOf = (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
@@ -300,6 +311,9 @@ export function createFakeContext(
     executionWorkspaces: {
       get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
     },
+    projects: {
+      getWorkspaceForIssue: async (issueId: string) => projectWorkspaces.get(issueId) ?? null,
+    },
     events: {
       on: (name: string, fn: (event: unknown) => Promise<void>) => {
         const list = events.get(name) ?? [];
@@ -315,5 +329,5 @@ export function createFakeContext(
   const emit = async (name: string, event: unknown) => {
     for (const fn of events.get(name) ?? []) await fn(event);
   };
-  return { ctx, state, logs, jobs, issues, workspaces, secrets, emit };
+  return { ctx, state, logs, jobs, issues, workspaces, projectWorkspaces, secrets, emit };
 }

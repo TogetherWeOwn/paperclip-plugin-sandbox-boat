@@ -294,6 +294,30 @@ def rpc(action, data):
         finally:
             if probe.exists():
                 probe.rmdir()
+    if action == 'fetch':
+        # Prime the cargo cache from the lockfile before the command's
+        # supervisor exists. Fixed argv only; the host admits this action for
+        # cargo --offline commands alone. A nonzero exit fails the prepare, so
+        # the command falls back locally instead of failing remotely.
+        fetch_argv = [data['executable']]
+        toolchain = data.get('toolchain')
+        if toolchain is not None:
+            # The host sends only its validated leading +toolchain selector,
+            # but still refuse anything but a bare rustup toolchain name here so
+            # a compromised host path cannot turn cache priming into argv injection.
+            if (not isinstance(toolchain, str) or len(toolchain) < 2
+                    or not toolchain.startswith('+') or '/' in toolchain
+                    or '\\' in toolchain or '\0' in toolchain
+                    or any(char.isspace() or char in ';&|$(){}[]<>' + chr(96) for char in toolchain)):
+                raise ValueError('invalid toolchain selector')
+            fetch_argv.append(toolchain)
+        fetch_argv += ['fetch', '--locked']
+        environment = {'PATH': data['path'], 'HOME': os.environ.get('HOME', '/tmp')}
+        completed = subprocess.run(fetch_argv,
+            cwd=canonical(data['cwd']), env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=540)
+        return {'exitCode': completed.returncode}
     if action == 'prepare':
         return prepare(data)
     root = pathlib.Path(canonical(data['root']))

@@ -110,6 +110,8 @@ export interface OffloadExecutorConfig {
   offloadMonthlyVmHourCap?: number;
   /** Named boat snapshot new pool VMs boot from (driver `templateSnapshot`); null = stock image. */
   templateSnapshot?: string | null;
+  /** Archived sandbox id new pool VMs fork from (driver `templateSourceSandboxId`); used only when `templateSnapshot` is unset. */
+  templateSourceSandboxId?: string | null;
 }
 
 export interface OffloadTimers {
@@ -202,7 +204,7 @@ export class OffloadExecutor {
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
-    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot">;
+    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot" | "templateSourceSandboxId">;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly recordDuration?: OffloadDeps["recordDuration"];
@@ -236,6 +238,7 @@ export class OffloadExecutor {
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
       offloadMonthlyVmHourCap: deps.config.offloadMonthlyVmHourCap ?? 0,
       templateSnapshot: deps.config.templateSnapshot ?? null,
+      templateSourceSandboxId: deps.config.templateSourceSandboxId ?? null,
     };
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
@@ -564,21 +567,29 @@ export class OffloadExecutor {
   }
 
   /**
-   * The runtime caches one executor per pool, and the template is not part of
-   * the pool identity, so later native bindings deliver the current selection
-   * here. It applies to later claims and creates; recorded VMs keep the key
-   * they were created with and are retired if it no longer matches.
+   * The runtime caches one executor per pool, and neither template selection
+   * is part of the pool identity, so later native bindings deliver the current
+   * selection here. It applies to later claims and creates; recorded VMs keep
+   * the key they were created with and are retired if it no longer matches.
    */
   setTemplateSnapshot(name: string | null): void {
     this.config.templateSnapshot = name;
   }
 
+  setTemplateSourceSandboxId(id: string | null): void {
+    this.config.templateSourceSandboxId = id;
+  }
+
   private compatibilityKey(command: OffloadCommand): string {
     // A VM booted from another guest image is never reused; it is retired like
     // any incompatible idle VM. Without a template the key is unchanged, so VMs
-    // recorded before templates existed stay reusable.
+    // recorded before templates existed stay reusable. Template selections use
+    // tagged pairs, so a snapshot literally named `fork:...` still cannot match
+    // a forked source id.
     const base = [command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null];
-    return JSON.stringify(this.config.templateSnapshot ? [...base, this.config.templateSnapshot] : base);
+    if (this.config.templateSnapshot) return JSON.stringify([...base, ["snapshot", this.config.templateSnapshot]]);
+    if (this.config.templateSourceSandboxId) return JSON.stringify([...base, ["fork", this.config.templateSourceSandboxId]]);
+    return JSON.stringify(base);
   }
 
   private workspaceKey(command: OffloadCommand): string | null {
@@ -768,12 +779,27 @@ export class OffloadExecutor {
       if (operation === "create") {
         // Same semantics as whole-run leases (vm-manager): a configured named
         // snapshot is the guest image; a missing one is a refused start, so the
-        // command stays local.
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
-          ...(this.config.templateSnapshot ? { from: this.config.templateSnapshot } : {}) });
-        const id = sandboxIdOf(response);
-        if (!id) throw new Error("create returned no sandbox id");
-        vm.sandboxId = id;
+        // command stays local. Named snapshots are blocked on the trial, so a
+        // configured archived sandbox is forked instead; a failing fork is a
+        // refused start the same way.
+        if (this.config.templateSnapshot) {
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+            from: this.config.templateSnapshot });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("create returned no sandbox id");
+          vm.sandboxId = id;
+        } else if (this.config.templateSourceSandboxId) {
+          const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+            ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("fork returned no sandbox id");
+          vm.sandboxId = id;
+        } else {
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("create returned no sandbox id");
+          vm.sandboxId = id;
+        }
       } else if (operation === "resume") {
         await this.boat.resume({ sandboxId: vm.sandboxId, ttlSeconds });
       } else {

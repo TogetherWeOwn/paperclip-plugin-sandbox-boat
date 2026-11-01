@@ -22,11 +22,14 @@ const started = { companyId, payload: { runId, issueId, agentId, status: "runnin
 function host(overrides: Partial<LocalRunHost> = {}): LocalRunHost {
   return {
     issueWorkspaceId: async () => workspaceId,
+    issueProjectWorkspace: async () => null,
     workspace: async () => ({ projectId: "project", projectWorkspaceId: null, path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
     apiKey: async () => "scoped-key",
     ...overrides,
   };
 }
+
+const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
 
 describe("local-run offload binding", () => {
   it("builds the native realization payload only from host-owned run, issue and workspace data", async () => {
@@ -40,6 +43,21 @@ describe("local-run offload binding", () => {
     });
   });
 
+  it("binds the project workspace when the live issue shape leaves executionWorkspaceId null", async () => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      issueWorkspaceId: async () => null,
+      issueProjectWorkspace: async () => ({ id: projectWorkspaceId, projectId: "project",
+        path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
+    }));
+    expect(params).toMatchObject({
+      companyId, environmentId, config: { maxOffloadVms: 1, apiKey: "scoped-key" },
+      workspace: { localPath: "/srv/work/repo", metadata: { workspaceRealizationRequest: {
+        version: 1, companyId, environmentId, heartbeatRunId: runId, executionWorkspaceId: projectWorkspaceId,
+        source: { localPath: "/srv/work/repo", repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId },
+      } } },
+    });
+  });
+
   it.each([
     ["disabled", { ...enabled, offloadLocalRunsEnabled: false }, host()],
     ["flag not boolean true", { ...enabled, offloadLocalRunsEnabled: "true" }, host()],
@@ -49,6 +67,14 @@ describe("local-run offload binding", () => {
     ["workspace unknown", enabled, host({ workspace: async () => null })],
     ["workspace not locally realized", enabled, host({ workspace: async () => ({ projectId: "p", projectWorkspaceId: null, path: null, repoUrl: null }) })],
     ["relative workspace path", enabled, host({ workspace: async () => ({ projectId: "p", projectWorkspaceId: null, path: "repo", repoUrl: null }) })],
+    ["project workspace lookup fails", enabled, host({ issueWorkspaceId: async () => null,
+      issueProjectWorkspace: async () => { throw new Error("projects unavailable"); } })],
+    ["project workspace unknown", enabled, host({ issueWorkspaceId: async () => null,
+      issueProjectWorkspace: async () => null })],
+    ["project workspace not locally realized", enabled, host({ issueWorkspaceId: async () => null,
+      issueProjectWorkspace: async () => ({ id: projectWorkspaceId, projectId: "p", path: null, repoUrl: null }) })],
+    ["relative project workspace path", enabled, host({ issueWorkspaceId: async () => null,
+      issueProjectWorkspace: async () => ({ id: projectWorkspaceId, projectId: "p", path: "repo", repoUrl: null }) })],
     ["secret resolves empty", enabled, host({ apiKey: async () => null })],
   ])("binds nothing when %s", async (_name, settings, fakeHost) => {
     expect(await localRunRealization(started, localRunSettings(settings), fakeHost)).toBe(null);
@@ -200,7 +226,7 @@ describe("plugin wiring", () => {
     }
   });
 
-  it("a failed state write on the first offload request answers 403 and stays retryable", async () => {
+  it("a failed state write on the first offload request falls back locally and stays retryable", async () => {
     const harness = await setup(enabled);
     harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
     await harness.emit("agent.run.started", started);
@@ -210,9 +236,28 @@ describe("plugin wiring", () => {
       if (input.namespace === "boat-offload-workspaces") throw new Error("state store unavailable");
       return originalSet(input, value);
     };
-    expect((await exec(runId)).status).toBe(403);
+    const fallback = await exec(runId);
+    expect(fallback.status).toBe(503);
+    expect(fallback.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
     harness.ctx.state.set = originalSet;
     expect((await exec(runId)).status).toBe(200);
+  });
+
+  it("accepts the live shape: a null execution workspace id bound on the project workspace id", async () => {
+    const harness = await setup(enabled);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    await harness.emit("agent.run.started", started);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",
+      path: harness.workspaces.get(workspaceId)!.path, repoUrl: "https://github.com/example/public" });
+    const body = { version: 1, commandId: randomUUID(), executionWorkspaceId: projectWorkspaceId,
+      argv: ["test", "--locked"], cwdRelative: ".", env: {}, queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true };
+    const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
+      actor: { actorType: "agent", actorId: agentId, agentId, runId }, params: {}, query: {}, body } as never);
+    expect(response.status).toBe(200);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
+    // The started run's sibling still has no authority.
+    expect((await exec(randomUUID())).status).toBe(403);
   });
 
   it("a config read failure at run start is recovered on the first offload request", async () => {
@@ -351,6 +396,6 @@ describe("plugin wiring", () => {
   it("leaves local runs unbound while the setting is off", async () => {
     const harness = await setup({});
     await harness.emit("agent.run.started", started);
-    expect((await exec(runId)).status).toBe(403);
+    expect((await exec(runId)).status).toBe(503);
   });
 });

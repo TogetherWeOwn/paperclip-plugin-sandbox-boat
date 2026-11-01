@@ -94,6 +94,7 @@ The board approves these capabilities:
 | `jobs.schedule` | the idle sweep every 5 minutes |
 | `api.routes.register` | `/usage`, `/sweep` (board) and the `offload_*` routes (agent) |
 | `issues.read` | seeing whether a card is done, and the run's issue workspace |
+| `projects.read`, `project.workspaces.read` | the run's project workspace when the live issue shape has no execution workspace |
 | `events.subscribe` | `agent.run.started/finished/failed/cancelled` for local-run binding |
 | `execution.workspaces.read` | the local path and repository of the run's workspace |
 | `secrets.read-ref` | resolving `BOAT_CI_API_KEY` for each binding, never stored |
@@ -128,6 +129,7 @@ curl -fsS -X POST "$PAPERCLIP/api/plugins/$PLUGIN_ID/config" \
   "offloadLocalDriverConfig": {
     "size": "default",
     "templateSnapshot": "<named snapshot from the guest template>",
+    "templateSourceSandboxId": "<archived template sandbox id, when named snapshots are unavailable>",
     "maxOffloadVms": 2,
     "offloadIdleStopSeconds": 15
   },

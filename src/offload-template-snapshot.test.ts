@@ -65,3 +65,59 @@ describe("offload pool templateSnapshot", () => {
     expect("from" in f.boat.callsOf("create").at(-1)!.args).toBe(false);
   });
 });
+
+describe("offload pool fork boot", () => {
+  it("forks pool VMs from the archived sandbox when no named snapshot is set", async () => {
+    f.boat.addSandbox({ id: "bx_archived1", state: "archived" });
+    const p = f.pool("fork-pool", { templateSourceSandboxId: "bx_archived1" });
+    expect(await p.execute(command("fork-a"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("create")).toHaveLength(0);
+    expect(f.boat.callsOf("fork")).toHaveLength(1);
+    expect(f.boat.callsOf("fork")[0]!.args).toMatchObject({ sandboxId: "bx_archived1", monitoring: true, failFast: true, noEnv: true });
+  });
+
+  it("fails closed when the archived sandbox is gone", async () => {
+    const p = f.pool("fork-missing-pool", { templateSourceSandboxId: "bx_nonexistent" });
+    const result = await p.execute(command("fork-missing-a"));
+    expect(result.status).not.toBe("completed");
+    expect(f.executions).toHaveLength(0);
+  });
+
+  it("prefers the named snapshot when both selections are set", async () => {
+    f.boat.addSandbox({ id: "bx_archived2", state: "archived" });
+    const p = f.pool("fork-precedence-pool", { templateSnapshot: "paperclip-offload-delegated-v1",
+      templateSourceSandboxId: "bx_archived2" });
+    expect(await p.execute(command("fork-pref-a"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("fork")).toHaveLength(0);
+    expect(f.boat.callsOf("create").at(-1)!.args.from).toBe("paperclip-offload-delegated-v1");
+  });
+
+  it("keys forked VM reuse on the source id, apart from snapshot and stock keys", async () => {
+    type Keyed = { compatibilityKey(c: ReturnType<typeof command>): string };
+    const cmd = command("fork-key-a");
+    const legacy = JSON.stringify([cmd.companyId, cmd.repoId, cmd.profileId, cmd.trustDomainId ?? null]);
+    const plain = f.pool("fork-key-plain") as unknown as Keyed;
+    const forked = f.pool("fork-key-src", { templateSourceSandboxId: "bx_archived3" }) as unknown as Keyed;
+    const tmpl = f.pool("fork-key-tmpl", { templateSnapshot: "paperclip-offload-delegated-v1" }) as unknown as Keyed;
+    expect(plain.compatibilityKey(cmd)).toBe(legacy);
+    expect(forked.compatibilityKey(cmd)).not.toBe(legacy);
+    expect(forked.compatibilityKey(cmd)).not.toBe(tmpl.compatibilityKey(cmd));
+    expect(forked.compatibilityKey(cmd)).toContain("bx_archived3");
+    const hostile = f.pool("fork-key-hostile", { templateSnapshot: "fork:bx_archived3" }) as unknown as Keyed;
+    expect(hostile.compatibilityKey(cmd)).not.toBe(forked.compatibilityKey(cmd));
+  });
+
+  it("uses the latest fork selection for later creates on the same executor", async () => {
+    f.boat.addSandbox({ id: "bx_archived4", state: "archived" });
+    f.boat.addSandbox({ id: "bx_archived5", state: "archived" });
+    const p = f.pool("fork-switch-pool", { maxOffloadVms: 4 });
+    const live = p as unknown as { setTemplateSourceSandboxId(id: string | null): void };
+    live.setTemplateSourceSandboxId("bx_archived4");
+    expect(await p.execute(command("fork-switch-a"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("fork").at(-1)!.args.sandboxId).toBe("bx_archived4");
+    live.setTemplateSourceSandboxId("bx_archived5");
+    expect(await p.execute(command("fork-switch-b"))).toMatchObject({ status: "completed" });
+    expect(f.boat.callsOf("fork")).toHaveLength(2);            // the bx_archived4 VM is not reused for the new source
+    expect(f.boat.callsOf("fork").at(-1)!.args.sandboxId).toBe("bx_archived5");
+  });
+});

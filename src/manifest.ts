@@ -2,7 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { BOAT_SIZES } from "./size-policy.js";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
-export const PLUGIN_VERSION = "0.2.4";
+export const PLUGIN_VERSION = "0.2.5";
 export const DRIVER_KEY = "boat";
 export const SWEEP_JOB_KEY = "boat-idle-sweep";
 
@@ -24,6 +24,8 @@ const manifest: PaperclipPluginManifestV1 = {
     "jobs.schedule",
     "api.routes.register",
     "issues.read",
+    "projects.read",
+    "project.workspaces.read",
     "events.subscribe",
     "execution.workspaces.read",
     "secrets.read-ref",
@@ -211,7 +213,12 @@ const manifest: PaperclipPluginManifestV1 = {
           templateSnapshot: {
             type: "string",
             description:
-              "Named snapshot to create new card VMs from (`boat snapshot <id> <name>`). Blank: create from the base environment.",
+              "Named snapshot to create new card VMs from (`boat snapshot <id> <name>`). Blank: create from the base environment. Wins over templateSourceSandboxId when both are set.",
+          },
+          templateSourceSandboxId: {
+            type: "string",
+            description:
+              "Archived sandbox id whose image new pool VMs fork from when templateSnapshot is unset (named snapshots are blocked on the trial). Blank: create from the base environment.",
           },
           autoStopMinutes: {
             type: "number",

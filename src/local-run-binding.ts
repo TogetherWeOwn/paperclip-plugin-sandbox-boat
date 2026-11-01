@@ -2,8 +2,9 @@
 // environmentRealizeWorkspace call, so offload had no source authority for it.
 // This module builds the same native realization payload from host-owned data
 // only: the agent.run.started event (run -> issue), the issue's execution
-// workspace id, and ctx.executionWorkspaces (workspace -> local path, repo).
-// Nothing comes from the agent or the offload request body.
+// workspace id (or, when the live issue shape leaves it null, the issue's
+// project workspace id), and the resolved workspace (workspace -> local path,
+// repo). Nothing comes from the agent or the offload request body.
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 
@@ -14,8 +15,17 @@ export interface LocalRunSettings {
   driverConfig: Record<string, unknown>;
 }
 
+/** The issue's project workspace: the id the shim reports when the run has no execution workspace. */
+export interface LocalRunProjectWorkspace {
+  id: string;
+  projectId: string;
+  path: string | null;
+  repoUrl: string | null;
+}
+
 export interface LocalRunHost {
   issueWorkspaceId(issueId: string, companyId: string): Promise<string | null>;
+  issueProjectWorkspace(issueId: string, companyId: string): Promise<LocalRunProjectWorkspace | null>;
   workspace(workspaceId: string, companyId: string): Promise<{
     projectId: string; projectWorkspaceId: string | null; path: string | null; repoUrl: string | null;
   } | null>;
@@ -48,11 +58,30 @@ export async function localRunRealization(
   const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
   const { companyId } = event;
   if (!id(companyId) || !id(payload.runId) || !id(payload.issueId)) return null;
-  const workspaceId = await host.issueWorkspaceId(payload.issueId, companyId);
-  if (!id(workspaceId)) return null;
-  const workspace = await host.workspace(workspaceId, companyId);
-  const localPath = workspace?.path;
-  if (!workspace || typeof localPath !== "string" || !path.isAbsolute(localPath) || localPath.includes("\0")) return null;
+  // Isolated workspaces bind the issue's execution workspace exactly as before.
+  // Otherwise the live issue shape has no execution workspace id, and the shim
+  // reports PAPERCLIP_WORKSPACE_ID, the project workspace id: bind that.
+  let workspaceId: string | null = null;
+  let source: { localPath: string | null; repoUrl: string | null; projectId: string; projectWorkspaceId: string | null } | null = null;
+  const executionWorkspaceId = await host.issueWorkspaceId(payload.issueId, companyId);
+  if (id(executionWorkspaceId)) {
+    const workspace = await host.workspace(executionWorkspaceId, companyId);
+    if (workspace) {
+      workspaceId = executionWorkspaceId;
+      source = { localPath: workspace.path, repoUrl: workspace.repoUrl,
+        projectId: workspace.projectId, projectWorkspaceId: workspace.projectWorkspaceId };
+    }
+  } else {
+    const projectWorkspace = await host.issueProjectWorkspace(payload.issueId, companyId).catch(() => null);
+    if (projectWorkspace && id(projectWorkspace.id)) {
+      workspaceId = projectWorkspace.id;
+      source = { localPath: projectWorkspace.path, repoUrl: projectWorkspace.repoUrl,
+        projectId: projectWorkspace.projectId, projectWorkspaceId: projectWorkspace.id };
+    }
+  }
+  if (!workspaceId || !source) return null;
+  const localPath = source.localPath;
+  if (typeof localPath !== "string" || !path.isAbsolute(localPath) || localPath.includes("\0")) return null;
   const apiKey = await host.apiKey(settings.apiKeySecretRef, companyId);
   if (!apiKey) return null;
   return {
@@ -67,7 +96,7 @@ export async function localRunRealization(
         workspaceRealizationRequest: {
           version: 1, companyId, environmentId: settings.environmentId,
           heartbeatRunId: payload.runId, executionWorkspaceId: workspaceId,
-          source: { localPath, repoUrl: workspace.repoUrl, projectId: workspace.projectId, projectWorkspaceId: workspace.projectWorkspaceId },
+          source: { localPath, repoUrl: source.repoUrl, projectId: source.projectId, projectWorkspaceId: source.projectWorkspaceId },
         },
       },
     },

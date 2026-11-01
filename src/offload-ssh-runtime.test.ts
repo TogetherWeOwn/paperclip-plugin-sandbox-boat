@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
-import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { SshOffloadRuntime, hasCargoRegistryAuth } from "./offload-ssh-runtime.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -290,5 +290,112 @@ describe("templateSnapshot pool wiring", () => {
     expect(a.config.templateSnapshot).toBe("tmpl-a");
     expect(a.poolId).toBe(legacyPoolId());
     expect(boat.calls).toHaveLength(0);
+  });
+  it("forwards the configured fork source to a cached executor and keeps the pool identity", async () => {
+    const params = native();
+    params.config = { ...params.config, templateSourceSandboxId: "bx_archived-fork" };
+    runtime.remember(params);
+    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string;
+      config: { templateSnapshot: string | null; templateSourceSandboxId: string | null } };
+    expect(a.config.templateSnapshot).toBe(null);
+    expect(a.config.templateSourceSandboxId).toBe("bx_archived-fork");
+    expect(a.poolId).toBe(legacyPoolId());
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("offline cargo registry guard", () => {
+  const offline = (): BackendCommand => ({ ...command(), argv: ["test", "--offline"] });
+  it("resolves an offline command with a clean source", async () => {
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps an offline command local when the source pins a private registry", async () => {
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    await mkdir(path.join(source, ".cargo"), { recursive: true });
+    await writeFile(path.join(source, ".cargo/config.toml"), '[source.crates-io]\nreplace-with = "private"\n');
+    expect(await runtime.resolve(offline(), config)).toBe(null);
+    // A non-offline command is unaffected: no guest fetch would run.
+    expect(await runtime.resolve(command(), config)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+    await rm(path.join(source, ".cargo"), { recursive: true, force: true });
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+  });
+  it("keeps an offline command local when a nested checkout overrides the registry", async () => {
+    await mkdir(path.join(source, "crates/foo/.cargo"), { recursive: true });
+    await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
+    await writeFile(path.join(source, "crates/foo/.cargo/config"), '[registries.private]\nindex = "https://example.com"\n');
+    expect(await runtime.resolve({ ...offline(), cwdRelative: "crates/foo" }, config)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("hasCargoRegistryAuth", () => {
+  const clean = '[source.crates-io]\nregistry = "https://github.com/rust-lang/crates.io-index"\n';
+  async function configAt(relative: string, text: string) {
+    const dir = path.join(source, relative, ".cargo");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "config.toml"), text);
+  }
+  afterEach(async () => {
+    await rm(path.join(source, "scan"), { recursive: true, force: true });
+  });
+  it("passes a missing or clean config", async () => {
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(false);
+    await configAt("scan", clean);
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(false);
+  });
+  it.each([
+    ["registry table", '[registries.private]\nindex = "sparse+https://example.com/"\n'],
+    ["source replacement", '[source.crates-io]\nreplace-with = "vendored"\n'],
+    ["credential provider", '[credential-provider.cargo]\nargs = ["login"]\n'],
+    ["stored token", '[registry]\ntoken = "secret"\n'],
+  ])("flags %s", async (_name, text) => {
+    await configAt("scan", text);
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(true);
+  });
+  it("discovers the command directory upward but not sideways", async () => {
+    await configAt("scan", clean);
+    await configAt("scan/crates/foo", clean);
+    await mkdir(path.join(source, "scan/crates/bar"), { recursive: true });
+    await configAt("scan/other", '[registries.private]\nindex = "sparse+https://example.com/"\n');
+    const root = path.join(source, "scan");
+    expect(await hasCargoRegistryAuth(root, "crates/foo")).toBe(false);
+    expect(await hasCargoRegistryAuth(root, "crates/bar")).toBe(false);
+    await configAt("scan", '[registries.private]\nindex = "sparse+https://example.com/"\n');
+    expect(await hasCargoRegistryAuth(root, "crates/bar")).toBe(true);
+  });
+  it("fails closed on symlinked and over-limit configs", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(path.join(dir, ".cargo"), { recursive: true });
+    await writeFile(path.join(dir, "real.toml"), clean);
+    await symlink(path.join(dir, "real.toml"), path.join(dir, ".cargo/config.toml"));
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
+    await rm(path.join(dir, ".cargo/config.toml"), { force: true });
+    await writeFile(path.join(dir, ".cargo/config.toml"), `x = "${"y".repeat(70 * 1024)}"\n`);
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
+  });
+  it("fails closed on escaping and absolute command directories", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(dir, { recursive: true });
+    for (const cwd of ["..", "../other", "..\\other", "/etc", "/"]) {
+      expect(await hasCargoRegistryAuth(dir, cwd)).toBe(true);
+    }
+  });
+  it("fails closed on a symlinked ancestor directory", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(path.join(dir, "real/sub"), { recursive: true });
+    await symlink(path.join(dir, "real"), path.join(dir, "link"));
+    // The link itself is never descended through, even when it resolves inside
+    // the source root; the nested path below it cannot be attested either.
+    expect(await hasCargoRegistryAuth(dir, "link")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, "link/sub")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, "real/sub")).toBe(false);
+  });
+  it("fails closed when nesting exhausts the walk budget", async () => {
+    const dir = path.join(source, "scan");
+    const deep = Array.from({ length: 40 }, (_, i) => `d${i}`).join("/");
+    await mkdir(path.join(dir, deep), { recursive: true });
+    expect(await hasCargoRegistryAuth(dir, deep)).toBe(true);
   });
 });

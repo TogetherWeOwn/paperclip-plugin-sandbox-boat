@@ -61,7 +61,11 @@ export function readBudget(response: unknown): BudgetSnapshot {
   const minute = starts.minute ?? {};
 
   const trialCap = n(field("trialComputeCapSeconds"));
-  const used = n(field("creditUsedSeconds")) ?? 0;
+  // The trial reports its own consumption counter; only without a trial cap
+  // does the legacy credit counter apply.
+  const used = trialCap != null && trialCap > 0
+    ? (n(field("trialComputeUsedSeconds")) ?? n(field("creditUsedSeconds")) ?? 0)
+    : (n(field("creditUsedSeconds")) ?? 0);
   const balanceSeconds = n(field("creditBalanceSeconds"));
   const trialLeft = trialCap != null && trialCap > 0 ? Math.max(0, trialCap - used) : null;
   let computeSecondsLeft: number | null = trialLeft;

@@ -401,28 +401,53 @@ export class OffloadBroker {
     else this.known.add(record.commandId);
   }
 
+  private async existingResponse(existing: JournalRecord, digest: string, principal: BrokerAuth): Promise<BrokerResponse> {
+    if (existing.digest !== digest) {
+      return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: existing.commandId }) };
+    }
+    if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
+      return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: existing.commandId }) };
+    }
+    // Same orphan hold as resolve(): after a restart a live record has no
+    // handle, so hold for reconciliation instead of replaying live state
+    // where a sweep could expire it into a fallback-safe receipt.
+    if (!TERMINAL.has(existing.state) && existing.state !== "unknown" && !this.handles.has(existing.commandId)) {
+      existing.state = "unknown";
+      await this.save(existing);
+    }
+    this.trackLive(existing);
+    return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };
+  }
+
+  /**
+   * A pre-acceptance refusal must not claim a command never started when the
+   * journal already knows that ID. A missing binding is not proof of a clean
+   * ID: the workspace record can disappear after acceptance (for example when
+   * a run's bindings are forgotten while its command is still remote). Return
+   * the journal's verdict for a known ID, or null when this ID is still unused.
+   * Nothing is journaled for an unknown ID.
+   */
+  async existingSubmission(request: OffloadSubmitRequest, principal: BrokerAuth): Promise<BrokerResponse | null> {
+    return this.chain(`run:${principal.runId}`, async () => {
+      const digest = digestOf(request);
+      const existing = await this.load(request.commandId);
+      if (!existing) {
+        const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
+        if (tomb) {
+          return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "commandId already expired; never remint an ID", { commandId: request.commandId }) };
+        }
+        return null;
+      }
+      return this.existingResponse(existing, digest, principal);
+    });
+  }
+
   async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<BrokerResponse> {
     // Serialized per run so the 512-command admission bound cannot race.
     return this.chain(`run:${principal.runId}`, async () => {
       const digest = digestOf(request);
       const existing = await this.load(request.commandId);
-      if (existing) {
-        if (existing.digest !== digest) {
-          return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: request.commandId }) };
-        }
-        if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
-          return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "command belongs to another run", { commandId: request.commandId }) };
-        }
-        // Same orphan hold as resolve(): after a restart a live record has no
-        // handle, so hold for reconciliation instead of replaying live state
-        // where a sweep could expire it into a fallback-safe receipt.
-        if (!TERMINAL.has(existing.state) && existing.state !== "unknown" && !this.handles.has(existing.commandId)) {
-          existing.state = "unknown";
-          await this.save(existing);
-        }
-        this.trackLive(existing);
-        return { status: 200, body: this.view(existing, 0, OFFLOAD_BOUNDS.readLimitBytes) };
-      }
+      if (existing) return this.existingResponse(existing, digest, principal);
       const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
       if (tomb) {
         return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "commandId already expired; never remint an ID", { commandId: request.commandId }) };

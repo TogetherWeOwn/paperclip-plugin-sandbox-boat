@@ -5,6 +5,7 @@ import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { commandDigest, offloadError, type OffloadIdentity } from "./offload-journal.js";
 import type { GuestController, GuestIdentity, OffloadRunContext } from "./offload-lifecycle.js";
+import { isCargoOffline } from "./offload/router.js";
 import type { OffloadCommand } from "./offload.js";
 
 export interface SshOffloadGuestDeps {
@@ -24,10 +25,13 @@ export interface SshOffloadGuestDeps {
   path?: string;
   /** Guest checkout root when the source plans a uv (uv.lock) install, else null. */
   uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
+  /** Validated leading rustup toolchain selector for cargo cache priming, else null. */
+  cargoToolchain?: (command: OffloadCommand) => string | null;
 }
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
  * No process-group-only execution is advertised as equivalent containment. */
+const FETCH_TIMEOUT_MS = 600_000;
 export class SshOffloadGuest implements GuestController {
   private readonly prepared = new Map<string, { sandboxId: string; identity: GuestIdentity }>();
   private readonly sessions = new Map<string, SshSession>();
@@ -40,12 +44,12 @@ export class SshOffloadGuest implements GuestController {
     return path.posix.join(this.deps.stateRoot ?? "/tmp", name);
   }
 
-  private async rpc<T>(sandboxId: string, action: string, input: Record<string, unknown> = {}): Promise<T> {
+  private async rpc<T>(sandboxId: string, action: string, input: Record<string, unknown> = {}, timeoutMs = 15_000): Promise<T> {
     const session = await this.deps.session(sandboxId);
     this.sessions.set(sandboxId, session);
     const result = await this.deps.ssh.runStream(session,
       buildRemoteCommand(`exec python3 -I -c ${shellQuote(OFFLOAD_SSH_SCRIPT)} ${shellQuote(action)}`),
-      { stdin: Readable.from([JSON.stringify(input)]), timeoutMs: 15_000, maxOutputBytes: 128 * 1024 });
+      { stdin: Readable.from([JSON.stringify(input)]), timeoutMs, maxOutputBytes: 128 * 1024 });
     // Guest diagnostics may contain source or environment bytes. Never reflect
     // them into public broker errors/logs and never interpret SSH 255 as no start.
     if (result.exitCode !== 0 || result.timedOut || result.signal) throw offloadError("OFFLOAD_GUEST_TRANSPORT_UNKNOWN");
@@ -96,6 +100,14 @@ export class SshOffloadGuest implements GuestController {
         guestPath = `${venvBin}:${guestPath}`;
       }
     }
+    // An --offline build cannot download missing crates: prime the guest cargo
+    // cache from the lockfile before the command's supervisor exists. Fixed
+    // argv only, agent input never reaches a command line; a failing fetch
+    // fails the prepare, so the command falls back locally instead of failing
+    // remotely. resolve() already kept private-registry sources local.
+    if ((command.tool ?? "cargo") === "cargo" && executable === "cargo" && isCargoOffline(command.argv)) {
+      await this.fetchLocked(sandboxId, cwd, guestPath, this.deps.cargoToolchain?.(command) ?? null);
+    }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
       program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
       cwd,
@@ -107,6 +119,13 @@ export class SshOffloadGuest implements GuestController {
     });
     this.prepared.set(identity.cgroupPath, { sandboxId, identity });
     return identity;
+  }
+  /** `cargo fetch --locked` in the guest cwd. The SSH fence is 10 minutes; the
+   * guest-side call gives up first, so a timeout surfaces as INELIGIBLE. */
+  private async fetchLocked(sandboxId: string, cwd: string, guestPath: string, toolchain: string | null): Promise<void> {
+    const result = await this.rpc<{ exitCode: number }>(sandboxId, "fetch",
+      { executable: "cargo", toolchain, cwd, path: guestPath }, FETCH_TIMEOUT_MS);
+    if (result.exitCode !== 0) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
   }
   async armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }> {
     return this.call(sandboxId, "arm", identity);
