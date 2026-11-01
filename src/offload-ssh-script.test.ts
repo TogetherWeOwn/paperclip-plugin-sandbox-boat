@@ -140,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix='boat-fetch-', dir=request['scratch']) a
     cargo = stub / 'cargo-stub'
     cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "' + str(stub / 'argv') + '"\n'
                      'echo "cwd:$PWD" > "' + str(stub / 'pwd') + '"\n'
+                     'echo "cargo_home:$CARGO_HOME" > "' + str(stub / 'cargohome') + '"\n'
                      'exit ' + str(request['exit']) + '\n')
     cargo.chmod(0o755)
     if 'homeConfig' in request:
@@ -151,14 +152,24 @@ with tempfile.TemporaryDirectory(prefix='boat-fetch-', dir=request['scratch']) a
         cargo_dir = pathlib.Path(canonical) / '.cargo'
         cargo_dir.mkdir()
         (cargo_dir / 'config.toml').write_text(request['cwdConfig'])
+    cargo_home = None
+    if 'cargoHomeConfig' in request or request.get('cargoHome'):
+        cargo_home = pathlib.Path(directory) / 'toolchain-cargo'
+        if 'cargoHomeConfig' in request:
+            cargo_home.mkdir(parents=True)
+            (cargo_home / 'config.toml').write_text(request['cargoHomeConfig'])
     try:
         fetch_input = {'executable': str(cargo), 'cwd': canonical,
             'path': str(stub) + ':/usr/bin:/bin'}
         if 'toolchain' in request:
             fetch_input['toolchain'] = request['toolchain']
+        if cargo_home is not None:
+            fetch_input['cargoHome'] = str(cargo_home)
         outcome = guest['rpc']('fetch', fetch_input)
         print(json.dumps({'result': outcome, 'cwd': canonical,
+            'cargoHome': str(cargo_home) if cargo_home is not None else None,
             'argv': (stub / 'argv').read_text() if (stub / 'argv').exists() else None,
+            'cargohome': (stub / 'cargohome').read_text() if (stub / 'cargohome').exists() else None,
             'pwd': (stub / 'pwd').read_text() if (stub / 'pwd').exists() else None}))
     except Exception as error:
         print(json.dumps({'error': type(error).__name__ + ': ' + str(error)}))
@@ -211,6 +222,19 @@ describe("guest cargo cache priming", () => {
     const clean = fetchFixture(0, undefined, { homeConfig: "[build]\njobs = 4\n" });
     expect(clean.result).toEqual({ exitCode: 0 });
     expect(clean.argv).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+  });
+
+  it("primes into the host-assigned CARGO_HOME and scans its config", () => {
+    const fetched = fetchFixture(0, undefined, { cargoHome: true });
+    expect(fetched).not.toHaveProperty("error");
+    expect(fetched.result).toEqual({ exitCode: 0 });
+    expect(fetched.cargohome).toBe(`cargo_home:${fetched.cargoHome}\n`);
+    // A credential provider planted in that CARGO_HOME refuses priming even
+    // when the template HOME config is clean.
+    const provider = '[registry]\nglobal-credential-providers = ["demo-provider"]\n';
+    const refused = fetchFixture(0, undefined, { cargoHomeConfig: provider });
+    expect(refused.result.exitCode).not.toBe(0);
+    expect(refused.argv).toBeNull();
   });
 
   it("refuses a hostile toolchain selector instead of running it", () => {

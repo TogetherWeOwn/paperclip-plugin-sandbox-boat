@@ -30,6 +30,8 @@ export interface BrokerPrincipal {
   cardId: string;
   repoId: string;
   profileId: string;
+  /** Host-resolved pool trust domain; the executor never reuses a VM across domains. */
+  trustDomainId?: string;
 }
 
 /** Read-like calls bind only company + run; the journal holds the rest. */
@@ -63,6 +65,8 @@ export interface BackendCommand {
   /** Package runner / test binary, e.g. npm, pytest. Absent means cargo. */
   runner?: string;
   executionWorkspaceId: string;
+  /** Host-resolved pool trust domain (see BrokerPrincipal). */
+  trustDomainId?: string;
   cwdRelative: string;
   argv: string[];
   env: Record<string, string>;
@@ -511,6 +515,9 @@ export class OffloadBroker {
             tool: request.tool ?? "cargo",
             runner: request.runner ?? "cargo",
             executionWorkspaceId: request.executionWorkspaceId,
+            // Fail closed if a caller built a principal without a domain: the
+            // workspace itself is the smallest safe domain.
+            trustDomainId: principal.trustDomainId ?? `workspace:${request.executionWorkspaceId}`,
             cwdRelative: request.cwdRelative,
             argv: request.argv,
             env: request.env,

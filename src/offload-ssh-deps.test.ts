@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
+import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import type { OffloadCommand } from "./offload.js";
 
 const tmpdirs: string[] = [];
@@ -77,6 +78,10 @@ describe("installDependencies", () => {
     expect(ssh.runStream).toHaveBeenCalledTimes(2); // marker check + install
     expect(calls[1]).toContain("pip");
     expect(calls[1]).toContain("--require-hashes");
+    // A pip user-site fallback must land where the command (fresh HOME) reads
+    // it: the per-VM PYTHONUSERBASE, never the SSH session's home.
+    expect(calls[1]).toContain("PYTHONUSERBASE=");
+    expect(calls[1]).toContain(guestPythonUserBase("/tmp/boat-test", "vm-1"));
     const before = ssh.runStream.mock.calls.length;
     await sync.installDependencies("vm-1", py, root, "/guest/work");
     expect(ssh.runStream.mock.calls.length).toBe(before); // in-memory cache

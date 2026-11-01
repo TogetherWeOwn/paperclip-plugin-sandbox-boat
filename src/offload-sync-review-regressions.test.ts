@@ -23,7 +23,7 @@ describe("sync pool reclamation review regressions", () => {
     expect(await s.execute(command("other", identity))).toMatchObject({ status: "completed", warm: "cold" });
     const replacement = s.starts[1]!.sandboxId;
     expect(replacement).not.toBe(old);
-    expect(s.boat.boxes.get(old)?.state).toBe("archived");
+    expect(s.boat.boxes.has(old)).toBe(false); // retired VMs are deleted, not left archived
     expect(s.boat.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([old]);
     expect(s.boat.callsOf("resume")).toHaveLength(0);
     expect((await savedPool()).vms.map((vm) => vm.sandboxId)).toEqual([replacement]);

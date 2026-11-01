@@ -20,6 +20,12 @@ boat-offload-cargo --json -- test --locked           # run; result envelope on s
 
 Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
 
+## Pool isolation and mirror verification
+
+A pool VM is only ever reused by the execution workspace that first claimed it: the host resolves each submit's trust domain from its (host-fetched) execution workspace, and the pool compatibility key includes it, so code from one workspace — for example an untrusted PR branch — never runs on a VM another workspace later reuses warm or resumed. Commands without a resolvable workspace fail closed to per-workspace isolation in the executor. Repos listed in `offloadEphemeralRepos` go further: every command creates a fresh VM and deletes it at the provider after collect, and an incompatible VM retired from the pool is likewise deleted rather than left as a stopped disk. Each guest command runs with a root-owned-only `PATH` (`/usr/local/bin:/usr/bin:/bin`, plus a uv venv bin when applicable) and a fresh per-command `HOME`, so guest templates must install toolchains under root-owned paths and home-directory state never carries between commands. Toolchain caches (`CARGO_HOME`, and `PYTHONUSERBASE` for python commands) live outside `HOME` in a per-VM directory under the state root: cargo cache priming and pip user-site installs write there and commands read from there, so warm-VM caches survive across commands, but the tree is never on `PATH` and never leaves the VM's trust domain.
+
+The delta push does not trust the guest-side mirror marker alone: files the delta would skip are hashed on the guest against the host manifest on every push, and any missing or differing file is resent before the command runs, so a tampered mirror (including a poisoned lockfile) is repaired instead of executed or staged back.
+
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
 Rust offload above extends to long Node and Python commands on two more server

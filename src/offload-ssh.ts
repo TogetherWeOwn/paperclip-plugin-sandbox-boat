@@ -5,6 +5,7 @@ import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { commandDigest, offloadError, type OffloadIdentity } from "./offload-journal.js";
 import type { GuestController, GuestIdentity, OffloadRunContext } from "./offload-lifecycle.js";
+import { guestCargoHome, guestCommandHome, guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { isCargoOffline } from "./offload/router.js";
 import type { OffloadCommand } from "./offload.js";
 
@@ -77,7 +78,11 @@ export class SshOffloadGuest implements GuestController {
     const cwd = await this.deps.workspace(sandboxId, command);
     let executable = command.runner ?? command.executable ?? this.deps.executable ?? "cargo";
     let preparedEnv: Record<string, string> = { ...(this.deps.profileEnv?.(command) ?? {}), ...(command.env ?? {}) };
-    let guestPath = this.deps.path ?? "/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin";
+    // Root-owned directories only: a home-dir entry would let one command's
+    // guest code plant a trojan toolchain (e.g. ~/.cargo/bin/cargo) that a
+    // later command on the same warm VM then executes. Guest templates must
+    // install toolchains under root-owned paths.
+    let guestPath = this.deps.path ?? "/usr/local/bin:/usr/bin:/bin";
     // A uv (uv.lock) install lands in a checkout-local .venv that the guest
     // never activates: run the interpreter from the venv and activate it for
     // child processes, so console scripts and bare python subprocesses cannot
@@ -100,13 +105,25 @@ export class SshOffloadGuest implements GuestController {
         guestPath = `${venvBin}:${guestPath}`;
       }
     }
+    // Fresh per-command HOME: shell hooks or wrapper binaries planted under a
+    // persistent home by one command must never be seen by the next command
+    // on a reused VM. Toolchain caches live outside HOME in the per-VM
+    // toolchain root instead, so a warm VM keeps its crate and pip user-site
+    // caches (including what priming fetched) without any of it reaching
+    // PATH or another trust domain. The guest supervisor creates exactly
+    // these directories under the state root.
+    const stateRoot = this.deps.stateRoot ?? "/tmp";
+    const cargoHome = guestCargoHome(stateRoot, sandboxId);
+    preparedEnv = { ...preparedEnv, HOME: guestCommandHome(stateRoot, command), CARGO_HOME: cargoHome,
+      ...((command.tool ?? "cargo") === "python"
+        ? { PYTHONUSERBASE: guestPythonUserBase(stateRoot, sandboxId) } : {}) };
     // An --offline build cannot download missing crates: prime the guest cargo
     // cache from the lockfile before the command's supervisor exists. Fixed
     // argv only, agent input never reaches a command line; a failing fetch
     // fails the prepare, so the command falls back locally instead of failing
     // remotely. resolve() already kept private-registry sources local.
     if ((command.tool ?? "cargo") === "cargo" && executable === "cargo" && isCargoOffline(command.argv)) {
-      await this.fetchLocked(sandboxId, cwd, guestPath, this.deps.cargoToolchain?.(command) ?? null);
+      await this.fetchLocked(sandboxId, cwd, guestPath, this.deps.cargoToolchain?.(command) ?? null, cargoHome);
     }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
       program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
@@ -122,9 +139,9 @@ export class SshOffloadGuest implements GuestController {
   }
   /** `cargo fetch --locked` in the guest cwd. The SSH fence is 10 minutes; the
    * guest-side call gives up first, so a timeout surfaces as INELIGIBLE. */
-  private async fetchLocked(sandboxId: string, cwd: string, guestPath: string, toolchain: string | null): Promise<void> {
+  private async fetchLocked(sandboxId: string, cwd: string, guestPath: string, toolchain: string | null, cargoHome: string): Promise<void> {
     const result = await this.rpc<{ exitCode: number }>(sandboxId, "fetch",
-      { executable: "cargo", toolchain, cwd, path: guestPath }, FETCH_TIMEOUT_MS);
+      { executable: "cargo", toolchain, cwd, path: guestPath, cargoHome }, FETCH_TIMEOUT_MS);
     if (result.exitCode !== 0) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
   }
   async armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }> {

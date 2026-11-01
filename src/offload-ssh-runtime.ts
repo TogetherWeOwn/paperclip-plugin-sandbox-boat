@@ -365,6 +365,7 @@ export class SshOffloadRuntime {
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
       existing.executor.setTemplateSourceSandboxId(binding.config.templateSourceSandboxId ?? null);
+      existing.executor.setEphemeralRepos(normalizeOffloadSettings(settings).offloadEphemeralRepos);
       return existing.executor;
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
@@ -415,6 +416,7 @@ export class SshOffloadRuntime {
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
         offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
+        ephemeralRepos: normalizeOffloadSettings(settings).offloadEphemeralRepos,
         templateSnapshot: binding.config.templateSnapshot ?? null,
         templateSourceSandboxId: binding.config.templateSourceSandboxId ?? null },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),

@@ -158,19 +158,23 @@ describe("compatible pool scheduling", () => {
     expect(s.boat.callsOf("resume")).toHaveLength(1);
   });
 
-  it("refuses a busy incompatible pool rather than borrowing its active VM", async () => {
+  it("queues behind a busy incompatible pool rather than borrowing its active VM", async () => {
     const gate = s.hold("exec:first");
     const first = s.execute(command("first"));
     await until(() => s.trace.includes("exec:first"));
     const other = command("other", { trustDomainId: "untrusted-fork", executionWorkspaceId: "workspace-b" });
-    const refused = await s.execute(other);
-    expect(refused).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true });
+    const queued = s.execute(other);
+    for (let n = 0; n < 20; n += 1) await flush();
+    // The waiter never starts on (or stops) the other workspace's active VM.
+    expect(s.starts.map((start) => start.commandId)).toEqual(["first"]);
     expect(s.guest.alive("first")).toBe(true);
     expect(s.boat.callsOf("stop")).toHaveLength(0);
     gate.resolve();
     await first;
-    expect(await s.execute(other)).toEqual(refused);
-    expect(s.starts.map((start) => start.commandId)).toEqual(["first"]);
+    // After release the waiter retires that VM and runs on a fresh one.
+    expect(await queued).toMatchObject({ status: "completed", warm: "cold" });
+    expect(s.starts.map((start) => start.commandId)).toEqual(["first", "other"]);
+    expect(s.starts[1]!.sandboxId).not.toBe(s.starts[0]!.sandboxId);
   });
 
   it("lets an eligible waiter pass a head blocked on another workspace", async () => {

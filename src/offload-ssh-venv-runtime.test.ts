@@ -104,7 +104,7 @@ describe("runtime uv venv wiring", () => {
       await pool.guest.prepare("vm-1", { ...cmd, commandId: cmd.commandId, companyId, runId, cardId: "", repoId: cmd.repoId, profileId: cmd.profileId, tool: "python", runner: "python", argv: cmd.argv, cwdRelative: ".", env: {} });
       const input = seen[0] as Record<string, unknown>;
       expect(input.executable).toBe("python");
-      expect(input.env).toEqual({});
+      expect(Object.keys(input.env as Record<string, string>).sort()).toEqual(["CARGO_HOME", "HOME", "PYTHONUSERBASE"]);
       expect(String(input.path)).not.toContain(".venv/bin");
     } finally {
       await runtime.shutdown();

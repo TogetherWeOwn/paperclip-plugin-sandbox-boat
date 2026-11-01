@@ -44,6 +44,7 @@ Heavy-command offload is configured per company in the plugin config, not on the
 | `offloadExecutorEnabled` | false | Opt in to command-level offload through a lifecycle executor. Does not enable the Cargo shim or change whole-run leases. |
 | `offloadGuestTransportEnabled` | false | Enable the stock Linux SSH guest transport for explicitly approved public, secret-free workspaces. Requires `offloadExecutorEnabled`, native realization metadata and verified delegated cgroup v2. |
 | `offloadAllowedRepos` | `[]` | Exact canonical repository IDs approved for offload (`repo:https://github.com/example/public`). Empty denies every repository. |
+| `offloadEphemeralRepos` | `[]` | Exact canonical repository IDs under the ephemeral VM policy: one freshly created VM per command, deleted at the provider after collect, never warmed or resumed. Must also be in `offloadAllowedRepos`. |
 | `offloadCgroupParent` | none | Delegated cgroup v2 parent on the guest, below `/sys/fs/cgroup/`. See [Delegated guest template](operations.md#delegated-guest-template-required-for-remote-offload). |
 | `offloadArtifactRoot` | none | Operator-owned persistent host directory for frozen snapshots and staged returns. Required for stock offload. |
 | `offloadProfiles` | `["rust-public-1"]` | Server profiles admitted for remote dispatch. Add `node-public-1` and/or `python-public-1`; see [Node and Python offload](offload.md#node-and-python-offload-binboat-offload-node-binboat-offload-python). |
