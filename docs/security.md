@@ -165,8 +165,9 @@ nominated path lies inside an operator-listed `offloadLocalSourceRoots` entry
 and the checkout's own on-disk `remote.origin.url` (parsed from git config,
 never by running git) canonicalizes to the same repo id as the row's
 `repoUrl`, which the `offloadAllowedRepos` check then gates as usual. Both
-facts are re-proven on every executor resolve, not only at bind time, and the
-Boat secret is resolved only after they pass. This confines a row-rewriting
+facts are re-proven on every executor resolve and again before each upload
+snapshots the source, not only at bind time, and the Boat secret is resolved
+only after they pass. This confines a row-rewriting
 agent to directories the operator already designated whose own git identity
 matches an allowlisted repo; it does not make the contents of such a checkout
 trusted — the tracked-file sync and secret-scan gates are separate.
