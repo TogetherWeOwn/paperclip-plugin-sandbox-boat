@@ -104,6 +104,38 @@ With the `~/.boatignore` rule in place, the stop snapshot of such a VM does not 
 
 What this does not cover: per-minute snapshots taken before a VM first got the rule (a VM set up by 0.1.0) can hold the JWT until boat drops them, usually within a day, or the VM is deleted. A VM that boat's auto-stop stops, or one the plugin cannot reach, is not scrubbed by that stop; with the rule its snapshots have nothing to scrub, but boat keeps its machine and disk for 10 minutes, so a resume in that time finds the file again until the next scrub. Inside a running VM the agent can read the file, as it can read its own env. The real fix belongs in Paperclip: give sandbox MCP servers a bridge-scoped, short-lived token instead of the host run JWT.
 
+## Sync-out receiver budgets
+
+Sync-out is the one place guest-produced bytes land on the host: the guest can
+replace its sender, so the host tar receiver treats the whole stream as
+hostile and bounds it before anything is written:
+
+* **Member types**: only regular files, directories and symlinks (plus GNU
+  long-name/long-link records up to 256 KiB). The type allowlist is checked
+  before tarfile processes the member, so a GNU sparse (`S`), PAX, hardlink,
+  device or FIFO member is refused at its first header — extended sparse
+  headers are never buffered.
+* **Bytes**: one archive's files may total at most `syncOutMaxBytes`
+  (default 8 GiB, hard bound 32 GiB). A member that would cross the budget is
+  refused before its file is opened.
+* **Entries**: at most `syncOutMaxFiles` members (default 200000, hard bound
+  1000000), counting files, directories, symlinks and dropped members alike;
+  parent directories a member implies count against the same 100000-directory
+  budget as explicit ones, and no member path may exceed 256 components.
+* **Disk reserve**: before each member, `statvfs` must show that writing it
+  still leaves `syncOutDiskReserveBytes` free (default 10 GiB) and at least
+  5% of the filesystem, plus 8192 free inodes. These defaults are sized for a
+  legitimately large workspace sync — build output included — while making it
+  impossible for one archive to fill the filesystem Paperclip itself runs on.
+* A refusal (or any other receive failure) removes the partially received
+  tree, so refused bytes never stay on the host. Directory modes from the
+  guest are restored with owner `rwx` forced on, so a synced tree can always
+  be deleted again.
+* The host helper that parses these streams runs as `python3 -I` with a fixed
+  working directory (`/`) and a minimal environment (`PATH`, `LANG`): no
+  `PYTHON*` variables, no cwd or user-site imports, and none of the plugin
+  worker's own environment.
+
 ## Native task network-policy admission (not network isolation)
 
 Boat VMs have outbound internet and a guest user with passwordless sudo. This

@@ -375,6 +375,9 @@ export interface StreamProcessOptions {
   stdout?: Writable;
   maxOutputBytes?: number;
   timeoutMs: number;
+  /** Fixed working directory and environment instead of inheriting the worker's. */
+  cwd?: string;
+  env?: Record<string, string>;
 }
 
 /** Backpressured binary IO, bounded control output, and cleanup on either pipe's failure. */
@@ -383,7 +386,11 @@ export async function runStreamProcess(command: string, args: string[], options:
   if (!Number.isSafeInteger(cap) || cap < 0 || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error("Invalid streaming process limits.");
   }
-  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(command, args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    ...(options.cwd ? { cwd: options.cwd } : {}),
+    ...(options.env ? { env: options.env } : {}),
+  });
   let failure: Error | undefined;
   let timedOut = false;
   let closed = false;

@@ -2156,6 +2156,11 @@ export class BoatVmManager {
       const remoteRoot = str(params.lease.metadata?.remoteCwd) ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
       const result = await syncFiles({
         ssh: this.ssh, session, timeoutMs: config.timeoutMs, remoteRoot,
+        syncOutLimits: {
+          maxBytes: config.syncOutMaxBytes,
+          maxFiles: config.syncOutMaxFiles,
+          diskReserveBytes: config.syncOutDiskReserveBytes,
+        },
         onDirectoryReplaced: async (target) => {
           if (remoteRoot === target || remoteRoot.startsWith(`${target}/`)) {
             // A directory mapping destroys the previous workspace, including
