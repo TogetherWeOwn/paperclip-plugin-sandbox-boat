@@ -203,20 +203,37 @@ const URL_LIKE_RES: readonly RegExp[] = [
 ];
 
 /**
- * `user:password@` with or without a scheme: a `@` whose whitespace-delimited
- * token already holds a `:`. One pass, so a password may itself hold `/` or
- * `:` (a scheme-less `default:p/a:ss@host` DSN) without the quadratic retry
- * a `:[^\s@]*@` pattern makes on a long colon run with no `@`.
+ * `user:password@` with or without a scheme. One pass, so a password may
+ * itself hold `/` or `:` (a scheme-less `default:p/a:ss@host` DSN) without
+ * the quadratic retry a `:[^\s@]*@` pattern makes on a long colon run with
+ * no `@`. A `:` counts only when it is not a scheme or PATH separator
+ * (followed by `/`), and it arms a later `@` only in its own `/`-segment —
+ * or across segments when it sits in the token's first segment, where a
+ * scheme-less DSN's password can carry slashes (`default:Ab/Cd@host`). That
+ * keeps colon-joined paths (`/opt/python@3.11/bin` in a PATH) and `@` or `:`
+ * in separate URL path segments from reading as userinfo, while a
+ * `user:password@` tucked into one path segment still counts.
  */
 function hasSchemeLessUserinfo(text: string): boolean {
-  let colonInToken = false;
+  let colonInSegment = false;
+  let colonInFirstSegment = false;
+  let seenSlash = false;
   let previous = 0;
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
-    if (code === 32 || code === 9 || code === 10 || code === 13) colonInToken = false;
-    else if (code === 58) colonInToken = true;
+    if (code === 32 || code === 9 || code === 10 || code === 13) {
+      colonInSegment = false;
+      colonInFirstSegment = false;
+      seenSlash = false;
+    } else if (code === 47) {
+      seenSlash = true;
+      colonInSegment = false;
+    } else if (code === 58 && text.charCodeAt(i + 1) !== 47) {
+      colonInSegment = true;
+      if (!seenSlash) colonInFirstSegment = true;
+    }
     // An `@` that opens a path segment (`/@vendor/...` in a PATH) is no userinfo.
-    else if (code === 64 && colonInToken && previous !== 47) return true;
+    else if (code === 64 && (colonInSegment || colonInFirstSegment) && previous !== 47) return true;
     previous = code;
   }
   return false;
@@ -911,7 +928,8 @@ export function routeModelProxyThroughTunnel(
     let url: URL;
     try { url = new URL(value); } catch { return [name, value]; }
     const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
-    if (url.hostname !== tunnel.tunnelTargetHost || port !== tunnel.tunnelTargetPort) return [name, value];
+    // URL parsing lowercases a DNS hostname; the configured target may not be.
+    if (url.hostname !== tunnel.tunnelTargetHost.toLowerCase() || port !== tunnel.tunnelTargetPort) return [name, value];
     url.hostname = "127.0.0.1";
     url.port = String(tunnel.tunnelRemotePort);
     const rewritten = url.toString();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { routeModelProxyThroughTunnel } from "./env-policy.js";
+import { DEFAULT_ENV_ALLOWLIST, filterRunEnv, routeModelProxyThroughTunnel } from "./env-policy.js";
 
 // An agent's own adapter env (e.g. ANTHROPIC_BASE_URL=http://cliproxy:8317,
 // the host-side docker name) overrides the environment's tunnel address, and
@@ -21,6 +21,20 @@ describe("routeModelProxyThroughTunnel", () => {
     expect(routeModelProxyThroughTunnel(entries, tunnel)).toEqual(entries);
     expect(routeModelProxyThroughTunnel([["ANTHROPIC_BASE_URL", "http://cliproxy:9999"]], tunnel))
       .toEqual([["ANTHROPIC_BASE_URL", "http://cliproxy:9999"]]);
+  });
+  it("rewrites when the configured target host is uppercase (DNS names are case-insensitive)", () => {
+    expect(routeModelProxyThroughTunnel([["ANTHROPIC_BASE_URL", "http://cliproxy:8317"]], { ...tunnel, tunnelTargetHost: "CLIProxy" }))
+      .toEqual([["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"]]);
+  });
+  it("full flow: an uppercase target that vouches for the token also gets its base URL rewritten", () => {
+    const upper = { ...tunnel, tunnelTargetHost: "CLIProxy" };
+    const { kept } = filterRunEnv(
+      { ANTHROPIC_BASE_URL: "http://cliproxy:8317", ANTHROPIC_AUTH_TOKEN: "sk-dedicated" },
+      DEFAULT_ENV_ALLOWLIST,
+      upper,
+    );
+    expect(kept).toContainEqual(["ANTHROPIC_AUTH_TOKEN", "sk-dedicated"]);
+    expect(routeModelProxyThroughTunnel(kept, upper)).toContainEqual(["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"]);
   });
   it("does nothing when the tunnel is off or the value is not a URL", () => {
     expect(routeModelProxyThroughTunnel([["ANTHROPIC_BASE_URL", "http://cliproxy:8317"]], { ...tunnel, cliproxyTunnel: false }))
