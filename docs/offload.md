@@ -1,6 +1,6 @@
 # Heavy-command offload shims
 
-The agent and model stay on the Paperclip host; only an eligible heavy command and a frozen, secret-free source snapshot go to a pool VM. Everything is **default OFF**. To turn it on, see [Enabling the executor bridge](operations.md#enabling-the-executor-bridge). Internals: [Offload internals](design/offload-internals.md).
+The agent and model stay on the Paperclip host; only an eligible heavy command and a frozen, secret-free source snapshot go to a pool VM. Everything is **default OFF**. To turn it on, see [Enabling the executor bridge](operations.md#enabling-the-executor-bridge). Internals: [Offload internals](design/offload-internals.md). For local runs, the snapshot source is admitted only under an operator-listed `offloadLocalSourceRoots` entry with a matching on-disk git origin — see [Local-run offload source authority](security.md#local-run-offload-source-authority).
 
 ## Cargo offload shim (`bin/boat-offload-cargo`)
 

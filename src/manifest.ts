@@ -113,7 +113,11 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       offloadLocalRunsEnabled: {
         type: "boolean", default: false,
-        description: "Bind otherwise-local runs for heavy-command offload. On each agent.run.started event the plugin reads the run's issue and its execution workspace from Paperclip and records that local source as the run's offload binding. Off by default.",
+        description: "Bind otherwise-local runs for heavy-command offload. On each agent.run.started event the plugin reads the run's issue and its execution workspace from Paperclip. The workspace row only nominates a source: the bind stands only when the source sits under offloadLocalSourceRoots and the checkout's own origin matches its repo URL, re-checked on every resolve. Off by default.",
+      },
+      offloadLocalSourceRoots: {
+        type: "array", items: { type: "string" }, default: [],
+        description: "Operator-owned absolute host directories a local-run offload source must live under (for example the managed workspaces directory). Required with offloadLocalRunsEnabled: empty refuses every local-run bind.",
       },
       offloadLocalEnvironmentId: {
         type: "string",

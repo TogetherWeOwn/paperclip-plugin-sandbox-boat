@@ -155,6 +155,22 @@ Rollback must preserve unsupported-policy refusal: do not remove a requested gra
 or resume through an unrestricted older artifact. Full isolation and live
 forbidden/approved-destination before/after measurements remain unverified.
 
+## Local-run offload source authority
+
+A local run's execution-workspace row (`cwd`, `repoUrl`) is writable by the
+agent that owns the run, so the plugin never treats it as authority for which
+host directory offload may upload. The row only nominates a candidate: a
+local-run binding exists, and keeps dispatching, only while `realpath` of the
+nominated path lies inside an operator-listed `offloadLocalSourceRoots` entry
+and the checkout's own on-disk `remote.origin.url` (parsed from git config,
+never by running git) canonicalizes to the same repo id as the row's
+`repoUrl`, which the `offloadAllowedRepos` check then gates as usual. Both
+facts are re-proven on every executor resolve, not only at bind time, and the
+Boat secret is resolved only after they pass. This confines a row-rewriting
+agent to directories the operator already designated whose own git identity
+matches an allowlisted repo; it does not make the contents of such a checkout
+trusted — the tracked-file sync and secret-scan gates are separate.
+
 ## boat account settings
 
 These are the settings the plugin expects, with the docs (docs.boat.dev) that back them. Check yours with `boat env info <env>`, `boat data-retention status` and `boat limits`. The AI-proxy and auto-refill switches need an admin key or the dashboard to read.

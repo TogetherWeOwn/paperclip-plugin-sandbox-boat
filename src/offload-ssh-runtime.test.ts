@@ -118,6 +118,23 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), settings)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("re-validates a local-run binding's roots and on-disk origin on every resolve", async () => {
+    await mkdir(path.join(source, ".git"));
+    const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    await origin("https://github.com/example/public");
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    expect(await runtime.resolve(command(), rooted)).not.toBe(null);
+    await origin("https://github.com/example/private");
+    expect(await runtime.resolve(command(), rooted)).toBe(null);
+    await origin("https://github.com/example/public");
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
       expect(await runtime.resolve(command(), { ...config, [setting]: value })).toBe(null);

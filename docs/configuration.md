@@ -49,7 +49,8 @@ Heavy-command offload is configured per company in the plugin config, not on the
 | `offloadProfiles` | `["rust-public-1"]` | Server profiles admitted for remote dispatch. Add `node-public-1` and/or `python-public-1`; see [Node and Python offload](offload.md#node-and-python-offload-binboat-offload-node-binboat-offload-python). |
 | `offloadMinExpectedSeconds` | 120 | Node/Python commands go remote only when their recorded median meets this. Rust is not gated. |
 | `offloadMonthlyVmHourCap` | 0 (off) | Monthly cap on tracked offload VM-hours; see [Offload VM-hour cap](operations.md#offload-vm-hour-cap). |
-| `offloadLocalRunsEnabled` | false | Bind otherwise-local runs for offload; see [local runs](operations.md#enabling-the-executor-bridge). |
+| `offloadLocalRunsEnabled` | false | Bind otherwise-local runs for offload; see [local runs](operations.md#enabling-the-executor-bridge). The workspace row only nominates a source: roots and on-disk origin decide. |
+| `offloadLocalSourceRoots` | `[]` | Operator-owned absolute host directories a local-run source must live under (for example the managed workspaces directory). Required with `offloadLocalRunsEnabled`: empty refuses every local-run bind. |
 | `offloadLocalEnvironmentId` | none | Boat environment whose pool settings local-run offload uses. Required with `offloadLocalRunsEnabled`. |
 | `offloadLocalApiKeySecretRef` | none | Paperclip secret holding the scoped boat key for local-run offload. Resolved per binding, never stored. |
 | `offloadLocalDriverConfig` | `{}` | Driver settings for local-run offload pools (`maxOffloadVms`, `maxActive`, `offloadIdleStopSeconds`, `size`). `apiKey` is ignored here. |

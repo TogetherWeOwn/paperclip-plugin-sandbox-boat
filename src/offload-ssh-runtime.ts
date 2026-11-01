@@ -21,9 +21,12 @@ import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
 import { DEFAULT_SYNC_EXCLUDES, snapshotHasDirectory } from "./offload-sync.js";
+import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
-  config: BoatDriverConfig; environmentId: string; seenAt: number };
+  config: BoatDriverConfig; environmentId: string; seenAt: number;
+  /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
+  localRun: boolean };
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -285,6 +288,12 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
+  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
+  hasRun(companyId: string, runId: string): boolean {
+    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
+    return false;
+  }
+
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
   forgetRun(companyId: string, runId: string): string[] {
     const dropped: string[] = [];
@@ -305,7 +314,7 @@ export class SshOffloadRuntime {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
-      config, environmentId: params.environmentId, seenAt: Date.now(),
+      config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
     });
   }
 
@@ -316,6 +325,21 @@ export class SshOffloadRuntime {
       || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
     const binding = this.bindings.get(key(command.companyId, command.runId, command.executionWorkspaceId));
     if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
+    if (binding.localRun) {
+      // The workspace row behind a local-run binding is agent-mutable, so the
+      // operator-owned facts are re-proven on every resolve, not only at bind:
+      // the source still sits under a configured root (and was not swapped for
+      // a symlink), and the checkout's own origin still names the bound repo.
+      const roots = localSourceRoots(settings);
+      if (roots.length === 0) return null;
+      const canonical = await realpath(binding.source).catch(() => null);
+      if (!canonical || canonical !== binding.source) return null;
+      const canonicalRoots = (await Promise.all(roots.map((root) => realpath(root).catch(() => null))))
+        .filter((root): root is string => root !== null);
+      if (!withinRoots(canonical, canonicalRoots)) return null;
+      const onDiskRepoUrl = await readGitOriginUrl(canonical).catch(() => null);
+      if (!onDiskRepoUrl || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) !== binding.repoId) return null;
+    }
     const profile = profileForId(command.profileId);
     if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
     const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
