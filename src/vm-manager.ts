@@ -2199,10 +2199,12 @@ export class BoatVmManager {
         metadata: { provider: "boat", sandboxId, error: "BOAT_ACP_PROCESS_SESSION_REFUSED" },
       };
     }
-    // Default-deny env (env-policy.ts): only allowlisted names reach the VM.
-    const { kept: allowedEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist));
+    // Default-deny env (env-policy.ts): only allowlisted names reach the VM,
+    // and the model and GitHub credentials only under their explicit config
+    // policy (managedGithub, the tunnel, modelProxyKeyFingerprint).
+    const { kept: allowedEntries, dropped } = filterRunEnv(params.env, effectiveEnvAllowlist(config.envAllowlist), config);
     // A host-side proxy address in the agent's own env must use the tunnel.
-    const envEntries = routeModelProxyThroughTunnel(allowedEntries, config);
+    let envEntries = routeModelProxyThroughTunnel(allowedEntries, config);
     assertValidEnvKeys(envEntries);
     if (dropped.length > 0) this.logEnvDrops(sandboxId, dropped);
     const timeoutMs = params.timeoutMs ?? config.timeoutMs;
@@ -2250,6 +2252,17 @@ export class BoatVmManager {
       }
       await this.maybeExtend(config, sandboxId);
 
+      // The filter approved the model token for a tunnel the config asks
+      // for; if this session's tunnel could not be opened (ssh falls back
+      // to a master without forwarding), withhold the token before staging.
+      const withholdModelTokenIfTunnelDown = (): void => {
+        if (!config.cliproxyTunnel || session.tunnel === "up") return;
+        if (!envEntries.some(([name]) => name === "ANTHROPIC_AUTH_TOKEN")) return;
+        envEntries = envEntries.filter(([name]) => name !== "ANTHROPIC_AUTH_TOKEN");
+        this.logEnvDrops(sandboxId, [{ name: "ANTHROPIC_AUTH_TOKEN", reason: "model_credential_off_tunnel" }]);
+      };
+      withholdModelTokenIfTunnelDown();
+
       // Env values never ride argv: they go over the ssh stdin pipe into a
       // 0600 file (exe-dev rule). The file sits in a fresh 0700 directory
       // under /tmp, outside the git checkout and outside every boat snapshot,
@@ -2265,6 +2278,7 @@ export class BoatVmManager {
           // The VM was stopped under us (auto-stop or sweep). Nothing ran yet,
           // so resume and stage again once, in a new directory.
           session = await this.liveSession(config, params.companyId, sandboxId);
+          withholdModelTokenIfTunnelDown();
           remoteEnv = newRemoteEnvStage();
           staged = await this.ssh.run(session, stageRemoteEnvCommand(remoteEnv), {
             stdin: buildRemoteEnvFileContents(envEntries),

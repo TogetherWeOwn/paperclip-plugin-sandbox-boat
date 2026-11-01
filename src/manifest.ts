@@ -303,6 +303,19 @@ const manifest: PaperclipPluginManifestV1 = {
             description: "Port of the model proxy, as seen from the plugin worker.",
             ...advanced("Model proxy tunnel"),
           },
+          modelProxyKeyFingerprint: {
+            type: "string",
+            description:
+              "SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. ANTHROPIC_AUTH_TOKEN reaches the VM only when it is that key and ANTHROPIC_BASE_URL is the tunnel address; any other value (for example a managed AI-connection pool credential) is dropped. Unset: an on-tunnel token is delivered unverified and validation warns; an off-tunnel token is dropped either way.",
+            ...advanced("Model proxy tunnel"),
+          },
+          managedGithub: {
+            type: "boolean",
+            default: false,
+            description:
+              "Deliver Paperclip's managed-GitHub capability and its git/gh launcher shells to the VM, so the agent can push. Off by default: any process in the VM can exchange the capability for a GitHub credential with the run's grants while the run is live. Leave off for public repos and PR branches.",
+            ...advanced("VM"),
+          },
           envAllowlist: {
             type: "array",
             items: { type: "string" },
