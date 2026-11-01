@@ -153,9 +153,12 @@ default VM:
    `cargo fetch --locked` (plus the profile's validated `+toolchain` selector
    when the invocation carries one) before the command's supervisor exists; a
    failing fetch fails the prepare and the command runs locally instead. The
-   fetch never invokes registry credential providers — the guest pins the
-   provider list empty with a CLI `--config` override — and runs in its own
-   session so a hung fetch is group-killed at its fence. A source tree whose
+   fetch never invokes registry credential providers: cargo merges
+   array-valued config, so a CLI override cannot clear an inherited
+   provider, and the guest instead refuses to prime at all when any config
+   cargo would load names one (the prepare then fails and the command runs
+   locally). It also runs in its own session so a hung fetch is group-killed
+   at its fence. A source tree whose
    cargo config points at a private registry, a source replacement, or stored
    credentials stays local too, because the guest fetch could not satisfy it.
 

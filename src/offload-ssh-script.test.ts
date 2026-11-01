@@ -124,7 +124,7 @@ describe("guest state reads racing an atomic save", () => {
 // The stub's behavior is baked into its text: the action passes only PATH and
 // HOME to the child, so nothing reaches it through the environment.
 const FETCH_FIXTURE = String.raw`
-import contextlib, io, json, pathlib, sys, tempfile
+import contextlib, io, json, os, pathlib, sys, tempfile
 request = json.load(sys.stdin)
 # 'boot' at exec time: the module level runs rpc(sys.argv[1], {}) on import,
 # and only boot tolerates empty data. The fetch call below is explicit.
@@ -142,6 +142,15 @@ with tempfile.TemporaryDirectory(prefix='boat-fetch-', dir=request['scratch']) a
                      'echo "cwd:$PWD" > "' + str(stub / 'pwd') + '"\n'
                      'exit ' + str(request['exit']) + '\n')
     cargo.chmod(0o755)
+    if 'homeConfig' in request:
+        home = pathlib.Path(directory) / 'home'
+        (home / '.cargo').mkdir(parents=True)
+        (home / '.cargo' / 'config.toml').write_text(request['homeConfig'])
+        os.environ['HOME'] = str(home)
+    if 'cwdConfig' in request:
+        cargo_dir = pathlib.Path(canonical) / '.cargo'
+        cargo_dir.mkdir()
+        (cargo_dir / 'config.toml').write_text(request['cwdConfig'])
     try:
         fetch_input = {'executable': str(cargo), 'cwd': canonical,
             'path': str(stub) + ':/usr/bin:/bin'}
@@ -155,9 +164,9 @@ with tempfile.TemporaryDirectory(prefix='boat-fetch-', dir=request['scratch']) a
         print(json.dumps({'error': type(error).__name__ + ': ' + str(error)}))
 `;
 
-function fetchFixture(exit: number, toolchain?: unknown) {
+function fetchFixture(exit: number, toolchain?: unknown, extra: Record<string, unknown> = {}) {
   return JSON.parse(execFileSync("python3", ["-I", "-c", FETCH_FIXTURE], {
-    input: JSON.stringify({ program: OFFLOAD_SSH_SCRIPT, exit, toolchain,
+    input: JSON.stringify({ program: OFFLOAD_SSH_SCRIPT, exit, toolchain, ...extra,
       scratch: process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir() }),
     encoding: "utf8", timeout: 15_000,
   }));
@@ -185,6 +194,23 @@ describe("guest cargo cache priming", () => {
     expect(fetched.result).toEqual({ exitCode: 0 });
     expect(fetched.argv).toBe("+stable\nfetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
     expect(fetched.pwd).toBe(`cwd:${fetched.cwd}\n`);
+  });
+
+  it("refuses to prime when a guest cargo config names a credential provider", () => {
+    // Cargo merges array-valued config, so no CLI override can clear an
+    // inherited provider; the fetch must not run at all (argv never written),
+    // and the nonzero exit makes the host fall back locally.
+    const provider = '[registry]\nglobal-credential-providers = ["demo-provider"]\n';
+    for (const extra of [{ homeConfig: provider }, { cwdConfig: provider }]) {
+      const fetched = fetchFixture(0, undefined, extra);
+      expect(fetched).not.toHaveProperty("error");
+      expect(fetched.result.exitCode).not.toBe(0);
+      expect(fetched.argv).toBeNull();
+    }
+    // A config without a provider does not block priming.
+    const clean = fetchFixture(0, undefined, { homeConfig: "[build]\njobs = 4\n" });
+    expect(clean.result).toEqual({ exitCode: 0 });
+    expect(clean.argv).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
   });
 
   it("refuses a hostile toolchain selector instead of running it", () => {
