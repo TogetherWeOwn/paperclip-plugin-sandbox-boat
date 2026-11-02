@@ -7,7 +7,7 @@ import { lstat, mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { SshManager } from "../ssh.js";
+import { runProcess, SshManager } from "../ssh.js";
 import type { SshExecutionResult, SshSession } from "../ssh.js";
 
 // Proposed production transport seam. Kept structural so baseline compiles and
@@ -105,6 +105,15 @@ export class LocalSyncSsh extends SshManager {
     // run() carries inline control output (including pwd/runtime-ready paths).
     // Restore the VM namespace there; runStream's binary payload is untouched.
     return { ...result, stdout: result.stdout.replaceAll(path.join(this.root, "sandbox"), this.remoteRoot) };
+  }
+
+  /**
+   * Control-only: one ssh invocation with no supervisor wrap, so a test can
+   * prove the relay really exports the VM credentials that the supervised
+   * paths strip. Production code never runs a command this way.
+   */
+  async runUnwrapped(session: SshSession, command: string, timeoutMs: number) {
+    return await runProcess("ssh", ["-T", `${session.endpoint.user}@${session.endpoint.host}`, command], { timeoutMs });
   }
 
   // Passed to vi.mock(node:child_process). Every SSH exec launches the local

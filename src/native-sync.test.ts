@@ -837,7 +837,9 @@ describe("local transfer harness controls", () => {
     const result = await ssh.run(session, `printf scratch-only > '${ssh.remotePath(local)}'`, { timeoutMs: 5000 });
     expect(result.exitCode).toBe(0);
     expect(await readFile(local, "utf8")).toBe("scratch-only");
-    expect(ssh.records.at(-1)?.args.at(-1)).toContain("/home/user/native-sync-fixture/namespace-probe");
+    // The wire command (inside its supervisor wrap; a cancel follows it)
+    // still names the VM namespace, never the scratch path it maps to.
+    expect(ssh.records.some((record) => record.args.at(-1)?.includes("/home/user/native-sync-fixture/namespace-probe"))).toBe(true);
   });
 
   it("preserves an opaque inner shell argument through the local namespace relay", async () => {
