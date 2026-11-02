@@ -34,7 +34,7 @@ function base(raw: Record<string, unknown> = config) {
 }
 async function acquire(runId = "run-1", raw: Record<string, unknown> = config, settings?: Record<string, unknown>) {
   return await plugin.definition.onEnvironmentAcquireLease!({
-    ...base(raw), runId, issueId: "issue-size-policy", executionWorkspaceSettings: settings,
+    ...base(raw), runId, issueId: "issue-size-policy", agentId: "agent-1", executionWorkspaceSettings: settings,
   });
 }
 async function release(lease: Awaited<ReturnType<typeof acquire>>) {

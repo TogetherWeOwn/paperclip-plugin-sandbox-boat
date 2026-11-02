@@ -14,6 +14,10 @@ export interface FakeSandbox {
   noEnv: boolean;
   monitoring: boolean;
   from: string | null;
+  /** As boat reports it: the pinned environment name, or null for a noEnv sandbox. */
+  environment: string | null;
+  /** As boat reports it: the sandbox still holds its creator's logins. */
+  holdsCreatorLogins: boolean;
 }
 
 export interface FakeCall {
@@ -123,6 +127,8 @@ export class FakeBoat {
       noEnv: true,
       monitoring: false,
       from: null,
+      environment: null,
+      holdsCreatorLogins: false,
       ...partial,
     };
     this.boxes.set(sandbox.id, sandbox);
@@ -149,6 +155,10 @@ export class FakeBoat {
       noEnv: args.noEnv === true,
       monitoring: args.monitoring !== false,
       from: (args.from as string) ?? null,
+      // A noEnv create is attached to no environment and holds no logins;
+      // otherwise the named (or the account-default) environment applies.
+      environment: args.noEnv === true ? null : ((args.environment as string) ?? "base"),
+      holdsCreatorLogins: args.noEnv !== true,
     });
     return { ok: true, type: "sandbox.created", status: "ready", ttlSeconds: ttl, sandbox: this.view(sandbox) };
   }
@@ -185,6 +195,14 @@ export class FakeBoat {
     if (sandbox.state === "archiving") throw responseError(409, { code: "sandbox_stopping", message: "sandbox is stopping" });
     sandbox.state = "ready";
     if (typeof args.type === "string") sandbox.type = args.type;
+    // Resuming as noEnv is one-way on boat: owner secrets are scrubbed from
+    // the restored snapshot and later resumes stay noEnv.
+    if (args.noEnv === true) {
+      sandbox.noEnv = true;
+      sandbox.environment = null;
+      sandbox.holdsCreatorLogins = false;
+    }
+    if (typeof args.environment === "string" && args.noEnv !== true) sandbox.environment = args.environment;
     const ttl = typeof args.ttlSeconds === "number" ? args.ttlSeconds : sandbox.ttlSeconds;
     sandbox.ttlSeconds = ttl;
     sandbox.archiveAfter = ttl == null ? null : new Date(this.clock.now() + ttl * 1000);

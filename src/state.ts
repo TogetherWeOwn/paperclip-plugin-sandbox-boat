@@ -53,6 +53,16 @@ export interface VmRecord {
    * stop looks there. Absent on records written before 0.2.0.
    */
   remoteRoots?: string[];
+  /**
+   * The only agent this VM's disk may ever be handed to: a resumed or running
+   * disk keeps whatever an earlier run planted in it (shell hooks, toolchain
+   * shims), so it must never serve a different principal's credentials. The
+   * VM key already scopes lookups by a digest of this id; the field is kept
+   * so acquire can refuse a record whose principal differs (a pre-scoping or
+   * hand-edited record). Absent on records written before the scoping: those
+   * are unknown-principal and no named agent reuses them.
+   */
+  principalAgentId?: string | null;
 }
 
 const MAX_REMOTE_ROOTS = 8;

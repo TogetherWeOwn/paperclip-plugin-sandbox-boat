@@ -38,7 +38,10 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `maxOffloadVms` | 4 | Offload pool: at most this many shared VMs for heavy commands. Beyond it, commands queue. |
 | `offloadIdleStopSeconds` | 15 | Offload pool: stop a VM this many seconds after its last command ends. |
 | `allowPaidNamedSnapshots` | false | Allow template capture beyond boat's 10 free named snapshots ($1.70 a month each). |
+| `deleteCardVmOnRelease` | false | Delete a card VM, not just stop it, when its last run releases it, so no later run inherits its disk. Set true for untrusted work (public repos, third-party PR branches); see [VM reuse boundary](security.md#vm-reuse-boundary). `stop_and_retain` releases and StopLease still keep the disk. |
 | `apiBase` | `https://boat.dev/api/v1` | boat API base URL. |
+
+Card VMs are keyed by card **and agent**: a different agent's run gets its own VM, and an acquire that names no agent gets a per-run VM deleted on release (see [VM reuse boundary](security.md#vm-reuse-boundary)). Upgrading: card VMs created before per-agent keying are not reused by any named agent; they stop billing at their auto-stop deadline and age out under `deleteAfterDays`.
 
 ## Company plugin settings (offload)
 

@@ -6,7 +6,7 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 
 ## Overview
 
-* **One VM per card.** A card's VM is created or resumed when a run needs it and stopped on release, so the checkout and build output stay on its disk between runs. See [Lease lifecycle](docs/design/lifecycle.md).
+* **One VM per card and agent.** A card's VM for one agent is created or resumed when a run needs it and stopped on release, so the checkout and build output stay on its disk between that agent's runs; a different agent never inherits the disk. See [Lease lifecycle](docs/design/lifecycle.md).
 * **Budget guard on every start.** Each create or resume checks boat's limits first and fails fast; an idle sweep and boat's auto-stop deadline stop forgotten VMs. See [Budget and caps](docs/operations.md#budget-and-caps).
 * **Per-run cost accounting** from boat's own usage meter, through a board-authenticated route. See [Usage accounting](docs/operations.md#usage-accounting).
 * **Optional heavy-command offload** (Cargo, Node, Python) to a shared VM pool while the agent stays on the host. Default OFF. See [Offload](docs/offload.md).
