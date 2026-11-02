@@ -140,6 +140,61 @@ describe("SshManager.run() over a live ControlMaster (loopback sshd)", () => {
     expect(session.master!.pid).toBe(masterPid);
   }, 20_000);
 
+  it("a background job started by a successful run() keeps running after the command returns", async () => {
+    const { manager, session } = fixture;
+    const pidFile = path.join(fixture.root, "run-daemon.pid");
+    const logFile = path.join(fixture.root, "run-daemon.log");
+    let daemonPid = 0;
+    try {
+      const result = await manager.run(
+        session,
+        `nohup sleep 30 > ${shellQuote(logFile)} 2>&1 & echo $! > ${shellQuote(pidFile)}; echo started`,
+        { timeoutMs: 5_000 },
+      );
+      expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "started\n" });
+      daemonPid = Number(readFileSync(pidFile, "utf8"));
+      expect(daemonPid).toBeGreaterThan(1);
+      // The clean-exit finalize must deregister the run without signalling
+      // its group: a helper the command deliberately detached (dev server,
+      // watcher) outlives the execute that started it, as it did before
+      // run() became supervised. Give a wrong group-kill time to land.
+      await new Promise((r) => setTimeout(r, 300));
+      expect(pidRunning(daemonPid)).toBe(true);
+    } finally {
+      if (daemonPid > 1) {
+        try { process.kill(daemonPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }, 20_000);
+
+  it("a rejected guest-store spawn still kills the stalled guest receiver before settling", async () => {
+    const { manager, session } = fixture;
+    const snapshot = path.join(fixture.root, "snap3");
+    const guestDir = path.join(fixture.root, `paperclip-boat-mirror-${"d".repeat(32)}`);
+    await mkdir(snapshot, { recursive: true });
+    await mkdir(guestDir, { recursive: true });
+    await writeFile(path.join(snapshot, "file.txt"), "payload");
+    const entry = { path: "file.txt", size: 7, mtimeMs: 0, mode: 0o644, sha256: "0".repeat(64) };
+    const pidFile = path.join(fixture.root, "stalled-rejected.pid");
+    const rejectingStore = new SshGuestStore({
+      ssh: manager,
+      session,
+      spawn: async (command, args, opts) => {
+        const stalled = [`--rsync-path=sleep 20 & echo $! > '${pidFile}'; wait; rsync`, ...args];
+        await runStreamProcess(command, stalled, { stdin: opts.stdin, timeoutMs: 1_000, killProcessGroup: true });
+        // A streaming failure (output cap, pipe error) rejects the spawn
+        // instead of returning a result: cleanup must still run.
+        throw new Error("Streaming process control output exceeds its byte limit.");
+      },
+    });
+    await expect(rejectingStore.push(snapshot, [entry], guestDir))
+      .rejects.toThrow(/control output exceeds/);
+    const stalledPid = Number(readFileSync(pidFile, "utf8"));
+    const deadline = Date.now() + 2_000;
+    while (pidRunning(stalledPid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    expect(pidRunning(stalledPid)).toBe(false);
+  }, 30_000);
+
   it("a timed-out guest-store push kills the stalled guest receiver before releasing, then a clean push lands", async () => {
     const { manager, session } = fixture;
     const snapshot = path.join(fixture.root, "snap2");

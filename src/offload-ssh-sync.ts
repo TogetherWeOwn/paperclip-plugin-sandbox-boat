@@ -33,6 +33,13 @@ export class SshOffloadSync implements OffloadSync {
   private readonly mirrors = new Map<string, SourceManifest>();
   /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
   private readonly mirrorLocks = new Map<string, Promise<void>>();
+  /**
+   * Mirrors a failed push left unfenced: its guest receiver may still be
+   * writing (cleanup failed or was skipped over a dead transport). Keyed
+   * like `mirrors` (VM + mirror). An unfenced mirror is never reused: the
+   * next push re-kills receivers, wipes it, and fully resyncs first.
+   */
+  private readonly unfencedMirrors = new Set<string>();
   /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
@@ -91,7 +98,7 @@ export class SshOffloadSync implements OffloadSync {
   /** Plan against the stored manifest, verify the guest agrees, then push only the delta. */
   private async pushLocked(sandboxId: string, guestDir: string, key: string, manifest: SourceManifest, frozen: string): Promise<void> {
     const baseKey = `${sandboxId}:${key}`;
-    const stored = this.mirrors.get(baseKey) ?? null;
+    let stored = this.mirrors.get(baseKey) ?? null;
     const planned = manifest.files.map((file) => file.path);
     const openStore = async (session: SshSession): Promise<SshGuestStore> =>
       new SshGuestStore({ ssh: this.deps.ssh, session, spawn: this.deps.spawn });
@@ -111,10 +118,22 @@ export class SshOffloadSync implements OffloadSync {
       verification = await store.verifyMirror(guestDir, planned);
     }
     // A wipe removes the marker with the rest of the mirror: treat it as gone.
-    const marker = verification.suspect === null ? verification.marker : null;
+    let marker = verification.suspect === null ? verification.marker : null;
+    if (this.unfencedMirrors.has(baseKey)) {
+      // Fence before any reuse: prove no receiver from the failed push can
+      // still write, then wipe — a marker alone proves neither. If the kill
+      // cannot prove that, this throws, nothing is written, and the mirror
+      // stays unfenced for the next attempt.
+      await store.killStalledReceivers(guestDir);
+      await store.wipeMirror(guestDir);
+      this.unfencedMirrors.delete(baseKey);
+      marker = null;
+      stored = null;
+    } else if (verification.suspect !== null) {
+      await store.wipeMirror(guestDir);
+    }
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
-    if (verification.suspect !== null) await store.wipeMirror(guestDir);
     // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
     // snapshot), removed checkout-local installs too; the install must run again.
     if (marker === null) this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
@@ -125,7 +144,16 @@ export class SshOffloadSync implements OffloadSync {
     // not of the guest state.
     const plan = planPush(trusted ? stored : null, manifest);
     const stale = trusted ? plan.toDeleteFromMirror : planPush(stored, manifest).toDeleteFromMirror;
-    if (plan.toSend.length > 0) await store.push(frozen, plan.toSend, guestDir);
+    if (plan.toSend.length > 0) {
+      try {
+        await store.push(frozen, plan.toSend, guestDir);
+      } catch (error) {
+        if ((error as { receiverMayBeLive?: unknown } | null)?.receiverMayBeLive === true) {
+          this.unfencedMirrors.add(baseKey);
+        }
+        throw error;
+      }
+    }
     if (stale.length > 0) await store.pruneMirror(guestDir, stale);
     const fresh = hashManifest(manifest);
     if (marker?.manifestHash !== fresh || marker?.mirrorKey !== key) {

@@ -29,6 +29,7 @@ export const MIRROR_DIR_NAME = ".boat-offload";
 /** Mirror marker: which host manifest this mirror holds. Verified on every push. */
 export const MIRROR_MARKER_RELPATH = `${MIRROR_DIR_NAME}/mirror.json`;
 const RSYNC_TIMEOUT_MS = 300_000;
+const KILL_STALLED_RSYNC_TIMEOUT_MS = 5_000;
 const MIRROR_OP_TIMEOUT_MS = 30_000;
 const PRUNE_TIMEOUT_MS = 60_000;
 const WIPE_TIMEOUT_MS = 60_000;
@@ -309,17 +310,38 @@ print(json.dumps({'ok': True}))
 
 // After a failed or timed-out push the local rsync is dead, but its guest
 // receiver can still be running over the shared master: it holds no local
-// handle we can kill. Before the mirror lock is released, terminate any
-// guest rsync process whose command line names this mirror, so a stalled
-// receiver cannot resume and overwrite a newer push's files.
+// handle we can kill. Before the mirror lock is released, terminate the
+// guest rsync receiver for this mirror, so a stalled receiver cannot resume
+// and overwrite a newer push's files. Matching is by receiver shape, never
+// by mere mentions: an rsync process running with --server, or a shell whose
+// -c body invokes `rsync ... --server` (the form sshd starts), and the
+// mirror path in the command line. A process group is signalled only when
+// its leader is itself a matched receiver; everyone else is signalled by
+// pid alone, so unrelated guest work sharing a group is never hit.
 export const MIRROR_KILL_STALLED_RSYNC_SCRIPT = String.raw`
 # boat-offload-mirror-kill-rsync v1
-import json, os, signal, sys, time
+import json, os, re, signal, sys, time
 mirror = json.load(sys.stdin)[0]
 if not isinstance(mirror, str) or not mirror.startswith('/'):
     raise ValueError('invalid mirror path')
 me = os.getpid()
 my_group = os.getpgrp()
+server_call = re.compile(r'(^|[;&|]\s*)(exec\s+)?(\S*/)?rsync\s+[^;&|]*--server\b')
+
+def is_receiver(argv):
+    if mirror not in '\0'.join(argv):
+        return False
+    base = os.path.basename(argv[0]).lstrip('-')
+    if base == 'rsync':
+        return '--server' in argv[1:]
+    if base in ('sh', 'bash', 'dash', 'ash') and len(argv) >= 3:
+        if argv[1] == '-c':
+            return server_call.search(argv[2]) is not None
+        # A shell-script wrapper named rsync: the kernel runs it as
+        # 'sh /path/rsync --server ...' until it execs the real binary.
+        if os.path.basename(argv[1]) == 'rsync':
+            return '--server' in argv[2:]
+    return False
 
 def targets():
     found = []
@@ -334,21 +356,15 @@ def targets():
         except OSError:
             continue
         argv = [part.decode('utf-8', 'surrogateescape') for part in raw.split(b'\0') if part]
-        if not argv:
-            continue
-        joined = '\0'.join(argv)
-        # The receiver may be rsync itself or the login shell sshd ran it
-        # through (sh -c '... rsync --server ... <mirror>'): match the
-        # --server marker anywhere in the joined command line.
-        if mirror in joined and (os.path.basename(argv[0]) == 'rsync' or '--server' in joined):
+        if argv and is_receiver(argv):
             try:
                 found.append((pid, os.getpgid(pid)))
             except OSError:
                 found.append((pid, pid))
     return found
 
-def hit(pid, pgid, sig):
-    if pgid > 1 and pgid != my_group:
+def hit(pid, pgid, leader_pgids, sig):
+    if pgid in leader_pgids and pgid > 1 and pgid != my_group:
         try:
             os.killpg(pgid, sig)
             return
@@ -359,15 +375,24 @@ def hit(pid, pgid, sig):
     except OSError:
         pass
 
-initial = targets()
-for pid, pgid in initial:
-    hit(pid, pgid, signal.SIGTERM)
+def strike(sig):
+    current = targets()
+    leaders = {pgid for pid, pgid in current if pid == pgid}
+    for pid, pgid in current:
+        hit(pid, pgid, leaders, sig)
+    return current
+
+initial = strike(signal.SIGTERM)
 deadline = time.monotonic() + 1.0
 while time.monotonic() < deadline and targets():
     time.sleep(0.02)
-for pid, pgid in targets():
-    hit(pid, pgid, signal.SIGKILL)
-print(json.dumps({'ok': True, 'killed': len(initial)}))
+strike(signal.SIGKILL)
+deadline = time.monotonic() + 0.5
+remaining = targets()
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.02)
+    remaining = targets()
+print(json.dumps({'ok': not remaining, 'killed': len(initial), 'remaining': len(remaining)}))
 `;
 
 // Wipe a suspect mirror whole. Only the caller-selected mirror path is removed,
@@ -548,22 +573,80 @@ export class SshGuestStore implements GuestStore {
       entries.map((entry) => entry.path),
     );
     const [command, ...args] = argv;
-    const result = await this.spawn(command!, args, {
-      stdin: Readable.from([renderFilesFromList(entries)]),
-      timeoutMs: RSYNC_TIMEOUT_MS,
-    });
-    if (result.exitCode !== 0 || result.timedOut || result.signal) {
-      // The push is dead locally, but a stalled guest receiver may still be
-      // writing into this mirror. Kill it before throwing: the caller holds
-      // the mirror lock until this settles, so no newer push can race it.
-      // A failed kill leaves the next push's verify/wipe as the backstop and
-      // must not replace the push failure itself.
-      await this.runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [guestDir], 15_000).catch(() => undefined);
-      throw new Error(
-        `Offload delta push failed (exit=${result.exitCode}, signal=${result.signal}, timedOut=${result.timedOut}).`,
+    let result: SpawnResult | undefined;
+    let spawnFailure: unknown;
+    let spawnFailed = false;
+    try {
+      result = await this.spawn(command!, args, {
+        stdin: Readable.from([renderFilesFromList(entries)]),
+        timeoutMs: RSYNC_TIMEOUT_MS,
+      });
+    } catch (error) {
+      // A streaming failure (output cap, pipe error) rejects instead of
+      // returning a result; the guest receiver may still be stalled. Track
+      // the rejection with a flag, not the value: a seam may reject with
+      // anything, including undefined.
+      spawnFailed = true;
+      spawnFailure = error;
+    }
+    if (!spawnFailed && result !== undefined && result.exitCode === 0 && !result.timedOut && !result.signal) {
+      return { files: entries.length, bytes: entries.reduce((sum, entry) => sum + entry.size, 0), skipped: 0 };
+    }
+    // The push is dead locally, but a stalled guest receiver may still be
+    // writing into this mirror. Kill it before throwing: the caller holds
+    // the mirror lock until this settles, so no newer push can race it.
+    // An ssh transport failure (exit 255) means there is no live channel to
+    // clean over, so don't spend the kill budget rediscovering that; the
+    // mirror is simply reported unfenced. When cleanup cannot prove the
+    // receiver stopped, the failure carries receiverMayBeLive and the
+    // caller quarantines the mirror (kill + wipe + full resync) before its
+    // next use. Cleanup never replaces the push failure itself.
+    const transportDead = result !== undefined && result.exitCode === 255 && !result.timedOut;
+    let receiverMayBeLive = true;
+    if (!transportDead) {
+      receiverMayBeLive = await this.killStalledReceivers(guestDir).then(
+        () => false,
+        () => true,
       );
     }
-    return { files: entries.length, bytes: entries.reduce((sum, entry) => sum + entry.size, 0), skipped: 0 };
+    if (spawnFailed) {
+      if (!receiverMayBeLive) throw spawnFailure;
+      // Tag the original failure so the caller fences the mirror. A value
+      // that cannot carry the tag (non-object, frozen) is wrapped with the
+      // original kept as `cause` — never lose the flag, never replace the
+      // failure with a tagging TypeError.
+      if (typeof spawnFailure === "object" && spawnFailure !== null && Object.isExtensible(spawnFailure)) {
+        (spawnFailure as { receiverMayBeLive?: boolean }).receiverMayBeLive = true;
+        throw spawnFailure;
+      }
+      const wrapped = new Error(
+        `Offload delta push failed (${spawnFailure instanceof Error ? spawnFailure.message : String(spawnFailure)}).`,
+        { cause: spawnFailure },
+      ) as Error & { receiverMayBeLive?: boolean };
+      wrapped.receiverMayBeLive = true;
+      throw wrapped;
+    }
+    const failure = new Error(
+      `Offload delta push failed (exit=${result?.exitCode ?? null}, signal=${result?.signal ?? null}, timedOut=${result?.timedOut ?? false}).`,
+    ) as Error & { receiverMayBeLive?: boolean };
+    if (receiverMayBeLive) failure.receiverMayBeLive = true;
+    throw failure;
+  }
+
+  /**
+   * Terminate any guest rsync receiver still writing into this mirror and
+   * prove it stopped (the script reports the survivors). Throws unless the
+   * guest confirms no matching receiver remains.
+   */
+  async killStalledReceivers(guestDir: string): Promise<void> {
+    assertGuestDir(guestDir);
+    const result = (await this.runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [guestDir], KILL_STALLED_RSYNC_TIMEOUT_MS)) as {
+      ok?: unknown;
+      remaining?: unknown;
+    };
+    if (result?.ok !== true || result?.remaining !== 0) {
+      throw new Error("Offload stalled-receiver cleanup could not prove the guest receiver stopped.");
+    }
   }
 
   async pruneMirror(guestDir: string, relPaths: string[]): Promise<{ removed: number }> {

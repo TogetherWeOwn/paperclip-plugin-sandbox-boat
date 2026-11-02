@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { cancelRemoteCommand, stripRunMarker, wrapRemoteCommand } from "./shell.js";
+import { cancelRemoteCommand, finalizeRemoteCommand, stripRunMarker, wrapRemoteCommand } from "./shell.js";
 
 export interface SshEndpoint {
   host: string;
@@ -264,7 +264,7 @@ export class SshManager {
       // (or an ssh that never connects) reports its own status — 3, or 255 —
       // never a thrown EPIPE that would bypass callers' status handling.
       tolerateStdinClose: true,
-    }, false);
+    }, false, false);
   }
 
   /** Binary transport over the same pinned connection; run() remains control-only. */
@@ -281,6 +281,13 @@ export class SshManager {
     // and branch on it — execute, env staging and the scrub status mapping
     // would all be bypassed by a cleanup throw — so run() logs and returns.
     cleanupFailureThrows = true,
+    // Binary sync payloads are ours: nothing they start may outlive them.
+    // run() also carries whole-run execute, whose commands may deliberately
+    // detach a helper (`nohup server >log 2>&1 &`): a clean exit there only
+    // deregisters the run, as the old unsupervised run() left it running.
+    // A background job holding the channel's pipes never reaches a clean
+    // exit, so timeouts still reach the group cancel below.
+    cancelGroupOnCleanExit = true,
   ): Promise<SshExecutionResult> {
     const key = await this.ensureKey();
     const slave = (command: string) => [
@@ -298,10 +305,20 @@ export class SshManager {
     } finally {
       // Local pipe/cap errors throw, while timeouts return a result. Both must
       // finish bounded remote cleanup BEFORE releasing activity/rejecting. On
-      // success this also removes the registration and any background children.
-      // Never signal the shared master, and never replace the original failure.
+      // success this also removes the registration — and, for sync payloads,
+      // any background children; a clean run() exit only deregisters (see
+      // cancelGroupOnCleanExit). Never signal the shared master, and never
+      // replace the original failure.
+      // Exit 255 is ssh's own transport failure: the payload may have been
+      // submitted and may still be running guest-side, so it is never a
+      // proven completion — cancel, don't just deregister. (A payload that
+      // itself exits 255 therefore also loses its background helpers.)
+      const cleanExit = result !== undefined && !result.timedOut && result.signal === null && result.exitCode !== 255;
+      const cleanupCommand = cleanExit && !cancelGroupOnCleanExit
+        ? finalizeRemoteCommand(runId)
+        : cancelRemoteCommand(runId);
       try {
-        const cleanup = await runStreamProcess("ssh", slave(cancelRemoteCommand(runId)), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
+        const cleanup = await runStreamProcess("ssh", slave(cleanupCommand), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
         if (cleanup.timedOut || cleanup.exitCode !== 0) {
           throw new Error(`Remote command cleanup failed: ${cleanup.stderr.trim() || "timeout or nonzero exit"}`);
         }

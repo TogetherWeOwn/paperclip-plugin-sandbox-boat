@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync } from "./offload-ssh-sync.js";
 import {
   hashManifest,
+  MIRROR_KILL_STALLED_RSYNC_SCRIPT,
   MIRROR_MARKER_RELPATH,
   MIRROR_PRUNE_SCRIPT,
   MIRROR_VERIFY_SCRIPT,
@@ -71,13 +72,14 @@ async function readAll(stream: Readable | undefined): Promise<string> {
 interface StubGuest {
   markers: Map<string, MirrorMarker>;
   suspect: Map<string, string>;
-  failNext: { verify?: unknown; prune?: unknown; write?: unknown; install?: boolean } | null;
+  failNext: { verify?: unknown; prune?: unknown; write?: unknown; install?: boolean; kill?: unknown } | null;
   wipes: Array<{ vm: string; dir: string }>;
   prunes: Array<{ vm: string; dir: string; paths: string[] }>;
+  kills: Array<{ vm: string; dir: string }>;
   installs: string[];
 }
 function stubGuest(): StubGuest {
-  return { markers: new Map(), suspect: new Map(), failNext: null, wipes: [], prunes: [], installs: [] };
+  return { markers: new Map(), suspect: new Map(), failNext: null, wipes: [], prunes: [], kills: [], installs: [] };
 }
 const guestKey = (vm: string, dir: string) => `${vm}\0${dir}`;
 function setMarker(guest: StubGuest, vm: string, dir: string, marker: MirrorMarker): void {
@@ -148,6 +150,16 @@ function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number)
       guest.markers.delete(guestKey(vm, mirrorDir));
       guest.suspect.delete(guestKey(vm, mirrorDir));
       return ok({ ok: true });
+    }
+    if (remoteCommand.includes("boat-offload-mirror-kill-rsync")) {
+      const [mirrorDir] = JSON.parse(stdin) as [string];
+      guest.kills.push({ vm, dir: mirrorDir });
+      if (guest.failNext?.kill) {
+        const error = guest.failNext.kill;
+        guest.failNext = null;
+        throw error;
+      }
+      return ok({ ok: true, killed: 0, remaining: 0 });
     }
     if (remoteCommand.includes("boat-offload-mirror-prune")) {
       if (guest.failNext?.prune) {
@@ -414,6 +426,48 @@ describe("delta push over stub SSH", () => {
     expect(refreshSession).not.toHaveBeenCalled();
   });
 
+  it("fences a mirror whose failed push could not prove the receiver dead: kill, wipe, full resync", async () => {
+    const root = source({ "a.txt": "a", "sub/b.txt": "b" });
+    const { sync, spawns, guest, spawn } = setup(root);
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(1);
+    // One edit: the delta push fails AND the guest-side receiver kill fails,
+    // so a stalled receiver may still write into this mirror.
+    writeFileSync(path.join(root, "sub/b.txt"), "b-changed");
+    spawn.mockResolvedValueOnce({ exitCode: 23, signal: null, timedOut: false });
+    guest.failNext = { kill: new Error("guest unreachable during cleanup") };
+    await expect(sync.push("vm-1", command())).rejects.toThrow(/delta push failed/i);
+    expect(guest.kills).toHaveLength(1);
+    expect(guest.wipes).toHaveLength(0);
+    // Next push must not trust the marker/manifest: re-kill, wipe, then send
+    // the whole tree again instead of just the one-file delta.
+    await sync.push("vm-1", command());
+    expect(guest.kills).toHaveLength(2);
+    expect(guest.wipes).toHaveLength(1);
+    expect(filesFromStdin(spawns[spawns.length - 1]!.stdin).sort()).toEqual(["a.txt", "sub/b.txt"]);
+    // And the fence is one-shot: a further unchanged push is a no-op again.
+    const spawnCount = spawns.length;
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(spawnCount);
+    expect(guest.wipes).toHaveLength(1);
+  });
+
+  it("refuses to reuse an unfenced mirror while the receiver kill still fails", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest, spawn } = setup(root);
+    await sync.push("vm-1", command());
+    writeFileSync(path.join(root, "a.txt"), "a-changed");
+    spawn.mockResolvedValueOnce({ exitCode: 23, signal: null, timedOut: false });
+    guest.failNext = { kill: new Error("guest unreachable during cleanup") };
+    await expect(sync.push("vm-1", command())).rejects.toThrow(/delta push failed/i);
+    const spawnCount = spawns.length;
+    guest.failNext = { kill: new Error("guest still unreachable") };
+    await expect(sync.push("vm-1", command())).rejects.toThrow();
+    // Nothing was written into the suspect mirror: no rsync spawn, no wipe.
+    expect(spawns).toHaveLength(spawnCount);
+    expect(guest.wipes).toHaveLength(0);
+  });
+
   it("does not refresh the session for a malformed verification envelope", async () => {
     const root = source({ "a.txt": "a" });
     const { sync, refreshSession, guest } = setup(root);
@@ -579,6 +633,55 @@ describe("SshGuestStore boundary", () => {
     const snap = await captureSnapshot(source({ "a.txt": "a" }), temp("boat-delta-snap-"));
     await expect(guestStore.push(temp("boat-delta-empty-"), snap.manifest.files, "/guest/mirror")).rejects.toThrow(/delta push failed/i);
   });
+
+  it("skips the guest receiver kill on an ssh transport failure (255) and flags the mirror unfenced", async () => {
+    const harness = setup(source({ "a.txt": "a" }));
+    harness.spawn.mockResolvedValueOnce({ exitCode: 255, signal: null, timedOut: false });
+    const guestStore = new SshGuestStore({ ssh: harness.ssh as never, session: harness.sessionFor("vm-1") as never, spawn: harness.spawn as never });
+    const snap = await captureSnapshot(source({ "a.txt": "a" }), temp("boat-delta-snap-"));
+    const error = await guestStore.push(temp("boat-delta-empty-"), snap.manifest.files, "/guest/mirror").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/delta push failed/i);
+    // No point spending the kill script's budget over a dead transport; the
+    // caller fences the mirror for its next reachable push instead.
+    expect(harness.guest.kills).toHaveLength(0);
+    expect((error as { receiverMayBeLive?: unknown }).receiverMayBeLive).toBe(true);
+  });
+
+  it("runs the receiver kill after a nonzero rsync exit and reports the mirror fenced", async () => {
+    const harness = setup(source({ "a.txt": "a" }));
+    harness.spawn.mockResolvedValueOnce({ exitCode: 23, signal: null, timedOut: false });
+    const guestStore = new SshGuestStore({ ssh: harness.ssh as never, session: harness.sessionFor("vm-1") as never, spawn: harness.spawn as never });
+    const snap = await captureSnapshot(source({ "a.txt": "a" }), temp("boat-delta-snap-"));
+    const error = await guestStore.push(temp("boat-delta-empty-"), snap.manifest.files, "/guest/mirror").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect((error as Error).message).toMatch(/delta push failed/i);
+    expect(harness.guest.kills).toEqual([{ vm: "vm-1", dir: "/guest/mirror" }]);
+    expect((error as { receiverMayBeLive?: unknown }).receiverMayBeLive).not.toBe(true);
+  });
+
+  it("keeps the fence flag when the spawn rejection cannot carry it (frozen error, failed kill)", async () => {
+    const harness = setup(source({ "a.txt": "a" }));
+    const frozen = Object.freeze(new Error("pipe failed"));
+    harness.spawn.mockRejectedValueOnce(frozen);
+    harness.guest.failNext = { kill: new Error("guest unreachable during cleanup") };
+    const guestStore = new SshGuestStore({ ssh: harness.ssh as never, session: harness.sessionFor("vm-1") as never, spawn: harness.spawn as never });
+    const snap = await captureSnapshot(source({ "a.txt": "a" }), temp("boat-delta-snap-"));
+    const error = await guestStore.push(temp("boat-delta-empty-"), snap.manifest.files, "/guest/mirror").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/delta push failed.*pipe failed/i);
+    expect((error as { cause?: unknown }).cause).toBe(frozen);
+    expect((error as { receiverMayBeLive?: unknown }).receiverMayBeLive).toBe(true);
+    expect(harness.guest.kills).toHaveLength(1);
+  });
 });
 
 describe("hashManifest", () => {
@@ -701,6 +804,55 @@ describe("mirror scripts executed locally", () => {
     symlinkSync(mirror, linked);
     expect(runScript(MIRROR_WIPE_SCRIPT, [linked]).exitCode).not.toBe(0);
   });
+
+  it("kill-stalled-rsync kills a genuine rsync --server receiver and spares cmdline lookalikes", () => {
+    const mirror = path.join(temp("boat-delta-kill-"), "mirror");
+    mkdirSync(mirror, { recursive: true });
+    const running = (pid: number) => {
+      try {
+        const text = readFileSync(`/proc/${pid}/stat`, "utf8");
+        return text.slice(text.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
+      } catch {
+        return false;
+      }
+    };
+    const children: ChildProcess[] = [];
+    const own = (child: ChildProcess): number => {
+      if (!child.pid) throw new Error("child did not start");
+      children.push(child);
+      return child.pid;
+    };
+    try {
+      // Lookalike 1: an unrelated process that merely mentions --server and
+      // the mirror path in its argv (an editor, a grep, an agent helper).
+      const bystander = own(spawn("python3", ["-c", "import time; time.sleep(30)", "--server", mirror], { stdio: "ignore" }));
+      // Lookalike 2: a shell whose -c body is not an rsync server at all;
+      // "rsync --server <mirror>" appears only in its trailing argv.
+      const decoyShell = own(spawn("sh", ["-c", "exec sleep 30", "rsync", "--server", mirror], { stdio: "ignore" }));
+      // Genuine receiver: exec'd rsync --server waiting on its stdin pipe.
+      const receiver = own(spawn("sh", ["-c", `exec rsync --server -vlogDtpre.iLsfxCIvu . ${mirror}`], { stdio: ["pipe", "ignore", "ignore"] }));
+      expect(running(receiver)).toBe(true);
+      // Wrapper shape: a shell script named rsync that has not exec'd the
+      // real binary yet runs as 'sh /path/rsync --server ... <mirror>'.
+      const wrapper = path.join(temp("boat-delta-wrapper-"), "rsync");
+      writeFileSync(wrapper, "sleep 10\n");
+      const wrappedReceiver = own(spawn("sh", [wrapper, "--server", "-vlogDtpre.iLsfxCIvu", ".", mirror], { stdio: "ignore" }));
+      expect(running(wrappedReceiver)).toBe(true);
+
+      const { stdout, exitCode } = runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [mirror]);
+
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({ ok: true, remaining: 0 });
+      expect(running(receiver), "genuine receiver must be dead").toBe(false);
+      expect(running(wrappedReceiver), "rsync wrapper script must be dead").toBe(false);
+      expect(running(bystander), "argv lookalike must survive").toBe(true);
+      expect(running(decoyShell), "shell lookalike must survive").toBe(true);
+    } finally {
+      for (const child of children) {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }, 15_000);
 });
 
 describe("host staging retention", () => {

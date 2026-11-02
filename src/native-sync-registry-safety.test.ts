@@ -9,7 +9,7 @@ import { chmod, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
-import { cancelRemoteCommand } from "./shell.js";
+import { cancelRemoteCommand, finalizeRemoteCommand } from "./shell.js";
 
 const children: ChildProcess[] = [];
 const records: string[] = [];
@@ -76,6 +76,12 @@ function spawnOwnedGroup(): { child: ChildProcess; pid: number; start: string } 
 
 function runCancel(runId: string) {
   const command = cancelRemoteCommand(runId);
+  expect(command).toContain(recordPath(runId));
+  return spawnSync("sh", ["-c", command], { encoding: "utf8", timeout: 8000 });
+}
+
+function runFinalize(runId: string) {
+  const command = finalizeRemoteCommand(runId);
   expect(command).toContain(recordPath(runId));
   return spawnSync("sh", ["-c", command], { encoding: "utf8", timeout: 8000 });
 }
@@ -188,6 +194,19 @@ it("locked record times out with a diagnostic and is left untouched", async () =
   expect(existsSync(record)).toBe(true);
   expect(await readFile(record, "utf8")).toBe(before);
 }, 15000);
+
+it("finalize removes a valid record without signalling the owned group", async () => {
+  const runId = newRunId();
+  const { pid, start } = spawnOwnedGroup();
+  const record = await writeRecord(runId, JSON.stringify({ pgid: pid, start }));
+
+  const result = runFinalize(runId);
+
+  expect(result.status, `accept valid record, stderr: ${result.stderr}`).toBe(0);
+  expect(existsSync(record), "finalize removes its record").toBe(false);
+  expect(procIdentity(pid).running, "finalize must not signal the group").toBe(true);
+  expect(procIdentity(pid).start, "same process, not a recycled PID").toBe(start);
+});
 
 it("control: a fresh valid record is accepted and the owned group is cancelled", async () => {
   const runId = newRunId();

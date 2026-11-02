@@ -131,7 +131,10 @@ default VM:
    `rsync` that stalls (or is replaced by repo code that ran in the VM)
    cannot wedge the push: it is bounded by a fixed timeout, and on expiry
    the push fails, its ssh transport is killed with it, and the per-mirror
-   lock is released for the next command.
+   lock is released for the next command. If the failed push's guest
+   receiver cannot be proven dead, the next command's push fences that
+   mirror first (kill, wipe, full resync), so expect one slower full sync
+   after such a failure rather than a delta.
 5. Reboot, then run the preflight with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
    `true`.
