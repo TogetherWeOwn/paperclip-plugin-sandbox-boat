@@ -248,19 +248,21 @@ describe("cleanupStaleKeyDirs", () => {
     }
   });
 
-  it("removes old unmarked dirs with no live ssh referencing them", async () => {
+  it("keeps old unmarked dirs even when idle: idle is not dead", async () => {
     const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
     try {
-      const stale = path.join(base, "pcboat-legacy-stale");
-      await mkdir(stale);
-      await writeFile(path.join(stale, "id_ed25519"), "stale", { mode: 0o600 });
-      // Predates the owner.pid marker: backdate past the grace age last, so
-      // creating the contents does not refresh the mtime.
+      const legacy = path.join(base, "pcboat-legacy-stale");
+      await mkdir(legacy);
+      await writeFile(path.join(legacy, "id_ed25519"), "stale", { mode: 0o600 });
+      // Predates the owner.pid marker: backdate well past a day last, so
+      // creating the contents does not refresh the mtime. A live
+      // pre-upgrade worker between commands has no referencing ssh client,
+      // so the sweep must still keep it — these leak until manual cleanup.
       const old = new Date(Date.now() - 25 * 3_600_000);
-      await utimes(stale, old, old);
+      await utimes(legacy, old, old);
       const removed = await cleanupStaleKeyDirs(base);
-      expect(removed).toEqual([stale]);
-      expect(existsSync(stale)).toBe(false);
+      expect(removed).toEqual([]);
+      expect(existsSync(legacy)).toBe(true);
     } finally {
       await rm(base, { recursive: true, force: true });
     }

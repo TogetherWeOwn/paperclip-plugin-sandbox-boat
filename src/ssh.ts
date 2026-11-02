@@ -460,8 +460,6 @@ export class SshManager {
 
 /** Prefix for worker SSH key dirs under os.tmpdir(). */
 export const STALE_KEY_DIR_PREFIX = "pcboat-";
-/** Unmarked key dirs (no owner.pid, predating the marker) are only reaped past this age. */
-const UNMARKED_KEY_DIR_MAX_AGE_MS = 24 * 60 * 60_000;
 
 function pidAlive(pid: number): boolean {
   try {
@@ -514,14 +512,15 @@ async function killStaleSshForDir(dir: string): Promise<void> {
   }
 }
 
-/** Remove worker key dirs whose creator is gone: a dead owner pid, or (for
- * dirs predating the owner.pid marker) an mtime older than a day with no live
- * ssh client still referencing the dir. Age alone cannot prove a legacy dir
- * dead — a pre-upgrade worker may still be running — so a referenced dir is
- * kept, and an unverifiable reference scan (non-Linux) keeps it too. Only
- * same-uid dirs are considered: the uid is the boundary, and another user's
- * key material is never touched. Returns the removed dirs. Failures for one
- * dir never block the others. */
+/** Remove worker key dirs whose owner pid is verifiably dead (kill(pid, 0)
+ * reports ESRCH). Dirs predating the owner.pid marker are never reaped: going
+ * idle is not dying — a still-running pre-upgrade worker whose master died and
+ * whose last direct command finished has no live ssh client referencing its
+ * dir, so age plus no referencing client cannot prove the owner dead. Legacy
+ * unmarked dirs therefore leak until manual/ops cleanup. Only same-uid dirs
+ * are considered: the uid is the boundary, and another user's key material is
+ * never touched. Returns the removed dirs. Failures for one dir never block
+ * the others. */
 export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<string[]> {
   const removed: string[] = [];
   let entries;
@@ -554,13 +553,11 @@ export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<s
       // alive, which keeps the dir — the safe direction.)
       if (pidAlive(pid)) continue;
     } else {
-      // Unmarked legacy dir: only reap when old AND no live ssh client still
-      // uses it. A concurrently-creating worker's dir is fresh, so it is
-      // never reaped; a still-running pre-upgrade worker's dir is referenced,
-      // so it is kept until it goes idle.
-      if (Date.now() - stat.mtimeMs <= UNMARKED_KEY_DIR_MAX_AGE_MS) continue;
-      const referencing = await sshPidsForDir(dir);
-      if (referencing === null || referencing.length > 0) continue;
+      // Unmarked legacy dir (predates the owner.pid marker): never reaped.
+      // Idle is not dead — a live pre-upgrade worker between commands has no
+      // referencing ssh client — so no age/reference check can prove the
+      // owner gone. These leak until manual/ops cleanup.
+      continue;
     }
     await killStaleSshForDir(dir);
     try {
