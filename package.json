@@ -46,7 +46,7 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@boatdev/sdk": "1.10.0",
+    "@boatdev/sdk": "1.13.0",
     "@paperclipai/plugin-sdk": "2026.1023.0"
   },
   "devDependencies": {
