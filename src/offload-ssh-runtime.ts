@@ -1,8 +1,9 @@
 // Stock-worker integration. Authorization originates in native realization
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
-import { createHash } from "node:crypto";
+import { createHash, scrypt } from "node:crypto";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { promisify } from "node:util";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
@@ -38,7 +39,23 @@ export async function scrubOffloadGuestBashrc(ssh: SshManager, session: SshSessi
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number;
   /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
-  localRun: boolean };
+  localRun: boolean;
+  /** Memoized KDF digest of the bind-time credential (memory only). A binding's
+   * credential never changes mid-run, so the digest is computed once. */
+  credentialDigest?: Promise<string> };
+
+const scryptAsync = promisify(scrypt) as (password: string, salt: string, keylen: number) => Promise<Buffer>;
+
+/**
+ * The credential part of pool identity. The digest is persisted (inside the
+ * poolId) but the key never is, so derive it with a password KDF rather than
+ * a fast hash: a leaked pool journal then gives no cheap offline test for
+ * guessed API keys. The salt binds the digest to this purpose and endpoint.
+ */
+async function poolCredentialDigest(config: BoatDriverConfig): Promise<string> {
+  const derived = await scryptAsync(resolveApiKey(config), `boat-offload-pool\u0000${config.apiBase}`, 32);
+  return derived.toString("hex");
+}
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -309,8 +326,9 @@ export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
   private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
   /** Credential-free pool identity (the poolId fields minus the credential
-   * digest) to the live poolId, so a rotated or re-pointed API key retires
-   * the pool bound to the old credential instead of silently reusing it. */
+   * digest) to the live poolId, so a rotated or re-pointed API key presented
+   * by a new binding retires the pool bound to the old credential instead of
+   * silently reusing it. */
   private readonly poolByBaseIdentity = new Map<string, string>();
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
@@ -436,12 +454,17 @@ export class SshOffloadRuntime {
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
-    // The credential digest (same account digest the whole-run manager uses)
-    // is part of pool identity: persisted executor state stays credential-free
-    // (a sha256 digest is not the key), and a rotated or re-pointed key must
-    // not keep operating pools, journals or VMs under the old account. A
-    // secret rotated in place therefore takes effect on the next resolve.
-    const credentialDigest = createHash("sha256").update(`${binding.config.apiBase}\u0000${resolveApiKey(binding.config)}`).digest("hex");
+    // The credential digest is part of pool identity: persisted executor state
+    // stays credential-free (a KDF digest is not the key), and a rotated or
+    // re-pointed key must not keep operating pools, journals or VMs under the
+    // old account. A binding's config — credential included — is captured at
+    // bind time, so rotation takes effect when a new binding presents the new
+    // key (the next run or realization, or the first bind after a worker
+    // restart), never by switching a live binding's credential mid-run. That
+    // resolve retires the old credential's pool below instead of reusing it.
+    binding.credentialDigest ??= poolCredentialDigest(binding.config)
+      .catch((error: unknown) => { binding.credentialDigest = undefined; throw error; });
+    const credentialDigest = await binding.credentialDigest;
     const baseIdentity = JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]);
     const poolId = createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest]))

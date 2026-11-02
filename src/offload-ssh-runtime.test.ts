@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, scryptSync } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
@@ -390,7 +390,7 @@ describe("templateSnapshot pool wiring", () => {
   function legacyPoolId(profileId = "rust-public-1") {
     const baseIdentity = JSON.stringify([companyId, "env", "repo:https://github.com/example/public", profileId,
       DEFAULT_API_BASE, "small", config.offloadCgroupParent, config.offloadArtifactRoot]);
-    const credentialDigest = createHash("sha256").update(`${DEFAULT_API_BASE}\u0000test-only`).digest("hex");
+    const credentialDigest = scryptSync("test-only", `boat-offload-pool\u0000${DEFAULT_API_BASE}`, 32).toString("hex");
     return createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest])).digest("hex").slice(0, 24);
   }
   function withTemplate(name: string): PluginEnvironmentRealizeWorkspaceParams {
