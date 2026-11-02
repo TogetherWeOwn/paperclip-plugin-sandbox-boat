@@ -771,18 +771,21 @@ export class BoatVmManager {
 
   private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
     const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
-    // Dedupe on the persisted content, not the write time: seenAt changes on
-    // every hook, so including it would defeat the cache with a write per call.
-    const encoded = JSON.stringify([companyId, publicFields]);
-    if (this.persistedSweeps.get(environmentId) === encoded) return;
     // A non-secret same-account marker: the ops listing runs under the inline
     // key's account, so rehydration through the host key is only safe when the
     // host key resolves to that same account. A digest, never the key itself.
+    const accountDigest = config.apiKey != null
+      ? createHash("sha256").update(`${config.apiBase}\u0000${config.apiKey}`).digest("hex")
+      : null;
+    // Dedupe on the persisted content, not the write time: seenAt changes on
+    // every hook, so including it would defeat the cache with a write per call.
+    // The marker and digest are part of the identity: a key-only rotation must
+    // re-persist, or a stale digest would let a restarted sweep match the old
+    // account's host key against the new account's live VMs and forget them.
+    const encoded = JSON.stringify([companyId, publicFields, config.apiKey != null, accountDigest]);
+    if (this.persistedSweeps.get(environmentId) === encoded) return;
     const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
-      hadInlineKey: config.apiKey != null,
-      accountDigest: config.apiKey != null
-        ? createHash("sha256").update(`${config.apiBase}\u0000${config.apiKey}`).digest("hex")
-        : null };
+      hadInlineKey: config.apiKey != null, accountDigest };
     await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
     await this.store.rememberCompany(companyId);
     this.persistedSweeps.set(environmentId, encoded);

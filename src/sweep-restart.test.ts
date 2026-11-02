@@ -10,6 +10,8 @@ vi.mock("node:child_process", async () => {
 
 import type { BoatApiLike } from "./boat-client.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
+import { createHash } from "node:crypto";
+import { DEFAULT_API_BASE } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
@@ -171,6 +173,35 @@ describe("sweep after a worker restart", () => {
     } | null;
     expect(Object.values(doc?.vms ?? {}).some(
       (record) => record.sandboxId === sandboxId && record.status !== "deleted")).toBe(true);
+  });
+
+  it("re-persists the sweep descriptor when only the inline key changes", async () => {
+    const keyA = "boat_inline_key_account_a_not_real";
+    const keyB = "boat_inline_key_account_b_not_real";
+    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const readDigest = async () => (await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
+      envs?: Record<string, { accountDigest?: unknown }>;
+    } | null)?.envs?.[environmentId]?.accountDigest;
+    await plugin.definition.onEnvironmentAcquireLease!({
+      companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey: keyA }, runId: "run-key-a",
+      issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+    });
+    await untilSweepDescriptor();
+    expect(await readDigest()).toBe(digestOf(keyA));
+    // A key-only rotation keeps every public field: without the marker in the
+    // dedupe identity the stale digest would survive, and a restarted sweep
+    // under the old account's host key would forget the new account's VMs.
+    await plugin.definition.onEnvironmentAcquireLease!({
+      companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey: keyB }, runId: "run-key-b",
+      issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+    });
+    // The persist runs fire-and-forget after the hook: poll until it lands.
+    for (let n = 0; n < 1000; n += 1) {
+      if ((await readDigest()) === digestOf(keyB)) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(await readDigest()).toBe(digestOf(keyB));
   });
 
   it("an unloaded-pool sweep leaves a reservation made mid-sweep alone", async () => {

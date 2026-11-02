@@ -39,7 +39,10 @@ describe("offload lifecycle: persisted reconciliation", () => {
     expect.soft(s.starts.map((v) => v.commandId)).toEqual(["uncertain"]);
     const next = await s.execute(command("unrelated", { executionWorkspaceId: "workspace-b", cardId: "card-b" }), restarted);
     expect.soft(next).toMatchObject({ status: "unavailable" });
-    expect.soft(s.boat.callsOf("stop")).toEqual([]);
+    // A stop is neither a replay nor a release: the fenced VM is stopped to
+    // halt billing while its slot stays fenced (the unrelated command still
+    // reads unavailable, and only one VM was ever created).
+    expect.soft(s.boat.callsOf("stop").map((v) => v.args.sandboxId)).toEqual([s.starts[0]!.sandboxId]);
     expect(s.boat.callsOf("create")).toHaveLength(1);
   });
 
@@ -260,15 +263,20 @@ describe("offload lifecycle: recovery reconciliation keeps its stop duties", () 
     const cmd = command("doomed");
     await s.execute(cmd);
     const sandboxId = s.starts[0]!.sandboxId;
+    // The stop is accepted but never takes effect, so the fence can be
+    // observed while the provider still reports running.
+    s.boat.stopMode = "stays_up";
     s.clock.crashWorker();
     s.fail.clear();
     // The guest is gone-clean but the provider still reports running: the
-    // receipt is unresolved, so recovery and sweep must keep the slot fenced.
+    // receipt is unresolved, so recovery and sweep must keep the slot fenced
+    // while still stopping the VM to halt billing.
     const restarted = s.make({}, new DiskState(s.state.path));
     await s.api(restarted).recover?.();
     await s.api(restarted).sweep?.();
     expect(await poolOf(new DiskState(s.state.path)).load())
       .toMatchObject([{ sandboxId, quarantined: true }]);
+    expect(s.boat.callsOf("stop").map((call) => call.args.sandboxId)).toContain(sandboxId);
     // Once the provider archives it, the terminal branch settles and frees it.
     s.boat.boxes.get(sandboxId)!.state = "archived";
     await s.api(restarted).sweep?.();

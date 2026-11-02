@@ -282,9 +282,11 @@ export class OffloadExecutor {
    * settles (stop stamped, settled to terminal-read unknown, never replayed);
    * a failed settlement keeps the slot fenced for retry. A running VM stays
    * fenced unless observe verifies it clean with known workspace ownership
-   * and no unresolved command receipt for its sandbox; a past-due running VM
-   * with no verifiable identity is still stopped (retrying while stopping),
-   * and the terminal observation releases it once Boat archives it.
+   * and no unresolved command receipt for its sandbox; a fenced VM with an
+   * unresolved receipt is still stopped to halt billing while it stays fenced;
+   * a past-due running VM with no verifiable identity is still stopped
+   * (retrying while stopping), and the terminal observation releases it once
+   * Boat archives it.
    */
   private async reconcileQuarantined(vm: PoolVm): Promise<void> {
     if (!vm.sandboxId || vm.deletePending) return;
@@ -331,7 +333,13 @@ export class OffloadExecutor {
           // guest looks clean: the disk is unverified, and the pending receipt
           // is what restart recovery re-holds to re-fence it. Only a terminal
           // provider observation (branch above) settles it, never a rejoin.
-          if (this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) return;
+          // The fence does not pause billing, so halt it with a forced stop
+          // while staying fenced; the terminal branch settles the receipt and
+          // frees the slot once Boat archives the VM.
+          if (this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
+            await this.stopVm(vm, true, true).catch(() => undefined);
+            return;
+          }
           vm.quarantined = false;
           await this.persistPool().catch(() => undefined);
         }
