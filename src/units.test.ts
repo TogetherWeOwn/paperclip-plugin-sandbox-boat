@@ -708,6 +708,17 @@ describe("env policy", () => {
       ["TWO_PRIVKEY", "x", ["secret_name_needs_exact_entry"]],
       ["TWO_SSH_ID_ED25519", pem, ["secret_value"]],
       ["TWO_PG_CONN", "host=db.prod.example password=s3cret", ["secret_value"]],
+      // Keyword-DSN assignments glued to a separator are the canonical forms:
+      // `;Password=` (ADO.NET), `;Pwd=` (ODBC), `&password=`, an identifier
+      // suffix (`db_password=`), and a single-quoted JSON-style key.
+      ["TWO_SETTINGS", "Server=db.example;Database=app;User Id=svc;Password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "Driver={SQL Server};Server=db.example;Uid=svc;Pwd=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "a=1&password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "db_password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "{'password': 'hunter2'}", ["secret_value"]],
+      ["TWO_SETTINGS", "host=db,pwd=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", '{"db_password":"hunter2"}', ["secret_value"]],
+      ["TWO_SETTINGS", "passwd: hunter2", ["secret_value"]],
       ["TWO_REDIS", "default:Ab/Cd+ef==@redis.prod:6379", ["remote_database_or_credential_url"]],
       // A password starting with `/` must not hide behind the separator rule:
       // the `:` is in the token's first segment and is no `://` separator.
@@ -731,6 +742,8 @@ describe("env policy", () => {
     expect(decide("CLAUDE_CODE_DB_PWD", "x", ["CLAUDE_CODE_*"])).toBe("secret_name_needs_exact_entry");
     // A secret JSON key behind a \u escape is a secret key once decoded.
     expect(decide("CLAUDE_CODE_CONFIG", '{"\\u0070assword":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
+    expect(decide("CLAUDE_CODE_CONFIG", '{"\\u0070wd":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
+    expect(decide("CLAUDE_CODE_CONFIG", '{"db_\\u0070assword":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
     // A benign value through the same prefix, and the exact-entry local database URL, still pass.
     expect(decide("TWO_FEATURE_FLAG", "on", ["TWO_*"])).toBe("kept");
     expect(decide("TWO_TEST_DATABASE_URL", "postgres://u:p@127.0.0.1/two", ["TWO_TEST_DATABASE_URL"])).toBe("kept");

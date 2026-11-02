@@ -37,7 +37,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 //      CONN(ECTION)STR(ING), WEBHOOK or DSN in it, or ending in KEY (_KEY, or
 //      the whole name), KEYS, _AUTH or _PAT; a value that is itself a secret
 //      whatever its name (a PEM private key, JSON with a private_key,
-//      client_secret or password key, a keyword DSN with `password=`, an
+//      client_secret or password key, a keyword DSN with a `password=` or
+//      `pwd=` assignment, glued forms (`;Password=`) included, an
 //      AccountKey/SharedAccessKey, or a well-known token prefix such as sk-,
 //      ghp_, AKIA, xoxb- or glpat-); and a VM-local database URL or URL with
 //      credentials. A `..._TOKENS` name with a whole-number value is a token
@@ -169,8 +170,13 @@ const SECRET_NAME_RE =
 // each pattern is linear in the value.
 const SECRET_VALUE_RES: readonly RegExp[] = [
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
-  /"(?:private_key|client_secret|password)"\s*:/i,
-  /(?:^|\s)password\s*=/i,
+  // A credential keyword assignment in any of its glued or spaced forms:
+  // a JSON-style key (`"password":`, single-quoted too), a keyword DSN
+  // assignment glued to its separator (`;Password=`, `;Pwd=`, `&password=`),
+  // or an identifier ending in the keyword (`db_password=`). No leading
+  // boundary is required: this runs on prefix matches only, where dropping
+  // a benign look-alike is the safe side.
+  /(?:private_key|client_secret|password|passwd|passphrase|pwd)\s*["']?\s*[:=]/i,
   /(?:AccountKey|SharedAccessKey)=/i,
   /(?:^|[^A-Za-z0-9])(?:sk-ant-|sk-or-|sk-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[abpr]-|glpat-)/,
 ];
@@ -494,7 +500,7 @@ interface ValueInspection {
   secretValue: boolean;
 }
 
-const SECRET_JSON_KEY_RE = /^(?:private_key|client_secret|password)$/i;
+const SECRET_JSON_KEY_RE = /(?:^|[_-])(?:private_key|client_secret|password|passwd|passphrase|pwd)(?:[_-]|$)/i;
 
 /**
  * Every string (keys included) in a parsed JSON value, iteratively (no
