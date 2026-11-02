@@ -900,6 +900,15 @@ export class OffloadExecutor {
     }
     // Another trust domain's retry must not adopt the replayed VM; stop it so
     // it never bills untracked, close the retained reservation, and free the slot.
+    // Settle the reservation against the replayed VM first: without a started()
+    // receipt the intent has no sandbox id, so a later stopped() could never
+    // match it and the hold would leak. A failing receipt write keeps the
+    // placeholder quarantined for a later claim to retry.
+    try {
+      await ledger.started(this.boat, reservation, id);
+    } catch {
+      return null;
+    }
     await this.boat.stop({ sandboxId: id }).catch(() => undefined);
     await ledger.stopped(id, this.now(), reservation.id).catch(() => undefined);
     this.retireVm(vm);

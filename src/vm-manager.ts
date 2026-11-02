@@ -1953,6 +1953,9 @@ export class BoatVmManager {
     }
     const sandboxId = sandbox.id;
     this.sandboxCompany.set(sandboxId, params.companyId);
+    // Repopulate the in-memory hard deadline from the persisted record: a
+    // worker that never saw the lease must still cap the resume's ttl.
+    await this.hardDeadlineMsFor(params.companyId, sandboxId);
     const wasUp = UP_STATES.has(sandbox.state);
     const taskClass = parseTaskClass(params.leaseMetadata?.taskClass, config.taskClass);
     const runningSize = sandbox.state !== "archived" ? requireBoatSize(sandbox.type) : undefined;
@@ -2081,6 +2084,9 @@ export class BoatVmManager {
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
         const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
         const startConfig = { ...config, size };
+        // After a restart the map is empty until a lease path repopulates it;
+        // fall back to the persisted record so the resume honors the hard deadline.
+        const hardDeadline = await this.hardDeadlineMsFor(companyId, sandboxId);
         const response = await this.startCall(
           "resume",
           startConfig,
@@ -2088,7 +2094,7 @@ export class BoatVmManager {
             api.resume({
               sandboxId,
               failFast: config.failFast,
-              ttlSeconds: this.ttlSeconds(config, this.hardDeadlines.get(sandboxId) ?? null),
+              ttlSeconds: this.ttlSeconds(config, hardDeadline),
               ...resumeEnvPolicy(config),
               ...(size !== sandbox.type && sandbox.state === "archived" ? { type: size } : {}),
             }),
@@ -2096,7 +2102,7 @@ export class BoatVmManager {
             const now = await this.getSandbox(api, sandboxId);
             return !!now && UP_STATES.has(now.state);
           },
-          { sandboxId, ttlSeconds: this.ttlSeconds(config, this.hardDeadlines.get(sandboxId) ?? null) },
+          { sandboxId, ttlSeconds: this.ttlSeconds(config, hardDeadline) },
         );
         this.noteDeadline(sandboxId, toView((response as { sandbox?: unknown } | null)?.sandbox)?.archiveAfter ?? null);
         this.logger.info("boat: resumed a stopped VM for a command", { sandboxId, previousState: sandbox.state });
@@ -2299,7 +2305,10 @@ export class BoatVmManager {
     const runId = str(params.leaseMetadata?.runId);
     const api = this.opsApi(config);
 
-    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+    // The sweep must run even when the release throws (a failed delete still
+    // stopped the VM; the sweep retries the delete). This covers every caller,
+    // including StopLease, which has no plugin-level sweep of its own.
+    const done: Promise<PluginEnvironmentTerminationReceipt | undefined> = this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       // The run's lease ends: its offload workspace bindings must not outlive it.
       if (runId) await this.forgetRunOffload(params.companyId, runId);
       const snapshot = await this.store.update(params.companyId, (doc) => {
@@ -2367,7 +2376,12 @@ export class BoatVmManager {
       if (deleting) {
         // A run-keyed VM can never be reused, so there is nothing to keep: delete it.
         await this.recordStopUsage(config, params.companyId, sandboxId, runId).catch(() => undefined);
-        await this.deleteSandbox(api, sandboxId);
+        try {
+          await this.deleteSandbox(api, sandboxId);
+        } catch (error) {
+          // A failed delete must still stop the billing VM; the error is rethrown.
+          await this.stopAfterFailedDelete({ config, companyId: params.companyId, sandboxId, runId, trigger: "release", cause: error });
+        }
         await this.markDeleted(params.companyId, sandboxId);
         this.logger.info(
           snapshot?.keyKind === "run" ? "boat: deleted per-run VM on release" : "boat: deleted card VM on release (deleteCardVmOnRelease)",
@@ -2436,6 +2450,11 @@ export class BoatVmManager {
       this.logger.warn("boat: stop did not take effect; the sweep retries it", { sandboxId, stillUp });
       return undefined;
     }));
+    try {
+      return await done;
+    } finally {
+      this.sweepSoon("release");
+    }
   }
 
   private async recordRunEnd(config: BoatDriverConfig, companyId: string, sandboxId: string, runId: string): Promise<void> {
@@ -2464,6 +2483,42 @@ export class BoatVmManager {
       if (info.status === 404) return;
       throw new BoatProviderError("BOAT_DELETE_FAILED", `boat delete of VM ${sandboxId} failed: ${formatBoatError(info)}`);
     }
+  }
+
+  /**
+   * A delete that failed must not leave the VM running untracked: stop it so
+   * billing stops, record the stop, and rethrow the delete error so the
+   * caller reports it. No tombstone is written (the VM still exists), the
+   * other runs are cleared only once the stop is confirmed (they may still
+   * hold the lease while the save is pending), and the sweep retries the
+   * delete from the record left behind.
+   */
+  private async stopAfterFailedDelete(input: {
+    config: BoatDriverConfig;
+    companyId: string;
+    sandboxId: string;
+    runId: string | null;
+    trigger: string;
+    cause: unknown;
+  }): Promise<never> {
+    const { config, companyId, sandboxId, runId, trigger, cause } = input;
+    const stopped = await this.stopAndConfirm(config, sandboxId, config.stopConfirmTimeoutMs).catch(() => false);
+    await this.store
+      .update(companyId, (doc) => {
+        const record = findBySandboxId(doc, sandboxId);
+        if (!record) return;
+        record.status = stopped ? "stopped" : "stopping";
+        record.lastStoppedAt = this.nowIso();
+        record.lastActivityAt = this.nowIso();
+        // Only a confirmed-down VM clears the other runs: they may still hold
+        // the lease while the save is pending, and clearing them would let the
+        // sweep idle-stop or delete under them.
+        if (stopped) record.activeRunIds = [];
+      })
+      .catch(() => undefined);
+    await this.recordStopUsage(config, companyId, sandboxId, runId).catch(() => undefined);
+    this.logger.warn("boat: delete failed; VM stopped instead", { sandboxId, trigger, stopped });
+    throw cause;
   }
 
   private async markDeleted(companyId: string, sandboxId: string): Promise<void> {
@@ -2517,7 +2572,12 @@ export class BoatVmManager {
       this.inflight.delete(sandboxId);
       this.envDropsLogged.delete(sandboxId);
       await this.recordStopUsage(config, params.companyId, sandboxId, null).catch(() => undefined);
-      await this.deleteSandbox(api, sandboxId);
+      try {
+        await this.deleteSandbox(api, sandboxId);
+      } catch (error) {
+        // A failed delete must still stop the billing VM; the error is rethrown.
+        await this.stopAfterFailedDelete({ config, companyId: params.companyId, sandboxId, runId, trigger: "destroy lease", cause: error });
+      }
       await this.markDeleted(params.companyId, sandboxId);
       this.logger.info("boat: deleted VM (destroy lease) and forgot its card mapping", { sandboxId });
       return { providerLeaseId: sandboxId, state: "destroyed" };
@@ -2858,78 +2918,112 @@ export class BoatVmManager {
   ): Promise<PluginEnvironmentCaptureTemplateResult> {
     const api = this.opsApi(config);
     const name = sanitizeSnapshotName(params.templateLabel, `${config.namePrefix}-tpl-${params.environmentId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase()}-${this.now().toString(36)}`);
-    const list = (await api.listNamedSnapshots()) as {
-      snapshots?: Array<{ name?: string }>;
-      allowance?: { free?: number; used?: number };
-    };
-    const exists = (list.snapshots ?? []).some((entry) => entry.name === name);
-    const free = list.allowance?.free ?? 10;
-    const used = list.allowance?.used ?? (list.snapshots ?? []).length;
-    if (!exists && used >= free && !config.allowPaidNamedSnapshots) {
-      throw new BoatProviderError(
-        "BOAT_NAMED_SNAPSHOT_NOT_FREE",
-        `all ${free} free boat named snapshots are used; one more costs $1.70 a month. Delete an old template, or set allowPaidNamedSnapshots.`,
-      );
-    }
-    // A named snapshot outlives every run and seeds new VMs, so it must never
-    // hold the run JWT in Paperclip's MCP config: remove it first, and refuse
-    // the capture when that cannot be verified. A stopped VM is resumed for it
-    // (budget-guarded, as for a command): its disk may come from an auto-stop
-    // that nobody scrubbed.
-    let session: SshSession;
+    // A VM this capture resumed must be stopped again afterwards (its disk is
+    // kept: it is the card's). A VM that was already up is left running. The
+    // stop runs on every path below, including the scrub refusal and the
+    // snapshot failure, so a capture never leaves a resumed VM billing.
+    const before = await this.getSandbox(api, sandboxId).catch(() => null);
+    const resumedForCapture = !!before && !UP_STATES.has(before.state);
     try {
-      session = await this.liveSession(config, params.companyId, sandboxId);
-    } catch (error) {
-      throw new BoatProviderError(
-        "BOAT_RUNTIME_SCRUB_FAILED",
-        `could not reach boat VM ${sandboxId} to remove Paperclip's run MCP config (run JWT) before the template capture, so nothing was captured: ${errorText(error)}`,
-      );
-    }
-    const record = await this.store
-      .read(params.companyId)
-      .then((doc) => findBySandboxId(doc, sandboxId))
-      .catch(() => null);
-    const scrub = await this.scrubRuntimeSecrets({
-      api,
-      config,
-      sandboxId,
-      roots: this.runtimeRoots(config, sandboxId, null, record),
-      before: "template capture",
-      connect: false,
-      session,
-    });
-    if (scrub.status !== "clean" && scrub.status !== "scrubbed") {
-      throw new BoatProviderError(
-        "BOAT_RUNTIME_SCRUB_FAILED",
-        `could not verify that Paperclip's run MCP config (run JWT) is gone from boat VM ${sandboxId}, so no template was captured (${scrub.status}${scrub.detail ? `: ${scrub.detail}` : ""}).`,
-      );
-    }
-    await api.saveNamedSnapshot({ sandboxId, name });
-    const timeoutMs = typeof params.timeoutMs === "number" && params.timeoutMs > 0 ? params.timeoutMs : config.timeoutMs;
-    const deadline = this.now() + timeoutMs;
-    for (;;) {
-      const info = (await api.getNamedSnapshot({ name })) as { snapshot?: { status?: string; error?: string; sizeBytes?: number; snapshotId?: string } };
-      const status = info.snapshot?.status;
-      if (status === "ready") {
-        return {
-          templateRef: name,
-          templateKind: "snapshot",
-          metadata: {
-            provider: "boat",
-            sandboxId,
-            snapshotId: info.snapshot?.snapshotId ?? null,
-            sizeBytes: info.snapshot?.sizeBytes ?? null,
-            capturedAt: this.nowIso(),
-          },
+      // A named snapshot outlives every run and seeds new VMs, so it must never
+      // hold the run JWT in Paperclip's MCP config: remove it first, and refuse
+      // the capture when that cannot be verified. A stopped VM is resumed for it
+      // (budget-guarded, as for a command): its disk may come from an auto-stop
+      // that nobody scrubbed.
+      const session = await this.liveSession(config, params.companyId, sandboxId).catch((error: unknown): never => {
+        throw new BoatProviderError(
+          "BOAT_RUNTIME_SCRUB_FAILED",
+          `could not reach boat VM ${sandboxId} to remove Paperclip's run MCP config (run JWT) before the template capture, so nothing was captured: ${errorText(error)}`,
+        );
+      });
+      const record = await this.store
+        .read(params.companyId)
+        .then((doc) => findBySandboxId(doc, sandboxId))
+        .catch(() => null);
+      const scrub = await this.scrubRuntimeSecrets({
+        api,
+        config,
+        sandboxId,
+        roots: this.runtimeRoots(config, sandboxId, null, record),
+        before: "template capture",
+        connect: false,
+        session,
+      });
+      if (scrub.status !== "clean" && scrub.status !== "scrubbed") {
+        throw new BoatProviderError(
+          "BOAT_RUNTIME_SCRUB_FAILED",
+          `could not verify that Paperclip's run MCP config (run JWT) is gone from boat VM ${sandboxId}, so no template was captured (${scrub.status}${scrub.detail ? `: ${scrub.detail}` : ""}).`,
+        );
+      }
+      // The allowance check and the save run under one lock: concurrent captures
+      // of different cards share no card lock, so without this both could see a
+      // free slot and both save. The poll below runs unlocked.
+      await this.withLock("boat:named-snapshots", async () => {
+        const list = (await api.listNamedSnapshots()) as {
+          snapshots?: Array<{ name?: string }>;
+          allowance?: { free?: number; used?: number };
         };
+        const exists = (list.snapshots ?? []).some((entry) => entry.name === name);
+        const free = list.allowance?.free ?? 10;
+        const used = list.allowance?.used ?? (list.snapshots ?? []).length;
+        if (!exists && used >= free && !config.allowPaidNamedSnapshots) {
+          throw new BoatProviderError(
+            "BOAT_NAMED_SNAPSHOT_NOT_FREE",
+            `all ${free} free boat named snapshots are used; one more costs $1.70 a month. Delete an old template, or set allowPaidNamedSnapshots.`,
+          );
+        }
+        await api.saveNamedSnapshot({ sandboxId, name });
+      });
+      const timeoutMs = typeof params.timeoutMs === "number" && params.timeoutMs > 0 ? params.timeoutMs : config.timeoutMs;
+      const deadline = this.now() + timeoutMs;
+      for (;;) {
+        const info = (await api.getNamedSnapshot({ name })) as { snapshot?: { status?: string; error?: string; sizeBytes?: number; snapshotId?: string } };
+        const status = info.snapshot?.status;
+        if (status === "ready") {
+          // Our check and save were atomic, but another client may have filled
+          // the allowance between them: never keep a paid snapshot without
+          // permission. On overage the just-saved snapshot is deleted again.
+          if (!config.allowPaidNamedSnapshots) {
+            const verify = (await api.listNamedSnapshots()) as {
+              snapshots?: Array<{ name?: string }>;
+              allowance?: { free?: number; used?: number };
+            };
+            const verifyFree = verify.allowance?.free ?? 10;
+            const verifyUsed = verify.allowance?.used ?? (verify.snapshots ?? []).length;
+            if (verifyUsed > verifyFree) {
+              await api.deleteNamedSnapshot({ name }).catch((error: unknown) => {
+                this.logger.warn("boat: could not delete the over-allowance template capture", { name, error: errorText(error) });
+              });
+              throw new BoatProviderError(
+                "BOAT_NAMED_SNAPSHOT_NOT_FREE",
+                `named snapshot ${name} would exceed the ${verifyFree} free boat named snapshots, so it was deleted again; delete an old template, or set allowPaidNamedSnapshots.`,
+              );
+            }
+          }
+          return {
+            templateRef: name,
+            templateKind: "snapshot",
+            metadata: {
+              provider: "boat",
+              sandboxId,
+              snapshotId: info.snapshot?.snapshotId ?? null,
+              sizeBytes: info.snapshot?.sizeBytes ?? null,
+              capturedAt: this.nowIso(),
+            },
+          };
+        }
+        if (status === "failed") {
+          throw new BoatProviderError("BOAT_SNAPSHOT_FAILED", `boat could not save named snapshot ${name}: ${info.snapshot?.error ?? "unknown error"}`);
+        }
+        if (this.now() >= deadline) {
+          throw new BoatProviderError("BOAT_SNAPSHOT_TIMEOUT", `named snapshot ${name} was still saving after ${Math.round(timeoutMs / 1000)} s.`);
+        }
+        await this.sleep(5000);
       }
-      if (status === "failed") {
-        throw new BoatProviderError("BOAT_SNAPSHOT_FAILED", `boat could not save named snapshot ${name}: ${info.snapshot?.error ?? "unknown error"}`);
+    } finally {
+      if (resumedForCapture) {
+        await this.stopAndConfirm(config, sandboxId, config.stopConfirmTimeoutMs).catch(() => false);
       }
-      if (this.now() >= deadline) {
-        throw new BoatProviderError("BOAT_SNAPSHOT_TIMEOUT", `named snapshot ${name} was still saving after ${Math.round(timeoutMs / 1000)} s.`);
-      }
-      await this.sleep(5000);
     }
   }
 
