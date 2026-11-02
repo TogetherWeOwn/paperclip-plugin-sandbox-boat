@@ -152,6 +152,26 @@ function runHoldsVm(record: VmRecord | null | undefined): boolean {
   return !!record && (record.activeRunIds.length > 0 || record.sessions.some((entry) => !entry.endedAt));
 }
 
+/**
+ * The provider-side effect of a start whose receipt write then failed
+ * (startCall's ledger `started()` after a successful create or resume). The
+ * id is attached to the thrown error so the caller can stop the VM instead of
+ * orphaning a billing sandbox it has no record of.
+ */
+function withCreatedSandboxId(error: unknown, sandboxId: string): unknown {
+  if (error !== null && (typeof error === "object" || typeof error === "function")) {
+    (error as { createdSandboxId?: string }).createdSandboxId = sandboxId;
+    return error;
+  }
+  return Object.assign(new Error(typeof error === "string" ? error : "boat start receipt failed"), { createdSandboxId: sandboxId });
+}
+
+/** The created id a failed start carries, if the provider effect happened before the recording failed. */
+export function createdSandboxIdOf(error: unknown): string | null {
+  const id = (error as { createdSandboxId?: unknown } | null)?.createdSandboxId;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 export interface ManagerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
   warn(message: string, meta?: Record<string, unknown>): void;
@@ -978,7 +998,14 @@ export class BoatVmManager {
         await this.account(config).failed(reservation, false);
         throw new BoatProviderError("BOAT_START_FAILED", "provider reply omitted the sandbox identity; account reservation retained");
       }
-      await this.account(config).started(api, reservation, id);
+      try {
+        await this.account(config).started(api, reservation, id);
+      } catch (error) {
+        // The provider already created (or resumed) the VM; without its id the
+        // caller could never stop it, so it would bill untracked. Hand it back
+        // on the error for the caller's stop/delete cleanup.
+        throw withCreatedSandboxId(error, id);
+      }
       return response;
     }
   }
@@ -1305,6 +1332,25 @@ export class BoatVmManager {
   }
 
   /**
+   * The lease's hard deadline for a VM, restored from its persisted record
+   * when this worker has not seen the lease (a restart, or a lease that
+   * started in another worker). The map is the fast path; the record is the
+   * durable one acquire maintains on every start.
+   */
+  private async hardDeadlineMsFor(companyId: string, sandboxId: string): Promise<number | null> {
+    const live = this.hardDeadlines.get(sandboxId);
+    if (live != null) return live;
+    const record = await this.store
+      .read(companyId)
+      .then((doc) => findBySandboxId(doc, sandboxId))
+      .catch(() => null);
+    const parsed = record?.hardDeadline ? Date.parse(record.hardDeadline) : NaN;
+    if (Number.isNaN(parsed)) return null;
+    this.hardDeadlines.set(sandboxId, parsed);
+    return parsed;
+  }
+
+  /**
    * Auto-stop counts from the start or the last resume, not from activity, so a
    * long run must move it forward. PATCH ttlSeconds sets the deadline to now +
    * TTL (`boat extend`). Only called while a command runs, so an idle VM is never
@@ -1314,7 +1360,10 @@ export class BoatVmManager {
     const ttlMs = config.autoStopMinutes * 60 * 1000;
     const known = this.deadlines.get(sandboxId);
     if (known != null && known - this.now() > ttlMs / 2) return;
-    const hard = this.hardDeadlines.get(sandboxId) ?? null;
+    // After a restart the map is empty until a lease path repopulates it; fall
+    // back to the persisted record via the VM's company when it is known.
+    const companyId = this.sandboxCompany.get(sandboxId);
+    const hard = companyId ? await this.hardDeadlineMsFor(companyId, sandboxId) : (this.hardDeadlines.get(sandboxId) ?? null);
     let ttlSeconds = config.autoStopMinutes * 60;
     if (hard != null) ttlSeconds = Math.min(ttlSeconds, Math.floor((hard - this.now()) / 1000));
     if (ttlSeconds < 60) return;
@@ -1548,6 +1597,9 @@ export class BoatVmManager {
       let startedNew = false;
       // The card's existing VM was resumed: its disk holds the card's work (TOG-37714).
       let resumedExisting = false;
+      // The resume target while its startCall is in flight, so a receipt-write
+      // failure after the provider resume still keeps that disk.
+      let resumeTargetId: string | null = null;
       let archiveAfter: string | null = null;
       try {
         if (sandbox && UP_STATES.has(sandbox.state)) {
@@ -1574,6 +1626,10 @@ export class BoatVmManager {
           if (sandbox) {
             const target = sandbox;
             const sizeChange = target.state === "archived" && target.type !== config.size ? { type: config.size } : {};
+            // The resume's provider effect may land before its receipt write
+            // fails; remember the target so the catch keeps that disk (it is
+            // the card's) instead of deleting it as a fresh VM.
+            resumeTargetId = target.id;
             try {
               const response = await this.startCall(
                 "resume",
@@ -1630,7 +1686,10 @@ export class BoatVmManager {
 
         this.sandboxCompany.set(sandboxId, params.companyId);
         this.lastActivity.set(sandboxId, this.now());
+        // A lease without a deadline clears the previous lease's: otherwise
+        // the old deadline caps every later extend on the same VM.
         if (hardDeadlineMs != null && !Number.isNaN(hardDeadlineMs)) this.hardDeadlines.set(sandboxId, hardDeadlineMs);
+        else this.hardDeadlines.delete(sandboxId);
         this.noteDeadline(sandboxId, archiveAfter);
         // Persist the mapping before waiting, so a crash cannot orphan a billing VM.
         await this.store.update(params.companyId, (state) =>
@@ -1691,9 +1750,17 @@ export class BoatVmManager {
         }
         return lease;
       } catch (error) {
+        // A receipt write can fail after the provider effect landed (startCall
+        // attaches the created id then). Without that id the new VM would bill
+        // untracked: no record was persisted and the rename never ran.
+        const receiptOrphanId = createdSandboxIdOf(error);
+        const doomedId = sandboxId || receiptOrphanId;
+        // A resume whose receipt failed still owns the card's disk, even though
+        // resumedExisting is only set after startCall returns.
+        const keptDisk = resumedExisting || (receiptOrphanId != null && receiptOrphanId === resumeTargetId);
         // The VM's record as stored, for the workspace roots earlier runs (and other workers) recorded on it.
         let stored: VmRecord | null = null;
-        if (sandboxId) {
+        if (doomedId) {
           stored = await this.store
             .update(params.companyId, (state) => {
               const record = state.vms[key];
@@ -1702,24 +1769,24 @@ export class BoatVmManager {
                 const open = record.sessions.find((entry) => entry.runId === params.runId && !entry.endedAt);
                 if (open) open.endedAt = this.nowIso();
               }
-              const own = findBySandboxId(state, sandboxId);
+              const own = findBySandboxId(state, doomedId);
               return own ? structuredClone(own) : null;
             })
             .catch(() => null);
         }
-        if (startedNew && sandboxId) {
+        if (doomedId && (startedNew || receiptOrphanId)) {
           // Never leave a VM billing after a failed start. A resumed disk can
           // still hold an earlier run's MCP config, so scrub first when SSH
           // works, in every root the VM's record knows of.
           const scrub = await this.scrubRuntimeSecrets({
             api,
             config,
-            sandboxId,
-            roots: this.runtimeRoots(config, sandboxId, null, stored),
+            sandboxId: doomedId,
+            roots: this.runtimeRoots(config, doomedId, null, stored),
             before: "stop",
             connect: false,
           });
-          await this.ssh.closeSession(sandboxId).catch(() => undefined);
+          await this.ssh.closeSession(doomedId).catch(() => undefined);
           // A runtime directory that failed on the VM fails again at every resume of this disk; a fresh VM does not.
           const linkFailed = error instanceof BoatProviderError && error.code === "BOAT_RUNTIME_DIR_FAILED" && error.details.onVm === true;
           const reason =
@@ -1729,21 +1796,21 @@ export class BoatVmManager {
                 ? "its .paperclip-runtime could not be prepared (~/.boatignore rule, real directory)"
                 : null;
           let deleted = false;
-          if (reason && resumedExisting) {
+          if (reason && keptDisk) {
             // The card's own VM: stop it and keep its work (TOG-37714). Its next start links and scrubs again.
-            this.logKeptDisk({ sandboxId, trigger: "failed start", keep: "resumed_disk", reason });
+            this.logKeptDisk({ sandboxId: doomedId, trigger: "failed start", keep: "resumed_disk", reason });
           } else if (reason && scrub.status === "incomplete" && !linkFailed) {
-            this.logKeptDisk({ sandboxId, trigger: "failed start", keep: "incomplete_scan", reason });
+            this.logKeptDisk({ sandboxId: doomedId, trigger: "failed start", keep: "incomplete_scan", reason });
           } else if (reason) {
             // A VM this start created holds nothing of the card's yet.
-            deleted = await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId, runId: params.runId, trigger: "failed start", reason });
+            deleted = await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId: doomedId, runId: params.runId, trigger: "failed start", reason });
           }
           if (!deleted) {
-            await this.stopAndConfirm(config, sandboxId, 30_000).catch(() => false);
+            await this.stopAndConfirm(config, doomedId, 30_000).catch(() => false);
             await this.store
               .update(params.companyId, (state) => {
                 const record = state.vms[key];
-                if (record && record.sandboxId === sandboxId) {
+                if (record && record.sandboxId === doomedId) {
                   record.status = "stopped";
                   record.lastStoppedAt = this.nowIso();
                 }
