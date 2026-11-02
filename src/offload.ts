@@ -103,6 +103,10 @@ export interface OffloadExecutorConfig {
   queueLimit?: number;
   queueTimeoutMs?: number;
   size?: BoatSize;
+  /** Boat monitoring for new pool VMs (driver `monitoring`); default on. A VM
+   * keeps the policy it was created under, so the policy is part of pool-VM
+   * reuse compatibility. */
+  monitoring?: boolean;
   maxActive?: number;
   maxStartsPerDay?: number;
   minComputeHoursLeft?: number;
@@ -206,7 +210,7 @@ export class OffloadExecutor {
   private readonly now: () => number;
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
-    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
+    Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "monitoring" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
     Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot" | "templateSourceSandboxId"> &
     Required<Pick<OffloadExecutorConfig, "ephemeralRepos">>;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
@@ -237,6 +241,7 @@ export class OffloadExecutor {
       queueLimit: deps.config.queueLimit ?? DEFAULTS.queueLimit,
       queueTimeoutMs: deps.config.queueTimeoutMs ?? DEFAULTS.queueTimeoutMs,
       size: deps.config.size ?? DEFAULTS.size,
+      monitoring: deps.config.monitoring ?? true,
       maxActive: deps.config.maxActive ?? DEFAULTS.maxActive,
       maxStartsPerDay: deps.config.maxStartsPerDay ?? DEFAULTS.maxStartsPerDay,
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
@@ -601,6 +606,16 @@ export class OffloadExecutor {
     this.config.ephemeralRepos = [...repos];
   }
 
+  /**
+   * Same live-update contract as the template setters: monitoring is an
+   * environment setting, not pool identity, so later resolves deliver the
+   * current policy here. It applies to later creates and claims; a VM keeps
+   * the policy (and compatibility key) it was created under.
+   */
+  setMonitoring(enabled: boolean): void {
+    this.config.monitoring = enabled;
+  }
+
   private compatibilityKey(command: OffloadCommand): string {
     // A VM booted from another guest image is never reused; it is retired like
     // any incompatible idle VM. Without a template the key is unchanged, so VMs
@@ -624,6 +639,12 @@ export class OffloadExecutor {
       : this.config.templateSourceSandboxId ? [...base, ["fork", this.config.templateSourceSandboxId]]
       : [...base];
     if (this.isEphemeral(command)) key.push(["ephemeral", command.commandId]);
+    // A VM keeps the monitoring policy from its creation, so the opt-out keys
+    // reuse: an unmonitored command never claims a monitored VM (and the
+    // converse, because that VM's recorded key carries the tag). Monitored is
+    // the historical default and keeps the bare layout, so VMs recorded before
+    // the opt-out reached offload stay reusable under the default policy.
+    if (!this.config.monitoring) key.push(["monitoring", false]);
     return JSON.stringify(key);
   }
 
@@ -834,19 +855,19 @@ export class OffloadExecutor {
         // configured archived sandbox is forked instead; a failing fork is a
         // refused start the same way.
         if (this.config.templateSnapshot) {
-          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true,
             from: this.config.templateSnapshot });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("create returned no sandbox id");
           vm.sandboxId = id;
         } else if (this.config.templateSourceSandboxId) {
           const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
-            ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+            ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("fork returned no sandbox id");
           vm.sandboxId = id;
         } else {
-          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("create returned no sandbox id");
           vm.sandboxId = id;
