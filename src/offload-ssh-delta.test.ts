@@ -5,6 +5,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync } from "./offload-ssh-sync.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import {
   hashManifest,
   MIRROR_MARKER_RELPATH,
@@ -180,6 +181,7 @@ function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number)
     session: async (sandboxId: string) => sessionFor(sandboxId) as never,
     refreshSession: refreshSession as never,
     sourceRoot: async () => root,
+    trackedFiles: listAllFilesAsTracked,
     artifactRoot,
     workRoot: "/tmp/boat-test",
     spawn: spawn as never,
@@ -297,6 +299,16 @@ describe("delta push over stub SSH", () => {
     expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
   });
 
+  it("wipes a mirror that predates this worker before the full resync", async () => {
+    const root = source({ "a.txt": "a" });
+    const { sync, spawns, guest } = setup(root);
+    const dir = sync.directory(command());
+    setMarker(guest, "vm-1", dir, { version: 1, mirrorKey: "old", manifestHash: "0".repeat(64) });
+    await sync.push("vm-1", command());
+    expect(guest.wipes).toEqual([{ vm: "vm-1", dir }]);
+    expect(filesFromStdin(spawns[0]!.stdin)).toEqual(["a.txt"]);
+  });
+
   it("falls back to a full upload when the guest marker disagrees with host state", async () => {
     const root = source({ "a.txt": "a" });
     const { sync, spawns, guest } = setup(root);
@@ -377,6 +389,7 @@ describe("delta push over stub SSH", () => {
       session: async (sandboxId: string) => harness.sessionFor(sandboxId) as never,
       refreshSession: harness.refreshSession as never,
       sourceRoot: async (cmd: OffloadCommand) => (cmd.executionWorkspaceId === WS_B ? rootB : rootA),
+      trackedFiles: listAllFilesAsTracked,
       artifactRoot: temp("boat-delta-artifacts-b-"),
       workRoot: "/tmp/boat-test",
       spawn: harness.spawn as never,
@@ -436,6 +449,7 @@ describe("delta push over stub SSH", () => {
       ssh: harness.ssh as never,
       session: async (sandboxId: string) => harness.sessionFor(sandboxId) as never,
       sourceRoot: async () => root,
+      trackedFiles: listAllFilesAsTracked,
       artifactRoot: temp("boat-delta-artifacts-c-"),
       workRoot: "/tmp/boat-test",
       spawn: harness.spawn as never,
@@ -520,7 +534,7 @@ describe("delta push over stub SSH", () => {
   });
 
   it("collects and stages without deleting the persistent mirror", async () => {
-    const root = source({});
+    const root = source({ "a.txt": "a" });
     const { sync, ssh } = setup(root);
     const cmd = command();
     await sync.push("vm-1", cmd);
@@ -528,7 +542,9 @@ describe("delta push over stub SSH", () => {
     const runsBeforeStage = ssh.runStream.mock.calls.length;
     const staged = await sync.stage("vm-1", cmd, collected);
     expect(ssh.runStream.mock.calls.length).toBe(runsBeforeStage);
-    expect(staged).toMatchObject({ state: "clean", changedPaths: [] });
+    // The stub scan reports an empty guest, so the one pushed file reads as a
+    // proposed delete; staging it must still not touch the mirror over SSH.
+    expect(staged).toMatchObject({ state: "staged", changedPaths: ["a.txt"] });
   });
 
   it("keeps the guest cwd inside the per-card mirror", async () => {

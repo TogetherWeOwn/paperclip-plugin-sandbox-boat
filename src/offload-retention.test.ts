@@ -7,6 +7,7 @@ import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import { OffloadJournal, type OffloadSync } from "./offload-journal.js";
 import { command as lifecycleCommand, DiskState, EPOCH } from "./test-support/offload-lifecycle-contract.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -120,7 +121,7 @@ describe("stock runtime journal retention", () => {
   }, 15_000);
   function stockRuntime(state: StateClientLike = harness.ctx.state): SshOffloadRuntime {
     const boat = new FakeBoat({ now: Date.now });
-    return new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+    return new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
       boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
   }

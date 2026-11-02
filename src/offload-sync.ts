@@ -16,6 +16,7 @@ import { O_NOFOLLOW, O_RDONLY } from "node:constants";
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
+import { containsSecretContent } from "./offload-secret-scan.js";
 
 export const SYNC_MANIFEST_VERSION = 1;
 
@@ -40,14 +41,29 @@ export const DEFAULT_SYNC_EXCLUDES: readonly string[] = [
   ".claude/",
   ".cargo/",
   ".boat-offload/",
+  ".aws/",
+  ".docker/",
+  ".kube/",
   ".env",
   ".env.*",
+  ".envrc",
+  ".dev.vars",
   ".npmrc",
   ".yarnrc",
   ".yarnrc.yml",
   ".pypirc",
   "pip.conf",
   ".netrc",
+  ".git-credentials",
+  "*.pem",
+  "*.key",
+  "id_rsa*",
+  "id_ed25519*",
+  "id_ecdsa*",
+  "*credentials*.json",
+  "service-account*.json",
+  "*.tfvars",
+  "*.tfstate*",
 ];
 
 const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
@@ -60,7 +76,9 @@ export type SyncErrorCode =
   | "SYNC_SOURCE_TOO_LARGE"
   | "SYNC_CONCURRENT_EDIT"
   | "SYNC_TRAVERSAL"
-  | "SYNC_GUEST_READ";
+  | "SYNC_GUEST_READ"
+  | "SYNC_NOT_GIT_WORKTREE"
+  | "SYNC_SECRET_CONTENT";
 
 export class SyncError extends Error {
   readonly code: SyncErrorCode;
@@ -122,6 +140,15 @@ export interface CaptureOptions {
   maxFiles?: number;
   fs?: ManifestFs;
   now?: () => number;
+  /**
+   * When set, only these root-relative posix paths may be captured (the
+   * git-tracked set in production): every other file, link or special file
+   * is skipped before any validation, so untracked or ignored workspace
+   * content can neither sync nor block the capture.
+   */
+  onlyPaths?: ReadonlySet<string>;
+  /** When true, a captured file carrying a known credential shape aborts the capture with SYNC_SECRET_CONTENT. */
+  scanForSecrets?: boolean;
 }
 
 function sha256Hex(data: string | Buffer): string {
@@ -272,7 +299,7 @@ export async function captureManifest(root: string, opts: CaptureOptions = {}): 
   const started = clock();
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const files = await walkAndHash(root, io, excludes, maxBytes, maxFiles);
+      const files = await walkAndHash(root, io, excludes, maxBytes, maxFiles, opts.onlyPaths, opts.scanForSecrets === true);
       files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
       const bytes = files.reduce((sum, f) => sum + f.size, 0);
       return {
@@ -286,9 +313,29 @@ export async function captureManifest(root: string, opts: CaptureOptions = {}): 
   throw new SyncError("SYNC_CONCURRENT_EDIT", `source under ${root} changed during capture on both attempts; nothing was pushed.`);
 }
 
-async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExcludes, maxBytes: number, maxFiles: number): Promise<SyncFileEntry[]> {
+async function walkAndHash(
+  root: string,
+  io: ManifestFs,
+  excludes: ParsedExcludes,
+  maxBytes: number,
+  maxFiles: number,
+  onlyPaths?: ReadonlySet<string>,
+  scanForSecrets = false,
+): Promise<SyncFileEntry[]> {
   const base = path.resolve(root);
   const files: SyncFileEntry[] = [];
+  // Ancestor directories of the allowed set: the walk never descends
+  // anywhere else, so untracked trees are not even listed.
+  const onlyDirs = new Set<string>();
+  if (onlyPaths) {
+    for (const allowed of onlyPaths) {
+      let dir = path.posix.dirname(allowed);
+      while (dir !== ".") {
+        onlyDirs.add(dir);
+        dir = path.posix.dirname(dir);
+      }
+    }
+  }
   let bytes = 0;
   const stack: string[] = [""];
   while (stack.length > 0) {
@@ -307,6 +354,10 @@ async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExclude
     for (const entry of sorted) {
       const entryRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
       const entryAbs = path.join(base, entryRel);
+      // Tracked-only captures skip everything outside the allowed set before
+      // any validation: an untracked escaping link or FIFO is not synced and
+      // must not block (or be probed by) the capture.
+      if (onlyPaths && !entry.isDirectory() && !onlyPaths.has(entryRel)) continue;
       if (entry.isSymbolicLink()) {
         // Excluded names skip before any link validation: target/ as a link
         // is still target/, whether its target escapes or stays in-root.
@@ -319,6 +370,7 @@ async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExclude
         files.push({ path: entryRel, size: Buffer.byteLength(target), mtimeMs: st.mtimeMs, mode: st.mode & 0o777, sha256: symlinkHash(target), symlink: target });
       } else if (entry.isDirectory()) {
         if (isExcluded(entryRel, true, excludes)) continue;
+        if (onlyPaths && !onlyDirs.has(entryRel)) continue;
         stack.push(entryRel);
       } else if (entry.isFile()) {
         if (isExcluded(entryRel, false, excludes)) continue;
@@ -328,6 +380,9 @@ async function walkAndHash(root: string, io: ManifestFs, excludes: ParsedExclude
         const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW));
         try {
           const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs));
+          if (scanForSecrets && containsSecretContent(content)) {
+            throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: it carries a known credential shape; the command stays local.`);
+          }
           bytes += size;
           if (bytes > maxBytes) throw new SyncError("SYNC_SOURCE_TOO_LARGE", `source under ${root} exceeds the ${maxBytes}-byte cap.`);
           files.push({ path: entryRel, size, mtimeMs, mode: pre.mode & 0o777, sha256: sha256Hex(content) });

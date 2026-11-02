@@ -6,8 +6,8 @@ How the opt-in command-level executor, its guest transport and its sync work. De
 
 The stock worker now has a concrete Linux guest transport over the existing
 API-authorized, pinned-host-key Boat SSH connection. The agent/model stays on
-the server; only an eligible heavy command and a frozen, secret-free source
-snapshot go to a pool VM. **Everything remains default OFF**: both company
+the server; only an eligible heavy command and a frozen snapshot of the
+workspace's git-tracked files go to a pool VM. **Everything remains default OFF**: both company
 flags, an explicit repository allowlist, native workspace realization metadata,
 a delegated cgroup parent and a private artifact directory are required. The
 separate Cargo shim opt-in is still required. See the enabling and smoke
@@ -176,6 +176,14 @@ Use an already delegated guest image; the plugin never changes systemd, mounts,
 delegation or services. This is lifecycle containment within a trusted pool,
 not a security boundary against hostile code sharing its UID/delegation authority.
 
+Source admission is tracked-only: `SshOffloadRuntime.resolve` lists the
+index with `git ls-files -z --cached` (fsmonitor/hooks disabled), keeps the
+command local when the source is not a git work tree, the index is empty, or
+a bounded scan of the tracked syncable files finds a known credential shape
+(cloud key ids, private-key headers, provider tokens, JWTs); the push
+re-lists and re-scans at capture time (`SYNC_NOT_GIT_WORKTREE`,
+`SYNC_SECRET_CONTENT`), and the manifest is the tracked set intersected with
+the walk, so untracked or ignored files are never listed, hashed or synced.
 Source is frozen with the existing manifest/exclusion checks, then delta-pushed
 with rsync over the pinned SSH control master into a persistent per-card mirror
 on the pool VM (`paperclip-boat-mirror-*`, keyed by company, repo and execution
@@ -186,8 +194,9 @@ missing or disagreeing marker (fresh VM, new machine) fully resyncs, which also
 repairs content drift in tracked files. Guest-only extras are retained as
 caches; prune removes only host-known deletions. Return inspection hashes files in bounded chunks and
 fetches at most 4 MiB into private staged artifacts, never live source. Only
-approved public, secret-free inputs belong here: exclusions are defense in
-depth, not a secret scanner. The mirror persists across commands (delta base,
+approved public inputs belong here: the tracked-only rule is the boundary,
+exclusions and the credential-shape scan are defense in depth, and neither
+proves a workspace secret-free. The mirror persists across commands (delta base,
 dependencies, cargo caches); VM stop/retirement reclaims it. Artifacts remain
 in the configured persistent host root for explicit review/removal. Failed or
 uncertain collection retains the reservation and files.
