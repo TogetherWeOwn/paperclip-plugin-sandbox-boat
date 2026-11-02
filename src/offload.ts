@@ -582,8 +582,13 @@ export class OffloadExecutor {
         for (const [oldKey, entry] of this.journal) {
           if (this.journal.size <= MAX_VOLATILE_JOURNAL) break;
           // Live entries back in-flight work: finish() and duplicate joins
-          // need them, and they stay bounded by queue plus admission.
-          if (entry.result !== null) this.journal.delete(oldKey);
+          // need them, and they stay bounded by queue plus admission. An entry
+          // whose promise has not settled stays even with a result: finish()
+          // runs before accounting, duration recording and VM release, so
+          // evicting it would let a duplicate re-execute while the first call
+          // is still pending, and the settling call would then delete the
+          // duplicate's inFlight join.
+          if (entry.result !== null && !this.inFlight.has(oldKey)) this.journal.delete(oldKey);
         }
       }
     }

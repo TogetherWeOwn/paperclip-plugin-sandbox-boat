@@ -15,7 +15,10 @@ class MemDisk {
   private ck(input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) {
     return JSON.stringify([input.scopeKind, input.scopeId ?? null, input.namespace ?? null, input.stateKey]);
   }
-  private parsed(key: string) { return JSON.parse(key) as { namespace: string; stateKey: string }; }
+  private parsed(key: string) {
+    const [, , namespace, stateKey] = JSON.parse(key) as [string, string | null, string | null, string];
+    return { namespace, stateKey };
+  }
   async get(input: Parameters<MemDisk["set"]>[0]) {
     const value = this.doc.get(this.ck(input));
     return value === undefined ? null : structuredClone(value);
@@ -119,6 +122,60 @@ describe("offload in-memory pruning", () => {
     expect(maps.journal.size).toBeLessThanOrEqual(512);
     // The VM was released, not stuck busy behind a journal throw.
     await expect(ex.execute(command("after", { executionWorkspaceId: "workspace-long" }))).resolves.toMatchObject({ status: "completed" });
+    await ex.shutdown();
+  }, 180_000);
+
+  it("a duplicate joins a command still in post-finish accounting", async () => {
+    // finish() records the result before accounting, duration recording and
+    // VM release finish. Another command's cap eviction must not delete that
+    // entry while its promise is still pending: the duplicate would
+    // re-execute beside the first call, and the settling call would then
+    // delete the duplicate's inFlight join so a later duplicate fails.
+    const runs: string[] = [];
+    let accountingEntered = false;
+    let releaseAccounting!: () => void;
+    const accountingGate = new Promise<void>((resolve) => { releaseAccounting = resolve; });
+    const ex = new OffloadExecutor({
+      state: s.state,
+      accountId: "volatile-journal-inflight-test",
+      poolId: "volatile-journal-inflight-pool",
+      boat: s.boat as never,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      now: s.clock.now,
+      timers: { set: s.clock.set, clear: s.clock.clear },
+      config: { maxOffloadVms: 2, offloadIdleStopSeconds: 3600 },
+      runCommand: async (_sandboxId: string, cmd) => {
+        runs.push(cmd.commandId);
+        return { exitCode: 0, seconds: 1 };
+      },
+      recordDuration: async (cmd) => {
+        if (cmd.commandId === "gated") { accountingEntered = true; await accountingGate; }
+      },
+    });
+    const gatedPending = ex.execute(command("gated", { executionWorkspaceId: "workspace-gated" }));
+    await until(() => accountingEntered);
+    // Fill the journal past its 512-entry cap while the gated command is
+    // still settling, so other commands' cap eviction runs against it.
+    for (let n = 0; n < 512; n += 1) {
+      await ex.execute(command(`short-${n}`, { executionWorkspaceId: "workspace-shorts" }));
+    }
+    // The shorts' eviction ran while the gated command was still settling:
+    // the duplicate must join the settled receipt, not start a second
+    // execution. Raced so a regression fails fast: a re-executed duplicate
+    // parks behind the same accounting gate instead of resolving.
+    const dupPending = ex.execute(command("gated", { executionWorkspaceId: "workspace-gated" }));
+    try {
+      const joined = await Promise.race([
+        dupPending,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("duplicate did not join the settled receipt")), 10_000)),
+      ]);
+      expect(joined).toMatchObject({ status: "completed" });
+      expect(runs.filter((id) => id === "gated")).toHaveLength(1);
+    } finally {
+      releaseAccounting();
+    }
+    await expect(gatedPending).resolves.toMatchObject({ status: "completed" });
     await ex.shutdown();
   }, 180_000);
 

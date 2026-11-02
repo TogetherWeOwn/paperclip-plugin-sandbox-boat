@@ -101,9 +101,12 @@ Every sweep (scoped or scheduled) ages out owner records older than 24 hours
 and ended tombstones via the persisted per-company owner index, so terminal
 events lost to a restart cannot accumulate rows. Age alone never retires a
 live issue run: the sweep deletes a stale issue owner only on positive
-disproof (its issue exists and names a different run). A host lookup failure,
-a missing issues provider, or a missing issue keeps the owner for the next
-sweep; the ownership gate stays fail-closed (refuses) on the same uncertainty. A run that started while the company did not use
+disproof (its issue exists and names a different run, or a successful lookup
+finds no issue at all). A thrown host lookup error or a missing issues
+provider keeps the owner for the next sweep; the ownership gate stays
+fail-closed (refuses) on the same uncertainty. A terminal forget whose row
+delete fails leaves the ended tombstone indexed, so the next sweep retries
+the delete instead of orphaning the row. A run that started while the company did not use
 Boat has no persisted owner, so a worker restart before Boat is enabled leaves
 that run unable to offload; runs started afterwards are unaffected. This adds five capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,

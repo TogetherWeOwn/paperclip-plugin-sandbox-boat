@@ -115,6 +115,22 @@ describe("run-owner state retention", () => {
     expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["flaky-run"] });
   });
 
+  it("a 25 h issue owner whose issue is gone is still swept", async () => {
+    // A successful lookup that finds no issue is positive disproof, not a
+    // transient failure: a deleted issue never reappears, so retaining the
+    // row would repeat a futile host lookup on every sweep and leak it
+    // forever. Only a thrown lookup error or a missing provider retains.
+    const recordKey = `company|${COMPANY}|boat-offload-runs|gone-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "gone-run",
+      issueId: "issue-deleted", agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["gone-run"] });
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
   it("a 25 h issue owner naming another run is still swept", async () => {
     // The fix must not retain every issue run: an issue that exists but names
     // a different run positively disproves liveness, so the sweep deletes it.
@@ -150,6 +166,31 @@ describe("run-owner state retention", () => {
     expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["old-run"] });
     const retry = await currentManager().sweep("test", { force: true, companyId: COMPANY });
     expect(retry.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
+  it("a failed terminal forget keeps the tombstone indexed for the next sweep", async () => {
+    // The per-company index is the sweep's only enumeration source: when the
+    // row delete fails, the ended tombstone must stay indexed so a later
+    // sweep retries the delete instead of orphaning a row no sweep finds.
+    const recordKey = `company|${COMPANY}|boat-offload-runs|ended-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "ended-run",
+      issueId: null, agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["ended-run"] });
+    const realDelete = harness.state.delete.bind(harness.state);
+    let failDeletes = true;
+    harness.state.delete = (key: string) => {
+      if (failDeletes && key === recordKey) throw new Error("state outage");
+      return realDelete(key);
+    };
+    await currentManager().forgetLocalRun(COMPANY, "ended-run");
+    expect(harness.state.get(recordKey)).toMatchObject({ ended: true });
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["ended-run"] });
+    failDeletes = false;
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
     expect(harness.state.get(recordKey)).toBeUndefined();
     expect(harness.state.get(indexKey)).toBeUndefined();
   });

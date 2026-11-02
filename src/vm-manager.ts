@@ -581,11 +581,12 @@ export class BoatVmManager {
 
   /**
    * Tri-state liveness for the owner sweep: only a positively-disproven run
-   * may be deleted — its issue exists and names another run, or a run without
-   * an issue is past the age bound. A lookup failure, a missing issues
-   * provider, or a missing issue keeps the run for the next sweep, the same
-   * retry posture as a failed row delete. The ownership gate stays fail-closed
-   * by treating anything but "live" as not owned (savedRunLive).
+   * may be deleted — its issue exists and names another run, its issue is
+   * gone from a successful lookup, or a run without an issue is past the age
+   * bound. A thrown lookup error or a missing issues provider keeps the run
+   * for the next sweep, the same retry posture as a failed row delete. The
+   * ownership gate stays fail-closed by treating anything but "live" as not
+   * owned (savedRunLive).
    */
   private async savedRunLiveness(companyId: string, runId: string, issueId: string | null, startedAt: unknown): Promise<"live" | "dead" | "unknown"> {
     if (issueId === null) {
@@ -598,7 +599,10 @@ export class BoatVmManager {
     } catch {
       return "unknown";
     }
-    if (!issue) return "unknown";
+    // A successful lookup that finds no issue is positive disproof, not a
+    // transient failure: a deleted issue never reappears, so keeping the row
+    // would repeat a futile host lookup on every sweep and leak it forever.
+    if (!issue) return "dead";
     return issue.executionRunId === runId || issue.checkoutRunId === runId ? "live" : "dead";
   }
 
@@ -649,9 +653,11 @@ export class BoatVmManager {
     this.endedLocalRuns.set(id, this.now());
     this.localRuns.delete(id);
     // Retried: a surviving record would let a restarted worker admit this finished run.
+    let rowDeleted = false;
     for (let attempt = 1; ; attempt++) {
       try {
         await this.offloadState.delete(this.runOwnerScope(companyId, runId));
+        rowDeleted = true;
         break;
       } catch (error) {
         if (attempt >= 3) {
@@ -664,7 +670,11 @@ export class BoatVmManager {
     }
     // From the persisted index, so bindings are forgotten even when this worker never saw the run start.
     await this.forgetRunOffload(companyId, runId);
-    await this.untrackRunOwner(companyId, runId);
+    // The index is the sweep's only enumeration source: a surviving row (a
+    // failed delete, even with a tombstone write) stays indexed, so a later
+    // sweep retries the delete instead of orphaning the row where no sweep
+    // finds it.
+    if (rowDeleted) await this.untrackRunOwner(companyId, runId);
   }
 
   /** True once this worker has seen a whole-run config for the company (cached on acquire/realize). */
@@ -714,8 +724,8 @@ export class BoatVmManager {
             // applies the same liveness bound instead of stranding active runs.
             if (!tombstone && saved !== null && typeof saved === "object") {
               const issueId = typeof saved.issueId === "string" ? saved.issueId : null;
-              // Delete only positively-disproven runs: a lookup failure or a
-              // missing provider/issue keeps the run for the next sweep, so a
+              // Delete only positively-disproven runs: a thrown lookup error
+              // or a missing provider keeps the run for the next sweep, so a
               // transient host error never strands a live issue run.
               if ((await this.savedRunLiveness(companyId, runId, issueId, saved.startedAt)) !== "dead") {
                 live.add(runId);
