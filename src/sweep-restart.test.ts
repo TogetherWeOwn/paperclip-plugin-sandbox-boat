@@ -10,6 +10,7 @@ vi.mock("node:child_process", async () => {
 
 import type { BoatApiLike } from "./boat-client.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
+import { commandDigest } from "./offload-journal.js";
 import { createHash } from "node:crypto";
 import { DEFAULT_API_BASE } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
@@ -247,6 +248,117 @@ describe("sweep after a worker restart", () => {
     expect((await store.load()).find((vm) => vm.sandboxId === box.id))
       .toMatchObject({ busy: true, stopping: false });
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).not.toContain(box.id);
+  });
+
+  it("keeps an unloaded terminal slot fenced when the journal settlement fails", async () => {
+    const poolId = "pool-restart-settle-fail";
+    const accountId = "account-restart";
+    const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+    // Provider-gone VM: no box in the fake, so the provider GET 404s to deleted.
+    const sandboxId = "bx_terminal0000001";
+    await store.save(
+      { maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+      [{ sandboxId, busy: false, stopped: false, stopping: false, quarantined: false,
+        lastActiveAt: clock - 60_000, generation: 1, idleHandle: null,
+        stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null }],
+    );
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-settle", seenAt: clock - 60_000 } },
+    );
+    // Seed a live journal receipt bound to the VM, then fail its write: the
+    // settlement reads fine but cannot persist, so settleSandboxUnknown throws
+    // after the slot would previously have been freed.
+    const journalScope = (stateKey: string) =>
+      ({ scopeKind: "company" as const, scopeId: companyId, namespace: `boat-executor-${poolId}`, stateKey });
+    const runId = "run-settle-fail";
+    const commandId = "cmd-settle-1";
+    const journalCommand = { companyId, runId, commandId };
+    const digest = commandDigest(journalCommand as never);
+    const recordKey = `command/${companyId}/${runId}/${commandId}`;
+    await harness.ctx.state.set(journalScope("index"), [recordKey]);
+    await harness.ctx.state.set(journalScope(recordKey), {
+      version: 1, companyId, runId, commandId, command: journalCommand, digest, state: "running",
+      identity: { companyId, runId, commandId, digest, sandboxId, guestBootId: "boot-1", journalGeneration: 1 },
+      acceptedAt: clock, updatedAt: clock, resultAt: null, result: null, remoteStarted: null, fallbackSafe: false,
+    });
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    harness.ctx.state.set = (async (input: Parameters<typeof realSet>[0], value: unknown) => {
+      if (input.namespace === `boat-executor-${poolId}`) throw new Error("journal write failed");
+      return realSet(input, value);
+    }) as typeof harness.ctx.state.set;
+    try {
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId });
+      await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+      await runtime.shutdown();
+    } finally {
+      harness.ctx.state.set = realSet;
+    }
+    // The slot stays fenced for retry instead of being spliced out or freed on
+    // an unsettled receipt.
+    expect((await store.load()).find((vm) => vm.sandboxId === sandboxId))
+      .toMatchObject({ quarantined: true, stopped: false });
+  });
+
+  it("an A→B→A hook burst leaves the latest descriptor digest on disk", async () => {
+    const keyA = "boat_burst_key_a_not_real";
+    const keyB = "boat_burst_key_b_not_real";
+    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const readDigest = async () => (await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
+      envs?: Record<string, { accountDigest?: unknown }>;
+    } | null)?.envs?.[environmentId]?.accountDigest;
+    const burstAcquire = (apiKey: string, runId: string) =>
+      plugin.definition.onEnvironmentAcquireLease!({
+        companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey }, runId,
+        issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+      });
+    // Settle config A on disk first: the dedupe cache and the doc agree.
+    await burstAcquire(keyA, "run-burst-a1");
+    for (let n = 0; n < 1000; n += 1) {
+      if ((await readDigest()) === digestOf(keyA)) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(await readDigest()).toBe(digestOf(keyA));
+
+    // Gate sweep-config writes: B's write stays queued while A returns. The
+    // hook promises are held, not awaited — B's hook parks on the store chain
+    // behind its own gated write, and awaiting either before release hangs.
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let releaseWrites!: () => void;
+    const writesBlocked = new Promise<void>((resolve) => { releaseWrites = resolve; });
+    let blockedWrites = 0;
+    harness.ctx.state.set = (async (input: Parameters<typeof realSet>[0], value: unknown) => {
+      if (input.namespace === "boat-sandbox" && input.stateKey === "sweep-configs") {
+        blockedWrites += 1;
+        await writesBlocked;
+      }
+      return realSet(input, value);
+    }) as typeof harness.ctx.state.set;
+    try {
+      const pendingB = burstAcquire(keyB, "run-burst-b");
+      for (let n = 0; n < 1000 && blockedWrites === 0; n += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(blockedWrites).toBeGreaterThan(0);
+      // A returns while B is still queued. Without the claim this skips its
+      // write on a stale dedupe hit and B lands last; with it A queues behind B.
+      const pendingA = burstAcquire(keyA, "run-burst-a2");
+      await new Promise((resolve) => setImmediate(resolve));
+      releaseWrites();
+      await pendingB;
+      await pendingA;
+    } finally {
+      harness.ctx.state.set = realSet;
+    }
+    for (let n = 0; n < 1000; n += 1) {
+      if ((await readDigest()) === digestOf(keyA)) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    // The stored digest matches the live config: a restarted sweep compares
+    // the host key against the right account.
+    expect(await readDigest()).toBe(digestOf(keyA));
   });
 
   it("leaves name-matching VMs alone when the VM document is unreadable", async () => {

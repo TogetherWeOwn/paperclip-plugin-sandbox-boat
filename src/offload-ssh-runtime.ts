@@ -671,6 +671,12 @@ export class SshOffloadRuntime {
       if (["archived", "cancelled", "deleted"].includes(state)) {
         vm.stopObservedAt ??= now;
         await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id).catch(() => undefined);
+        // Same rule as the loaded executor: a failed settlement keeps the
+        // slot fenced for retry, never freed on an unsettled receipt.
+        if (!await journal.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
+          if (!vm.quarantined) { vm.quarantined = true; changed = true; }
+          continue;
+        }
         if (state === "deleted") { pool.splice(pool.indexOf(vm), 1); deletedIds.add(vm.sandboxId); }
         else {
           vm.busy = false;
@@ -679,7 +685,6 @@ export class SshOffloadRuntime {
           vm.quarantined = false;
           vm.workspaceKey = null;
         }
-        await journal.settleSandboxUnknown(vm.sandboxId).catch(() => undefined);
         changed = true;
         continue;
       }

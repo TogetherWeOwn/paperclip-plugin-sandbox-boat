@@ -775,6 +775,7 @@ export class BoatVmManager {
     // key's account, so rehydration through the host key is only safe when the
     // host key resolves to that same account. A digest, never the key itself.
     const accountDigest = config.apiKey != null
+      // codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
       ? createHash("sha256").update(`${config.apiBase}\u0000${config.apiKey}`).digest("hex")
       : null;
     // Dedupe on the persisted content, not the write time: seenAt changes on
@@ -784,11 +785,21 @@ export class BoatVmManager {
     // account's host key against the new account's live VMs and forget them.
     const encoded = JSON.stringify([companyId, publicFields, config.apiKey != null, accountDigest]);
     if (this.persistedSweeps.get(environmentId) === encoded) return;
+    // Claim the latest content before awaiting, so a later identical hook
+    // cannot skip its write while an older, different write is still queued.
+    // Queued writes run in order (VmStateStore serializes), so the last claim
+    // still wins on disk; without the claim an A→B→A burst could leave B's
+    // digest on disk under live config A.
+    this.persistedSweeps.set(environmentId, encoded);
     const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
       hadInlineKey: config.apiKey != null, accountDigest };
-    await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
-    await this.store.rememberCompany(companyId);
-    this.persistedSweeps.set(environmentId, encoded);
+    try {
+      await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
+      await this.store.rememberCompany(companyId);
+    } catch (error) {
+      if (this.persistedSweeps.get(environmentId) === encoded) this.persistedSweeps.delete(environmentId);
+      throw error;
+    }
   }
 
   /**
@@ -837,6 +848,7 @@ export class BoatVmManager {
     if (apiBase !== DEFAULT_API_BASE) return false;
     const hostKey = process.env.BOAT_API_KEY?.trim() ?? "";
     if (!hostKey) return false;
+    // codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
     return createHash("sha256").update(`${apiBase}\u0000${hostKey}`).digest("hex") === descriptor.accountDigest;
   }
 
