@@ -59,4 +59,14 @@ describe("host BOAT keys and apiBase", () => {
     expect(factoryCalls.length).toBeGreaterThan(0);
     for (const call of factoryCalls) expect(call.apiBase).toBe(DEFAULT_API_BASE);
   });
+
+  it("prefers the environment's own apiKey over the host BOAT_READONLY_KEY for cost reads", () => {
+    // The host read-only key may belong to a different Boat account than this
+    // environment's ops key; cost reads under the wrong account would 404.
+    expect(resolveCostApiKey(parseDriverConfig({ apiKey: "env-ops" }))).toBe("env-ops");
+    // An explicit costApiKey still wins over both.
+    expect(resolveCostApiKey(parseDriverConfig({ apiKey: "env-ops", costApiKey: "env-cost" }))).toBe("env-cost");
+    // The host read-only key remains the fallback when the ops key is host-sourced too.
+    expect(resolveCostApiKey(parseDriverConfig({}))).toBe("host-readonly-key");
+  });
 });

@@ -350,7 +350,7 @@ describe("offload executor", () => {
       now,
       timers: { set, clear },
       config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
-      runCommand: async () => ({ exitCode: 0, seconds: 42 }),
+      runCommand: async () => { setup.clock.t += 42_000; return { exitCode: 0, seconds: 42 }; },
       recordDuration: async (command, seconds) => {
         recorded.push({ command, seconds });
       },
@@ -363,6 +363,93 @@ describe("offload executor", () => {
     expect(recorded[0]!.seconds).toBe(result.seconds);
     expect(recorded[0]!.seconds).toBe(42);
     expect(recorded[0]!.command.commandId).toBe("cmd-duration-1");
+    await executor.shutdown();
+  });
+
+  it("learns host-measured wall time, never a guest-inflated duration", async () => {
+    const { fake, logger, now, set, clear } = setup;
+    const recorded: Array<{ command: OffloadCommand; seconds: number }> = [];
+    const executor = new OffloadExecutor({
+      ...setup.account,
+      boat: fake as unknown as BoatApiLike,
+      logger,
+      now,
+      timers: { set, clear },
+      config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
+      runCommand: async () => { setup.clock.t += 1_000; return { exitCode: 0, seconds: 1e300 }; },
+      recordDuration: async (command, seconds) => {
+        recorded.push({ command, seconds });
+      },
+    });
+    const result = await executor.execute(cmd({ commandId: "cmd-duration-guest-lie",
+      tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"] }));
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") throw new Error("expected completed");
+    // About one host second, and never more than the one-day learning bound.
+    expect(result.seconds).toBe(1);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.seconds).toBe(1);
+    expect(recorded[0]!.seconds).toBeLessThanOrEqual(86_400);
+    await executor.shutdown();
+  });
+});
+
+describe("offload monitoring opt-out", () => {
+  function executorFor(setup: ReturnType<typeof testSetup>, monitoring?: boolean) {
+    return new OffloadExecutor({
+      ...setup.account,
+      boat: setup.fake as unknown as BoatApiLike,
+      logger: setup.logger,
+      now: setup.now,
+      timers: { set: setup.set, clear: setup.clear },
+      config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15, ...(monitoring === undefined ? {} : { monitoring }) },
+      runCommand: async () => ({ exitCode: 0, seconds: 1 }),
+    });
+  }
+
+  it("sends monitoring:false when opted out, and true by default", async () => {
+    const optedOut = testSetup();
+    const off = executorFor(optedOut, false);
+    expect((await off.execute(cmd({ commandId: "mon-off-1" }))).status).toBe("completed");
+    expect(optedOut.fake.callsOf("create")).toHaveLength(1);
+    expect(optedOut.fake.callsOf("create")[0]!.args).toMatchObject({ monitoring: false });
+    await off.shutdown();
+
+    const dflt = testSetup();
+    const on = executorFor(dflt);
+    expect((await on.execute(cmd({ commandId: "mon-default-1" }))).status).toBe("completed");
+    expect(dflt.fake.callsOf("create")[0]!.args).toMatchObject({ monitoring: true });
+    await on.shutdown();
+  });
+
+  it("never reuses a VM created under the other monitoring policy", async () => {
+    const setup = testSetup();
+    const executor = executorFor(setup, true);
+    const first = await executor.execute(cmd({ commandId: "mon-reuse-1" }));
+    expect(first.status).toBe("completed");
+    if (first.status !== "completed") throw new Error("expected completed");
+    // Same policy still reuses the warm VM.
+    const second = await executor.execute(cmd({ commandId: "mon-reuse-2" }));
+    if (second.status !== "completed") throw new Error("expected completed");
+    expect(second.sandboxId).toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(1);
+
+    // Flipping the policy (as a later resolve does) must not claim the
+    // monitored VM: it keeps its creation policy, so a new VM is created
+    // unmonitored instead.
+    executor.setMonitoring(false);
+    const third = await executor.execute(cmd({ commandId: "mon-reuse-3" }));
+    if (third.status !== "completed") throw new Error("expected completed");
+    expect(third.sandboxId).not.toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(2);
+    expect(setup.fake.callsOf("create")[1]!.args).toMatchObject({ monitoring: false });
+
+    // And flipping back must not claim the unmonitored VM either.
+    executor.setMonitoring(true);
+    const fourth = await executor.execute(cmd({ commandId: "mon-reuse-4" }));
+    if (fourth.status !== "completed") throw new Error("expected completed");
+    expect(fourth.sandboxId).toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(2);
     await executor.shutdown();
   });
 });

@@ -28,6 +28,9 @@ export interface SshOffloadGuestDeps {
   uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
   /** Validated leading rustup toolchain selector for cargo cache priming, else null. */
   cargoToolchain?: (command: OffloadCommand) => string | null;
+  /** Guest supervisor source, default OFFLOAD_SSH_SCRIPT. Tests override it to
+   * emulate a skewed guest clock; production never does. */
+  script?: string;
 }
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
@@ -45,11 +48,13 @@ export class SshOffloadGuest implements GuestController {
     return path.posix.join(this.deps.stateRoot ?? "/tmp", name);
   }
 
+  private script(): string { return this.deps.script ?? OFFLOAD_SSH_SCRIPT; }
+
   private async rpc<T>(sandboxId: string, action: string, input: Record<string, unknown> = {}, timeoutMs = 15_000): Promise<T> {
     const session = await this.deps.session(sandboxId);
     this.sessions.set(sandboxId, session);
     const result = await this.deps.ssh.runStream(session,
-      buildRemoteCommand(`exec python3 -I -c ${shellQuote(OFFLOAD_SSH_SCRIPT)} ${shellQuote(action)}`),
+      buildRemoteCommand(`exec python3 -I -c ${shellQuote(this.script())} ${shellQuote(action)}`),
       { stdin: Readable.from([JSON.stringify(input)]), timeoutMs, maxOutputBytes: 128 * 1024 });
     // Guest diagnostics may contain source or environment bytes. Never reflect
     // them into public broker errors/logs and never interpret SSH 255 as no start.
@@ -126,7 +131,7 @@ export class SshOffloadGuest implements GuestController {
       await this.fetchLocked(sandboxId, cwd, guestPath, this.deps.cargoToolchain?.(command) ?? null, cargoHome);
     }
     const identity = await this.rpc<GuestIdentity>(sandboxId, "prepare", {
-      program: OFFLOAD_SSH_SCRIPT, cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
+      program: this.script(), cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
       cwd,
       executable,
       args: this.deps.args?.(command) ?? command.argv, env: preparedEnv, timeoutMs: command.timeoutMs ?? 120_000,
@@ -159,7 +164,13 @@ export class SshOffloadGuest implements GuestController {
     if (empty === true) this.prepared.delete(identity.cgroupPath);
     return empty;
   }
-  async heartbeat(sandboxId: string, identity: GuestIdentity): Promise<void> { await this.call(sandboxId, "heartbeat", identity); }
+  async heartbeat(sandboxId: string, identity: GuestIdentity): Promise<void> {
+    // Durations cross the boundary, never absolute timestamps: the guest
+    // renews its own clock-side deadline from renewMs and the host computes
+    // its own from the send time, so a skewed guest clock cannot fail or
+    // refuse the renewal.
+    await this.call(sandboxId, "heartbeat", identity, { renewMs: 30_000 });
+  }
   async receipt(identity: OffloadIdentity): Promise<unknown> { return this.call(identity.sandboxId, "receipt", identity as GuestIdentity); }
 
   async runCommand(sandboxId: string, _command: OffloadCommand, context?: OffloadRunContext) {
@@ -170,10 +181,10 @@ export class SshOffloadGuest implements GuestController {
     for (;;) {
       if (Date.now() > identity.guestDeadline + 15_000) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
       const page = await this.call<{ events: Array<{ stream: "stdout" | "stderr"; dataBase64: string }>;
-        result: { exitCode: number; seconds: number } | null; supervisorAlive: boolean;
+        result: unknown; supervisorAlive: boolean;
         outputLimitExceeded: boolean }>(sandboxId, "read", identity, { after });
       if (page.outputLimitExceeded) throw offloadError("OFFLOAD_OUTPUT_LIMIT");
-      if (!page.supervisorAlive && !page.result && !page.events.length) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      if (!page.supervisorAlive && page.result == null && !page.events.length) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
       for (const event of page.events) {
         if (!["stdout", "stderr"].includes(event.stream) || typeof event.dataBase64 !== "string") throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         const bytes = Buffer.from(event.dataBase64, "base64");
@@ -181,7 +192,7 @@ export class SshOffloadGuest implements GuestController {
         await context.output(event.stream, bytes);
         after++;
       }
-      if (page.result) return page.result;
+      if (page.result != null) return validatedGuestResult(page.result);
       if (!page.events.length) await new Promise<void>((resolve) => setTimeout(resolve, 100));
     }
   }
@@ -200,4 +211,20 @@ export class SshOffloadGuest implements GuestController {
     this.prepared.clear();
     this.sessions.clear();
   }
+}
+
+/** Guest-reported exit facts are untrusted: only a safe-integer exit code in
+ * 0..255 and finite non-negative seconds cross this boundary, with exactly
+ * the two fields the supervisor writes. Anything else (a megabyte string, a
+ * guest-asserted cancelled/timedOut, an extra key) ends the command unknown
+ * instead of entering the journal or the account ledger. */
+function validatedGuestResult(value: unknown): { exitCode: number; seconds: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+  const result = value as Record<string, unknown>;
+  if (Object.keys(result).some((key) => key !== "exitCode" && key !== "seconds")
+    || !Number.isSafeInteger(result.exitCode) || (result.exitCode as number) < 0 || (result.exitCode as number) > 255
+    || typeof result.seconds !== "number" || !Number.isFinite(result.seconds) || (result.seconds as number) < 0) {
+    throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+  }
+  return { exitCode: result.exitCode as number, seconds: result.seconds as number };
 }

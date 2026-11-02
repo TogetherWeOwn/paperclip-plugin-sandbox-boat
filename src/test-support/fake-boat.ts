@@ -264,7 +264,8 @@ export class FakeBoat {
       machineIp: "203.0.113.10",
       sshUser: "user",
       sshEndpoint: null,
-      hostKey: `ssh-ed25519 AAAAHOSTKEY${sandbox.id}`,
+      // Base64-shaped like a real answer: the plugin validates the format.
+      hostKey: `ssh-ed25519 AAAAHOSTKEY${sandbox.id.replace(/[^A-Za-z0-9+/]/g, "")}`,
     };
   }
 

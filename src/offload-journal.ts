@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { OffloadCommand, OffloadResult, OffloadWarm, OffloadSyncBack } from "./offload.js";
 import type { CommandExit, GuestIdentity } from "./offload-lifecycle.js";
+import { MAX_DURATION_SECONDS } from "./offload/duration-history.js";
 
 export interface OffloadStore {
   get(key: string): Promise<unknown>;
@@ -151,8 +152,17 @@ export function matchingReceipt(value: unknown, identity: OffloadIdentity): valu
   if (!(Object.keys(identity) as Array<keyof OffloadIdentity>)
     .filter((key) => key !== "heartbeatDeadline").every((key) => actual[key] === identity[key])) return false;
   if (!["marker", "started", "result", "not_started"].includes(String(value.kind))) return false;
-  return value.kind !== "result" || (object(value.result) && Number.isInteger(value.result.exitCode)
-    && Number.isFinite(value.result.seconds) && (value.result.seconds as number) >= 0);
+  // Guest result receipts are untrusted: only the exact two fields the
+  // supervisor writes cross this boundary, with a safe-integer exit in
+  // 0..255 and finite non-negative seconds. Extra keys (a guest-asserted
+  // cancelled/timedOut/status) or out-of-range facts fail the match so the
+  // recovery path holds unknown instead of adopting them.
+  if (value.kind !== "result") return true;
+  if (!object(value.result)) return false;
+  const facts = value.result as Record<string, unknown>;
+  return Object.keys(facts).every((key) => key === "exitCode" || key === "seconds")
+    && Number.isSafeInteger(facts.exitCode) && (facts.exitCode as number) >= 0 && (facts.exitCode as number) <= 255
+    && typeof facts.seconds === "number" && Number.isFinite(facts.seconds) && (facts.seconds as number) >= 0;
 }
 
 function parseRecord(value: unknown, key: string): OffloadRecord {
@@ -426,6 +436,17 @@ export class OffloadJournal {
       if (PRE_START.has(record.state) && result.status === "unknown") {
         result = this.unavailable(command, "command failed before durable starting intent");
       }
+      // Guest-controlled facts never commit unvalidated: a malformed exit
+      // commits unknown (holding the reservation) instead of throwing past
+      // it. The no-lifecycle journal path runs runCommand with no upstream
+      // validator, so this is the fence for that reachable path.
+      if (result.status !== "unavailable") {
+        const exit = (result as { exitCode?: unknown }).exitCode;
+        const secs = (result as { seconds?: unknown }).seconds;
+        if (!Number.isInteger(exit) || !Number.isFinite(secs) || (secs as number) < 0) {
+          result = this.unknown(record);
+        }
+      }
       if (result.status === "unavailable") {
         if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
@@ -489,10 +510,15 @@ export class OffloadJournal {
       if (answer.kind === "result") {
         const raw = answer.result!;
         // Resume only output collection/staging, never command execution.
+        // Rebuild from named facts: a receipt that passed matchingReceipt
+        // carries exactly exitCode/seconds, but spread would still adopt any
+        // future extra key (cancelled/status/syncBack). Clamp the duration
+        // to the one-day learning bound like every other guest measurement.
         await this.commit(record, { state: "syncing_out", remoteStarted: true });
         const syncBack = await this.syncOut(record.identity.sandboxId, record.command!);
         const result: OffloadResult = { status: "completed", commandId: record.commandId, sandboxId: record.identity.sandboxId,
-          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0, ...(syncBack ? { syncBack } : {}) };
+          warm: "cold" as OffloadWarm, queueWaitMs: 0, exitCode: raw.exitCode,
+          seconds: Math.min(raw.seconds, MAX_DURATION_SECONDS), dollars: 0, ...(syncBack ? { syncBack } : {}) };
         await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
         await this.release(record);
         return result;

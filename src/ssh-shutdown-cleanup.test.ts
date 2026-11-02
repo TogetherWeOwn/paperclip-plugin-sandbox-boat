@@ -146,7 +146,10 @@ describe("ensureMaster single-flight (loopback sshd)", () => {
 
   it("closeSession removes known_hosts and the control socket", async () => {
     const { manager, session } = fixture;
-    const opened = await manager.openSession({ sandboxId: "close-me-test", endpoint: session.endpoint,
+    // The fixture's host.pub carries an ssh-keygen comment; production
+    // endpoints are exactly `<type> <base64>`, which openSession enforces.
+    const endpoint = { ...session.endpoint, hostKey: session.endpoint.hostKey.split(" ").slice(0, 2).join(" ") };
+    const opened = await manager.openSession({ sandboxId: "close-me-test", endpoint,
       tunnel: null, connectTimeoutSec: 2 });
     expect(manager.getSession("close-me-test")).not.toBeNull();
     expect(existsSync(opened.knownHostsPath)).toBe(true);

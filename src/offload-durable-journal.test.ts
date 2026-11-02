@@ -253,6 +253,41 @@ describe("durable host journal: restart recovery matrix", () => {
     expect(await h.openExecutor().executor.execute(command())).toMatchObject({ status: "unknown", fallbackSafe: false });
     expect(h.attempts).toHaveLength(0);
   });
+
+  it("a malformed guest exit commits unknown instead of throwing past the reservation", async () => {
+    const { executor } = h.openExecutor({
+      runCommand: async () => ({ exitCode: "x".repeat(100_000), seconds: 1e300 }) as never,
+    });
+    const result = await settled(executor.execute(command()));
+    expect(result).toMatchObject({ status: "unknown", fallbackSafe: false, exitCode: 75 });
+    expect(JSON.stringify(result)).not.toContain("xxxx");
+    expect(await new FileStore(h.hostDirectory).get(hostKey(command()))).toMatchObject({ state: "unknown" });
+  });
+
+  it("a guest receipt with extra keys or out-of-range exit facts cannot overwrite the durable result", async () => {
+    await seed("syncing_out");
+    const hostile = receipt("result");
+    Object.assign(hostile.result as Record<string, unknown>, {
+      exitCode: 999999, seconds: 1e300, cancelled: true, status: "completed", note: "INJECT-MARKER",
+    });
+    h.setReceipt(hostile);
+    const { executor } = h.openExecutor();
+    const result = await settled(executor.execute(command()));
+    expect(result).toMatchObject({ status: "unknown", fallbackSafe: false, exitCode: 75 });
+    expect(result).not.toMatchObject({ cancelled: true });
+    expect(JSON.stringify(result)).not.toContain("INJECT-MARKER");
+    expect(await new FileStore(h.hostDirectory).get(hostKey(command()))).toMatchObject({ state: "unknown" });
+  });
+
+  it("clamps a guest-reported receipt duration to the one-day bound", async () => {
+    await seed("syncing_out");
+    const big = receipt("result");
+    (big.result as unknown as Record<string, unknown>).seconds = 1e300;
+    h.setReceipt(big);
+    const result = await h.openExecutor().executor.execute(command()) as { status: string; seconds: number };
+    expect(result.status).toBe("completed");
+    expect(result.seconds).toBeLessThanOrEqual(86_400);
+  });
 });
 
 describe("durable host journal: quarantine and binding", () => {

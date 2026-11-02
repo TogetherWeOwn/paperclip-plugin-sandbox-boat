@@ -46,7 +46,10 @@ export class OffloadGuestRunner {
   }
 
   private completed(result: { exitCode: number; seconds: number }) {
-    return { status: "completed" as const, ...result, remoteStarted: true, fallbackSafe: false };
+    // Named fields only: result comes from a matchingReceipt-checked receipt,
+    // but a spread would adopt any extra guest-controlled key verbatim.
+    return { status: "completed" as const, exitCode: result.exitCode, seconds: result.seconds,
+      remoteStarted: true, fallbackSafe: false };
   }
 
   private async replay(identity: OffloadIdentity, marker: unknown) {

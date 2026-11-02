@@ -188,7 +188,7 @@ def supervise(root):
     now = int(time.time() * 1000)
     identity = {**request['base'], 'guestBootId': BOOT, 'processGroupId': child.pid,
                 'cgroupPath': str(group), 'journalGeneration': 1, 'heartbeatDeadline': now + 30000,
-                'guestDeadline': now + request['timeoutMs']}
+                'guestDeadline': now + request['timeoutMs'], 'guestNow': now}
     value = {'identity': identity, 'cgroupInode': group.stat().st_ino, 'processStart': start_time(child.pid),
              'supervisorPid': os.getpid(), 'supervisorStart': start_time(os.getpid()),
              'armed': False, 'started': False, 'startRequested': False, 'result': None}
@@ -425,13 +425,28 @@ def rpc(action, data):
                 save(root, value)
             return {'verified': bool(verified), 'outsideCommandCgroup': outside}
         if action == 'heartbeat':
-            deadline = data['identity']['heartbeatDeadline']
             now = int(time.time() * 1000)
-            if now >= identity['heartbeatDeadline'] or deadline > now + 30000 or deadline < identity['heartbeatDeadline']:
-                raise ValueError('expired or invalid interest renewal')
+            if now >= identity['heartbeatDeadline']:
+                raise ValueError('expired interest renewal')
+            renew = data.get('renewMs')
+            if isinstance(renew, bool) or not isinstance(renew, (int, float)):
+                # Pre-duration hosts renew with an absolute host-clock
+                # deadline; validate it as before.
+                deadline = data['identity']['heartbeatDeadline']
+                if deadline > now + 30000 or deadline < identity['heartbeatDeadline']:
+                    raise ValueError('expired or invalid interest renewal')
+            else:
+                # Durations cross the boundary, never absolute timestamps: the
+                # guest renews from its own clock, so host/guest skew can
+                # neither fail nor refuse the renewal.
+                if not 0 < renew <= 60000:
+                    raise ValueError('invalid interest renewal')
+                deadline = min(now + int(renew), now + 30000)
+                if deadline < identity['heartbeatDeadline']:
+                    raise ValueError('expired or invalid interest renewal')
             identity['heartbeatDeadline'] = deadline
             save(root, value)
-            return True
+            return {'heartbeatDeadline': deadline}
         if action == 'start':
             if not value['armed'] or value['startRequested'] or value['result'] or start_time(value['supervisorPid']) != value['supervisorStart'] or int(time.time() * 1000) >= min(identity['heartbeatDeadline'], identity['guestDeadline']):
                 raise ValueError('guest start is fenced')

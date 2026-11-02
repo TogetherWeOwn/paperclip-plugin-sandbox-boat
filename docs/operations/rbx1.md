@@ -118,6 +118,7 @@ curl -fsS -X POST "$PAPERCLIP/api/plugins/$PLUGIN_ID/config" \
   "offloadExecutorEnabled": false,
   "offloadGuestTransportEnabled": false,
   "offloadLocalRunsEnabled": false,
+  "offloadLocalSourceRoots": ["<operator-owned root containing the pilot checkout>"],
   "offloadLocalEnvironmentId": "$ENV_ID",
   "offloadLocalApiKeySecretRef": {"type": "secret_ref", "secretId": "$SECRET_ID"},
   "offloadLocalDriverConfig": {
@@ -138,6 +139,7 @@ EOF
 
 Then, when the one-VM smoke starts, save the same config with the three flags `true`. Only literal `true` turns a flag on.
 
+* `offloadLocalSourceRoots` is required whenever `offloadLocalRunsEnabled` is used: an empty or missing list refuses every local-run bind, so every offload request fails closed (503) even with all three flags on. Choose the narrowest operator-owned directory that contains the offload source checkouts (for example the managed projects directory for the repository being piloted). The checkout's `realpath` must sit under a listed root and its on-disk git origin must match the workspace repository URL; both facts are re-checked on every command.
 * `offloadAllowedRepos` holds two-bot-next only, in the route's canonical form: lowercase URL, no `.git` and no trailing slash. An empty list denies every repository.
 * `maxOffloadVms` and `offloadIdleStopSeconds` are driver settings, so they go in `offloadLocalDriverConfig`. An `apiKey` there is ignored; the key comes from the secret ref.
 * `offloadMonthlyVmHourCap: 20` is the pilot's VM-hour cap. When it is reached, commands run locally until the next month.
