@@ -692,7 +692,9 @@ describe("journal partial-write recovery", () => {
 
       // The pool accepts new work after recovery.
       const result = await executor.execute(command());
-      expect(["completed", "not_started", "unknown"]).toContain(result.status);
+      const detail = result.status === "completed" ? `exitCode=${result.exitCode}` : `${result.code}: ${result.reason}`;
+      expect(["completed", "not_started", "unknown"],
+        `post-recovery execute settled ${result.status} (${detail})`).toContain(result.status);
     } finally {
       await rt.shutdown();
     }
