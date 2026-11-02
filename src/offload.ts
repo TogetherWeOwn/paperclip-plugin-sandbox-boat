@@ -48,8 +48,10 @@ export interface OffloadCommand {
 export type OffloadWarm = "warm" | "cold";
 
 // Returned changes are staged for explicit review, never applied to live files.
+// truncated: the command completed but collecting its writes failed; the exit
+// code is real, no artifact exists, and the VM is released, not quarantined.
 export interface OffloadSyncBack {
-  state: "clean" | "staged" | "conflict";
+  state: "clean" | "staged" | "conflict" | "truncated";
   changedPaths: string[];
   conflictPaths: string[];
   artifactId: string | null;

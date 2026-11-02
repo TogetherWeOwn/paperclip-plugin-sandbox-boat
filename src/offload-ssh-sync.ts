@@ -5,7 +5,7 @@ import { planDependencies } from "./offload/deps-install.js";
 import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
-import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
+import { captureSnapshot, collectAndStage, planPush, SyncError, type GuestFileState, type SourceManifest } from "./offload-sync.js";
 import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
@@ -44,6 +44,19 @@ export class SshOffloadSync implements OffloadSync {
    * next push re-kills receivers, wipes it, and fully resyncs first.
    */
   private readonly unfencedMirrors = new Set<string>();
+  /**
+   * Mirrors whose collect failed after a completed transport: the guest scan
+   * could not be trusted, so the next push wipes and fully resyncs instead of
+   * delta-ing against unknown mirror content. Keyed like `mirrors`.
+   */
+  private readonly suspectMirrors = new Set<string>();
+  /**
+   * Last complete post-collect guest scan per mirror (host-kept, like
+   * `mirrors`): guest content identical to it was already reported by the
+   * previous command and must not re-stage as this command's change. Never
+   * stored in the guest-writable mirror marker. Keyed like `mirrors`.
+   */
+  private readonly previousGuestScans = new Map<string, Map<string, GuestFileState>>();
   /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
@@ -162,11 +175,23 @@ export class SshOffloadSync implements OffloadSync {
       await store.wipeMirror(guestDir);
       marker = null;
     }
+    if (this.suspectMirrors.has(baseKey)) {
+      // A collect failure left this mirror's contents unverified: wipe and
+      // fully resync rather than reusing it as a delta base.
+      await store.wipeMirror(guestDir);
+      this.suspectMirrors.delete(baseKey);
+      marker = null;
+      stored = null;
+    }
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
     // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
     // snapshot), removed checkout-local installs too; the install must run again.
-    if (marker === null) this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
+    // It also removed every guest-only output the stored scan remembers.
+    if (marker === null) {
+      this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
+      this.previousGuestScans.delete(baseKey);
+    }
     // Never trust the stored manifest alone: a missing or disagreeing guest
     // marker (fresh VM, new machine, failed marker write) fully resyncs,
     // which also repairs content drift in tracked files via rsync --checksum.
@@ -272,8 +297,29 @@ export class SshOffloadSync implements OffloadSync {
     const upload = this.uploads.get(this.key(command));
     if (!upload) throw new Error("Missing frozen offload manifest; hold for reconciliation");
     const guest = new SshGuestStore({ ssh: this.deps.ssh, session: await this.deps.session(sandboxId), spawn: this.deps.spawn });
-    return collectAndStage({ liveRoot: upload.source, uploaded: upload.manifest, guest, guestDir: upload.guestDir,
-      stagingDir: path.join(upload.scratch, "returned") });
+    const baseKey = `${sandboxId}:${this.mirrorKey(command)}`;
+    const staged = await collectAndStage({ liveRoot: upload.source, uploaded: upload.manifest, guest, guestDir: upload.guestDir,
+      stagingDir: path.join(upload.scratch, "returned"), previousGuest: this.previousGuestScans.get(baseKey) }).catch((error: unknown) => {
+      // A SyncError here is guest mirror content refusing collection (scan
+      // validation, traversal, deterministic inspect refusal): retrying the
+      // collect can never succeed, so tag it for the journal's truncated
+      // path. Transport failures stay untagged and hold for reconciliation.
+      if (error instanceof SyncError && Object.isExtensible(error)) {
+        (error as SyncError & { collectDeterministic?: boolean }).collectDeterministic = true;
+      }
+      throw error;
+    });
+    // Only a complete enumeration can prove what the next command did not
+    // change; a truncated scan forgets instead of guessing.
+    if (!staged.scan.truncated) this.previousGuestScans.set(baseKey, staged.scan.files);
+    else this.previousGuestScans.delete(baseKey);
+    return staged;
+  }
+  /** Remember a mirror whose collect failed: the next push wipes it before reuse. */
+  async markSuspect(sandboxId: string, command: OffloadCommand): Promise<void> {
+    const baseKey = `${sandboxId}:${this.mirrorKey(command)}`;
+    this.suspectMirrors.add(baseKey);
+    this.previousGuestScans.delete(baseKey);
   }
   async stage(_sandboxId: string, command: OffloadCommand, collected: unknown) {
     const staged = collected as Awaited<ReturnType<typeof collectAndStage>>;
@@ -307,18 +353,33 @@ export class SshOffloadSync implements OffloadSync {
   }
 }
 
-/** Remove command-* scratch dirs under an artifact root last modified before cutoff, except live ones. */
-export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, live: ReadonlySet<string> = new Set()): Promise<void> {
+/** Retained artifact dirs are count-capped as well as aged out: a mirror that
+ * staged on every command must not grow the artifact root without bound. */
+export const MAX_ARTIFACT_DIRS = 256;
+
+/** Remove command-* scratch dirs under an artifact root last modified before
+ * cutoff, then the oldest beyond the count cap, except live ones. */
+export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, live: ReadonlySet<string> = new Set(), maxDirs = MAX_ARTIFACT_DIRS): Promise<void> {
   const entries = await readdir(artifactRoot).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return [] as string[];
     throw error;
   });
+  const retained: Array<{ dir: string; mtimeMs: number }> = [];
   for (const name of entries) {
     if (!name.startsWith("command-")) continue;
     const dir = path.join(artifactRoot, name);
-    if (live.has(dir)) continue;
     const info = await lstat(dir).catch(() => null);
-    if (!info?.isDirectory() || info.mtimeMs >= cutoff) continue;
-    await rm(dir, { recursive: true, force: true });
+    if (!info?.isDirectory()) continue;
+    if (!live.has(dir) && info.mtimeMs < cutoff) {
+      await rm(dir, { recursive: true, force: true });
+    } else {
+      retained.push({ dir, mtimeMs: info.mtimeMs });
+    }
+  }
+  const excess = retained.filter(({ dir }) => !live.has(dir)).sort((a, b) => a.mtimeMs - b.mtimeMs);
+  while (retained.length > maxDirs && excess.length > 0) {
+    const oldest = excess.shift()!;
+    retained.splice(retained.indexOf(oldest), 1);
+    await rm(oldest.dir, { recursive: true, force: true });
   }
 }

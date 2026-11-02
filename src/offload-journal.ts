@@ -69,6 +69,9 @@ export interface OffloadSync {
   stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
   // Drop the host-side upload after a command failed before transport; never throws.
   discard?(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Collect failed after a completed transport: the guest mirror cannot be
+  // trusted as a delta base, so the next push wipes and fully resyncs it.
+  markSuspect?(sandboxId: string, command: OffloadCommand): Promise<void>;
 }
 
 export interface OffloadDurableDeps {
@@ -398,7 +401,7 @@ export class OffloadJournal {
         await this.commit(record, { state: "running", remoteStarted: true });
         await this.commit(record, { state: "syncing_out" });
       });
-      const syncBack = await this.syncOut(sandboxId, command);
+      const syncBack = await this.syncOutAfterTransport(sandboxId, command);
       return { ...result, ...(syncBack ? { syncBack } : {}) };
     } catch (error) {
       if (!transported) await this.deps.sync.discard?.(sandboxId, command);
@@ -408,6 +411,31 @@ export class OffloadJournal {
 
   private async syncOut(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
     const collected = await this.deps.sync.collect(sandboxId, command);
+    const staged = await this.deps.sync.stage(sandboxId, command, collected);
+    return staged === undefined ? undefined : structuredClone(staged);
+  }
+
+  /**
+   * Collect after the transport already returned an exit. A *deterministic*
+   * collect failure — the sync adapter tags it `collectDeterministic` when
+   * guest mirror content (a special file, an over-limit scan, a malformed
+   * scan result) makes collection impossible no matter how often it is
+   * retried — is not an execution unknown: the command completed, so report
+   * its real exit with a truncated sync-back, mark the mirror suspect for a
+   * wipe on the next push, and drop the upload. Every other collect failure
+   * (transport loss during collect, say) keeps the held-for-reconciliation
+   * path, and stage failures always do.
+   */
+  private async syncOutAfterTransport(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
+    let collected: unknown;
+    try {
+      collected = await this.deps.sync.collect(sandboxId, command);
+    } catch (error) {
+      if ((error as { collectDeterministic?: unknown } | null)?.collectDeterministic !== true) throw error;
+      await this.deps.sync.markSuspect?.(sandboxId, command).catch(() => undefined);
+      await this.deps.sync.discard?.(sandboxId, command).catch(() => undefined);
+      return { state: "truncated", changedPaths: [], conflictPaths: [], artifactId: null };
+    }
     const staged = await this.deps.sync.stage(sandboxId, command, collected);
     return staged === undefined ? undefined : structuredClone(staged);
   }
@@ -490,7 +518,7 @@ export class OffloadJournal {
         const raw = answer.result!;
         // Resume only output collection/staging, never command execution.
         await this.commit(record, { state: "syncing_out", remoteStarted: true });
-        const syncBack = await this.syncOut(record.identity.sandboxId, record.command!);
+        const syncBack = await this.syncOutAfterTransport(record.identity.sandboxId, record.command!);
         const result: OffloadResult = { status: "completed", commandId: record.commandId, sandboxId: record.identity.sandboxId,
           warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0, ...(syncBack ? { syncBack } : {}) };
         await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
