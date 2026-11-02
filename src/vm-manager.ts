@@ -2299,9 +2299,7 @@ export class BoatVmManager {
     const runId = str(params.leaseMetadata?.runId);
     const api = this.opsApi(config);
 
-    // The sweep must run even when the release throws. This covers every
-    // caller, including StopLease, which has no plugin-level sweep of its own.
-    const done: Promise<PluginEnvironmentTerminationReceipt | undefined> = this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
+    return await this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       // The run's lease ends: its offload workspace bindings must not outlive it.
       if (runId) await this.forgetRunOffload(params.companyId, runId);
       const snapshot = await this.store.update(params.companyId, (doc) => {
@@ -2443,11 +2441,6 @@ export class BoatVmManager {
       this.logger.warn("boat: stop did not take effect; the sweep retries it", { sandboxId, stillUp });
       return undefined;
     }));
-    try {
-      return await done;
-    } finally {
-      this.sweepSoon("release");
-    }
   }
 
   private async recordRunEnd(config: BoatDriverConfig, companyId: string, sandboxId: string, runId: string): Promise<void> {

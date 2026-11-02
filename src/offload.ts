@@ -693,10 +693,14 @@ export class OffloadExecutor {
     if (this.lifecycle && this.pool.some((vm) => vm.quarantined && vm.workspaceKey === undefined)) {
       return { kind: "unavailable", reason: "recovered workspace ownership unknown; reconciliation required" };
     }
-    // Adopt (or free) lost-create placeholders before selecting; the loop ends
-    // when none remain or a replay stays uncertain.
+    // Adopt (or free) this workspace's lost-create placeholders before
+    // selecting; another workspace's placeholders stay quarantined under
+    // their own workspace. The loop ends when none remain or a replay stays
+    // uncertain.
+    const workspace = this.workspaceKey(command);
     for (;;) {
-      const uncertain = this.pool.find((vm) => vm.quarantined && vm.sandboxId === "" && vm.accountReservation);
+      const uncertain = this.pool.find((vm) => vm.quarantined && vm.sandboxId === "" && vm.accountReservation
+        && vm.workspaceKey === workspace);
       if (!uncertain) break;
       const resolved = await this.resolveUncertainCreate(uncertain, command);
       if (resolved) {
@@ -705,7 +709,6 @@ export class OffloadExecutor {
       }
       break;
     }
-    const workspace = this.workspaceKey(command);
     const held = workspace === null ? undefined : this.pool.find((vm) =>
       vm.workspaceKey === workspace && (vm.busy || vm.quarantined));
     if (held?.quarantined) return { kind: "unavailable", reason: "workspace quarantined; guest reconciliation required" };

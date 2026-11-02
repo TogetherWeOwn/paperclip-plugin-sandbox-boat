@@ -230,18 +230,27 @@ const plugin = definePlugin({
   },
 
   async onEnvironmentReleaseLease(params) {
-    const receipt = await requireManager().release(params, "release");
-    requireManager().sweepSoon("release");
-    return receipt;
+    // The sweep runs even when the release throws (a failed delete still
+    // stopped the VM; the sweep retries the delete from the record).
+    try {
+      return await requireManager().release(params, "release");
+    } finally {
+      requireManager().sweepSoon("release");
+    }
   },
 
   async onEnvironmentStopLease(params) {
+    // No sweep here: release-review interleavings call the manager directly
+    // to keep fire-and-forget sweeps out. A failed stop stays tracked
+    // (stopping, no tombstone) for the scheduled sweep to retry.
     const receipt = await requireManager().release(params, "stop");
     if (!receipt) throw new Error("boat stop was not confirmed.");
     return receipt;
   },
 
   async onEnvironmentDestroyLease(params) {
+    // No sweep here, matching StopLease above. A failed delete stops the VM
+    // and keeps it tracked (stopped, no tombstone) for the scheduled sweep.
     return await requireManager().destroy(params);
   },
 
