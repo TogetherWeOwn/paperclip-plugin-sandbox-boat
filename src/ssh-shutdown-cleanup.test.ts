@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -75,25 +75,26 @@ describe("manager shutdown reaches ssh.closeAll", () => {
     await writeFile(knownHostsPath, "stub");
     const stub: SshSession = { sandboxId: "vm-1", endpoint: { host: "127.0.0.1", port: 22, user: "u", hostKey: "k" },
       knownHostsPath, controlPath: path.join(stubDir, "vm-1.ctl"), master: null, tunnel: "disabled",
-      tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null };
+      tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null, startingChild: null };
     (ssh as unknown as { sessions: Map<string, SshSession> }).sessions.set("vm-1", stub);
-    let releaseSleep!: () => void;
-    const manager = new BoatVmManager({ state: harness.ctx.state, logger: harness.ctx.logger, ssh,
-      sleep: () => new Promise<void>((resolve) => { releaseSleep = resolve; }) });
-    // Never settles: shutdown must proceed once the drain budget fires.
+    // Default real clock: the drain budget is a real-time deadline, not the
+    // injectable sleep, so a hanging drain holds shutdown for the budget and
+    // then releases it. Never settles: shutdown must proceed anyway.
+    const manager = new BoatVmManager({ state: harness.ctx.state, logger: harness.ctx.logger, ssh });
     (manager as unknown as { nativeOffload: { shutdown(): Promise<void> } }).nativeOffload.shutdown =
       () => new Promise<void>(() => {});
-    const shutdown = manager.shutdown();
-    await Promise.resolve();
-    // Still draining: sessions untouched.
-    expect(ssh.getSession("vm-1")).not.toBeNull();
-    releaseSleep();
-    await shutdown;
+    const started = Date.now();
+    await manager.shutdown();
+    const elapsed = Date.now() - started;
+    // Bounded by the budget (plus slack for a loaded CI box), and the budget
+    // actually waited out rather than skipped by a fake clock.
+    expect(elapsed).toBeGreaterThanOrEqual(SHUTDOWN_DRAIN_TIMEOUT_MS - 1_000);
+    expect(elapsed).toBeLessThan(SHUTDOWN_DRAIN_TIMEOUT_MS + 10_000);
     expect(ssh.getSession("vm-1")).toBeNull();
     expect(ssh.keyDirPath).toBeNull();
     expect(existsSync(keyDir)).toBe(false);
     await rm(stubDir, { recursive: true, force: true });
-  }, 15_000);
+  }, 20_000);
 
   it("a rejecting offload drain still closes sessions and removes the key dir", async () => {
     const harness = createFakeContext();
@@ -105,7 +106,7 @@ describe("manager shutdown reaches ssh.closeAll", () => {
     await writeFile(knownHostsPath, "stub");
     const stub: SshSession = { sandboxId: "vm-2", endpoint: { host: "127.0.0.1", port: 22, user: "u", hostKey: "k" },
       knownHostsPath, controlPath: path.join(stubDir, "vm-2.ctl"), master: null, tunnel: "disabled",
-      tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null };
+      tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null, startingChild: null };
     (ssh as unknown as { sessions: Map<string, SshSession> }).sessions.set("vm-2", stub);
     const manager = new BoatVmManager({ state: harness.ctx.state, logger: harness.ctx.logger, ssh,
       sleep: () => new Promise<void>(() => {}) });
@@ -156,6 +157,40 @@ describe("ensureMaster single-flight (loopback sshd)", () => {
   }, 30_000);
 });
 
+describe("closeSession with an in-flight master", () => {
+  function connectingSession(sandboxId: string): SshSession {
+    return { sandboxId, endpoint: { host: "127.0.0.1", port: 22, user: "u", hostKey: "k" },
+      knownHostsPath: path.join(tmpdir(), `${sandboxId}-known-hosts`),
+      controlPath: path.join(tmpdir(), `${sandboxId}.ctl`),
+      master: null, tunnel: "disabled", tunnelSpec: null, tunnelError: null,
+      connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null, startingChild: null };
+  }
+
+  it("kills a still-connecting master child", async () => {
+    const manager = new SshManager({ info() {}, warn() {} });
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    const session = connectingSession("closing-while-connecting");
+    session.startingChild = child;
+    (manager as unknown as { sessions: Map<string, SshSession> }).sessions.set(session.sandboxId, session);
+    await manager.closeSession(session.sandboxId);
+    expect(manager.getSession(session.sandboxId)).toBeNull();
+    expect(session.startingChild).toBeNull();
+    await expect.poll(() => pidRunning(child.pid!), { timeout: 5_000 }).toBe(false);
+  }, 15_000);
+
+  it("startMaster does not spawn for an unregistered session", async () => {
+    const manager = new SshManager({ info() {}, warn() {} });
+    // Never registered: simulates a closeSession that won the race before
+    // the starter ran. ensureKey runs (real ssh-keygen), then the liveness
+    // guard returns before any ssh child is spawned.
+    const session = connectingSession("already-closed");
+    await (manager as unknown as { startMaster(session: SshSession): Promise<void> }).startMaster(session);
+    expect(session.master).toBeNull();
+    expect(session.startingChild).toBeNull();
+    await manager.closeAll();
+  }, 15_000);
+});
+
 describe("cleanupStaleKeyDirs", () => {
   it("removes dead-owner dirs and keeps live-owned and fresh unmarked dirs", async () => {
     const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
@@ -176,6 +211,57 @@ describe("cleanupStaleKeyDirs", () => {
       expect(existsSync(other)).toBe(true);
     } finally {
       await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("removes old unmarked dirs with no live ssh referencing them", async () => {
+    const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
+    try {
+      const stale = path.join(base, "pcboat-legacy-stale");
+      await mkdir(stale);
+      await writeFile(path.join(stale, "id_ed25519"), "stale", { mode: 0o600 });
+      // Predates the owner.pid marker: backdate past the grace age last, so
+      // creating the contents does not refresh the mtime.
+      const old = new Date(Date.now() - 25 * 3_600_000);
+      await utimes(stale, old, old);
+      const removed = await cleanupStaleKeyDirs(base);
+      expect(removed).toEqual([stale]);
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an old unmarked dir still referenced by a live ssh client", async () => {
+    const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
+    // Stand-in for a pre-upgrade worker's live control master: a process
+    // named ssh whose command line references the legacy dir. A shell script
+    // keeps comm at its own basename (a copied node binary would rename its
+    // thread to MainThread after startup and escape the sweep's filter).
+    const bin = await mkdtemp(path.join(tmpdir(), "pcboat-fakessh-"));
+    const fakeSsh = path.join(bin, "ssh");
+    await writeFile(fakeSsh, "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+    const legacy = path.join(base, "pcboat-legacy-live");
+    await mkdir(legacy);
+    const old = new Date(Date.now() - 25 * 3_600_000);
+    await utimes(legacy, old, old);
+    const watcher = spawn(fakeSsh, [legacy], { stdio: "ignore" });
+    try {
+      await expect.poll(async () => {
+        try {
+          return (await readFile(`/proc/${watcher.pid}/comm`, "utf8")).trim();
+        } catch {
+          return "";
+        }
+      }, { timeout: 5_000 }).toBe("ssh");
+      const removed = await cleanupStaleKeyDirs(base);
+      expect(removed).toEqual([]);
+      expect(existsSync(legacy)).toBe(true);
+    } finally {
+      watcher.kill("SIGKILL");
+      await once(watcher, "exit").catch(() => undefined);
+      await rm(base, { recursive: true, force: true });
+      await rm(bin, { recursive: true, force: true });
     }
   });
 

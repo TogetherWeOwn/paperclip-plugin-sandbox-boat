@@ -47,6 +47,8 @@ export interface SshSession {
   lastMasterStartAt: number;
   /** In-flight startMaster shared by concurrent ensureMaster callers. */
   masterStarting: Promise<void> | null;
+  /** Control-master child still connecting (not yet stored in master). */
+  startingChild: ChildProcess | null;
 }
 
 export interface SshExecutionResult {
@@ -183,6 +185,7 @@ export class SshManager {
       connectTimeoutSec: input.connectTimeoutSec,
       lastMasterStartAt: 0,
       masterStarting: null,
+      startingChild: null,
     };
     this.sessions.set(input.sandboxId, session);
     await this.startMaster(session);
@@ -218,6 +221,9 @@ export class SshManager {
     session.lastMasterStartAt = Date.now();
     const attempts: Array<TunnelSpec | null> = session.tunnelSpec ? [session.tunnelSpec, session.tunnelSpec, null] : [null];
     for (const tunnel of attempts) {
+      // A concurrent closeSession/closeAll must win: never start (or retry)
+      // a master for a session that is no longer registered.
+      if (this.sessions.get(session.sandboxId) !== session) return;
       const args = [
         "-N",
         "-o",
@@ -237,11 +243,20 @@ export class SshManager {
         `${session.endpoint.user}@${session.endpoint.host}`,
       ];
       const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"] });
+      session.startingChild = child;
+      // closeSession may have run between the loop-top check and spawn: a
+      // removed session never gains a new master child.
+      if (this.sessions.get(session.sandboxId) !== session) {
+        session.startingChild = null;
+        killQuietly(child);
+        return;
+      }
       let stderr = "";
       child.stderr?.on("data", (chunk) => {
         stderr += String(chunk);
       });
       const ready = await waitForControlSocket(child, session.controlPath, (session.connectTimeoutSec + 5) * 1000);
+      if (session.startingChild === child) session.startingChild = null;
       if (ready) {
         // The session may have been closed or replaced while we waited for
         // the socket (or a concurrent starter won first): never resurrect a
@@ -269,9 +284,14 @@ export class SshManager {
       }
       killQuietly(child);
       session.tunnelError = stderr.trim().slice(0, 500) || "control master did not start";
-      if (tunnel) await this.pause(2_000);
+      if (tunnel) {
+        if (this.sessions.get(session.sandboxId) !== session) return;
+        await this.pause(2_000);
+      }
     }
-    // No master: commands fall back to one direct connection each.
+    // No master: commands fall back to one direct connection each. A removed
+    // session stays untouched (no resurrecting log noise for a closed one).
+    if (this.sessions.get(session.sandboxId) !== session) return;
     session.master = null;
     if (session.tunnelSpec) session.tunnel = "down";
     this.logger.warn("boat: SSH control master did not start; falling back to direct connections", {
@@ -371,6 +391,12 @@ export class SshManager {
     const session = this.sessions.get(sandboxId);
     if (!session) return;
     this.sessions.delete(sandboxId);
+    // Also signal a still-connecting master: it is not in session.master
+    // yet, and without this it would outlive shutdown until it connects or
+    // times out. waitForControlSocket notices the exit within one poll, and
+    // the liveness guards above stop the starter from retrying.
+    if (session.startingChild) killQuietly(session.startingChild);
+    session.startingChild = null;
     if (session.master) killQuietly(session.master);
     session.master = null;
     await rm(session.knownHostsPath, { force: true }).catch(() => undefined);
@@ -401,40 +427,54 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** SIGTERM every ssh client multiplexing on sockets inside a dead worker's key
- * dir (Linux /proc scan). Best effort: a missed client only leaks until the
- * next sweep, and /proc races are ignored. Never touches live dirs. */
-async function killStaleSshForDir(dir: string): Promise<void> {
-  if (process.platform !== "linux") return;
+/** Pids of live ssh clients with dir on their command line (Linux /proc
+ * scan). Null when the platform cannot answer (non-Linux, unreadable /proc):
+ * keep-decisions treat unknown as "in use" (never reap what may be live),
+ * best-effort kills treat it as "nothing to kill". */
+async function sshPidsForDir(dir: string): Promise<number[] | null> {
+  if (process.platform !== "linux") return null;
   let pids;
   try {
     pids = await readdir("/proc");
   } catch {
-    return;
+    return null;
   }
+  const found: number[] = [];
   for (const pid of pids) {
     if (!/^\d+$/.test(pid)) continue;
     try {
       if ((await readFile(`/proc/${pid}/comm`, "utf8")).trim() !== "ssh") continue;
       const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8");
       if (!cmdline.split("\0").some((part) => part.includes(dir))) continue;
-      try {
-        process.kill(Number(pid), "SIGTERM");
-      } catch {
-        // Already gone.
-      }
+      found.push(Number(pid));
     } catch {
       // /proc race: the process exited mid-scan.
+    }
+  }
+  return found;
+}
+
+/** SIGTERM every ssh client multiplexing on sockets inside a dead worker's key
+ * dir (Linux /proc scan). Best effort: a missed client only leaks until the
+ * next sweep, and /proc races are ignored. Never touches live dirs. */
+async function killStaleSshForDir(dir: string): Promise<void> {
+  for (const pid of (await sshPidsForDir(dir)) ?? []) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already gone.
     }
   }
 }
 
 /** Remove worker key dirs whose creator is gone: a dead owner pid, or (for
- * dirs predating the owner.pid marker) an mtime older than a day, so a
- * concurrently-creating worker's dir is never reaped. Only same-uid dirs are
- * considered: the uid is the boundary, and another user's key material is
- * never touched. Returns the removed dirs. Failures for one dir never block
- * the others. */
+ * dirs predating the owner.pid marker) an mtime older than a day with no live
+ * ssh client still referencing the dir. Age alone cannot prove a legacy dir
+ * dead — a pre-upgrade worker may still be running — so a referenced dir is
+ * kept, and an unverifiable reference scan (non-Linux) keeps it too. Only
+ * same-uid dirs are considered: the uid is the boundary, and another user's
+ * key material is never touched. Returns the removed dirs. Failures for one
+ * dir never block the others. */
 export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<string[]> {
   const removed: string[] = [];
   let entries;
@@ -462,8 +502,19 @@ export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<s
       owner = null;
     }
     const pid = owner !== null && /^\d+$/.test(owner) ? Number(owner) : NaN;
-    const stale = Number.isSafeInteger(pid) ? !pidAlive(pid) : Date.now() - stat.mtimeMs > UNMARKED_KEY_DIR_MAX_AGE_MS;
-    if (!stale) continue;
+    if (Number.isSafeInteger(pid)) {
+      // Marked dir: liveness is verifiable by pid. (A recycled pid reads as
+      // alive, which keeps the dir — the safe direction.)
+      if (pidAlive(pid)) continue;
+    } else {
+      // Unmarked legacy dir: only reap when old AND no live ssh client still
+      // uses it. A concurrently-creating worker's dir is fresh, so it is
+      // never reaped; a still-running pre-upgrade worker's dir is referenced,
+      // so it is kept until it goes idle.
+      if (Date.now() - stat.mtimeMs <= UNMARKED_KEY_DIR_MAX_AGE_MS) continue;
+      const referencing = await sshPidsForDir(dir);
+      if (referencing === null || referencing.length > 0) continue;
+    }
     await killStaleSshForDir(dir);
     try {
       await rm(dir, { recursive: true, force: true });

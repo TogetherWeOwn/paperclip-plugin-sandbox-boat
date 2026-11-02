@@ -3388,13 +3388,15 @@ export class BoatVmManager {
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
     // Bound the offload drain, never the session close: a hanging or
     // rejecting offload shutdown must not outlive the worker or strand SSH
-    // state (masters, the tunnel, known_hosts and the key dir).
+    // state (masters, the tunnel, known_hosts and the key dir). Real-time
+    // deadline, not the injectable sleep: the injectable clock exists for
+    // deterministic tests, and racing it would let an instant fake sleep
+    // skip the drain in tests while a real hang still holds the loop open
+    // here (the timer below is unref'd and cleared on settle).
     const drain = this.nativeOffload.shutdown();
     void drain.catch(() => undefined);
     try {
-      await Promise.race([drain, this.sleep(SHUTDOWN_DRAIN_TIMEOUT_MS).then(() => {
-        throw new Error("boat: offload shutdown exceeded its drain budget");
-      })]);
+      await withDeadline(drain, SHUTDOWN_DRAIN_TIMEOUT_MS, "boat: offload shutdown");
     } catch (error) {
       this.logger.warn("boat: offload shutdown did not settle; SSH state still closed", {
         reason: errorText(error),

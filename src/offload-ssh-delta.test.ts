@@ -123,6 +123,7 @@ function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number)
     connectTimeoutSec: 10,
     lastMasterStartAt: 0,
     masterStarting: null,
+    startingChild: null,
   });
   const refreshSession = vi.fn(async (sandboxId: string) => sessionFor(sandboxId) as never);
   const runStream = vi.fn(async (session: unknown, remoteCommand: string, opts: { stdin?: Readable } = {}) => {

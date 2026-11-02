@@ -116,7 +116,7 @@ uncertain command locally. Broker restart still holds unresolved commands for
 reconciliation; the [executor backend adapter](design/offload-internals.md#executor-backend-adapter) does not
 automatically reattach lost handles.
 The stock lifecycle executor uses the existing native sweep/recovery/shutdown
-integration. Worker shutdown bounds the offload drain at 5 s and then closes all
+integration. Worker shutdown bounds the offload drain at a real-time 5 s and then closes all
 SSH state (control masters, tunnels, key dir) even when the drain hangs or
 rejects, so a stuck offload shutdown cannot leak SSH processes or key material.
 Loopback SSH acceptance tests exercise actual kernel enforcement;
