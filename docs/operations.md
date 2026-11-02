@@ -116,7 +116,10 @@ uncertain command locally. Broker restart still holds unresolved commands for
 reconciliation; the [executor backend adapter](design/offload-internals.md#executor-backend-adapter) does not
 automatically reattach lost handles.
 The stock lifecycle executor uses the existing native sweep/recovery/shutdown
-integration. Loopback SSH acceptance tests exercise actual kernel enforcement;
+integration. Worker shutdown bounds the offload drain at a real-time 5 s and then closes all
+SSH state (control masters, tunnels, key dir) even when the drain hangs or
+rejects, so a stuck offload shutdown cannot leak SSH processes or key material.
+Loopback SSH acceptance tests exercise actual kernel enforcement;
 no deployment, live Boat call or live Boat enforcement claim is part of them.
 
 The shim's own rollback and the native network-policy rollback rules are in [Cargo offload shim](offload.md#cargo-offload-shim-binboat-offload-cargo) and [Native task network-policy admission](security.md#native-task-network-policy-admission-not-network-isolation).

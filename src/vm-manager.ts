@@ -358,6 +358,11 @@ function withDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T
   });
 }
 
+/** Upper bound for the offload drain inside shutdown: session, master,
+ * tunnel and key-dir release always happens within this budget, even when
+ * the offload drain hangs or rejects. */
+export const SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
+
 export class BoatVmManager {
   private readonly store: VmStateStore;
   private readonly accountState: StateClientLike;
@@ -3382,7 +3387,22 @@ export class BoatVmManager {
 
   async shutdown(): Promise<void> {
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
-    await this.nativeOffload.shutdown();
+    // Bound the offload drain, never the session close: a hanging or
+    // rejecting offload shutdown must not outlive the worker or strand SSH
+    // state (masters, the tunnel, known_hosts and the key dir). Real-time
+    // deadline, not the injectable sleep: the injectable clock exists for
+    // deterministic tests, and racing it would let an instant fake sleep
+    // skip the drain in tests while a real hang still holds the loop open
+    // here (the timer below is unref'd and cleared on settle).
+    const drain = this.nativeOffload.shutdown();
+    void drain.catch(() => undefined);
+    try {
+      await withDeadline(drain, SHUTDOWN_DRAIN_TIMEOUT_MS, "boat: offload shutdown");
+    } catch (error) {
+      this.logger.warn("boat: offload shutdown did not settle; SSH state still closed", {
+        reason: errorText(error),
+      });
+    }
     await this.ssh.closeAll();
     this.sessionPolicy.clear();
   }

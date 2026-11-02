@@ -348,7 +348,7 @@ const poolRegistryScope = (companyId: string) =>
 
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
-  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
+  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync; sessions: Map<string, SshSession> }>();
   /** Credential-free pool identity (the poolId fields minus the credential
    * digest) to the live poolId, so a rotated or re-pointed API key presented
    * by a new binding retires the pool bound to the old credential instead of
@@ -531,19 +531,32 @@ export class SshOffloadRuntime {
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
     const sessions = new Map<string, SshSession>();
+    // First-touch races share one opener per VM: concurrent guests warming
+    // the same pool never authorize the key or open the session twice.
+    const pending = new Map<string, Promise<SshSession>>();
     const session = this.deps.session ?? (async (sandboxId: string) => {
       const cached = sessions.get(sandboxId);
       if (cached) return cached;
-      await waitReady(api, sandboxId, { timeoutMs: binding.config.timeoutMs });
-      const sshKey = await this.deps.ssh.ensureKey();
-      const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
-      const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
-        connectTimeoutSec: binding.config.sshConnectTimeoutSec });
-      // Once per opened session (sessions are cached; a refresh after resume
-      // re-opens and re-scrubs), before any dependency install runs guest code.
-      await scrubOffloadGuestBashrc(this.deps.ssh, opened);
-      sessions.set(sandboxId, opened);
-      return opened;
+      const ongoing = pending.get(sandboxId);
+      if (ongoing) return ongoing;
+      const opening = (async (): Promise<SshSession> => {
+        await waitReady(api, sandboxId, { timeoutMs: binding.config.timeoutMs });
+        const sshKey = await this.deps.ssh.ensureKey();
+        const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
+        const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
+          connectTimeoutSec: binding.config.sshConnectTimeoutSec });
+        // Once per opened session (sessions are cached; a refresh after resume
+        // re-opens and re-scrubs), before any dependency install runs guest code.
+        await scrubOffloadGuestBashrc(this.deps.ssh, opened);
+        sessions.set(sandboxId, opened);
+        return opened;
+      })();
+      pending.set(sandboxId, opening);
+      try {
+        return await opening;
+      } finally {
+        if (pending.get(sandboxId) === opening) pending.delete(sandboxId);
+      }
     });
     const sourceRoot = async (cmd: OffloadCommand) => {
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
@@ -591,6 +604,14 @@ export class SshOffloadRuntime {
         ephemeralRepos: normalizeOffloadSettings(settings).offloadEphemeralRepos,
         templateSnapshot: binding.config.templateSnapshot ?? null,
         templateSourceSandboxId: binding.config.templateSourceSandboxId ?? null },
+      // A released VM's session is closed and forgotten; the next command
+      // needing it re-opens on demand through the cached-session path.
+      // A plain dep, not persisted config, so pool snapshots stay
+      // structured-cloneable. Never throws: cleanup must not lose a receipt.
+      onVmReleased: async (sandboxId: string) => {
+        sessions.delete(sandboxId);
+        await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
+      },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is
@@ -616,7 +637,7 @@ export class SshOffloadRuntime {
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
-    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
+    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync, sessions });
     this.poolByBaseIdentity.set(baseIdentity, poolId);
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
     // lost write is retried by every sweep while the pool is loaded.
@@ -750,6 +771,16 @@ export class SshOffloadRuntime {
       await guest.shutdown();
     }));
     await this.registryTail;
+    // Sessions outlive executors only when their release hook never fired
+    // (a pool created before the hook existed, or a VM deleted out-of-band):
+    // runtime shutdown still closes what it cached. The worker-level
+    // closeAll in BoatVmManager.shutdown remains the backstop for the rest.
+    for (const { sessions } of this.pools.values()) {
+      for (const sandboxId of [...sessions.keys()]) {
+        sessions.delete(sandboxId);
+        await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
+      }
+    }
     this.closed = true;
   }
 }

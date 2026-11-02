@@ -82,7 +82,7 @@ export class LoopbackSsh {
       this.session = {
         sandboxId: "loopback-only", endpoint: { host: "127.0.0.1", port, user: userInfo().username, hostKey },
         knownHostsPath, controlPath: path.join(this.root, "ctl"), master: null,
-        tunnel: "disabled", tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0,
+        tunnel: "disabled", tunnelSpec: null, tunnelError: null, connectTimeoutSec: 2, lastMasterStartAt: 0, masterStarting: null, startingChild: null,
       };
       let masterDiagnostic = "";
       this.master = spawn("ssh", ["-F", "/dev/null", "-N", "-o", "ControlMaster=yes", "-o", "ControlPersist=no",

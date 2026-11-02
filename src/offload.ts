@@ -152,6 +152,12 @@ export interface OffloadDeps extends Partial<OffloadDurableDeps> {
    * never fails a command.
    */
   recordDuration?: (command: OffloadCommand, seconds: number) => Promise<void> | void;
+  /** Released-VM hook: called with the pool VM id once its SSH session is no
+   * longer needed — a confirmed stop, retirement, quarantine, or a failed
+   * pending delete. A plain dep, not persisted config: pool snapshots must
+   * stay structured-cloneable. Best effort and never throws; hook failures
+   * are logged and swallowed so a stop receipt is never lost because of them. */
+  onVmReleased?: ((sandboxId: string) => void | Promise<void>) | null;
 }
 
 // A separate transport shape keeps the landed identity-only runner compatible.
@@ -215,6 +221,7 @@ export class OffloadExecutor {
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "monitoring" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
     Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot" | "templateSourceSandboxId"> &
     Required<Pick<OffloadExecutorConfig, "ephemeralRepos">>;
+  private readonly onVmReleased: ((sandboxId: string) => void | Promise<void>) | null;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly recordDuration?: OffloadDeps["recordDuration"];
@@ -252,6 +259,7 @@ export class OffloadExecutor {
       templateSourceSandboxId: deps.config.templateSourceSandboxId ?? null,
       ephemeralRepos: [...(deps.config.ephemeralRepos ?? [])],
     };
+    this.onVmReleased = deps.onVmReleased ?? null;
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
       throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
@@ -339,6 +347,8 @@ export class OffloadExecutor {
     } else {
       vm.stopping = false;
       vm.stopped = true;
+      // A confirmed terminal observation ends the VM's SSH session.
+      await this.notifyReleased(vm);
     }
     return false;
   }
@@ -996,6 +1006,8 @@ export class OffloadExecutor {
       vm.generation += 1;
       this.clearIdleTimer(vm);
       await this.persistPool();
+      // A quarantined VM is never reused: its SSH session can go now.
+      await this.notifyReleased(vm);
       this.logger.warn("boat offload VM quarantined; guest receipt reconciliation required", { commandId: command.commandId, sandboxId: vm.sandboxId });
       if (!this.closed) await this.dispatchQueued();
     });
@@ -1057,6 +1069,22 @@ export class OffloadExecutor {
     vm.generation += 1;
     const at = this.pool.indexOf(vm);
     if (at >= 0) this.pool.splice(at, 1);
+    // The pool no longer references the VM: its SSH session can go too.
+    void this.notifyReleased(vm);
+  }
+
+  /** Best-effort release hook: a hook failure is logged, never thrown, so a
+   * stop receipt or retirement is never lost because session cleanup failed. */
+  private async notifyReleased(vm: PoolVm): Promise<void> {
+    const hook = this.onVmReleased;
+    if (!hook || !vm.sandboxId) return;
+    try {
+      await hook(vm.sandboxId);
+    } catch (error) {
+      this.logger.warn("boat offload release hook failed; session cleanup unverified", {
+        sandboxId: vm.sandboxId, reason: (error as Error).message,
+      });
+    }
   }
 
   /** Delete at the provider; a 404 already proves the disk is gone. */
@@ -1102,6 +1130,9 @@ export class OffloadExecutor {
       vm.quarantined = true;
       vm.deletePending = true;
       this.logger.error("boat offload ephemeral delete failed; VM quarantined with delete pending", { sandboxId: vm.sandboxId });
+      // The delete stays pending for a later sweep, but the VM is already
+      // quarantined against reuse: its SSH session can go now.
+      await this.notifyReleased(vm);
       return false;
     }
     this.retireVm(vm);
@@ -1181,6 +1212,9 @@ export class OffloadExecutor {
       this.logger.error("boat offload stop receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
     });
     this.stopFailures.delete(vm.sandboxId);
+    // A confirmed stop ends the VM's SSH session; an unconfirmed one keeps
+    // it for the bounded retry.
+    if (vm.stopped) await this.notifyReleased(vm);
     await this.persistPool().catch(() => {
       this.logger.error("boat offload stop state persistence failed; reconciliation required", { sandboxId: vm.sandboxId });
     });

@@ -78,6 +78,8 @@ beforeEach(() => {
     tunnelError: null,
     connectTimeoutSec: 2,
     lastMasterStartAt: 0,
+    masterStarting: null,
+    startingChild: null,
   };
 });
 
