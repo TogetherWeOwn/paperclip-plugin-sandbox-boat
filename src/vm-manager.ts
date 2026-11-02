@@ -80,6 +80,26 @@ const ACTIVITY_PERSIST_INTERVAL_MS = 60 * 1000;
 // Below the minimum idle-stop threshold (one minute), including silent syncs.
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 15_000;
 const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
+// A sweep is single-flight: if one hangs (a stalled provider stream, a blocked
+// broker chain), every later sweep coalesces onto it and idle VMs stop being
+// stopped until the worker restarts. Bound the whole sweep well past any
+// legitimate pass (sequential per-VM stop confirmations) but finitely: past
+// the deadline the sweep rejects, single-flight clears, and the next sweep
+// starts fresh (every stop/delete re-checks under its card lock first).
+const SWEEP_DEADLINE_MS = 10 * 60 * 1000;
+// Offload upkeep runs inside the sweep but must never delay whole-run idle
+// stops for long: the pool sweep and every company's broker retention run
+// concurrently under one shared budget (not 60 s per company in sequence, so
+// more blocked brokers cannot eat the sweep deadline), each is reported
+// unverified when it overruns, and then the VM pass runs.
+const OFFLOAD_UPKEEP_TIMEOUT_MS = 60 * 1000;
+// One VM's locked sweep work (bounded request/scrub/stop-confirm calls stack
+// up past any single request timeout) gets this long before the sweep leaves
+// that VM and moves to the next. The bound sits outside the lock on purpose:
+// a later release's FIFO turn can still wait behind long-running work, but
+// work that never settles must not strand the sweep's remaining VMs — in
+// this pass or any later one — on the held card lock.
+const SWEEP_VM_TIMEOUT_MS = 5 * 60 * 1000;
 /** How long the in-memory end fence and whole-run realizations are kept, and how long a
  * persisted owner of a run without an issue (which the host cannot confirm live) is trusted. */
 const LOCAL_RUN_STATE_MAX_AGE_MS = 24 * 60 * 60_000;
@@ -174,6 +194,10 @@ export interface ManagerDeps {
   ssh?: SshManager;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Test seams for the sweep bounds; never sourced from API input. */
+  sweepDeadlineMs?: number;
+  offloadUpkeepTimeoutMs?: number;
+  sweepVmTimeoutMs?: number;
 }
 
 interface SandboxView {
@@ -246,6 +270,22 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Race `work` against a real-time deadline (not the injectable clock/sleep:
+ * this bounds actual hangs). The work itself is not cancelled — it may still
+ * settle in the background — but the caller is never held past `ms`.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([work, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 export class BoatVmManager {
   private readonly store: VmStateStore;
   private readonly accountState: StateClientLike;
@@ -261,6 +301,9 @@ export class BoatVmManager {
   private readonly nativeOffload: SshOffloadRuntime;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sweepDeadlineMs: number;
+  private readonly offloadUpkeepTimeoutMs: number;
+  private readonly sweepVmTimeoutMs: number;
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly inflight = new Map<string, number>();
   private readonly lastActivity = new Map<string, number>();
@@ -298,6 +341,9 @@ export class BoatVmManager {
     });
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.sweepDeadlineMs = deps.sweepDeadlineMs ?? SWEEP_DEADLINE_MS;
+    this.offloadUpkeepTimeoutMs = deps.offloadUpkeepTimeoutMs ?? OFFLOAD_UPKEEP_TIMEOUT_MS;
+    this.sweepVmTimeoutMs = deps.sweepVmTimeoutMs ?? SWEEP_VM_TIMEOUT_MS;
     this.ssh = deps.ssh ?? new SshManager(deps.logger, this.sleep);
     // Without an explicit credential-free account identity, conservatively group
     // this worker's provider clients. Never persist a key or partition by company.
@@ -2546,7 +2592,7 @@ export class BoatVmManager {
     if (!options.force && this.now() - this.lastSweepAt < SWEEP_MIN_INTERVAL_MS) {
       return { skipped: "recent", stopped: [], deleted: [], forgotten: [], errors: [] };
     }
-    const report: Promise<TaggedSweepReport> = this.doSweep(reason, scope).finally(() => {
+    const report: Promise<TaggedSweepReport> = withDeadline(this.doSweep(reason, scope), this.sweepDeadlineMs, "boat sweep").finally(() => {
       if (scope === null) this.lastSweepAt = this.now();
       if (this.sweeping?.report === report) this.sweeping = null;
     });
@@ -2572,10 +2618,20 @@ export class BoatVmManager {
     return running ? running.report.then((report) => scopeSweepReport(report, running.scope)) : null;
   }
 
-  /** The lock the sweep holds to stop or delete a VM: its card's, or for an orphan, its name's (acquire holds both). */
+  /**
+   * The lock the sweep holds to stop or delete a VM: its card's, or for an
+   * orphan, its name's (acquire holds both). The deadline wraps the locked
+   * work itself: work that never settles cannot be cancelled and keeps its
+   * lock, but the sweep still gives up on this VM and moves on. (The give-up
+   * starts the locked work in the chain's normal FIFO order; the caller's
+   * try/catch turns the timeout and any queued re-run's fresh-checks into
+   * ordinary per-VM errors or no-ops.)
+   */
   private withSweepLock<T>(companyId: string, sandbox: SandboxView, record: VmRecord | null, fn: () => Promise<T>): Promise<T> {
-    if (record) return this.withLock(this.cardLockKey(companyId, record.key.split("~")[0]), fn);
-    return sandbox.name ? this.withLock(this.nameLockKey(sandbox.name), fn) : fn();
+    const locked = record
+      ? this.withLock(this.cardLockKey(companyId, record.key.split("~")[0]), fn)
+      : sandbox.name ? this.withLock(this.nameLockKey(sandbox.name), fn) : fn();
+    return withDeadline(locked, this.sweepVmTimeoutMs, `sweep work for ${sandbox.id}`);
   }
 
   /**
@@ -2626,10 +2682,17 @@ export class BoatVmManager {
       // a command or config is seen again, so cover every known company.
       const offloadCompanies = new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId)]);
       // Existing native job owns stop retry/reconciliation; no host pacer.
-      await this.nativeOffload.sweep(offloadCompanies).catch(() => report.errors.push(tag(null, "offload pool sweep unverified")));
-      for (const companyId of offloadCompanies) {
-        await this.offloadBroker(companyId).collectGarbage().catch(() => report.errors.push(tag(null, "offload broker retention unverified")));
-      }
+      // All upkeep runs concurrently under one shared budget: a blocked pool
+      // sweep or broker chain is reported unverified and must not delay the
+      // whole-run VM stops below, however many companies are blocked.
+      await Promise.all([
+        withDeadline(this.nativeOffload.sweep(offloadCompanies), this.offloadUpkeepTimeoutMs, "offload pool sweep")
+          .catch(() => report.errors.push(tag(null, "offload pool sweep unverified"))),
+        ...[...offloadCompanies].map((companyId) =>
+          withDeadline(this.offloadBroker(companyId).collectGarbage(), this.offloadUpkeepTimeoutMs, "offload broker retention")
+            .catch(() => report.errors.push(tag(null, "offload broker retention unverified"))),
+        ),
+      ]);
     }
     if (this.configs.size === 0) {
       report.skipped = "no_config_seen";
