@@ -305,6 +305,17 @@ export function sandboxNameFor(prefix: string, companyId: string, environmentId:
   return `${prefix}-${digest}`;
 }
 
+/**
+ * Non-secret account-equality fingerprint: lets a restarted sweep check that
+ * the host key belongs to the same account as an inline-key descriptor without
+ * ever persisting key bytes. The input is a high-entropy API key, not a
+ * password, so a password-strength KDF would add cost without meaning.
+ */
+// codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
+function sweepAccountDigest(apiBase: string, apiKey: string): string {
+  return createHash("sha256").update(`${apiBase}\u0000${apiKey}`).digest("hex");
+}
+
 function iso(value: unknown): string | null {
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
   if (typeof value === "string" && value.length > 0) {
@@ -766,17 +777,31 @@ export class BoatVmManager {
     );
   }
 
-  /** Last persisted descriptor per environment, so hot hooks skip redundant writes. */
+  /**
+   * Last durably persisted descriptor per environment, so hot hooks skip
+   * redundant writes. It is only marked after both state writes succeed: an
+   * optimistic claim would let a duplicate hook skip its write while the first
+   * is still pending, and a failure would then lose the descriptor entirely.
+   */
   private readonly persistedSweeps = new Map<string, string>();
 
-  private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
+  /**
+   * Per-environment persistence chain. Identical hooks join the in-flight
+   * write instead of skipping on a stale cache hit: each queued step re-checks
+   * durability after its predecessor settles, so a duplicate arriving during a
+   * failed first write retries it, and an A→B→A burst still lands the latest
+   * content last. The tail never rejects, so later hooks always run; each
+   * caller still observes its own write's failure through the returned promise.
+   */
+  private readonly sweepDescriptorWrites = new Map<string, Promise<void>>();
+
+  private persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
     const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
     // A non-secret same-account marker: the ops listing runs under the inline
     // key's account, so rehydration through the host key is only safe when the
     // host key resolves to that same account. A digest, never the key itself.
     const accountDigest = config.apiKey != null
-      // codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
-      ? createHash("sha256").update(`${config.apiBase}\u0000${config.apiKey}`).digest("hex")
+      ? sweepAccountDigest(config.apiBase, config.apiKey)
       : null;
     // Dedupe on the persisted content, not the write time: seenAt changes on
     // every hook, so including it would defeat the cache with a write per call.
@@ -784,22 +809,24 @@ export class BoatVmManager {
     // re-persist, or a stale digest would let a restarted sweep match the old
     // account's host key against the new account's live VMs and forget them.
     const encoded = JSON.stringify([companyId, publicFields, config.apiKey != null, accountDigest]);
-    if (this.persistedSweeps.get(environmentId) === encoded) return;
-    // Claim the latest content before awaiting, so a later identical hook
-    // cannot skip its write while an older, different write is still queued.
-    // Queued writes run in order (VmStateStore serializes), so the last claim
-    // still wins on disk; without the claim an A→B→A burst could leave B's
-    // digest on disk under live config A.
-    this.persistedSweeps.set(environmentId, encoded);
-    const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
-      hadInlineKey: config.apiKey != null, accountDigest };
-    try {
+    if (this.persistedSweeps.get(environmentId) === encoded && !this.sweepDescriptorWrites.has(environmentId)) {
+      return Promise.resolve();
+    }
+    const predecessor = this.sweepDescriptorWrites.get(environmentId) ?? Promise.resolve();
+    const write = predecessor.catch(() => undefined).then(async () => {
+      if (this.persistedSweeps.get(environmentId) === encoded) return;
+      const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
+        hadInlineKey: config.apiKey != null, accountDigest };
       await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
       await this.store.rememberCompany(companyId);
-    } catch (error) {
-      if (this.persistedSweeps.get(environmentId) === encoded) this.persistedSweeps.delete(environmentId);
-      throw error;
-    }
+      this.persistedSweeps.set(environmentId, encoded);
+    });
+    const tail = write.catch(() => undefined);
+    this.sweepDescriptorWrites.set(environmentId, tail);
+    void tail.then(() => {
+      if (this.sweepDescriptorWrites.get(environmentId) === tail) this.sweepDescriptorWrites.delete(environmentId);
+    });
+    return write;
   }
 
   /**
@@ -848,8 +875,7 @@ export class BoatVmManager {
     if (apiBase !== DEFAULT_API_BASE) return false;
     const hostKey = process.env.BOAT_API_KEY?.trim() ?? "";
     if (!hostKey) return false;
-    // codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
-    return createHash("sha256").update(`${apiBase}\u0000${hostKey}`).digest("hex") === descriptor.accountDigest;
+    return sweepAccountDigest(apiBase, hostKey) === descriptor.accountDigest;
   }
 
   /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */

@@ -361,6 +361,61 @@ describe("sweep after a worker restart", () => {
     expect(await readDigest()).toBe(digestOf(keyA));
   });
 
+  it("retries the descriptor when a duplicate hook arrives during a failed first write", async () => {
+    const keyA = "boat_retry_key_a_not_real";
+    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const readDigest = async () => (await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
+      envs?: Record<string, { accountDigest?: unknown }>;
+    } | null)?.envs?.[environmentId]?.accountDigest;
+    const hook = (runId: string) =>
+      plugin.definition.onEnvironmentAcquireLease!({
+        companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey: keyA }, runId,
+        issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+      });
+    // Hold the first sweep-config write until the duplicate hook has joined
+    // it, then fail that first write only. The duplicate must retry the write
+    // instead of having skipped it, or a restart would have no descriptor to
+    // rehydrate until another hook arrives.
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let releaseWrites!: () => void;
+    const writesBlocked = new Promise<void>((resolve) => { releaseWrites = resolve; });
+    let seenWrites = 0;
+    let failures = 1;
+    harness.ctx.state.set = (async (input: Parameters<typeof realSet>[0], value: unknown) => {
+      if (input.namespace === "boat-sandbox" && input.stateKey === "sweep-configs") {
+        seenWrites += 1;
+        if (seenWrites === 1) await writesBlocked;
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("transient sweep-config write failed");
+        }
+      }
+      return realSet(input, value);
+    }) as typeof harness.ctx.state.set;
+    try {
+      const pending1 = hook("run-retry-1");
+      for (let n = 0; n < 1000 && seenWrites === 0; n += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(seenWrites).toBeGreaterThan(0);
+      const pending2 = hook("run-retry-2");
+      for (let n = 0; n < 20; n += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      releaseWrites();
+      await pending1;
+      await pending2;
+    } finally {
+      harness.ctx.state.set = realSet;
+    }
+    for (let n = 0; n < 1000; n += 1) {
+      if ((await readDigest()) === digestOf(keyA)) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(await readDigest()).toBe(digestOf(keyA));
+  });
+
   it("leaves name-matching VMs alone when the VM document is unreadable", async () => {
     await acquire();
     // Roll back to a document this version cannot read; the sweep must report
