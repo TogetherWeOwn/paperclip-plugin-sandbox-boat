@@ -32,7 +32,7 @@ describe("journal releases the host upload only on a failure before transport", 
     const journal = new OffloadJournal({ journalStore: state.store(),
       guestReceipts: { bootId, read: async () => null },
       resolveRunState: async () => ({ permanentlyTerminal: false, terminatedAt: null, tokenExpiresAt: EPOCH + DAY }),
-      sync: { push: async () => {}, collect: async () => ({}), stage: async () => undefined, discard, ...sync },
+      sync: { push: async () => {}, collect: async () => ({}), stage: async () => undefined, markSuspect: async () => {}, discard, ...sync },
     }, () => clock.t, { hold: async () => {}, release: async () => {}, cancel: async () => {} });
     return { journal, discard };
   }

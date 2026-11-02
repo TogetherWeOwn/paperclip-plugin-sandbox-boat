@@ -986,8 +986,11 @@ export interface CollectOptions {
   maxStagedBytes?: number;
   /**
    * The previous command's post-collect guest scan for this mirror (host-kept,
-   * complete scans only). Guest content identical to it was already reported
-   * by that command: it is not this command's change and must not re-stage.
+   * complete scans only). Guest-only content identical to it was already
+   * reported by that command: it is not this command's change and must not
+   * re-stage. Uploaded paths are never suppressed by it: push restores them
+   * to the baseline before every command, so their modifies and deletes are
+   * always compared against the baseline.
    */
   previousGuest?: ReadonlyMap<string, GuestFileState>;
   /**
@@ -1020,9 +1023,12 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
   const changes: StagedChange[] = [];
   for (const [rel, state] of guest) {
     // Identical to the previous command's post-collect scan: stale mirror
-    // output that command already reported, not a change by this one.
+    // output that command already reported, not a change by this one. Only
+    // guest-only paths qualify: uploaded files are restored to the host
+    // baseline on every push, so a modify that repeats the previous scan is
+    // still this command's own change against that baseline.
     const prev = previous?.get(rel);
-    if (prev && sameGuestState(prev, state)) continue;
+    if (prev && sameGuestState(prev, state) && !uploaded.has(rel)) continue;
     const baseline = uploaded.get(rel);
     if (!baseline) {
       changes.push(await newGuestChange(live, opts.guest, opts.guestDir, rel, state, policy));
@@ -1036,10 +1042,11 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
     }
   }
   for (const [rel, baseline] of uploaded) {
-    if (!guest.has(rel)) {
-      // Already missing in the previous complete scan: that command proposed
-      // the delete; do not re-propose it on every later command.
-      if (previous && !previous.has(rel)) continue;
+    // Absence only proves deletion in a complete enumeration: a truncated
+    // scan may simply not have reached this path. Uploaded files are
+    // restored on every push, so a repeated absence is this command's own
+    // delete and is proposed again (no previous-scan suppression here).
+    if (!guest.has(rel) && !scan.truncated) {
       changes.push({ path: rel, op: "proposed-delete", supported: isReturnEligible(rel, policy), baselineSha256: baseline.sha256, returnedSha256: null, liveSha256: await liveHash(live, rel), stagedRelPath: null });
     }
   }

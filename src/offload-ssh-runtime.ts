@@ -520,7 +520,7 @@ export class SshOffloadRuntime {
       }),
       sync: { push: (vm, cmd) => sync.push(vm, cmd),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
-        discard: (vm, cmd) => sync.discard(vm, cmd) },
+        discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
     this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
@@ -558,7 +558,7 @@ export class SshOffloadRuntime {
     const journal = new OffloadJournal({ journalStore: store, guestReceipts: { read: inert },
       resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
         tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
-      sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
+      sync: { push: inert, collect: inert, stage: inert, markSuspect: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
     await journal.collectGarbage();
     return (await store.list("")).length === 0;
   }

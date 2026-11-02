@@ -304,6 +304,7 @@ export async function fixture() {
         push: sync.push,
         collect: (vm: string, cmd: OffloadCommand) => sync.collect(vm, cmd as LifecycleCommand),
         stage: (_vm: string, cmd: OffloadCommand, collected: unknown) => sync.stage(cmd as LifecycleCommand, collected),
+        markSuspect: async () => {},
       },
       runCommand: async (sandboxId: string, raw: OffloadCommand, context?: RunContext) => {
         const cmd = raw as LifecycleCommand;

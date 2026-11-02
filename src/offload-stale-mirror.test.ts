@@ -99,6 +99,48 @@ describe("stale mirror output does not fail later commands", () => {
     expect(exit).toBe(74);
   });
 
+  it("a repeated edit to an uploaded file stages again on the second collect", async () => {
+    // Push restores uploaded files to the host baseline before every command,
+    // so an edit identical to the previous command's is still this command's
+    // change: the previous-scan suppression covers guest-only output only.
+    const { first, second } = await collectTwice((guest) => {
+      write(guest, "Cargo.lock", "v1\n# new-dep\n");
+    });
+    expect(first.state).toBe("staged");
+    expect(second.state).toBe("staged");
+    expect(second.artifactDir).not.toBeNull();
+    expect(second.changedPaths).toEqual(["Cargo.lock"]);
+  });
+
+  it("a repeated delete of an uploaded file is proposed again on the second collect", async () => {
+    const { first, second } = await collectTwice((guest) => {
+      rmSync(path.join(guest, "Cargo.lock"));
+    });
+    expect(first.changes).toContainEqual(expect.objectContaining({ path: "Cargo.lock", op: "proposed-delete" }));
+    expect(second.state).toBe("staged");
+    expect(second.changes).toContainEqual(expect.objectContaining({ path: "Cargo.lock", op: "proposed-delete" }));
+  });
+
+  it("a truncated scan never stages phantom deletions of unseen uploaded files", async () => {
+    const live = temp();
+    const guest = temp();
+    write(live, "src/main.rs", "x\n");
+    write(live, "Cargo.lock", "v1\n");
+    write(guest, "src/main.rs", "x\n");
+    write(guest, "Cargo.lock", "v1\n");
+    write(guest, "extra-output.log", "noise\n");
+    const uploaded = (await captureManifest(live)).manifest;
+    const result = await collectAndStage({
+      liveRoot: live, uploaded, guest: new LocalGuestStore({ maxScanEntries: 1 }),
+      guestDir: guest, stagingDir: path.join(temp(), "cmd-trunc"),
+    });
+    expect(result.scan.truncated).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.changes.some((c) => c.op === "proposed-delete")).toBe(false);
+    expect(result.state).toBe("clean");
+    expect(result.artifactDir).toBeNull();
+  });
+
   it("clean and truncated sync-backs preserve the remote exit code", () => {
     for (const state of ["clean", "truncated"] as const) {
       expect(exitForTerminal({
@@ -169,6 +211,34 @@ describe("special files and oversized output never make collect throw", () => {
     expect(scan.files.get("keep.txt")?.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(scan.files.has("test-results/trace.zip")).toBe(false);
   });
+
+  it("the guest inspect script truncates before its JSON outgrows the transport cap", async () => {
+    const mirror = temp();
+    const scratch = temp();
+    // Deep, long names: each scan entry's JSON is ~1 KiB, so the serialized
+    // byte budget binds well before the 100k entry limit.
+    const deep = path.join(mirror, "d".repeat(250), "e".repeat(250), "f".repeat(250));
+    mkdirSync(deep, { recursive: true });
+    const total = 14_000;
+    for (let i = 0; i < total; i += 1) {
+      writeFileSync(path.join(deep, `f${String(i).padStart(200, "0")}`), "");
+    }
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = spawn("python3", ["-I", "-c", GUEST_INSPECT_SCRIPT], { cwd: scratch });
+      const chunks: Buffer[] = [];
+      child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+      child.stderr.on("data", () => undefined);
+      child.on("error", reject);
+      child.on("close", (code) => code === 0
+        ? resolve(Buffer.concat(chunks).toString("utf8"))
+        : reject(new Error(`inspect script exited ${code}`)));
+      child.stdin.end(JSON.stringify([mirror, "scan", null, DEFAULT_SYNC_EXCLUDES]));
+    });
+    expect(Buffer.byteLength(stdout)).toBeLessThan(16 * 1024 * 1024);
+    const scan = validateGuestScan(JSON.parse(stdout));
+    expect(scan.truncated).toBe(true);
+    expect(scan.files.size).toBeLessThan(total);
+  }, 60_000);
 });
 
 describe("deterministic inspect failures surface as SyncError", () => {
@@ -231,17 +301,33 @@ describe("collect failure after a completed transport", () => {
 });
 
 describe("artifact root sweep", () => {
-  it("caps retained artifact dirs by count, oldest first, never touching live ones", async () => {
-    const root = temp();
-    for (let i = 0; i < 5; i += 1) {
+  function plantArtifacts(root: string, base: number, count: number): void {
+    for (let i = 0; i < count; i += 1) {
       const dir = path.join(root, `command-${i}`);
       mkdirSync(dir);
-      const when = new Date(1_700_000_000_000 + i * 1000);
+      const when = new Date(base + i * 1000);
       utimesSync(dir, when, when);
     }
+  }
+
+  it("caps retained artifact dirs by count, oldest first, never touching live ones", async () => {
+    const root = temp();
+    plantArtifacts(root, 1_700_000_000_000, 5);
     const live = new Set([path.join(root, "command-0")]);
-    await sweepArtifactRoot(root, 0, live, 2);
+    // Every dir is older than the count-eviction horizon, so the cap binds.
+    await sweepArtifactRoot(root, 0, live, 2, 1_800_000_000_000);
     expect(readdirSync(root).sort()).toEqual(["command-0", "command-4"]);
     expect(existsSync(path.join(root, "command-0"))).toBe(true);
+  });
+
+  it("never count-evicts an artifact a retained result can still name", async () => {
+    const root = temp();
+    plantArtifacts(root, 1_700_000_000_000, 5);
+    // All dirs are younger than the count-eviction horizon (the result
+    // retention window): the count cap must not delete any of them early.
+    await sweepArtifactRoot(root, 0, new Set(), 2, 1_600_000_000_000);
+    expect(readdirSync(root).sort()).toEqual([
+      "command-0", "command-1", "command-2", "command-3", "command-4",
+    ]);
   });
 });

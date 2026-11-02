@@ -71,7 +71,8 @@ export interface OffloadSync {
   discard?(sandboxId: string, command: OffloadCommand): Promise<void>;
   // Collect failed after a completed transport: the guest mirror cannot be
   // trusted as a delta base, so the next push wipes and fully resyncs it.
-  markSuspect?(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Required (not optional) so an adapter cannot silently drop the marking.
+  markSuspect(sandboxId: string, command: OffloadCommand): Promise<void>;
 }
 
 export interface OffloadDurableDeps {
@@ -432,7 +433,7 @@ export class OffloadJournal {
       collected = await this.deps.sync.collect(sandboxId, command);
     } catch (error) {
       if ((error as { collectDeterministic?: unknown } | null)?.collectDeterministic !== true) throw error;
-      await this.deps.sync.markSuspect?.(sandboxId, command).catch(() => undefined);
+      await this.deps.sync.markSuspect(sandboxId, command).catch(() => undefined);
       await this.deps.sync.discard?.(sandboxId, command).catch(() => undefined);
       return { state: "truncated", changedPaths: [], conflictPaths: [], artifactId: null };
     }

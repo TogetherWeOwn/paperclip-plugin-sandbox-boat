@@ -547,6 +547,7 @@ else:
     truncated = False
     hashed = 0
     budget = 268435456
+    emitted = 0
     stack = ['']
     while stack and not truncated:
         relative = stack.pop()
@@ -600,6 +601,14 @@ else:
                         value['sha256'] = digest.hexdigest()
             else:
                 value.update({'special': True, 'sha256': ''})
+            # Bound the serialized response, not just the entry count: long
+            # paths can outgrow the transport output cap well before 100000
+            # entries. 192 bytes of headroom covers the entry's fixed JSON
+            # fields (size, mtimeMs, hash, flags) plus framing.
+            emitted += len(json.dumps(name)) + 192
+            if emitted > 12582912:
+                truncated = True
+                break
             result[name] = value
     result = {'files': result, 'truncated': truncated}
 print(json.dumps(result))

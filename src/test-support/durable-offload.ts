@@ -166,7 +166,7 @@ export type DurableDeps = OffloadDeps & {
   journalStore: FileStore;
   guestReceipts: { read(id: Identity): Promise<unknown> };
   resolveRunState(companyId: string, runId: string): Promise<RunState>;
-  sync: { push(vm: string, cmd: Command): Promise<void>; collect(vm: string, cmd: Command): Promise<void>; stage(vm: string, cmd: Command): Promise<void> };
+  sync: { push(vm: string, cmd: Command): Promise<void>; collect(vm: string, cmd: Command): Promise<void>; stage(vm: string, cmd: Command): Promise<void>; markSuspect(vm: string, cmd: Command): Promise<void> };
 };
 export interface View {
   version: 1; commandId: string; state: State; remoteStarted: boolean | null;
@@ -209,7 +209,7 @@ export function harness(root: string) {
       resolveRunState: async (_companyId, runId) => runStates.get(runId)
         ?? { permanentlyTerminal: false, terminatedAt: null, tokenExpiresAt: EPOCH + 40 * DAY },
       guestReceipts: { read: async (id) => { receiptReads.push(id); return structuredClone(guestAnswer); } },
-      sync: { push: async () => {}, collect: async () => {}, stage: async () => {} },
+      sync: { push: async () => {}, collect: async () => {}, stage: async () => {}, markSuspect: async () => {} },
       runCommand: async (vm, cmd, ...rest: unknown[]) => {
         attempts.push({ vm, command: cmd as Command, intent: await new FileStore(hostDirectory).get(hostKey(cmd as Command)), identity: rest[0] as Identity | undefined });
         return { ...cargoResult };

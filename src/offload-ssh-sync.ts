@@ -2,6 +2,7 @@ import { lstat, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
+import { OFFLOAD_BOUNDS } from "./offload/protocol.js";
 import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
@@ -349,17 +350,21 @@ export class SshOffloadSync implements OffloadSync {
   async collectGarbage(): Promise<void> {
     const cutoff = this.now() - ARTIFACT_RETENTION_MS;
     for (const [id, upload] of this.uploads) if (upload.at < cutoff) this.uploads.delete(id);
-    await sweepArtifactRoot(this.deps.artifactRoot, cutoff, new Set([...this.uploads.values()].map((upload) => upload.scratch)));
+    await sweepArtifactRoot(this.deps.artifactRoot, cutoff, new Set([...this.uploads.values()].map((upload) => upload.scratch)),
+      MAX_ARTIFACT_DIRS, this.now() - OFFLOAD_BOUNDS.resultRetentionMs);
   }
 }
 
 /** Retained artifact dirs are count-capped as well as aged out: a mirror that
- * staged on every command must not grow the artifact root without bound. */
+ * staged on every command must not grow the artifact root without bound. The
+ * count cap only reaches dirs older than the result-retention window, so an
+ * artifact a retained result can still name is never evicted early. */
 export const MAX_ARTIFACT_DIRS = 256;
 
 /** Remove command-* scratch dirs under an artifact root last modified before
- * cutoff, then the oldest beyond the count cap, except live ones. */
-export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, live: ReadonlySet<string> = new Set(), maxDirs = MAX_ARTIFACT_DIRS): Promise<void> {
+ * cutoff, then the oldest beyond the count cap among dirs last modified
+ * before countEvictBefore, except live ones. */
+export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, live: ReadonlySet<string> = new Set(), maxDirs = MAX_ARTIFACT_DIRS, countEvictBefore = 0): Promise<void> {
   const entries = await readdir(artifactRoot).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return [] as string[];
     throw error;
@@ -376,7 +381,7 @@ export async function sweepArtifactRoot(artifactRoot: string, cutoff: number, li
       retained.push({ dir, mtimeMs: info.mtimeMs });
     }
   }
-  const excess = retained.filter(({ dir }) => !live.has(dir)).sort((a, b) => a.mtimeMs - b.mtimeMs);
+  const excess = retained.filter(({ dir, mtimeMs }) => !live.has(dir) && mtimeMs < countEvictBefore).sort((a, b) => a.mtimeMs - b.mtimeMs);
   while (retained.length > maxDirs && excess.length > 0) {
     const oldest = excess.shift()!;
     retained.splice(retained.indexOf(oldest), 1);
