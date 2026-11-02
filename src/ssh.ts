@@ -468,9 +468,9 @@ function pidAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    // EPERM proves a live process we may not signal; anything else (ESRCH)
-    // means no such process.
-    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+    // Only ESRCH proves the owner is gone. EPERM and any other error mean the
+    // process exists or the result is uncertain: keep the dir.
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
   }
 }
 

@@ -217,6 +217,37 @@ describe("cleanupStaleKeyDirs", () => {
     }
   });
 
+  it("keeps a marked dir when owner liveness is uncertain", async () => {
+    const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
+    try {
+      const uncertain = path.join(base, "pcboat-uncertain");
+      await mkdir(uncertain);
+      await writeFile(path.join(uncertain, "id_ed25519"), "stale", { mode: 0o600 });
+      const owner = await deadPid();
+      await writeFile(path.join(uncertain, "owner.pid"), `${owner}\n`);
+      // An unexpected kill error (neither ESRCH nor EPERM) proves nothing
+      // about the owner: the dir must be kept, not reaped as dead.
+      const realKill = process.kill.bind(process);
+      const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+        if (pid === owner) {
+          const err = new Error("uncertain liveness") as NodeJS.ErrnoException;
+          err.code = "EINVAL";
+          throw err;
+        }
+        return realKill(pid, signal as 0);
+      }) as typeof process.kill);
+      try {
+        const removed = await cleanupStaleKeyDirs(base);
+        expect(removed).toEqual([]);
+        expect(existsSync(uncertain)).toBe(true);
+      } finally {
+        kill.mockRestore();
+      }
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("removes old unmarked dirs with no live ssh referencing them", async () => {
     const base = await mkdtemp(path.join(tmpdir(), "pcboat-sweep-test-"));
     try {
