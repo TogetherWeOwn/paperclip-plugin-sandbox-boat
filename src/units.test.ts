@@ -178,9 +178,10 @@ describe("env policy", () => {
       // Versioned `@` directories (Homebrew python@3.11, node@20) are paths, not userinfo.
       ["PATH", "/usr/bin:/opt/homebrew/opt/python@3.11/bin:/usr/local/opt/node@20/bin"],
       // A relative first PATH entry makes the separator a first-segment `:/`;
-      // the `@` still sits mid-path, not in a final credential segment.
+      // what follows the `@` is a version, not a host, so it stays a path.
       ["PATH", "bin:/opt/python@3.11/bin"],
       ["PATH", "bin:/opt/python@3.11/bin:/usr/bin"],
+      ["PATH", "bin:/python@3.11/bin"],
       // An `@` in a URL path is not userinfo either: the authority already ended.
       ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/projects/release@v2"],
       ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/at/10:30/release@v2"],
@@ -712,6 +713,11 @@ describe("env policy", () => {
       // the `:` is in the token's first segment and is no `://` separator.
       ["TWO_CONFIG", "user:/password@db.prod.example:5432", ["remote_database_or_credential_url"]],
       ["TWO_CONFIG", "user:/pa/ss@db.prod.example", ["remote_database_or_credential_url"]],
+      // A path after the host does not launder it either: what follows the
+      // `@` reads as a host, not as a versioned directory (`python@3.11`).
+      ["TWO_CONFIG", "user:/password@db.example/path", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/pa/ss@db.prod.example/path", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/password@10.11.12.13/path", ["remote_database_or_credential_url"]],
       ["TWO_CONFIG", "user://password@db.prod.example", ["remote_database_or_credential_url"]],
       ["TWO_API_URL", "https://api.example/x?pw=hunter2", ["remote_database_or_credential_url"]],
       ["TWO_CALLBACK", "https://a.example/cb#access_token=ghp_abc", ["remote_database_or_credential_url"]],

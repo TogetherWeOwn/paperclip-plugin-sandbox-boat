@@ -203,6 +203,57 @@ const URL_LIKE_RES: readonly RegExp[] = [
 ];
 
 /**
+ * The segment tail between a slash-led `@` and the next `/` (a `:` — port
+ * or PATH separator — ends it early), read as a version: an optional `v`,
+ * then dot-separated digit groups with an optional `-`/`+` suffix, as in
+ * `python@3.11`, `node@20`, `release@v2`. Four bare groups are a dotted
+ * IPv4 host, not a version. One scan over a segment the caller's pass
+ * already walked, so the whole check stays linear.
+ */
+function isVersionLikeSegmentTail(text: string, start: number, end: number): boolean {
+  let limit = start;
+  while (limit < end && text.charCodeAt(limit) !== 58) limit += 1;
+  let i = start;
+  if (
+    i + 1 < limit &&
+    (text.charCodeAt(i) === 118 || text.charCodeAt(i) === 86) &&
+    text.charCodeAt(i + 1) >= 48 &&
+    text.charCodeAt(i + 1) <= 57
+  ) {
+    i += 1;
+  }
+  let groups = 0;
+  let suffixed = false;
+  for (;;) {
+    const groupStart = i;
+    while (i < limit && text.charCodeAt(i) >= 48 && text.charCodeAt(i) <= 57) i += 1;
+    if (i === groupStart) return false;
+    groups += 1;
+    if (i < limit && text.charCodeAt(i) === 46) {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (i < limit) {
+    const marker = text.charCodeAt(i);
+    if (marker !== 45 && marker !== 43) return false;
+    i += 1;
+    const suffixStart = i;
+    while (i < limit) {
+      const code = text.charCodeAt(i);
+      const ok =
+        (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 46 || code === 45 || code === 95;
+      if (!ok) return false;
+      i += 1;
+    }
+    if (i === suffixStart) return false;
+    suffixed = true;
+  }
+  return i === limit && (groups !== 4 || suffixed);
+}
+
+/**
  * `user:password@` with or without a scheme. One pass, so a password may
  * itself hold `/` or `:` (a scheme-less `default:p/a:ss@host` DSN) without
  * the quadratic retry a `:[^\s@]*@` pattern makes on a long colon run with
@@ -213,19 +264,23 @@ const URL_LIKE_RES: readonly RegExp[] = [
  * scheme separator, and a `:/` PATH separator outside the first segment.
  * A first-segment `:/` arms only weakly (slash-led): it is indistinguishable
  * from a PATH separator after a relative first entry (`bin:/opt/...`), so
- * its `@` counts only in the token's final segment — a versioned directory
- * mid-path (`bin:/opt/python@3.11/bin`) is a path, while
- * `user:/password@host` ends at its host. That keeps colon-joined paths and
- * `@` or `:` in separate URL path segments from reading as userinfo, while
- * a `user:password@` tucked into one path segment still counts.
+ * its `@` counts in the token's final segment — `user:/password@host` ends
+ * at its host — and a following `/` is no reprieve either when what follows
+ * the `@` reads as a host: `user:/password@db.example/path` is userinfo
+ * with a path, not a directory. Only a version-shaped tail escapes
+ * (`bin:/opt/python@3.11/bin`): a versioned directory mid-path is a path.
+ * That keeps colon-joined paths and `@` or `:` in separate URL path
+ * segments from reading as userinfo, while a `user:password@` tucked into
+ * one path segment still counts.
  */
 function hasSchemeLessUserinfo(text: string): boolean {
   let colonInSegment = false;
   let colonInFirstSegment = false;
   let slashLedColonInFirstSegment = false;
   // An `@` reached only through the slash-led arm: userinfo unless a `/`
-  // follows it in this token, which puts it mid-path instead.
+  // follows it in this token and puts it in a versioned directory mid-path.
   let slashLedAtPending = false;
+  let slashLedAtIndex = -1;
   let seenSlash = false;
   let previous = 0;
   for (let i = 0; i < text.length; i += 1) {
@@ -237,6 +292,9 @@ function hasSchemeLessUserinfo(text: string): boolean {
       slashLedColonInFirstSegment = false;
       seenSlash = false;
     } else if (code === 47) {
+      // A host-shaped tail before this `/` is userinfo with a path; only a
+      // version-shaped one (`@3.11/bin`) was a directory all along.
+      if (slashLedAtPending && !isVersionLikeSegmentTail(text, slashLedAtIndex + 1, i)) return true;
       seenSlash = true;
       colonInSegment = false;
       slashLedAtPending = false;
@@ -255,7 +313,10 @@ function hasSchemeLessUserinfo(text: string): boolean {
     // An `@` that opens a path segment (`/@vendor/...` in a PATH) is no userinfo.
     else if (code === 64 && previous !== 47) {
       if (colonInSegment || colonInFirstSegment) return true;
-      if (slashLedColonInFirstSegment) slashLedAtPending = true;
+      if (slashLedColonInFirstSegment) {
+        slashLedAtPending = true;
+        slashLedAtIndex = i;
+      }
     }
     previous = code;
   }
