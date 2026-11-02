@@ -123,7 +123,11 @@ default VM:
    Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
    with stdio and exit status unchanged.
 3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
-   guest PATH is fixed and has no `RUSTUP_HOME`.
+   guest PATH is fixed to root-owned directories and has no `RUSTUP_HOME`.
+   Each command also runs with a fresh per-command `HOME`, and its
+   `CARGO_HOME`/`PYTHONUSERBASE` point at a per-VM cache under the offload
+   state root (never on `PATH`), so nothing under a guest home directory may
+   be part of the toolchain setup.
 4. Install `rsync` on the template VM. Delta push shells out to the worker
    host's `rsync` over the pinned SSH transport, and the guest side needs the
    `rsync` binary too; without either end the push fails and the command stays
@@ -144,7 +148,8 @@ default VM:
    and the command stays local. The pool identity does not include the
    snapshot, so VMs recorded before a template change stay owned. They are
    never reused: VM reuse is keyed on the template name, and an idle VM from the old
-   image is retired through the normal stop path. Adding `rsync` to an existing
+   image is retired through the normal stop path and then deleted at the
+   provider, so its disk does not outlive pool retirement. Adding `rsync` to an existing
    template therefore means saving under a NEW snapshot name and updating
    `templateSnapshot`, so pre-rsync VMs are retired instead of served.
 

@@ -37,7 +37,7 @@ describe("retirement requires observed provider termination", () => {
     expect(h.boat.boxes.get(vm)?.state).toBe("ready");
     expect(await executor.execute(incompatible("replacement"))).toMatchObject({ status: "completed" });
     expect(h.boat.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([vm]);
-    expect(h.boat.boxes.get(vm)?.state).toBe("archived");
+    expect(h.boat.boxes.has(vm)).toBe(false); // retired VMs are deleted, not left archived
     expect(h.attempts).toHaveLength(2);
   });
 

@@ -132,6 +132,10 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "array", items: { type: "string" }, default: [],
         description: "Exact canonical repository IDs approved for public, secret-free offload (for example repo:https://github.com/example/public). Empty denies every repository, even with both flags enabled.",
       },
+      offloadEphemeralRepos: {
+        type: "array", items: { type: "string" }, default: [],
+        description: "Exact canonical repository IDs under the ephemeral VM policy: one freshly created VM per offloaded command, deleted at the provider after collect, never warmed or resumed. Repos listed here must also be in offloadAllowedRepos.",
+      },
       offloadArtifactRoot: {
         type: "string",
         description: "Operator-owned persistent host directory for private frozen snapshots and staged returns. Required for stock command offload; no automatic application to source files.",

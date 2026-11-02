@@ -10,6 +10,7 @@ import {
   hashManifest,
   MIRROR_KILL_STALLED_RSYNC_SCRIPT,
   MIRROR_MARKER_RELPATH,
+  mirrorVerifyTimeoutMs,
   MIRROR_PRUNE_SCRIPT,
   MIRROR_VERIFY_SCRIPT,
   MIRROR_WIPE_SCRIPT,
@@ -73,14 +74,16 @@ async function readAll(stream: Readable | undefined): Promise<string> {
 interface StubGuest {
   markers: Map<string, MirrorMarker>;
   suspect: Map<string, string>;
+  mismatched: Map<string, string[]>;
   failNext: { verify?: unknown; prune?: unknown; write?: unknown; install?: boolean; kill?: unknown } | null;
   wipes: Array<{ vm: string; dir: string }>;
   prunes: Array<{ vm: string; dir: string; paths: string[] }>;
   kills: Array<{ vm: string; dir: string }>;
   installs: string[];
+  verifies: Array<{ vm: string; dir: string; expected: Record<string, string> }>;
 }
 function stubGuest(): StubGuest {
-  return { markers: new Map(), suspect: new Map(), failNext: null, wipes: [], prunes: [], kills: [], installs: [] };
+  return { markers: new Map(), suspect: new Map(), mismatched: new Map(), failNext: null, wipes: [], prunes: [], kills: [], installs: [], verifies: [] };
 }
 const guestKey = (vm: string, dir: string) => `${vm}\0${dir}`;
 function setMarker(guest: StubGuest, vm: string, dir: string, marker: MirrorMarker): void {
@@ -131,9 +134,11 @@ function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number)
         guest.failNext = null;
         throw error;
       }
-      const [mirrorDir] = JSON.parse(stdin) as [string, unknown];
+      const [mirrorDir, , expected] = JSON.parse(stdin) as [string, unknown, Record<string, string>?];
+      guest.verifies.push({ vm, dir: mirrorDir, expected: expected ?? {} });
       const marker = guest.markers.get(guestKey(vm, mirrorDir)) ?? null;
-      return ok({ marker, suspect: guest.suspect.get(guestKey(vm, mirrorDir)) ?? null });
+      return ok({ marker, suspect: guest.suspect.get(guestKey(vm, mirrorDir)) ?? null,
+        mismatched: guest.mismatched.get(guestKey(vm, mirrorDir)) ?? [] });
     }
     if (remoteCommand.includes("boat-offload-mirror-write")) {
       if (guest.failNext?.write) {
@@ -240,6 +245,36 @@ describe("delta push over stub SSH", () => {
     expect(secondPushRuns.some((cmd) => cmd.includes("boat-offload-mirror-verify"))).toBe(true);
     expect(secondPushRuns.some((cmd) => cmd.includes("boat-offload-mirror-prune"))).toBe(false);
     expect(secondPushRuns.some((cmd) => cmd.includes("boat-offload-mirror-write"))).toBe(false);
+  });
+
+  it("resends a file whose guest hash differs even when the marker still matches", async () => {
+    const root = source({ "a.txt": "a", "sub/b.txt": "b" });
+    const { sync, spawns, guest } = setup(root);
+    const first = command();
+    await sync.push("vm-1", first);
+    // The guest marker still agrees with the stored manifest, but the guest
+    // bytes of a.txt were tampered with after the first push.
+    guest.mismatched.set(guestKey("vm-1", sync.directory(first)), ["a.txt"]);
+    await sync.push("vm-1", command());
+    expect(spawns).toHaveLength(2);
+    expect(filesFromStdin(spawns[1]!.stdin)).toEqual(["a.txt"]);
+  });
+
+  it("keeps a file named __proto__ in the expected-hash verification set", async () => {
+    const root = source(Object.fromEntries([["__proto__", "p"], ["a.txt", "a"]]));
+    const { sync, guest } = setup(root);
+    await sync.push("vm-1", command());
+    await sync.push("vm-1", command());
+    const second = guest.verifies.at(-1)!;
+    expect(Object.prototype.hasOwnProperty.call(second.expected, "__proto__")).toBe(true);
+    expect(second.expected["__proto__"]).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.expected["a.txt"]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("scales the mirror verify fence with the number of hashed files", () => {
+    expect(mirrorVerifyTimeoutMs(0)).toBe(30_000);
+    expect(mirrorVerifyTimeoutMs(4_000)).toBe(130_000);
+    expect(mirrorVerifyTimeoutMs(100_000)).toBe(600_000);
   });
 
   it("uploads exactly one file for one edit", async () => {
@@ -730,7 +765,7 @@ describe("mirror scripts executed locally", () => {
     const mirror = path.join(temp("boat-delta-mirror-"), "mirror");
     const { stdout, exitCode } = runScript(MIRROR_VERIFY_SCRIPT, [mirror, []]);
     expect(exitCode).toBe(0);
-    expect(JSON.parse(stdout)).toEqual({ marker: null, suspect: null });
+    expect(JSON.parse(stdout)).toEqual({ marker: null, suspect: null, mismatched: [] });
   });
 
   it("verify returns a stored marker and ignores a corrupt one", () => {
@@ -740,11 +775,11 @@ describe("mirror scripts executed locally", () => {
     writeFileSync(path.join(mirror, MIRROR_MARKER_RELPATH), JSON.stringify(marker));
     const hit = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["a.txt"]]);
     expect(hit.exitCode).toBe(0);
-    expect(JSON.parse(hit.stdout)).toEqual({ marker, suspect: null });
+    expect(JSON.parse(hit.stdout)).toEqual({ marker, suspect: null, mismatched: [] });
     writeFileSync(path.join(mirror, MIRROR_MARKER_RELPATH), "{not json");
     const corrupt = runScript(MIRROR_VERIFY_SCRIPT, [mirror, []]);
     expect(corrupt.exitCode).toBe(0);
-    expect(JSON.parse(corrupt.stdout)).toEqual({ marker: null, suspect: null });
+    expect(JSON.parse(corrupt.stdout)).toEqual({ marker: null, suspect: null, mismatched: [] });
   });
 
   it("verify refuses a symlinked mirror or an escaping planned path", () => {
@@ -771,7 +806,7 @@ describe("mirror scripts executed locally", () => {
     const dirLeaf = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["adir"]]);
     expect(JSON.parse(dirLeaf.stdout).suspect).toBe("adir");
     const clean = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["real/nested.txt", "new.txt"]]);
-    expect(JSON.parse(clean.stdout)).toEqual({ marker: null, suspect: null });
+    expect(JSON.parse(clean.stdout)).toEqual({ marker: null, suspect: null, mismatched: [] });
   });
 
   it("verify accepts planned files whose parent directory does not exist yet", () => {
@@ -779,7 +814,20 @@ describe("mirror scripts executed locally", () => {
     mkdirSync(path.join(mirror, "src"));
     const result = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["new/file.txt", "src/deep/er/file.txt", "src/ok.txt", "top.txt"]]);
     expect(result.exitCode).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ marker: null, suspect: null });
+    expect(JSON.parse(result.stdout)).toEqual({ marker: null, suspect: null, mismatched: [] });
+  });
+
+  it("verify reports expected-hash files whose guest content was tampered with or lost", async () => {
+    const mirror = temp("boat-delta-mirror-");
+    writeFileSync(path.join(mirror, "good.txt"), "good");
+    writeFileSync(path.join(mirror, "bad.txt"), "tampered");
+    const { createHash } = await import("node:crypto");
+    const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+    const result = runScript(MIRROR_VERIFY_SCRIPT, [mirror, ["good.txt", "bad.txt", "gone.txt"], {
+      "good.txt": sha("good"), "bad.txt": sha("original"), "gone.txt": sha("gone"),
+    }]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).mismatched.sort()).toEqual(["bad.txt", "gone.txt"]);
   });
 
   it("prune removes only files and links inside the mirror", () => {

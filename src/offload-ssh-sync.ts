@@ -2,6 +2,7 @@ import { lstat, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
+import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
@@ -118,14 +119,27 @@ export class SshOffloadSync implements OffloadSync {
     // Later ops run on the proven session: their failures are deterministic
     // and never evict it. Sync and parse errors are deterministic too: a bad
     // planned path or a malformed envelope fails identically after a refresh.
+    // Files the delta against the stored manifest would skip must prove their
+    // guest content still hashes to the manifest: the marker is guest-writable,
+    // so marker agreement alone never skips a content check.
+    const delta = planPush(stored, manifest);
+    const deltaPaths = new Set(delta.toSend.map((file) => file.path));
+    // Null-prototype: a source file literally named "__proto__" must keep its
+    // hash as an own key instead of being swallowed by the prototype setter.
+    const expectedHashes: Record<string, string> = Object.create(null) as Record<string, string>;
+    if (stored !== null) {
+      for (const file of manifest.files) {
+        if (!deltaPaths.has(file.path)) expectedHashes[file.path] = file.sha256;
+      }
+    }
     let store = await openStore(await this.deps.session(sandboxId));
     let verification: MirrorVerification;
     try {
-      verification = await store.verifyMirror(guestDir, planned);
+      verification = await store.verifyMirror(guestDir, planned, expectedHashes);
     } catch (error) {
       if (!this.deps.refreshSession || error instanceof SyncError || error instanceof SyntaxError) throw error;
       store = await openStore(await this.deps.refreshSession(sandboxId));
-      verification = await store.verifyMirror(guestDir, planned);
+      verification = await store.verifyMirror(guestDir, planned, expectedHashes);
     }
     // A wipe removes the marker with the rest of the mirror: treat it as gone.
     let marker = verification.suspect === null ? verification.marker : null;
@@ -160,9 +174,18 @@ export class SshOffloadSync implements OffloadSync {
     // not of the guest state.
     const plan = planPush(trusted ? stored : null, manifest);
     const stale = trusted ? plan.toDeleteFromMirror : planPush(stored, manifest).toDeleteFromMirror;
-    if (plan.toSend.length > 0) {
+    // Resend any skipped file whose guest bytes no longer match the manifest
+    // (tampered mirror sources are repaired before the command runs).
+    let toSend = plan.toSend;
+    if (trusted && verification.mismatched.length > 0) {
+      const plannedPaths = new Set(toSend.map((file) => file.path));
+      const resend = manifest.files.filter((file) =>
+        verification.mismatched.includes(file.path) && !plannedPaths.has(file.path));
+      toSend = [...toSend, ...resend];
+    }
+    if (toSend.length > 0) {
       try {
-        await store.push(frozen, plan.toSend, guestDir);
+        await store.push(frozen, toSend, guestDir);
       } catch (error) {
         if ((error as { receiverMayBeLive?: unknown } | null)?.receiverMayBeLive === true) {
           this.unfencedMirrors.add(baseKey);
@@ -220,8 +243,12 @@ export class SshOffloadSync implements OffloadSync {
       .join(" && ");
     // Global installs record the shared marker; checkout-local installs run
     // inside the per-card guestDir and are remembered per mirror checkout.
+    // pip may fall back to a user-site install when system site-packages is
+    // not writable: pin PYTHONUSERBASE to the per-VM toolchain root the
+    // command itself runs with, not the SSH session's HOME, which the
+    // command never sees (it runs under a fresh per-command HOME).
     const script = checkoutLocal ? steps
-      : `${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
+      : `export PYTHONUSERBASE=${shellQuote(guestPythonUserBase(this.deps.workRoot ?? "/tmp", sandboxId))} && ${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
     // Checkout-local node_modules/.venv match only the last installed lockfile:
     // forget it before the install mutates them, so a failed install of B never
     // leaves A trusted, and remember the one new hash only once it succeeded.

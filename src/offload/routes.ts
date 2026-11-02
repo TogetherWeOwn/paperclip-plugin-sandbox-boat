@@ -77,6 +77,8 @@ export interface OffloadSettings {
   offloadMinExpectedSeconds: number;
   /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
   offloadMonthlyVmHourCap: number;
+  /** Canonical repo ids under the ephemeral policy: one VM per command, deleted after collect. */
+  offloadEphemeralRepos: string[];
 }
 
 export interface OffloadRouteHost {
@@ -142,6 +144,7 @@ export const DEFAULT_SETTINGS: OffloadSettings = {
   offloadProfiles: ["rust-public-1"],
   offloadMinExpectedSeconds: 120,
   offloadMonthlyVmHourCap: 0,
+  offloadEphemeralRepos: [],
 };
 
 const KNOWN_PROFILE_IDS = new Set(["rust-public-1", "node-public-1", "python-public-1"]);
@@ -159,6 +162,9 @@ export function normalizeOffloadSettings(raw: unknown): OffloadSettings {
     offloadProfiles: profiles,
     offloadMinExpectedSeconds: Number.isFinite(min) && min >= 0 ? min : DEFAULT_SETTINGS.offloadMinExpectedSeconds,
     offloadMonthlyVmHourCap: Number.isFinite(cap) && cap > 0 ? cap : DEFAULT_SETTINGS.offloadMonthlyVmHourCap,
+    offloadEphemeralRepos: Array.isArray(record.offloadEphemeralRepos)
+      ? record.offloadEphemeralRepos.filter((id): id is string => typeof id === "string" && id !== "")
+      : [],
   };
 }
 
@@ -263,7 +269,7 @@ function authed(actor: RouteActor): string | null {
   return actor.runId;
 }
 
-function principalFor(companyId: string, runId: string, workspace: OffloadWorkspaceMeta, profile: ServerProfile): BrokerPrincipal {
+function principalFor(companyId: string, runId: string, workspace: OffloadWorkspaceMeta, profile: ServerProfile, executionWorkspaceId: string): BrokerPrincipal {
   return {
     companyId,
     runId,
@@ -272,6 +278,10 @@ function principalFor(companyId: string, runId: string, workspace: OffloadWorksp
     cardId: "",
     repoId: canonicalRepoId(workspace),
     profileId: profile.id,
+    // Host-resolved trust domain: one per execution workspace. The workspace
+    // was fetched and authorized by the host above, so a pool VM is only ever
+    // reused by the same workspace, never across cards or trust levels.
+    trustDomainId: `workspace:${executionWorkspaceId}`,
   };
 }
 
@@ -340,7 +350,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "unknown execution workspace; running local", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const principal = principalFor(input.companyId, runId, workspace, profile);
+  const principal = principalFor(input.companyId, runId, workspace, profile, request.executionWorkspaceId);
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.
