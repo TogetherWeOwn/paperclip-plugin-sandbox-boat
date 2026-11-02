@@ -78,6 +78,10 @@ const workspace = `smoke-ws-${stamp}`;
 const t0 = Date.now();
 const step = (name) => console.log(`\n=== ${name} (+${((Date.now() - t0) / 1000).toFixed(1)} s)`);
 let sandboxId = null;
+// Every lease id an acquire returns: a resume whose disk was cancelled or
+// expired comes back as a replacement VM, and cleanup must delete that one
+// too, not only the first VM.
+const sandboxIds = new Set();
 let failed = false;
 
 async function exec(lease, script, env = {}) {
@@ -127,6 +131,7 @@ try {
   step("acquire run 1 (create)");
   const lease1 = await manager.acquire({ ...base, runId: `smoke-run-1-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
   sandboxId = lease1.providerLeaseId;
+  sandboxIds.add(sandboxId);
   console.log(JSON.stringify(lease1.metadata));
 
   step("execute: identity, env, argv check, env file gone, tunnel, marker file");
@@ -320,6 +325,7 @@ try {
 
   step("acquire run 2 (resume the same card VM within 10 minutes: the same machine)");
   const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
+  sandboxIds.add(lease2.providerLeaseId);
   console.log(JSON.stringify(lease2.metadata));
   if (lease2.providerLeaseId !== sandboxId) throw new Error("expected the same VM on resume");
   const skills2 = await checkRuntimeAfterResume(lease2, "run 2");
@@ -329,18 +335,19 @@ try {
   if (sameMachine && skills2 !== "skills=present skill_mcp_config=present") throw new Error(`smoke check failed: the scrub removed a skill's own mcp-config (${skills2})`);
 
   step("release run 2 (stop)");
-  console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease2.metadata }, "release")));
+  console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: lease2.providerLeaseId, leaseMetadata: lease2.metadata }, "release")));
 
   if (process.env.SMOKE_NEW_MACHINE === "1") {
     step("wait 11 minutes (boat keeps the stopped machine 10 minutes, unbilled), then resume on a new machine");
     await sleep(11 * 60_000);
     const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
+    sandboxIds.add(lease3.providerLeaseId);
     console.log(JSON.stringify(lease3.metadata));
     const skills3 = await checkRuntimeAfterResume(lease3, "run 3");
     if (skills3 !== "skills=gone skill_mcp_config=gone") throw new Error("smoke check failed: the restored snapshot had files below .paperclip-runtime");
     console.log("runtime_dir_after_new_machine_resume=empty skills=gone");
     step("release run 3 (stop)");
-    console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease3.metadata }, "release")));
+    console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: lease3.providerLeaseId, leaseMetadata: lease3.metadata }, "release")));
   }
 
   step("usage summary");
@@ -350,13 +357,15 @@ try {
   failed = true;
   console.error("SMOKE FAILED:", error instanceof Error ? `${error.name} ${error.code ?? ""} ${error.message}` : String(error));
 } finally {
-  if (sandboxId) {
-    step("destroy (delete the VM)");
-    try {
-      console.log(JSON.stringify(await manager.destroy({ ...base, providerLeaseId: sandboxId })));
-    } catch (error) {
-      failed = true;
-      console.error("DELETE FAILED, delete by hand with: boat delete", sandboxId, "--yes", error?.message);
+  if (sandboxIds.size > 0) {
+    step("destroy (delete every VM an acquire returned)");
+    for (const id of sandboxIds) {
+      try {
+        console.log(JSON.stringify(await manager.destroy({ ...base, providerLeaseId: id })));
+      } catch (error) {
+        failed = true;
+        console.error("DELETE FAILED, delete by hand with: boat delete", id, "--yes", error?.message);
+      }
     }
   }
   await manager.shutdown();

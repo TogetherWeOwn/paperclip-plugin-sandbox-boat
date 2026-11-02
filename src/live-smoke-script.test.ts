@@ -28,6 +28,14 @@ it("resolves the smoke's acquire shape to one reusable card VM key, not a per-ru
   expect(run2.key).toBe(run1.key);
 });
 
+it("tracks every returned lease id so cleanup also deletes a replacement VM", () => {
+  // A resume over a cancelled or expired disk returns a new VM: each lease id
+  // must be recorded before any check can throw, and cleanup destroys them all.
+  expect([...smoke.matchAll(/sandboxIds\.add\(/g)]).toHaveLength(3);
+  expect(smoke).toContain("for (const id of sandboxIds)");
+  expect(smoke).toContain("manager.destroy({ ...base, providerLeaseId: id })");
+});
+
 it("gives the smoke's state client the delete the manager calls on release", () => {
   expect(smoke).toMatch(/state:\s*\{[^}]*get:/);
   expect(smoke).toMatch(/state:\s*\{[^}]*set:/);
