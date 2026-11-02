@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,6 +28,20 @@ function write(root: string, rel: string, content: string): void {
   const abs = path.join(root, rel);
   mkdirSync(path.dirname(abs), { recursive: true });
   writeFileSync(abs, content);
+}
+
+async function runGuestInspectScan(mirror: string, scratch: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn("python3", ["-I", "-c", GUEST_INSPECT_SCRIPT], { cwd: scratch });
+    const chunks: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on("data", () => undefined);
+    child.on("error", reject);
+    child.on("close", (code) => code === 0
+      ? resolve(Buffer.concat(chunks).toString("utf8"))
+      : reject(new Error(`inspect script exited ${code}`)));
+    child.stdin.end(JSON.stringify([mirror, "scan", null, DEFAULT_SYNC_EXCLUDES]));
+  });
 }
 
 async function collectTwice(plant: (guest: string) => Promise<void> | void) {
@@ -194,17 +208,7 @@ describe("special files and oversized output never make collect throw", () => {
     truncateSync(path.join(mirror, "huge.bin"), 300 * 1024 * 1024);
     await execFileAsync("mkfifo", [path.join(mirror, "fifo")]);
     write(mirror, "test-results/trace.zip", "excluded\n");
-    const stdout = await new Promise<string>((resolve, reject) => {
-      const child = spawn("python3", ["-I", "-c", GUEST_INSPECT_SCRIPT], { cwd: scratch });
-      const chunks: Buffer[] = [];
-      child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-      child.stderr.on("data", () => undefined);
-      child.on("error", reject);
-      child.on("close", (code) => code === 0
-        ? resolve(Buffer.concat(chunks).toString("utf8"))
-        : reject(new Error(`inspect script exited ${code}`)));
-      child.stdin.end(JSON.stringify([mirror, "scan", null, DEFAULT_SYNC_EXCLUDES]));
-    });
+    const stdout = await runGuestInspectScan(mirror, scratch);
     const scan = validateGuestScan(JSON.parse(stdout));
     expect(scan.files.get("fifo")).toMatchObject({ special: true, sha256: "" });
     expect(scan.files.get("huge.bin")).toMatchObject({ unhashed: true, sha256: "", size: 300 * 1024 * 1024 });
@@ -223,17 +227,24 @@ describe("special files and oversized output never make collect throw", () => {
     for (let i = 0; i < total; i += 1) {
       writeFileSync(path.join(deep, `f${String(i).padStart(200, "0")}`), "");
     }
-    const stdout = await new Promise<string>((resolve, reject) => {
-      const child = spawn("python3", ["-I", "-c", GUEST_INSPECT_SCRIPT], { cwd: scratch });
-      const chunks: Buffer[] = [];
-      child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-      child.stderr.on("data", () => undefined);
-      child.on("error", reject);
-      child.on("close", (code) => code === 0
-        ? resolve(Buffer.concat(chunks).toString("utf8"))
-        : reject(new Error(`inspect script exited ${code}`)));
-      child.stdin.end(JSON.stringify([mirror, "scan", null, DEFAULT_SYNC_EXCLUDES]));
-    });
+    const stdout = await runGuestInspectScan(mirror, scratch);
+    expect(Buffer.byteLength(stdout)).toBeLessThan(16 * 1024 * 1024);
+    const scan = validateGuestScan(JSON.parse(stdout));
+    expect(scan.truncated).toBe(true);
+    expect(scan.files.size).toBeLessThan(total);
+  }, 60_000);
+
+  it("the guest inspect script counts symlink targets against its serialized-size budget", async () => {
+    const mirror = temp();
+    const scratch = temp();
+    // In-root symlinks with near-path-max targets: the target string, not the
+    // link name, is what outgrows the transport cap if it is not counted.
+    const target = Array.from({ length: 17 }, () => "a".repeat(200)).join("/");
+    const total = 5_000;
+    for (let i = 0; i < total; i += 1) {
+      symlinkSync(target, path.join(mirror, `link-${String(i).padStart(4, "0")}`));
+    }
+    const stdout = await runGuestInspectScan(mirror, scratch);
     expect(Buffer.byteLength(stdout)).toBeLessThan(16 * 1024 * 1024);
     const scan = validateGuestScan(JSON.parse(stdout));
     expect(scan.truncated).toBe(true);

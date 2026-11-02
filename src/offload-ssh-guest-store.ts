@@ -602,10 +602,11 @@ else:
             else:
                 value.update({'special': True, 'sha256': ''})
             # Bound the serialized response, not just the entry count: long
-            # paths can outgrow the transport output cap well before 100000
-            # entries. 192 bytes of headroom covers the entry's fixed JSON
-            # fields (size, mtimeMs, hash, flags) plus framing.
-            emitted += len(json.dumps(name)) + 192
+            # paths, and symlink targets on non-escaping links, can outgrow
+            # the transport output cap well before 100000 entries. Count the
+            # whole serialized value so variable-length fields are never
+            # missed; 4 bytes covers the key/value framing.
+            emitted += len(json.dumps(name)) + len(json.dumps(value)) + 4
             if emitted > 12582912:
                 truncated = True
                 break
