@@ -719,6 +719,8 @@ describe("env policy", () => {
       ["TWO_SETTINGS", "host=db,pwd=hunter2", ["secret_value"]],
       ["TWO_SETTINGS", '{"db_password":"hunter2"}', ["secret_value"]],
       ["TWO_SETTINGS", "passwd: hunter2", ["secret_value"]],
+      // A long whitespace run before the `=` is still an assignment.
+      ["TWO_SETTINGS", `password${" ".repeat(64)}=hunter2`, ["secret_value"]],
       ["TWO_REDIS", "default:Ab/Cd+ef==@redis.prod:6379", ["remote_database_or_credential_url"]],
       // A password starting with `/` must not hide behind the separator rule:
       // the `:` is in the token's first segment and is no `://` separator.
@@ -871,6 +873,10 @@ describe("env policy", () => {
       ["eyJ. repeated (header then dot, no payload)", fill("eyJ."), "kept"],
       ["one header, then a payload run with no closing dot", `eyJa.eyJ${fill("a")}`, "kept"],
       ["letters with no ://", fill("a"), "kept"],
+      // A credential keyword followed by a whitespace run and no assignment:
+      // the two whitespace runs either side of the optional quote must not
+      // partition the run between them (quadratic on a long run).
+      ["password then a whitespace run, no assignment", `password${fill(" ")}x`, "kept"],
       ["scheme characters, no letter", fill("1+.-"), "kept"],
       // URL-like but not one parseable URL: dropped (fail closed), and decided fast.
       ["one URL whose authority is all colons", `a://${fill(":")}`, "remote_database_or_credential_url"],

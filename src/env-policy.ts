@@ -175,8 +175,11 @@ const SECRET_VALUE_RES: readonly RegExp[] = [
   // assignment glued to its separator (`;Password=`, `;Pwd=`, `&password=`),
   // or an identifier ending in the keyword (`db_password=`). No leading
   // boundary is required: this runs on prefix matches only, where dropping
-  // a benign look-alike is the safe side.
-  /(?:private_key|client_secret|password|passwd|passphrase|pwd)\s*["']?\s*[:=]/i,
+  // a benign look-alike is the safe side. The quote and the whitespace after
+  // it form one optional group, so a bare whitespace run after the keyword
+  // cannot be partitioned between two `\s*`s (that backtracks quadratically
+  // when no assignment follows).
+  /(?:private_key|client_secret|password|passwd|passphrase|pwd)\s*(?:["']\s*)?[:=]/i,
   /(?:AccountKey|SharedAccessKey)=/i,
   /(?:^|[^A-Za-z0-9])(?:sk-ant-|sk-or-|sk-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[abpr]-|glpat-)/,
 ];
