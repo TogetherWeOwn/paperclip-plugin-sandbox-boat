@@ -72,7 +72,8 @@ local-mode signatures (watch mode, single-file filters, inline code,
 unrecognized scripts) are refused before any state write, and each run is
 rate-limited (a short burst, then one report per second, 200 per run); excess
 samples are dropped. History keeps the last 20 runs per signature with a
-30-day TTL, and at most 500 signature keys per company+repo scope: evicted
+30-day TTL, and at most 500 signature keys per company scope (shared across
+repos): evicted
 and expired keys are deleted during the pool sweep, so unique-argv report
 loops cannot grow plugin state without bound. Guest-reported exit facts are
 untrusted input: only an integer exit code 0..255 with finite non-negative

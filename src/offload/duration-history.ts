@@ -25,7 +25,8 @@ export const DURATION_HISTORY_TTL_MS = 30 * 24 * 60 * 60_000;
 /** Upper bound for any learned sample: learning never exceeds one day. */
 export const MAX_DURATION_SECONDS = 86_400;
 /**
- * Bound on duration keys per company+repo scope. One state key holds the LRU
+ * Bound on duration keys per company scope (shared across repos: the index
+ * key lives in company-scoped state). One state key holds the LRU
  * signature index; evicted and expired keys are deleted, so an agent looping
  * unique argv cannot grow plugin state without bound.
  */
