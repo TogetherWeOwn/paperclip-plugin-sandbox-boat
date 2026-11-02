@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { NeverDispatchBackend, OffloadBroker, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
-import { durationKey, normalizeSignature } from "./duration-history.js";
+import { DURATION_INDEX_KEY, DURATION_INDEX_LIMIT, durationKey, normalizeSignature } from "./duration-history.js";
 import {
   NODE_PROFILE,
   PYTHON_PROFILE,
@@ -8,6 +8,7 @@ import {
   handleExec,
   handleReport,
   normalizeOffloadSettings,
+  resetReportBudgets,
   type OffloadRouteHost,
   type RouteActor,
 } from "./routes.js";
@@ -150,6 +151,10 @@ describe("handleExec node/python gating", () => {
 });
 
 describe("handleReport", () => {
+  // The per-run rate budget is module-global; reset it so report tests never
+  // depend on each other's consumption.
+  beforeEach(() => { resetReportBudgets(); });
+
   it("records a local duration and promotes the next dry-run to remote", async () => {
     const t = setup();
     const report = await handleReport({
@@ -192,5 +197,47 @@ describe("handleReport", () => {
     }
     expect((await handleReport({ actor: { ...ACTOR, runId: null }, companyId: COMPANY, body: base }, t.host)).status).toBe(401);
     expect((await handleReport({ actor: ACTOR, companyId: COMPANY, body: { ...base, executionWorkspaceId: CMD } }, { ...t.host, workspaces: { get: async () => null } })).status).toBe(403);
+  });
+
+  it("refuses local-mode signatures before any state write", async () => {
+    const t = setup();
+    for (const argv of [["run", "dev"], ["run", "test", "--watch"]]) {
+      const response = await handleReport({
+        actor: ACTOR,
+        companyId: COMPANY,
+        body: { executionWorkspaceId: WS, tool: "node", runner: "npm", argv, durationSeconds: 240 },
+      }, t.host);
+      expect(response.status).toBe(400);
+    }
+    expect(t.store.data.size).toBe(0);
+  });
+
+  it("caps stored keys when a thousand unique signatures report", async () => {
+    const t = setup();
+    for (let i = 0; i < 1000; i += 1) {
+      // Distinct runs: the per-run budget must not mask the key cap.
+      const runId = `report-run-${i}`;
+      const response = await handleReport({
+        actor: { actorType: "agent", actorId: runId, runId },
+        companyId: COMPANY,
+        body: { executionWorkspaceId: WS, tool: "node", runner: "npm", argv: ["run", `test:${i}`], durationSeconds: 240 },
+      }, t.host);
+      expect(response.status).toBe(200);
+    }
+    const keys = [...t.store.data.keys()].filter((key) => key !== DURATION_INDEX_KEY);
+    expect(keys.length).toBeLessThanOrEqual(DURATION_INDEX_LIMIT);
+    expect(keys.length).toBeGreaterThan(0);
+    // Evicted keys are deleted, not just unindexed.
+    expect(t.store.data.size).toBe(keys.length + 1);
+  });
+
+  it("rate-limits a run that floods reports", async () => {
+    const t = setup();
+    const body = { executionWorkspaceId: WS, tool: "node", runner: "npm", argv: ["run", "test"], durationSeconds: 240 };
+    for (let n = 0; n < 5; n += 1) {
+      expect((await handleReport({ actor: ACTOR, companyId: COMPANY, body }, t.host)).status).toBe(200);
+    }
+    const limited = await handleReport({ actor: ACTOR, companyId: COMPANY, body }, t.host);
+    expect(limited.status).toBe(429);
   });
 });

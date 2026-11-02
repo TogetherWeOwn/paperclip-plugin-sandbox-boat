@@ -141,6 +141,9 @@ describe("offload review: in-flight command identity", () => {
     // A duplicate is a receipt subscriber, not another queue admission or spawn.
     expect.soft(s.starts).toHaveLength(1);
     expect.soft(s.fake.callsOf("create")).toHaveLength(1);
+    // The duration gate learns host-measured wall time: let five fake seconds
+    // elapse so the host interval agrees with the guest-reported value.
+    await s.advance(5_000);
     gate.resolve(completed(5));
     const results = await Promise.all([first, second]);
     expect.soft(results[0]).toMatchObject({ status: "completed", seconds: 5 });
@@ -158,6 +161,9 @@ describe("offload review: in-flight command identity", () => {
     await flush();
     const second = s.executor.execute(command("running-duplicate"));
     await flush();
+    // The duration gate learns host-measured wall time: let five fake seconds
+    // elapse so the host interval agrees with the guest-reported value.
+    await s.advance(5_000);
     gate.resolve(completed(5));
     const receipts = await Promise.all([first, second]);
     expect.soft(receipts[0]).toMatchObject({ status: "completed", seconds: 5 });

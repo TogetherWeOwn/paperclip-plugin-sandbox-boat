@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { CGROUP_GATED, CGROUP_SKIP_NOTE, markCgroupGated } from "./test-support/cgroup-gate.js";
 import { SshOffloadGuest } from "./offload-ssh.js";
+import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { OffloadLifecycle } from "./offload-lifecycle.js";
 import { commandDigest } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
@@ -80,7 +81,19 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     expect(result.exitCode).toBe(7);
     expect(output).toEqual({ stdout: "hello", stderr: "error" });
     expect(await guest.verifyEmpty(ssh.session.sandboxId, full)).toBe(true);
-    expect(await guest.receipt(full)).toMatchObject({ kind: "result", identity: full, result: { exitCode: 7 } });
+    const receipt = await guest.receipt(full) as { kind: string; identity: Record<string, unknown>; result: unknown };
+    expect(receipt).toMatchObject({ kind: "result", result: { exitCode: 7 } });
+    // The stored identity is host-clock; the guest receipt carries the same
+    // ownership on the guest clock, so absolute deadlines may differ by the
+    // prepare round trip, never by more.
+    const { heartbeatDeadline, guestDeadline, guestNow, ...ownership } = receipt.identity;
+    void guestNow;
+    const { heartbeatDeadline: _h, guestDeadline: _g, ...fullOwnership } = full as unknown as Record<string, unknown>;
+    void _h; void _g;
+    expect(ownership).toEqual(fullOwnership);
+    for (const [key, want] of [["heartbeatDeadline", full.heartbeatDeadline], ["guestDeadline", full.guestDeadline]] as const) {
+      expect(Math.abs((receipt.identity[key] as number) - want)).toBeLessThan(10_000);
+    }
     // Re-sending a delivered start cannot execute it again.
     await expect(guest.runCommand(ssh.session.sandboxId, command, { identity: full, output: async () => {} }))
       .rejects.toThrow();
@@ -137,13 +150,63 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     }
   }, 20_000);
 
-  it("renews guest interest with a bounded deadline and rejects arbitrary extensions", { ...CGROUP_GATED, timeout: 15_000 }, async (ctx) => {
+  it("renews guest interest from a duration and rejects arbitrary extensions", { ...CGROUP_GATED, timeout: 15_000 }, async (ctx) => {
     await requireDelegation(ctx);
     const { full } = await identity(cmd());
-    const renewed = { ...full, heartbeatDeadline: Date.now() + 30_000 };
-    await guest.heartbeat(ssh.session.sandboxId, renewed);
-    expect((await guest.inspect(ssh.session.sandboxId, renewed)).identity.heartbeatDeadline).toBe(renewed.heartbeatDeadline);
-    await expect(guest.heartbeat(ssh.session.sandboxId, { ...renewed, heartbeatDeadline: Date.now() + 60_000 })).rejects.toThrow();
+    // Durations cross the boundary, never absolute timestamps: the renewal
+    // lands on the guest clock however far apart the two clocks are.
+    const before = Date.now();
+    await guest.heartbeat(ssh.session.sandboxId, full);
+    const stored = (await guest.inspect(ssh.session.sandboxId, full)).identity.heartbeatDeadline;
+    expect(stored).toBeGreaterThan(before);
+    expect(stored).toBeLessThanOrEqual(Date.now() + 30_000);
+    // A tampered far-future absolute in the identity is ignored: the renewal
+    // still lands on the guest clock and cannot extend interest past 30 s.
+    await guest.heartbeat(ssh.session.sandboxId, { ...full, heartbeatDeadline: Date.now() + 600_000 });
+    const capped = (await guest.inspect(ssh.session.sandboxId, full)).identity.heartbeatDeadline;
+    expect(capped).toBeLessThanOrEqual(Date.now() + 30_000);
+    // The guest refuses out-of-range renewals at the RPC boundary.
+    const raw = guest as unknown as { call: (sandboxId: string, action: string, identity: unknown,
+      extra?: Record<string, unknown>) => Promise<unknown> };
+    await expect(raw.call(ssh.session.sandboxId, "heartbeat", full, { renewMs: 120_000 })).rejects.toThrow();
+    await expect(raw.call(ssh.session.sandboxId, "heartbeat", full, { renewMs: 0 })).rejects.toThrow();
+  });
+
+  it("prepares and heartbeats across a skewed guest clock and keeps the real exit code", { ...CGROUP_GATED, timeout: 40_000 }, async (ctx) => {
+    await requireDelegation(ctx);
+    // A resumed VM's clock can sit seconds behind or ahead until chrony
+    // corrects it. Shifting the guest's time.time uniformly emulates that
+    // skew in the real supervisor; absolute deadlines must still neither
+    // fail heartbeats nor refuse prepare.
+    for (const skewSeconds of [-2, 2]) {
+      const skewed = OFFLOAD_SSH_SCRIPT.split("time.time()")
+        .join(skewSeconds < 0 ? `(time.time() - ${-skewSeconds})` : `(time.time() + ${skewSeconds})`);
+      const skewedGuest = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
+        stateRoot: ssh.root, workspace: async () => ssh.root, executable: "/bin/sh",
+        args: () => ["-c", "sleep 3; exit 9"], script: skewed });
+      try {
+        const command = cmd(30_000);
+        const boot = await skewedGuest.bootId(ssh.session.sandboxId);
+        const lifecycle = new OffloadLifecycle(skewedGuest, Date.now, { set: (cb, ms) => setTimeout(cb, ms), clear: (h) => clearTimeout(h as NodeJS.Timeout) });
+        const full = await lifecycle.prepare(ssh.session.sandboxId, command, { companyId: command.companyId,
+          runId: command.runId, commandId: command.commandId, digest: commandDigest(command),
+          sandboxId: ssh.session.sandboxId, guestBootId: boot, journalGeneration: 1 });
+        const output: string[] = [];
+        const pending = lifecycle.run(full, command,
+          (vm, c, context) => skewedGuest.runCommand(vm, c, context),
+          async (_stream, bytes) => { output.push(Buffer.from(bytes).toString()); });
+        for (let n = 0; n < 3; n += 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+          await lifecycle.heartbeat(full);
+        }
+        const result = await pending;
+        expect(result).toMatchObject({ exitCode: 9 });
+        expect(result).not.toMatchObject({ cancelled: true, timedOut: true });
+        expect(await skewedGuest.verifyEmpty(ssh.session.sandboxId, full)).toBe(true);
+      } finally {
+        await skewedGuest.shutdown();
+      }
+    }
   });
 
   it("rejects stale boot/group identities before signalling any process", { ...CGROUP_GATED, timeout: 15_000 }, async (ctx) => {

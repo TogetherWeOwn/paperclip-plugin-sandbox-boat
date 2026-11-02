@@ -623,6 +623,7 @@ export class BoatVmManager {
     return {
       get: (key: string) => store.get(key),
       set: (key: string, value: unknown) => store.set(key, value),
+      delete: (key: string) => store.delete(key),
     };
   }
 

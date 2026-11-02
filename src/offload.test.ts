@@ -350,7 +350,7 @@ describe("offload executor", () => {
       now,
       timers: { set, clear },
       config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
-      runCommand: async () => ({ exitCode: 0, seconds: 42 }),
+      runCommand: async () => { setup.clock.t += 42_000; return { exitCode: 0, seconds: 42 }; },
       recordDuration: async (command, seconds) => {
         recorded.push({ command, seconds });
       },
@@ -363,6 +363,33 @@ describe("offload executor", () => {
     expect(recorded[0]!.seconds).toBe(result.seconds);
     expect(recorded[0]!.seconds).toBe(42);
     expect(recorded[0]!.command.commandId).toBe("cmd-duration-1");
+    await executor.shutdown();
+  });
+
+  it("learns host-measured wall time, never a guest-inflated duration", async () => {
+    const { fake, logger, now, set, clear } = setup;
+    const recorded: Array<{ command: OffloadCommand; seconds: number }> = [];
+    const executor = new OffloadExecutor({
+      ...setup.account,
+      boat: fake as unknown as BoatApiLike,
+      logger,
+      now,
+      timers: { set, clear },
+      config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15 },
+      runCommand: async () => { setup.clock.t += 1_000; return { exitCode: 0, seconds: 1e300 }; },
+      recordDuration: async (command, seconds) => {
+        recorded.push({ command, seconds });
+      },
+    });
+    const result = await executor.execute(cmd({ commandId: "cmd-duration-guest-lie",
+      tool: "node", runner: "npm", profileId: "node-public-1", argv: ["run", "test"] }));
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") throw new Error("expected completed");
+    // About one host second, and never more than the one-day learning bound.
+    expect(result.seconds).toBe(1);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.seconds).toBe(1);
+    expect(recorded[0]!.seconds).toBeLessThanOrEqual(86_400);
     await executor.shutdown();
   });
 });

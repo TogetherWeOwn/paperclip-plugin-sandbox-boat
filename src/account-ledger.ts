@@ -495,11 +495,24 @@ export class AccountLedger {
 
   async finished(reservation: AccountReservation, unknown: boolean,
     metadata: Pick<AccountUsageRow, "warm" | "queueWaitMs" | "exitCode" | "outcome" | "expectedSeconds" | "expectedDollars"> = {}): Promise<void> {
+    // Defense in depth: copy only typed scalar fields, never a guest-shaped
+    // object wholesale, so a compromised upstream cannot plant unbounded
+    // bytes or unexpected keys in the shared account document.
+    const safe: typeof metadata = {
+      warm: metadata.warm === "warm" ? "warm" : "cold",
+      queueWaitMs: Number.isFinite(metadata.queueWaitMs) && (metadata.queueWaitMs as number) >= 0
+        ? Math.floor(metadata.queueWaitMs as number) : 0,
+      exitCode: Number.isInteger(metadata.exitCode) ? metadata.exitCode as number : 75,
+      outcome: metadata.outcome === "completed" ? "completed" : "unknown",
+      expectedSeconds: Number.isFinite(metadata.expectedSeconds) && (metadata.expectedSeconds as number) >= 0
+        ? metadata.expectedSeconds as number : 0,
+      expectedDollars: Number.isFinite(metadata.expectedDollars) ? metadata.expectedDollars as number : 0,
+    };
     await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
       const at = this.now(), row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
       if (row) {
-        Object.assign(row, metadata);
+        Object.assign(row, safe);
         if (at > intent.at) row.intervals = [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }];
         row.tailSince = unknown ? null : at;
         row.seconds = Math.max(0, (at - intent.at) / 1000) * WEIGHT[intent.size];

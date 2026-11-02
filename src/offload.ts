@@ -887,7 +887,13 @@ export class OffloadExecutor {
     let result: OffloadResult;
     try {
       const raw = await this.runCommand(vm.sandboxId, command);
-      const { exitCode, seconds } = raw;
+      // The duration gate learns from host-measured wall time, never from
+      // guest-reported seconds: the guest value can only shorten the host
+      // interval (early exit), never lengthen it, and cost learns the same.
+      const hostSeconds = Math.max(0, (this.now() - startedAt) / 1000);
+      const guestSeconds = Number.isFinite(raw.seconds) && raw.seconds >= 0 ? raw.seconds : Number.NaN;
+      const seconds = Number.isFinite(guestSeconds) ? Math.min(guestSeconds, hostSeconds) : hostSeconds;
+      const { exitCode } = raw;
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
       result = { status: "completed", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, exitCode, seconds, dollars,
         ...(raw.syncBack ? { syncBack: raw.syncBack } : {}),
