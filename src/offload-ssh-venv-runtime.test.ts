@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -42,7 +43,7 @@ function backend(source: string): { runtime: SshOffloadRuntime; boat: FakeBoat; 
     ssh: sshStub as never, accountId: "test-only",
     boat: () => boat as unknown as BoatApiLike,
     session: async () => ({} as never),
-    guestOptions: { stateRoot: workRoot },
+    guestOptions: { stateRoot: workRoot }, trackedFiles: listAllFilesAsTracked,
   });
   runtime.remember({
     driverKey: "boat", companyId, environmentId: "env",
@@ -104,7 +105,7 @@ describe("runtime uv venv wiring", () => {
       await pool.guest.prepare("vm-1", { ...cmd, commandId: cmd.commandId, companyId, runId, cardId: "", repoId: cmd.repoId, profileId: cmd.profileId, tool: "python", runner: "python", argv: cmd.argv, cwdRelative: ".", env: {} });
       const input = seen[0] as Record<string, unknown>;
       expect(input.executable).toBe("python");
-      expect(input.env).toEqual({});
+      expect(Object.keys(input.env as Record<string, string>).sort()).toEqual(["CARGO_HOME", "HOME", "PYTHONUSERBASE"]);
       expect(String(input.path)).not.toContain(".venv/bin");
     } finally {
       await runtime.shutdown();

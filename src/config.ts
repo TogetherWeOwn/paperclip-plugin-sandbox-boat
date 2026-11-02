@@ -18,6 +18,7 @@ export interface BoatDriverConfig {
   taskClass: string;
   sizeCostTable: SizeCostTable;
   templateSnapshot: string | null;
+  templateSourceSandboxId: string | null;
   boatEnvironment: string | null;
   noEnv: boolean;
   /** Retain provider command/process telemetry for newly created VMs. */
@@ -38,6 +39,20 @@ export interface BoatDriverConfig {
   tunnelRemotePort: number;
   tunnelTargetHost: string;
   tunnelTargetPort: number;
+  /**
+   * Deliver Paperclip's managed-GitHub capability (and its launcher shells)
+   * to the VM. Default false: any process in the VM can exchange the
+   * capability for a GitHub credential with the run's grants while the run
+   * is live, so it takes this explicit opt-in, not just an allowlist entry.
+   */
+  managedGithub: boolean;
+  /**
+   * SHA-256 (hex) of the one dedicated sandbox model-proxy key. When set,
+   * ANTHROPIC_AUTH_TOKEN reaches the VM only if it is that key, spent
+   * through the tunnel. Null: an on-tunnel token is delivered unverified
+   * (validation warns); an off-tunnel one is dropped either way.
+   */
+  modelProxyKeyFingerprint: string | null;
   sshConnectTimeoutSec: number;
   remoteWorkspaceDir: string | null;
   allowPaidNamedSnapshots: boolean;
@@ -53,6 +68,10 @@ export interface BoatDriverConfig {
   deleteCardVmOnRelease: boolean;
   maxOffloadVms: number;
   offloadIdleStopSeconds: number;
+  /** Host receiver budgets for one guest-produced sync-out archive. */
+  syncOutMaxBytes: number;
+  syncOutMaxFiles: number;
+  syncOutDiskReserveBytes: number;
   /**
    * Paperclip's own envelope flag (not a boat setting). The host passes it to
    * the plugin and keeps only what the plugin returns as normalized config, so
@@ -85,6 +104,7 @@ export const CONFIG_DEFAULTS = {
   timeoutMs: 300_000,
   stopConfirmTimeoutMs: 120_000,
   cliproxyTunnel: true,
+  managedGithub: false,
   tunnelRemotePort: 8317,
   tunnelTargetHost: "127.0.0.1",
   tunnelTargetPort: 8317,
@@ -94,6 +114,12 @@ export const CONFIG_DEFAULTS = {
   reuseLease: false,
   maxOffloadVms: 4,
   offloadIdleStopSeconds: 15,
+  // 8 GiB / 200k entries per archive covers a large workspace sync including
+  // build output; the 10 GiB reserve (never below 5% of the filesystem) keeps
+  // one hostile archive from filling the disk Paperclip itself runs on.
+  syncOutMaxBytes: 8 * 1024 * 1024 * 1024,
+  syncOutMaxFiles: 200_000,
+  syncOutDiskReserveBytes: 10 * 1024 * 1024 * 1024,
 };
 
 function str(value: unknown): string | null {
@@ -139,6 +165,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     taskClass: parseTaskClass(raw.taskClass),
     sizeCostTable: parseSizeCostTable(raw.sizeCostTable),
     templateSnapshot: str(raw.templateSnapshot),
+    templateSourceSandboxId: str(raw.templateSourceSandboxId),
     boatEnvironment: str(raw.boatEnvironment),
     noEnv: bool(raw.noEnv, CONFIG_DEFAULTS.noEnv),
     monitoring: bool(raw.monitoring, CONFIG_DEFAULTS.monitoring),
@@ -155,6 +182,8 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     timeoutMs: Math.trunc(num(raw.timeoutMs, CONFIG_DEFAULTS.timeoutMs)),
     stopConfirmTimeoutMs: Math.trunc(num(raw.stopConfirmTimeoutMs, CONFIG_DEFAULTS.stopConfirmTimeoutMs)),
     cliproxyTunnel: bool(raw.cliproxyTunnel, CONFIG_DEFAULTS.cliproxyTunnel),
+    managedGithub: bool(raw.managedGithub, CONFIG_DEFAULTS.managedGithub),
+    modelProxyKeyFingerprint: str(raw.modelProxyKeyFingerprint)?.toLowerCase() ?? null,
     tunnelRemotePort: Math.trunc(num(raw.tunnelRemotePort, CONFIG_DEFAULTS.tunnelRemotePort)),
     tunnelTargetHost: str(raw.tunnelTargetHost) ?? CONFIG_DEFAULTS.tunnelTargetHost,
     tunnelTargetPort: Math.trunc(num(raw.tunnelTargetPort, CONFIG_DEFAULTS.tunnelTargetPort)),
@@ -164,6 +193,9 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     deleteCardVmOnRelease: bool(raw.deleteCardVmOnRelease, CONFIG_DEFAULTS.deleteCardVmOnRelease),
     maxOffloadVms: Math.trunc(num(raw.maxOffloadVms, CONFIG_DEFAULTS.maxOffloadVms)),
     offloadIdleStopSeconds: num(raw.offloadIdleStopSeconds, CONFIG_DEFAULTS.offloadIdleStopSeconds),
+    syncOutMaxBytes: Math.trunc(num(raw.syncOutMaxBytes, CONFIG_DEFAULTS.syncOutMaxBytes)),
+    syncOutMaxFiles: Math.trunc(num(raw.syncOutMaxFiles, CONFIG_DEFAULTS.syncOutMaxFiles)),
+    syncOutDiskReserveBytes: Math.trunc(num(raw.syncOutDiskReserveBytes, CONFIG_DEFAULTS.syncOutDiskReserveBytes)),
     reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),
     envAllowlist: parseEnvAllowlist(raw.envAllowlist),
   };
@@ -193,6 +225,11 @@ export function remoteWorkspaceDirProblem(value: string | null): string | null {
 }
 
 const UUID_SECRET_REF_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const MODEL_PROXY_KEY_FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+
+/** Prefix allowlist entries whose namespaces hold no project secrets by design. */
+const VETTED_ENV_PREFIXES: readonly string[] = ["CARGO_*", "RUSTUP_*", "LC_*", "CLAUDE_CODE_*", "ANTHROPIC_DEFAULT_*", "PAPERCLIP_BRIDGE_*"];
 
 export function isSecretRef(value: string): boolean {
   return UUID_SECRET_REF_RE.test(value);
@@ -265,6 +302,17 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (config.offloadIdleStopSeconds < 1 || config.offloadIdleStopSeconds > 3600) {
     errors.push("offloadIdleStopSeconds must be between 1 and 3600.");
   }
+  if (config.syncOutMaxBytes < 1024 * 1024 || config.syncOutMaxBytes > 32 * 1024 * 1024 * 1024) {
+    errors.push("syncOutMaxBytes must be between 1048576 (1 MiB) and 34359738368 (32 GiB).");
+  }
+  if (config.syncOutMaxFiles < 1 || config.syncOutMaxFiles > 1_000_000) {
+    errors.push("syncOutMaxFiles must be between 1 and 1000000.");
+  }
+  if (config.syncOutDiskReserveBytes < 0 || config.syncOutDiskReserveBytes > 1024 * 1024 * 1024 * 1024) {
+    errors.push("syncOutDiskReserveBytes must be between 0 and 1099511627776 (1 TiB).");
+  } else if (config.syncOutDiskReserveBytes === 0) {
+    warnings.push("syncOutDiskReserveBytes is 0: the host tar receiver still keeps 5% of the target filesystem free, but no fixed reserve beyond it.");
+  }
   if (config.minComputeHoursLeft < 0) errors.push("minComputeHoursLeft cannot be negative.");
   if (config.timeoutMs < 10_000 || config.timeoutMs > 86_400_000) {
     errors.push("timeoutMs must be between 10000 and 86400000.");
@@ -308,11 +356,37 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
       if (never.length > 0) {
         warnings.push(`envAllowlist names keys this plugin never sends to a VM (provider credentials): ${never.slice(0, 5).join(", ")}.`);
       }
+      const unvetted = config.envAllowlist.filter((entry) => entry.endsWith("*") && !VETTED_ENV_PREFIXES.includes(entry));
+      if (unvetted.length > 0) {
+        warnings.push(
+          `envAllowlist prefix ${unvetted.slice(0, 5).join(", ")} can carry project secrets to an untrusted VM: a project-namespace prefix is unsafe even with the secret name and value checks. Prefer exact names, or a vetted prefix (${VETTED_ENV_PREFIXES.join(", ")}).`,
+        );
+      }
     }
   }
   if (config.cliproxyTunnel && config.tunnelTargetHost === "127.0.0.1") {
     warnings.push(
       "tunnelTargetHost is 127.0.0.1: the reverse tunnel reaches port tunnelTargetPort on the machine that runs the plugin worker. Inside a container, point it at the CLIProxy service name instead (for example cliproxy).",
+    );
+  }
+  if (config.modelProxyKeyFingerprint != null && !MODEL_PROXY_KEY_FINGERPRINT_RE.test(config.modelProxyKeyFingerprint)) {
+    errors.push("modelProxyKeyFingerprint must be the SHA-256 of the dedicated model-proxy key, as 64 hex characters.");
+  }
+  const modelTokenDeliverable =
+    config.envAllowlist == null || allowlistDelivers("ANTHROPIC_AUTH_TOKEN", config.envAllowlist);
+  if (modelTokenDeliverable && config.cliproxyTunnel && config.modelProxyKeyFingerprint == null) {
+    warnings.push(
+      "modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is delivered unverified whenever ANTHROPIC_BASE_URL is the tunnel address (an off-tunnel token is dropped). Set it to the SHA-256 of the dedicated, low-limit sandbox proxy key so a managed AI-connection pool credential can never reach a VM, and do not bind agents on boat environments to managed AI connections.",
+    );
+  }
+  if (modelTokenDeliverable && !config.cliproxyTunnel) {
+    warnings.push(
+      "cliproxyTunnel is off: ANTHROPIC_AUTH_TOKEN is always dropped (model_credential_off_tunnel), so a Claude run in the VM has no model credential. Turn the tunnel on with a dedicated key, or remove ANTHROPIC_AUTH_TOKEN from envAllowlist.",
+    );
+  }
+  if (config.managedGithub) {
+    warnings.push(
+      "managedGithub is on: any process in the VM, not only Paperclip's git/gh launchers, can exchange the run's capability for a GitHub credential with the run's grants while the run is live. Leave it off for public repos and PR branches; Paperclip's trust gate is what limits which runs get a capability at all.",
     );
   }
   return { errors, warnings };

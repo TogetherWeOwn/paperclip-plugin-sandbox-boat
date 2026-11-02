@@ -29,7 +29,15 @@ export const MIRROR_DIR_NAME = ".boat-offload";
 /** Mirror marker: which host manifest this mirror holds. Verified on every push. */
 export const MIRROR_MARKER_RELPATH = `${MIRROR_DIR_NAME}/mirror.json`;
 const RSYNC_TIMEOUT_MS = 300_000;
+const KILL_STALLED_RSYNC_TIMEOUT_MS = 5_000;
 const MIRROR_OP_TIMEOUT_MS = 30_000;
+/** Hash verification reads every skipped mirror file on the guest, so its
+ * fence scales with the file count (25 ms/file covers open+hash of a large
+ * file on a small VM with wide margin) up to a hard 10-minute cap, instead
+ * of the 30 s marker-op fence that predates content hashing. */
+export function mirrorVerifyTimeoutMs(expectedHashCount: number): number {
+  return Math.min(600_000, MIRROR_OP_TIMEOUT_MS + Math.max(0, expectedHashCount) * 25);
+}
 const PRUNE_TIMEOUT_MS = 60_000;
 const WIPE_TIMEOUT_MS = 60_000;
 
@@ -122,6 +130,9 @@ export interface MirrorVerification {
   marker: MirrorMarker | null;
   /** A planned path made unsafe by a symlinked/file parent or a directory leaf (wipe + full sync). */
   suspect: string | null;
+  /** Expected-hash paths whose guest content is missing or differs: the delta
+   * must resend them even when the (guest-writable) marker agrees. */
+  mismatched: string[];
 }
 
 function isMarker(value: unknown): value is MirrorMarker {
@@ -132,15 +143,23 @@ function isMarker(value: unknown): value is MirrorMarker {
 }
 
 // Verify the mirror, ensure it exists, and read its marker in one round trip.
-// stdin: [mirrorDir, plannedRelPaths[]]. Every planned path's parents must be
+// stdin: [mirrorDir, plannedRelPaths[], expectedHashes?]. When expected hashes
+// are given (the files a delta would skip), each is hashed on the guest and
+// any missing or differing path is reported as mismatched, so a tampered
+// mirror file is resent even though the guest-writable marker still agrees.
+// Every planned path's parents must be
 // real directories or absent; a symlinked parent, a file where a directory must
 // be, or a directory leaf where the host has a file/link makes the path suspect
 // (rsync would follow or fail there), and the caller wipes the disposable mirror
 // and fully resyncs instead of writing through it.
 export const MIRROR_VERIFY_SCRIPT = String.raw`
 # boat-offload-mirror-verify v1
-import errno, json, os, stat, sys
-mirror, planned = json.load(sys.stdin)
+import errno, hashlib, json, os, stat, sys
+payload = json.load(sys.stdin)
+mirror, planned = payload[0], payload[1]
+expected = payload[2] if len(payload) > 2 else {}
+if not isinstance(expected, dict) or len(expected) > 200000:
+    raise ValueError('invalid mirror verify input')
 if not isinstance(mirror, str) or not isinstance(planned, list) or len(planned) > 200000:
     raise ValueError('invalid mirror verify input')
 if os.path.realpath(os.path.dirname(mirror) or '/') != (os.path.dirname(mirror) or '/'):
@@ -230,7 +249,46 @@ except OSError:
     marker = None
 except ValueError:
     marker = None
-print(json.dumps({'marker': marker, 'suspect': suspect}))
+mismatched = []
+if suspect is None:
+    for rel, want in expected.items():
+        parts = parts_of(rel)
+        if not isinstance(want, str):
+            raise ValueError('invalid expected hash')
+        fd = open_parent(parts[:-1])
+        try:
+            if fd is None:
+                mismatched.append(rel)
+                continue
+            try:
+                leaf = os.lstat(parts[-1], dir_fd=fd)
+            except FileNotFoundError:
+                mismatched.append(rel)
+                continue
+            if stat.S_ISLNK(leaf.st_mode):
+                target = os.readlink(parts[-1], dir_fd=fd)
+                got = hashlib.sha256(b'offload-symlink\x00' + target.encode('utf8', 'surrogateescape')).hexdigest()
+            elif stat.S_ISREG(leaf.st_mode) and leaf.st_size <= 268435456:
+                digest = hashlib.sha256()
+                stream = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    while True:
+                        chunk = os.read(stream, 1048576)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                finally:
+                    os.close(stream)
+                got = digest.hexdigest()
+            else:
+                mismatched.append(rel)
+                continue
+            if got != want:
+                mismatched.append(rel)
+        finally:
+            if fd is not None:
+                os.close(fd)
+print(json.dumps({'marker': marker, 'suspect': suspect, 'mismatched': mismatched}))
 `;
 
 // Prune obsolete inputs: unlink only regular files and links, refuse anything else.
@@ -305,6 +363,93 @@ with open(tmp, 'w', encoding='utf8') as out:
     out.write(json.dumps(marker))
 os.replace(tmp, target)
 print(json.dumps({'ok': True}))
+`;
+
+// After a failed or timed-out push the local rsync is dead, but its guest
+// receiver can still be running over the shared master: it holds no local
+// handle we can kill. Before the mirror lock is released, terminate the
+// guest rsync receiver for this mirror, so a stalled receiver cannot resume
+// and overwrite a newer push's files. Matching is by receiver shape, never
+// by mere mentions: an rsync process running with --server, or a shell whose
+// -c body invokes `rsync ... --server` (the form sshd starts), and the
+// mirror path in the command line. A process group is signalled only when
+// its leader is itself a matched receiver; everyone else is signalled by
+// pid alone, so unrelated guest work sharing a group is never hit.
+export const MIRROR_KILL_STALLED_RSYNC_SCRIPT = String.raw`
+# boat-offload-mirror-kill-rsync v1
+import json, os, re, signal, sys, time
+mirror = json.load(sys.stdin)[0]
+if not isinstance(mirror, str) or not mirror.startswith('/'):
+    raise ValueError('invalid mirror path')
+me = os.getpid()
+my_group = os.getpgrp()
+server_call = re.compile(r'(^|[;&|]\s*)(exec\s+)?(\S*/)?rsync\s+[^;&|]*--server\b')
+
+def is_receiver(argv):
+    if mirror not in '\0'.join(argv):
+        return False
+    base = os.path.basename(argv[0]).lstrip('-')
+    if base == 'rsync':
+        return '--server' in argv[1:]
+    if base in ('sh', 'bash', 'dash', 'ash') and len(argv) >= 3:
+        if argv[1] == '-c':
+            return server_call.search(argv[2]) is not None
+        # A shell-script wrapper named rsync: the kernel runs it as
+        # 'sh /path/rsync --server ...' until it execs the real binary.
+        if os.path.basename(argv[1]) == 'rsync':
+            return '--server' in argv[2:]
+    return False
+
+def targets():
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            raw = open(f'/proc/{pid}/cmdline', 'rb').read()
+        except OSError:
+            continue
+        argv = [part.decode('utf-8', 'surrogateescape') for part in raw.split(b'\0') if part]
+        if argv and is_receiver(argv):
+            try:
+                found.append((pid, os.getpgid(pid)))
+            except OSError:
+                found.append((pid, pid))
+    return found
+
+def hit(pid, pgid, leader_pgids, sig):
+    if pgid in leader_pgids and pgid > 1 and pgid != my_group:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+def strike(sig):
+    current = targets()
+    leaders = {pgid for pid, pgid in current if pid == pgid}
+    for pid, pgid in current:
+        hit(pid, pgid, leaders, sig)
+    return current
+
+initial = strike(signal.SIGTERM)
+deadline = time.monotonic() + 1.0
+while time.monotonic() < deadline and targets():
+    time.sleep(0.02)
+strike(signal.SIGKILL)
+deadline = time.monotonic() + 0.5
+remaining = targets()
+while remaining and time.monotonic() < deadline:
+    time.sleep(0.02)
+    remaining = targets()
+print(json.dumps({'ok': not remaining, 'killed': len(initial), 'remaining': len(remaining)}))
 `;
 
 // Wipe a suspect mirror whole. Only the caller-selected mirror path is removed,
@@ -433,7 +578,10 @@ export type SpawnFn = (
 ) => Promise<SpawnResult>;
 
 async function defaultSpawn(command: string, args: string[], opts: { stdin: Readable; timeoutMs: number }): Promise<SpawnResult> {
-  const result = await runStreamProcess(command, args, { stdin: opts.stdin, timeoutMs: opts.timeoutMs });
+  // rsync forks ssh as its transport; signalling rsync alone orphans that
+  // ssh client, which keeps the remote channel (and this push, and the
+  // mirror lock around it) alive past the timeout. Kill the whole group.
+  const result = await runStreamProcess(command, args, { stdin: opts.stdin, timeoutMs: opts.timeoutMs, killProcessGroup: true });
   return { exitCode: result.exitCode, signal: result.signal, timedOut: result.timedOut };
 }
 
@@ -482,16 +630,80 @@ export class SshGuestStore implements GuestStore {
       entries.map((entry) => entry.path),
     );
     const [command, ...args] = argv;
-    const result = await this.spawn(command!, args, {
-      stdin: Readable.from([renderFilesFromList(entries)]),
-      timeoutMs: RSYNC_TIMEOUT_MS,
-    });
-    if (result.exitCode !== 0 || result.timedOut || result.signal) {
-      throw new Error(
-        `Offload delta push failed (exit=${result.exitCode}, signal=${result.signal}, timedOut=${result.timedOut}).`,
+    let result: SpawnResult | undefined;
+    let spawnFailure: unknown;
+    let spawnFailed = false;
+    try {
+      result = await this.spawn(command!, args, {
+        stdin: Readable.from([renderFilesFromList(entries)]),
+        timeoutMs: RSYNC_TIMEOUT_MS,
+      });
+    } catch (error) {
+      // A streaming failure (output cap, pipe error) rejects instead of
+      // returning a result; the guest receiver may still be stalled. Track
+      // the rejection with a flag, not the value: a seam may reject with
+      // anything, including undefined.
+      spawnFailed = true;
+      spawnFailure = error;
+    }
+    if (!spawnFailed && result !== undefined && result.exitCode === 0 && !result.timedOut && !result.signal) {
+      return { files: entries.length, bytes: entries.reduce((sum, entry) => sum + entry.size, 0), skipped: 0 };
+    }
+    // The push is dead locally, but a stalled guest receiver may still be
+    // writing into this mirror. Kill it before throwing: the caller holds
+    // the mirror lock until this settles, so no newer push can race it.
+    // An ssh transport failure (exit 255) means there is no live channel to
+    // clean over, so don't spend the kill budget rediscovering that; the
+    // mirror is simply reported unfenced. When cleanup cannot prove the
+    // receiver stopped, the failure carries receiverMayBeLive and the
+    // caller quarantines the mirror (kill + wipe + full resync) before its
+    // next use. Cleanup never replaces the push failure itself.
+    const transportDead = result !== undefined && result.exitCode === 255 && !result.timedOut;
+    let receiverMayBeLive = true;
+    if (!transportDead) {
+      receiverMayBeLive = await this.killStalledReceivers(guestDir).then(
+        () => false,
+        () => true,
       );
     }
-    return { files: entries.length, bytes: entries.reduce((sum, entry) => sum + entry.size, 0), skipped: 0 };
+    if (spawnFailed) {
+      if (!receiverMayBeLive) throw spawnFailure;
+      // Tag the original failure so the caller fences the mirror. A value
+      // that cannot carry the tag (non-object, frozen) is wrapped with the
+      // original kept as `cause` — never lose the flag, never replace the
+      // failure with a tagging TypeError.
+      if (typeof spawnFailure === "object" && spawnFailure !== null && Object.isExtensible(spawnFailure)) {
+        (spawnFailure as { receiverMayBeLive?: boolean }).receiverMayBeLive = true;
+        throw spawnFailure;
+      }
+      const wrapped = new Error(
+        `Offload delta push failed (${spawnFailure instanceof Error ? spawnFailure.message : String(spawnFailure)}).`,
+        { cause: spawnFailure },
+      ) as Error & { receiverMayBeLive?: boolean };
+      wrapped.receiverMayBeLive = true;
+      throw wrapped;
+    }
+    const failure = new Error(
+      `Offload delta push failed (exit=${result?.exitCode ?? null}, signal=${result?.signal ?? null}, timedOut=${result?.timedOut ?? false}).`,
+    ) as Error & { receiverMayBeLive?: boolean };
+    if (receiverMayBeLive) failure.receiverMayBeLive = true;
+    throw failure;
+  }
+
+  /**
+   * Terminate any guest rsync receiver still writing into this mirror and
+   * prove it stopped (the script reports the survivors). Throws unless the
+   * guest confirms no matching receiver remains.
+   */
+  async killStalledReceivers(guestDir: string): Promise<void> {
+    assertGuestDir(guestDir);
+    const result = (await this.runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [guestDir], KILL_STALLED_RSYNC_TIMEOUT_MS)) as {
+      ok?: unknown;
+      remaining?: unknown;
+    };
+    if (result?.ok !== true || result?.remaining !== 0) {
+      throw new Error("Offload stalled-receiver cleanup could not prove the guest receiver stopped.");
+    }
   }
 
   async pruneMirror(guestDir: string, relPaths: string[]): Promise<{ removed: number }> {
@@ -520,21 +732,36 @@ export class SshGuestStore implements GuestStore {
    * suspect -> wipe and full sync; marker agreeing with host state -> delta;
    * anything else -> full sync over the verified mirror.
    */
-  async verifyMirror(guestDir: string, planned: string[]): Promise<MirrorVerification> {
+  async verifyMirror(guestDir: string, planned: string[], expectedHashes: Record<string, string> = {}): Promise<MirrorVerification> {
     assertGuestDir(guestDir);
     for (const rel of planned) assertMirrorRel(rel);
-    const result = (await this.runScript(MIRROR_VERIFY_SCRIPT, [guestDir, planned], MIRROR_OP_TIMEOUT_MS)) as {
+    for (const rel of Object.keys(expectedHashes)) assertMirrorRel(rel);
+    const result = (await this.runScript(MIRROR_VERIFY_SCRIPT, [guestDir, planned, expectedHashes],
+      mirrorVerifyTimeoutMs(Object.keys(expectedHashes).length))) as {
       marker?: unknown;
       suspect?: unknown;
+      mismatched?: unknown;
     };
     if (result?.suspect !== null && typeof result?.suspect !== "string") {
       throw new SyncError("SYNC_GUEST_READ", "Offload mirror verification returned an invalid suspect path.");
+    }
+    // The mismatched list is part of our own script's envelope, so it is
+    // fail-closed like suspect: a response that cannot prove which skipped
+    // files still match must not silently read as "all match".
+    const plannedSet = new Set(planned);
+    if (!Array.isArray(result?.mismatched)
+      || result.mismatched.some((rel) => typeof rel !== "string" || !plannedSet.has(rel))) {
+      throw new SyncError("SYNC_GUEST_READ", "Offload mirror verification returned an invalid mismatched list.");
     }
     // The marker comes from a guest-side file that may be torn or tampered
     // with: anything malformed degrades to a full sync, never a throw. Only
     // the envelope shape (our own script's output) is fail-closed above.
     const marker = result?.marker;
-    return { marker: isMarker(marker) ? marker : null, suspect: (result?.suspect as string | null) ?? null };
+    return {
+      marker: isMarker(marker) ? marker : null,
+      suspect: (result?.suspect as string | null) ?? null,
+      mismatched: result.mismatched as string[],
+    };
   }
 
   async writeMarker(guestDir: string, marker: MirrorMarker): Promise<void> {

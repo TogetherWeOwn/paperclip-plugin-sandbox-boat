@@ -13,17 +13,21 @@ import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
-import { classifyNode, classifyPython } from "./offload/router.js";
+import { cargoToolchain, classifyNode, classifyPython, isCargoOffline } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
 import type { BackendCommand } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
-import { DEFAULT_SYNC_EXCLUDES, snapshotHasDirectory } from "./offload-sync.js";
+import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
+import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
+import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
-  config: BoatDriverConfig; environmentId: string; seenAt: number };
+  config: BoatDriverConfig; environmentId: string; seenAt: number;
+  /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
+  localRun: boolean };
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -32,10 +36,26 @@ export interface SshOffloadRuntimeDeps {
   // Boundary test seams: real SSH is still used, not an injected guest mock.
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
-  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot">;
+  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain">;
+  /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  trackedFiles?: TrackedFilesFn;
 }
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
+
+/** Secret-bearing names beyond registry config: never synced, and their presence keeps commands local. */
+const STAY_LOCAL_EXACT = [".envrc", ".dev.vars", ".git-credentials"];
+const STAY_LOCAL_DIRS = new Set([".aws", ".docker", ".kube"]);
+
+/** Basename test mirroring the sync-exclude globs for secret-bearing files. */
+function isSecretBearingName(name: string): boolean {
+  if (STAY_LOCAL_EXACT.includes(name)) return true;
+  if (name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".tfvars")) return true;
+  if (name.startsWith("id_rsa") || name.startsWith("id_ed25519") || name.startsWith("id_ecdsa")) return true;
+  if (name.includes(".tfstate")) return true;
+  if (name.endsWith(".json") && (name.includes("credentials") || name.startsWith("service-account"))) return true;
+  return false;
+}
 
 /** Sync-excluded directory names: never descended when looking for stay-local config. */
 const SKIP_DIRS = new Set(
@@ -59,9 +79,11 @@ function isUvAuthPyproject(text: string): boolean {
 }
 
 /** True when the source holds stay-local config at any depth: a registry
- * credential file (matched by basename, like the sync exclude), a uv.toml, or
- * a pyproject.toml with uv auth. Bounded and skips excluded dirs such as
- * node_modules; unreadable or over-limit sources fail closed to local. */
+ * credential file (matched by basename, like the sync exclude), a uv.toml, a
+ * pyproject.toml with uv auth, or any secret-bearing name or credential
+ * directory (.aws/, .docker/, .kube/, *.pem, id_rsa*, ...). Bounded and skips
+ * excluded dirs such as node_modules; unreadable or over-limit sources fail
+ * closed to local. */
 export async function hasRegistryCredentials(sourceRoot: string): Promise<boolean> {
   let entriesSeen = 0;
   const stack: Array<{ dir: string; depth: number }> = [{ dir: sourceRoot, depth: 0 }];
@@ -79,6 +101,8 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
       if (entriesSeen > MAX_CREDENTIAL_ENTRIES) return true;
       const name = entry.name;
       if (REGISTRY_CREDENTIAL_FILES.includes(name) || name === "uv.toml") return true;
+      if (isSecretBearingName(name)) return true;
+      if (entry.isDirectory() && STAY_LOCAL_DIRS.has(name)) return true;
       if (name === "pyproject.toml") {
         try {
           const abs = path.join(dir, name);
@@ -123,6 +147,88 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
     }
   }
   return false;
+}
+
+/** Cargo config that an --offline guest fetch from crates.io could not satisfy.
+ * A `[registries.*]` table, a source replacement, or a stored credential/token
+ * means the lockfile's deps may need private auth, so the command stays local.
+ * Symlinked configs are never read; an unreadable or over-limit file also stays
+ * local. Only host-authored source roots are scanned, never agent input. */
+const CARGO_REGISTRY_AUTH_MARKERS = [/^\s*\[registries[\s.\]]/m, /^\s*replace-with\s*=/m, /credential-provider/i, /^\s*token\s*=/m];
+const MAX_CARGO_CONFIG_BYTES = 64 * 1024;
+const MAX_CARGO_CONFIG_DEPTH = 32;
+
+export async function hasCargoRegistryAuth(sourceRoot: string, cwdRelative: string): Promise<boolean> {
+  // Cargo discovers config from the command directory upward, so walk from the
+  // cwd to the source root; the step cap bounds hostile nesting depth. Fail
+  // closed throughout: an escaping cwd, a symlinked ancestor, or an exhausted
+  // depth budget all keep the command local.
+  const root = path.normalize(sourceRoot);
+  const normalized = path.normalize(cwdRelative);
+  // Route validation already rejects backslashes; the scan stays unreachable
+  // for them by refusing them too, so a Windows-style escape never scans sideways.
+  if (path.isAbsolute(normalized) || normalized.includes("\\") || normalized.split(path.sep).includes("..")) return true;
+  let dir = normalized === "." ? root : path.join(root, normalized);
+  for (let steps = 0; ; steps += 1) {
+    // Ancestor directories are host-authored; a symlinked one could redirect
+    // the scan outside the source root, so never descend through one. A
+    // missing directory holds no config; keep scanning its parents.
+    try {
+      if ((await lstat(dir)).isSymbolicLink()) return true;
+    } catch {
+      // Fall through to the parent below.
+    }
+    // The .cargo component gets the same check: O_NOFOLLOW below guards only
+    // the final component, so a symlinked .cargo would redirect the scan
+    // outside the source root. A missing one holds no config at this level.
+    let cargoDir = null;
+    try {
+      cargoDir = await lstat(path.join(dir, ".cargo"));
+    } catch {
+      // No .cargo here; keep scanning parents.
+    }
+    if (cargoDir !== null && (cargoDir.isSymbolicLink() || !cargoDir.isDirectory())) return true;
+    for (const name of cargoDir === null ? [] : [".cargo/config.toml", ".cargo/config"]) {
+      const abs = path.join(dir, name);
+      let info;
+      try {
+        info = await lstat(abs);
+      } catch {
+        continue;
+      }
+      if (info.isSymbolicLink() || !info.isFile() || info.size > MAX_CARGO_CONFIG_BYTES) return true;
+      let handle;
+      try {
+        handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      } catch {
+        return true;
+      }
+      try {
+        const target = await handle.stat();
+        if (target.isSymbolicLink() || !target.isFile() || target.size > MAX_CARGO_CONFIG_BYTES) return true;
+        const buf = Buffer.alloc(MAX_CARGO_CONFIG_BYTES + 1);
+        let off = 0;
+        for (;;) {
+          const { bytesRead } = await handle.read(buf, off, buf.length - off);
+          if (bytesRead === 0) break;
+          off += bytesRead;
+          if (off > MAX_CARGO_CONFIG_BYTES) return true;
+        }
+        const text = buf.subarray(0, off).toString("utf8");
+        if (CARGO_REGISTRY_AUTH_MARKERS.some((marker) => marker.test(text))) return true;
+      } catch {
+        return true;
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    }
+    if (dir === root) return false;
+    // Reaching the step cap below the source root means an adversary-deep (or
+    // cyclic) tree the scan cannot fully cover: stay local.
+    if (steps >= MAX_CARGO_CONFIG_DEPTH) return true;
+    dir = path.dirname(dir);
+    if (dir !== root && path.relative(root, dir).startsWith("..")) return true;
+  }
 }
 
 /** Profile by id; unknown ids never resolve. */
@@ -194,6 +300,11 @@ export class SshOffloadRuntime {
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
   private registryTail: Promise<unknown> = Promise.resolve();
+  /** Latest operator-configured local-run roots seen by resolve, per company.
+   * Upload-time revalidation reads the pushing command's own company entry, so
+   * dropping a root also refuses that company's pushes already queued — and
+   * another company's config can neither cancel nor resurrect them. */
+  private readonly localRunRootsByCompany = new Map<string, string[]>();
   private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
@@ -201,6 +312,12 @@ export class SshOffloadRuntime {
   /** True when this run/workspace already has a native binding (whole-run realization wins). */
   has(companyId: string, runId: string, workspaceId: string): boolean {
     return this.bindings.has(key(companyId, runId, workspaceId));
+  }
+
+  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
+  hasRun(companyId: string, runId: string): boolean {
+    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
+    return false;
   }
 
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
@@ -223,17 +340,35 @@ export class SshOffloadRuntime {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
-      config, environmentId: params.environmentId, seenAt: Date.now(),
+      config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
     });
   }
 
+  /** Re-prove a local-run binding's operator-owned facts: the source still sits
+   * under a configured root (and was not swapped for a symlink), and the
+   * checkout's own origin still names the bound repo. */
+  private async revalidateLocalRun(binding: Binding, roots: string[]): Promise<boolean> {
+    if (roots.length === 0) return false;
+    const canonical = await realpath(binding.source).catch(() => null);
+    if (!canonical || canonical !== binding.source) return false;
+    const canonicalRoots = (await Promise.all(roots.map((root) => realpath(root).catch(() => null))))
+      .filter((root): root is string => root !== null);
+    if (!withinRoots(canonical, canonicalRoots)) return false;
+    const onDiskRepoUrl = await readGitOriginUrl(canonical).catch(() => null);
+    return !!onDiskRepoUrl && canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) === binding.repoId;
+  }
+
   async resolve(command: BackendCommand, settings: Record<string, unknown>) {
+    this.localRunRootsByCompany.set(command.companyId, localSourceRoots(settings));
     if (this.closing || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
       || !plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")
       || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
       || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
     const binding = this.bindings.get(key(command.companyId, command.runId, command.executionWorkspaceId));
     if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
+    // The workspace row behind a local-run binding is agent-mutable, so the
+    // operator-owned facts are re-proven on every resolve, not only at bind.
+    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) return null;
     const profile = profileForId(command.profileId);
     if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
     const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
@@ -249,6 +384,30 @@ export class SshOffloadRuntime {
     // The guest runs in the mirrored cwd: an empty or sync-excluded directory
     // is absent there, so the command could not start remotely.
     if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) return null;
+    // Tracked files only, for every tool: a non-git source, an empty index,
+    // or a tracked file carrying a known credential shape keeps the command
+    // local before any VM is reserved. The push re-checks both (the tree can
+    // change after admission); this gate keeps a secret-bearing or untracked
+    // workspace from ever spending a VM.
+    const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(binding.source).catch(() => null);
+    if (!tracked || tracked.size === 0) return null;
+    const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel));
+    if (syncable.length === 0) return null;
+    // A tracked secret-bearing name (a public test cert, a .docker/ context)
+    // is withheld from sync, so the guest tree would silently lack a file the
+    // build may read: stay local for every tool, cargo included.
+    if ([...tracked].some((rel) => { const parts = rel.split("/");
+      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) return null;
+    // Git lists normalized paths: "./src" or "src/." name the same directory.
+    const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
+    if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) return null;
+    if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) return null;
+    // An --offline build cannot download missing crates: a private-registry
+    // config in the source would fail the guest fetch, so the command stays
+    // local. This is prepare-time's stay-local decision; the guest cannot see
+    // the host source once the command is admitted.
+    if (tool === "cargo" && isCargoOffline(command.argv)
+      && await hasCargoRegistryAuth(binding.source, command.cwdRelative).catch(() => true)) return null;
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
@@ -265,10 +424,10 @@ export class SshOffloadRuntime {
     const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]))
       .digest("hex").slice(0, 24);
-    // templateSnapshot is deliberately NOT part of the pool identity: changing
-    // it must keep ownership of VMs already recorded under this pool so they
-    // are retired through the normal stop path. The executor keys VM reuse on
-    // the template instead (compatibilityKey).
+    // Neither template selection is deliberately part of the pool identity:
+    // changing it must keep ownership of VMs already recorded under this pool
+    // so they are retired through the normal stop path. The executor keys VM
+    // reuse on the template instead (compatibilityKey).
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
@@ -276,6 +435,8 @@ export class SshOffloadRuntime {
     }
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
+      existing.executor.setTemplateSourceSandboxId(binding.config.templateSourceSandboxId ?? null);
+      existing.executor.setEphemeralRepos(normalizeOffloadSettings(settings).offloadEphemeralRepos);
       return existing.executor;
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
@@ -294,9 +455,17 @@ export class SshOffloadRuntime {
     const sourceRoot = async (cmd: OffloadCommand) => {
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
       if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) throw new Error("Native offload binding unavailable");
+      // A queued command can snapshot long after resolve approved it, so a
+      // local-run binding is re-proven again at upload time against the latest
+      // roots configured for its own company. Throwing fails the push before
+      // transport, which the journal records as not_started (fallback-safe,
+      // runs locally).
+      if (native.localRun && !await this.revalidateLocalRun(native, this.localRunRootsByCompany.get(cmd.companyId) ?? [])) {
+        throw new Error("Local-run offload source no longer passes roots/origin validation");
+      }
       return native.source;
     };
-    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, artifactRoot: settings.offloadArtifactRoot,
+    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot: settings.offloadArtifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
       // Warm commands reuse the cached session and its control master. After a
       // resume (new machine, IP and host key) the first guest op fails on the
@@ -315,6 +484,7 @@ export class SshOffloadRuntime {
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       profileEnv: profileGuestEnv,
       uvVenvRoot,
+      cargoToolchain: (cmd) => cargoToolchain(cmd.argv, profile.toolchains),
       ...this.deps.guestOptions });
     // Sync-in begins every reservation, including resumed VMs. Sessions stay
     // cached across warm commands; push refreshes a stale session once through
@@ -325,7 +495,9 @@ export class SshOffloadRuntime {
         size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
         offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
-        templateSnapshot: binding.config.templateSnapshot ?? null },
+        ephemeralRepos: normalizeOffloadSettings(settings).offloadEphemeralRepos,
+        templateSnapshot: binding.config.templateSnapshot ?? null,
+        templateSourceSandboxId: binding.config.templateSourceSandboxId ?? null },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is

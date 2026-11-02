@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, type TestContext } from "vitest";
-import { access, mkdir, readdir, readFile, readlink, rmdir } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, readlink, rmdir, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import { userInfo } from "node:os";
@@ -84,6 +84,57 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     // Re-sending a delivered start cannot execute it again.
     await expect(guest.runCommand(ssh.session.sandboxId, command, { identity: full, output: async () => {} }))
       .rejects.toThrow();
+  }, 20_000);
+
+  it("primes the guest cargo cache before an offline prepare, and fails the prepare when the fetch fails", async () => {
+    const offline = cmd();
+    offline.tool = "cargo";
+    offline.argv = ["test", "--offline"];
+    async function primingGuest(exitCode: number, tag: string, toolchain: string | null = null) {
+      const stub = path.join(ssh.root, `cargo-stub-${tag}`);
+      await mkdir(stub);
+      await writeFile(path.join(stub, "cargo"),
+        `#!/bin/sh\nprintf '%s\\n' "$@" > ${stub}/argv\nexit ${exitCode}\n`, { mode: 0o755 });
+      const priming = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session, cgroupParent: parent,
+        stateRoot: ssh.root, workspace: async () => ssh.root, executable: "cargo", path: `${stub}:/usr/bin:/bin`,
+        cargoToolchain: () => toolchain });
+      return { priming, stub };
+    }
+    // A failing fetch fails the prepare before any supervisor exists, so the
+    // command falls back locally. No cgroup delegation needed for this path.
+    {
+      const { priming, stub } = await primingGuest(3, "fail");
+      try {
+        await expect(priming.prepare(ssh.session.sandboxId, offline)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+        expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+      } finally {
+        await priming.shutdown();
+      }
+    }
+    // --frozen is --locked plus --offline, so it primes the same way.
+    {
+      const frozen = cmd();
+      frozen.tool = "cargo";
+      frozen.argv = ["test", "--frozen"];
+      const { priming, stub } = await primingGuest(3, "frozen");
+      try {
+        await expect(priming.prepare(ssh.session.sandboxId, frozen)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+        expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+      } finally {
+        await priming.shutdown();
+      }
+    }
+    const capabilities = await guest.preflight(ssh.session.sandboxId, cmd());
+    if (!capabilities.cgroupV2Delegated) return;
+    const { priming, stub } = await primingGuest(0, "ok", "+stable");
+    try {
+      const identity = await priming.prepare(ssh.session.sandboxId, offline);
+      expect(identity.cgroupPath.startsWith(`${parent}/`)).toBe(true);
+      // The host-validated toolchain selector travels into the fixed fetch argv.
+      expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("+stable\nfetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+    } finally {
+      await priming.shutdown();
+    }
   }, 20_000);
 
   it("renews guest interest with a bounded deadline and rejects arbitrary extensions", { ...CGROUP_GATED, timeout: 15_000 }, async (ctx) => {

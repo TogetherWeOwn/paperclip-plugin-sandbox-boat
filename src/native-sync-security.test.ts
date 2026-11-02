@@ -308,7 +308,9 @@ describe("local VM credential sentinel control", () => {
   it("really supplies literal VM credentials so an absent unset cannot pass the native command test", async () => {
     ssh.remoteEnv = { ASCII_TOKEN: "LITERAL_ASCII_SENTINEL", BOAT_ID: "LITERAL_BOAT_SENTINEL" };
     const session = [...ssh.sessionMap.values()][0]!;
-    const result = await ssh.run(session, "printf '%s|%s' \"$ASCII_TOKEN\" \"$BOAT_ID\"", { timeoutMs: 5000 });
+    // Unwrapped on purpose: every supervised path strips these names, so
+    // only a bare invocation can prove the fixture really supplies them.
+    const result = await ssh.runUnwrapped(session, "printf '%s|%s' \"$ASCII_TOKEN\" \"$BOAT_ID\"", 5000);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("LITERAL_ASCII_SENTINEL|LITERAL_BOAT_SENTINEL");
   });

@@ -14,7 +14,7 @@
 //      bindings written by routes/plugins.js config save (extractSecretRefBindingsFromConfig)
 //   5. manifest:            services/plugin-capability-validator.js validateManifestCapabilities
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -38,6 +38,7 @@ const config = {
   offloadLocalRunsEnabled: true,
   offloadLocalEnvironmentId: environmentId,
   offloadLocalApiKeySecretRef: { type: "secret_ref", secretId },
+  offloadLocalSourceRoots: [tmpdir()],
   offloadLocalDriverConfig: { maxOffloadVms: 1 },
 };
 
@@ -198,7 +199,11 @@ const execBody = () => ({ version: 1, commandId: randomUUID(), executionWorkspac
 describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
   let source: string;
   let host: ReturnType<typeof startHost>;
-  beforeEach(async () => { source = await mkdtemp(path.join(tmpdir(), "boat-host-contract-")); });
+  beforeEach(async () => {
+    source = await mkdtemp(path.join(tmpdir(), "boat-host-contract-"));
+    await mkdir(path.join(source, ".git"));
+    await writeFile(path.join(source, ".git", "config"), '[remote "origin"]\n\turl = https://github.com/example/public\n');
+  });
   afterEach(async () => {
     try { await host?.call("shutdown", {}, null); } catch { /* worker already gone */ }
     host?.stop();
@@ -275,7 +280,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId: null }) }, companyId);
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(host.calls.some((entry) => entry.method === "issues.get")).toBe(false);
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(403);
+    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
   }, TIMEOUT);
 
   it("(3) a workspace with no local cwd (provider ref only) binds nothing", async () => {
@@ -294,7 +299,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
     await host.until(() => host.logs.includes("boat: local-run offload binding skipped"), "binding skip");
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(403);
+    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
   }, TIMEOUT);
 
   it("(2) host reads stay inside the event's company: a cross-company issue is invisible", async () => {

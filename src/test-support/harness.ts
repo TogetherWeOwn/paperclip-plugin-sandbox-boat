@@ -4,25 +4,29 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
+import { PassThrough, Writable } from "node:stream";
 
 export class MockChild extends EventEmitter {
-  stdout = new EventEmitter();
-  stderr = new EventEmitter();
+  // Real streams, not bare emitters: the supervised ssh paths pipe stdio
+  // through node:stream pipelines, which need genuine Readable/Writable
+  // behavior (pipe, unpipe, destroy, EOF) from the double.
+  stdout = new PassThrough();
+  stderr = new PassThrough();
   exitCode: number | null = null;
   signalCode: string | null = null;
   killed = false;
   stdinText = "";
   private stdinEnded: (() => void) | null = null;
-  stdin = {
-    on: () => this.stdin,
-    write: (chunk: string) => {
-      this.stdinText += chunk;
-      return true;
+  stdin = new Writable({
+    write: (chunk: Buffer | string, _encoding, done) => {
+      this.stdinText += String(chunk);
+      done();
     },
-    end: () => {
+    final: (done) => {
       this.stdinEnded?.();
+      done();
     },
-  };
+  });
 
   onStdinEnd(fn: () => void): void {
     this.stdinEnded = fn;
@@ -30,8 +34,13 @@ export class MockChild extends EventEmitter {
 
   finish(code: number, stdout = "", stderr = ""): void {
     queueMicrotask(() => {
-      if (stdout) this.stdout.emit("data", stdout);
-      if (stderr) this.stderr.emit("data", stderr);
+      // Like a real process: output flushes, stdio reaches EOF, then exit.
+      // Consumers that detach on exit (the multiplexed-ssh stderr rule) may
+      // already have destroyed a stream; writing to it is then a no-op.
+      if (stdout && !this.stdout.destroyed) this.stdout.write(stdout);
+      if (stderr && !this.stderr.destroyed) this.stderr.write(stderr);
+      this.stdout.end();
+      this.stderr.end();
       this.exitCode = code;
       this.emit("exit", code, null);
       this.emit("close", code, null);
@@ -43,6 +52,8 @@ export class MockChild extends EventEmitter {
     this.killed = true;
     this.signalCode = signal;
     queueMicrotask(() => {
+      this.stdout.end();
+      this.stderr.end();
       this.emit("exit", null, signal);
       this.emit("close", null, signal);
     });
@@ -55,6 +66,8 @@ export interface SpawnRecord {
   args: string[];
   stdin: string;
   child: MockChild;
+  /** For ssh execs: the payload command inside the supervisor wrap (what handlers answer as). */
+  remoteCommand: string;
 }
 
 export interface ExecReply {
@@ -75,6 +88,57 @@ export function scriptOfShDashC(remoteCommand: string): string | null {
   const at = remoteCommand.indexOf("sh -c '");
   if (at < 0 || !remoteCommand.endsWith("'")) return null;
   return remoteCommand.slice(at + "sh -c '".length, -1).replaceAll(`'"'"'`, "'");
+}
+
+/** Undo one level of shellQuote: the value inside a '...' span (with '"'"' escapes). */
+export function unquoteShell(span: string): string {
+  if (!span.startsWith("'") || !span.endsWith("'") || span.length < 2) return span;
+  return span.slice(1, -1).replaceAll(`'"'"'`, "'");
+}
+
+/**
+ * Split a remote command line into shell words, undoing shellQuote spans.
+ * Supervised commands arrive as `... python3 -c '<supervisor>' '<marker>'
+ * '<command>' '<record>'`: the payload the fake should answer as is a word,
+ * not the whole line. Unbalanced quoting falls back to one word (the line).
+ */
+export function shellWords(line: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let inWord = false;
+  for (let i = 0; i < line.length;) {
+    const ch = line[i];
+    if (ch === "'" || ch === '"') {
+      // shellQuote escapes a literal ' as '"'"': close, double-quoted ',
+      // reopen. Both quote kinds must toggle or the parity breaks.
+      const close = line.indexOf(ch, i + 1);
+      if (close < 0) return [line];
+      current += line.slice(i + 1, close);
+      inWord = true;
+      i = close + 1;
+    } else if (ch === " " || ch === "\t") {
+      if (inWord) { words.push(current); current = ""; inWord = false; }
+      i += 1;
+    } else {
+      current += ch;
+      inWord = true;
+      i += 1;
+    }
+  }
+  if (inWord) words.push(current);
+  return words;
+}
+
+/**
+ * The command the fake VM should act out: a supervised invocation's payload
+ * (recognized by its PCSYNC marker word), or the line itself. The cancel
+ * invocation (a run-record path argument, no marker) succeeds silently.
+ */
+export function effectiveRemoteCommand(remoteCommand: string): string {
+  const words = shellWords(remoteCommand);
+  const marker = words.findIndex((word) => /^PCSYNC:[a-f0-9]{32}:$/.test(word));
+  if (marker >= 0 && marker + 1 < words.length) return words[marker + 1];
+  return remoteCommand;
 }
 
 export interface FakeRuntimeLink {
@@ -100,7 +164,10 @@ export class FakeSsh {
 
   readonly spawn = (command: string, args: string[], options?: { stdio?: unknown[] }) => {
     const child = new MockChild();
-    const record: SpawnRecord = { command, args: [...args], stdin: "", child };
+    const record: SpawnRecord = {
+      command, args: [...args], stdin: "", child,
+      remoteCommand: command === "ssh" ? effectiveRemoteCommand(args.at(-1) ?? "") : "",
+    };
     this.spawned.push(record);
     if (command === "ssh-keygen") {
       const file = args[args.indexOf("-f") + 1];
@@ -123,7 +190,10 @@ export class FakeSsh {
       if (controlPath) writeFileSync(controlPath, "");
       return child; // stays alive until killed
     }
-    const remoteCommand = args[args.length - 1];
+    const rawCommand = args[args.length - 1];
+    // Remote commands run supervised: answer as the payload inside the
+    // supervisor wrap, so handlers keep matching the command they scripted.
+    const remoteCommand = effectiveRemoteCommand(rawCommand);
     const sandboxId = optionValue(args, "HostKeyAlias") ?? "";
     if (remoteCommand.includes("paperclip-boat-scrub")) this.timeline?.push(`ssh:scrub:${sandboxId}`);
     if (remoteCommand.includes("paperclip-boat-runtime")) this.timeline?.push(`ssh:link:${sandboxId}`);
@@ -166,7 +236,7 @@ export class FakeSsh {
   /** The runtime-directory commands sent to one sandbox. */
   links(sandboxId?: string): SpawnRecord[] {
     return this.execs().filter(
-      (entry) => entry.args.at(-1)!.includes("paperclip-boat-runtime") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
+      (entry) => effectiveRemoteCommand(entry.args.at(-1)!).includes("paperclip-boat-runtime") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
     );
   }
 
@@ -185,7 +255,7 @@ export class FakeSsh {
   /** The scrub commands sent to one sandbox. */
   scrubs(sandboxId?: string): SpawnRecord[] {
     return this.execs().filter(
-      (entry) => entry.args.at(-1)!.includes("paperclip-boat-scrub") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
+      (entry) => effectiveRemoteCommand(entry.args.at(-1)!).includes("paperclip-boat-scrub") && (sandboxId == null || entry.args.includes(`HostKeyAlias=${sandboxId}`)),
     );
   }
 }
@@ -253,14 +323,25 @@ export interface FakeIssue {
   checkoutRunId?: string | null;
 }
 
+export interface FakeProjectWorkspace {
+  id: string;
+  projectId: string;
+  name?: string;
+  path?: string | null;
+  repoUrl?: string | null;
+  [key: string]: unknown;
+}
+
 export function createFakeContext(
-  options: { issues?: Map<string, FakeIssue>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta> } = {},
+  options: { issues?: Map<string, FakeIssue>; hostScopes?: { proactiveCompanies: string[] }; workspaces?: Map<string, FakeWorkspaceMeta>;
+    projectWorkspaces?: Map<string, FakeProjectWorkspace> } = {},
 ) {
   const state = new Map<string, unknown>();
   const logs: FakeLogEntry[] = [];
   const jobs = new Map<string, (job: unknown) => Promise<void>>();
   const issues = options.issues ?? new Map<string, FakeIssue>();
   const workspaces = options.workspaces ?? new Map<string, FakeWorkspaceMeta>();
+  const projectWorkspaces = options.projectWorkspaces ?? new Map<string, FakeProjectWorkspace>();
   const events = new Map<string, Array<(event: unknown) => Promise<void>>>();
   const secrets = new Map<string, string>();
   const keyOf = (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) =>
@@ -300,6 +381,9 @@ export function createFakeContext(
     executionWorkspaces: {
       get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
     },
+    projects: {
+      getWorkspaceForIssue: async (issueId: string) => projectWorkspaces.get(issueId) ?? null,
+    },
     events: {
       on: (name: string, fn: (event: unknown) => Promise<void>) => {
         const list = events.get(name) ?? [];
@@ -315,5 +399,5 @@ export function createFakeContext(
   const emit = async (name: string, event: unknown) => {
     for (const fn of events.get(name) ?? []) await fn(event);
   };
-  return { ctx, state, logs, jobs, issues, workspaces, secrets, emit };
+  return { ctx, state, logs, jobs, issues, workspaces, projectWorkspaces, secrets, emit };
 }

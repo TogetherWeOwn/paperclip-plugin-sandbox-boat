@@ -1,6 +1,20 @@
 # Heavy-command offload shims
 
-The agent and model stay on the Paperclip host; only an eligible heavy command and a frozen, secret-free source snapshot go to a pool VM. Everything is **default OFF**. To turn it on, see [Enabling the executor bridge](operations.md#enabling-the-executor-bridge). Internals: [Offload internals](design/offload-internals.md).
+The agent and model stay on the Paperclip host; only an eligible heavy command and a frozen snapshot of the workspace's git-tracked files go to a pool VM. Everything is **default OFF**. To turn it on, see [Enabling the executor bridge](operations.md#enabling-the-executor-bridge). Internals: [Offload internals](design/offload-internals.md). For local runs, the snapshot source is admitted only under an operator-listed `offloadLocalSourceRoots` entry with a matching on-disk git origin — see [Local-run offload source authority](security.md#local-run-offload-source-authority).
+
+**What leaves the host.** Only files git tracks (the index, `git ls-files
+--cached`), minus the sync excludes (caches, build outputs and secret-bearing
+names such as `.env*`, `.dev.vars`, `*.pem`, `*.key`, `id_rsa*`, `.aws/`,
+`*.tfvars`). Untracked or ignored workspace files never sync, so stage new
+files (`git add`) before offloading a command that needs them; submodule
+contents are not in the parent index and do not sync. A source that is not a
+git work tree (or whose tracked files cannot be listed) stays local. Before
+admission, the tracked syncable files go through a bounded scan for known
+credential shapes (cloud key ids, private-key headers, provider tokens,
+JWTs); any hit keeps the command local, and the push re-checks. That scan is
+a heuristic net for well-known token formats, not a proof that a workspace
+holds no secrets: only approve repositories whose tracked content may run on
+an untrusted VM.
 
 ## Cargo offload shim (`bin/boat-offload-cargo`)
 
@@ -19,6 +33,12 @@ boat-offload-cargo --json -- test --locked           # run; result envelope on s
 ```
 
 Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
+
+## Pool isolation and mirror verification
+
+A pool VM is only ever reused by the execution workspace that first claimed it: the host resolves each submit's trust domain from its (host-fetched) execution workspace, and the pool compatibility key includes it, so code from one workspace — for example an untrusted PR branch — never runs on a VM another workspace later reuses warm or resumed. Commands without a resolvable workspace fail closed to per-workspace isolation in the executor. Repos listed in `offloadEphemeralRepos` go further: every command creates a fresh VM and deletes it at the provider after collect, and an incompatible VM retired from the pool is likewise deleted rather than left as a stopped disk. Each guest command runs with a root-owned-only `PATH` (`/usr/local/bin:/usr/bin:/bin`, plus a uv venv bin when applicable) and a fresh per-command `HOME`, so guest templates must install toolchains under root-owned paths and home-directory state never carries between commands. Toolchain caches (`CARGO_HOME`, and `PYTHONUSERBASE` for python commands) live outside `HOME` in a per-VM directory under the state root: cargo cache priming and pip user-site installs write there and commands read from there, so warm-VM caches survive across commands, but the tree is never on `PATH` and never leaves the VM's trust domain. Cargo configuration is executable state, not cache: the guest supervisor deletes `config.toml`/`config` from the per-VM `CARGO_HOME` before each command and before cache priming (which additionally refuses to run at all when any cargo config it would load names a credential provider), so a wrapper or alias planted by one command cannot ride the cache into the next.
+
+The delta push does not trust the guest-side mirror marker alone: files the delta would skip are hashed on the guest against the host manifest on every push, and any missing or differing file is resent before the command runs, so a tampered mirror (including a poisoned lockfile) is repaired instead of executed or staged back.
 
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
@@ -73,9 +93,18 @@ plugin never installs from an unlocked manifest, and an unpinned
 Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
 Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
 `.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,
-are never synced and keep commands local. Symlinked config is never followed:
+are never synced and keep commands local; the same holds for secret-bearing
+names and credential directories (`.dev.vars`, `.envrc`, `*.pem`, `*.key`,
+`id_rsa*`, `.git-credentials`, `.aws/`, `.docker/`, `.kube/`, `*.tfvars`,
+`*credentials*.json`). Symlinked config is never followed:
 a symlinked `pyproject.toml` stays local without reading its target, and
-regular `pyproject.toml` files are read bounded at 256 KiB. Only an empty env
+regular `pyproject.toml` files are read bounded at 256 KiB. The same rule
+covers every host-side workspace probe: toolchain pins (`rust-toolchain*`,
+bounded at 16 KiB) and lockfiles (bounded at 32 MiB) are opened no-follow and
+must be regular files under real directories — a symlink, FIFO, device,
+oversized file or symlinked run directory is unreadable and the command stays
+local, so a hostile checkout cannot make the worker buffer or block on
+host files outside the workspace. Only an empty env
 travels with Node/Python requests except `VIRTUAL_ENV` for `uv.lock` venv
 commands; secret-free env policy, public allow-listed
 repositories and cwd/argv confinement apply unchanged.

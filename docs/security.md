@@ -8,6 +8,7 @@
 * An ephemeral ed25519 key is made per worker process with `ssh-keygen`. It is never stored.
 * The host key comes from the API, and SSH uses `StrictHostKeyChecking=yes` with `HostKeyAlias=<sandbox id>`.
 * The tunnel binds to `127.0.0.1` inside the VM only. Nothing is published.
+* Every remote command (execute, scrub, env staging, sync helpers) runs under a supervised process group with a hard timeout: at `timeoutMs` the local call returns `timedOut` and the remote group is cancelled over a fresh channel, without signalling the shared control master. A guest that stalls a channel — a foreground `sleep`, a background job holding stderr, a wedged `rsync --server` — cannot hold the call (or the offload mirror lock) past its deadline; the rsync push additionally kills its whole local process group so its ssh transport cannot outlive it. Cancellation is for timeouts and aborts: a command that exits normally only deregisters its run, so a helper it deliberately detached (stdio redirected, backgrounded) keeps running, while sync payloads still have their whole group cancelled on every outcome. After a failed push the guest-side rsync receiver is killed before the mirror lock releases (matched by receiver shape — an `rsync --server` for that mirror — never by mere path mentions in a command line); if that kill cannot prove the receiver stopped, the mirror is fenced and the next push re-kills, wipes it, and fully resyncs instead of trusting its marker.
 
 ## VM reuse boundary
 
@@ -36,12 +37,14 @@ For each `NAME=value` that Paperclip passes to Execute:
 1. The name must match the allowlist: an exact `NAME`, or a `NAME_*` prefix. Anything else is dropped.
 2. These are never sent, even when the allowlist names them exactly:
    * names starting with `PLANETSCALE_`, `CLOUDFLARE_`, `CF_`, `DISCORD_`, `GH_`, `GITHUB_`, `BOAT_` or `ASCII_`;
-   * a value with a JWT anywhere in it (`eyJ...` header, `.`, `eyJ...` payload, `.`), bare, behind `Bearer `, or inside JSON or a header, for example Paperclip's run token (`PAPERCLIP_API_KEY` before the sandbox bridge starts);
+   * a value with a JWT or JWE anywhere in it: a dotted base64url chain of 3 segments (5 for a JWE, whose second segment may be empty) whose header decodes to a JSON object with an `alg` key — which also catches pretty-printed headers (`{ "alg"`, base64url `eyAi...`), payloads that do not start `{"`, tokens embedded in text or in plain JSON, and tokens split by newlines — plus the classic `eyJ...` / `eyJ...` shape, bare, behind `Bearer `, or inside JSON or a header, for example Paperclip's run token (`PAPERCLIP_API_KEY` before the sandbox bridge starts);
    * a value with anything URL-like in it (`scheme://`, also JSON-escaped as `:\/\/` or percent-encoded, or a `user:password@`) that is not, as a whole, one URL in unambiguous characters (no space, quote, backslash or control character; one `@` at most, in the authority; nothing URL-like in its path, query or fragment), or JSON whose every URL-like string is one. A URL that parses is never taken as proof that the text around it is safe: the old check parsed only `https://o/` out of `https://o/'reilly:pw@github.com/o/r`;
    * a database URL, or a URL with credentials (a user, a password or a credential query parameter such as `access_token`), unless its effective destination is the VM itself: the literal host `localhost`, `127.0.0.1` or `[::1]`, an empty host or a unix socket path, and no query parameter that names another endpoint (libpq's `host`, `hostaddr`, `service`, and anything like them; a `host` or `socket` of absolute paths is a socket). No other IP spelling (`0xc0000214` is 192.0.2.20 to the resolver) and no one-label name (a DNS search domain can resolve it off the VM) counts. Such a VM-local URL is allowed only by an exact entry. A `..._DATABASE_URL` or `..._DB_URL` name (also `_URI`, `_DSN`) counts as a database URL whatever its value, so it must be one such URL.
-3. A name with `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PRIVATE_KEY`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `CREDENTIAL`, `COOKIE`, `SIGNING`, `HMAC` or `SALT` in it, or ending in `_KEY` (or named just `KEY`), `_AUTH` or `_PAT`, is sent only when the allowlist names it exactly, never through a prefix. So `PAPERCLIP_BRIDGE_SIGNING_KEY` and `LC_SESSION_KEY` are dropped although `PAPERCLIP_BRIDGE_*` and `LC_*` are on the built-in list. A `..._TOKENS` name with a whole-number value is a token budget, not a credential.
+3. A name with `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`, `PWD`, `_PASS_`, `PRIVATE_KEY`, `PRIVKEY`, `API_KEY`, `APIKEY`, `ACCESS_KEY`, `CREDENTIAL(S)`, `CREDS`, `COOKIE`, `SIGNING`, `HMAC`, `SALT`, `SEED`, `MNEMONIC`, a `CONN(ECTION)STR(ING)`, `WEBHOOK` or a `DSN` segment in it, or ending in `_KEY`/`_KEYS` (or named just `KEY`), `_AUTH` or `_PAT`, is sent only when the allowlist names it exactly, never through a prefix. So `PAPERCLIP_BRIDGE_SIGNING_KEY` and `LC_SESSION_KEY` are dropped although `PAPERCLIP_BRIDGE_*` and `LC_*` are on the built-in list. A `..._TOKENS` name with a whole-number value is a token budget, not a credential. The same exact-entry rule applies to a value that is itself a secret whatever its name: a PEM private key, JSON with a `private_key`, `client_secret` or `password` key, a keyword DSN with a `password=` or `pwd=` assignment (glued forms such as `;Password=` included), an `AccountKey=`/`SharedAccessKey=`, or a well-known token prefix (`sk-`, `sk-ant-`, `sk-or-`, `ghp_` and its siblings, `github_pat_`, `AKIA`/`ASIA`, `xoxb-`, `glpat-`) — through a prefix it is dropped as `secret_value`. A credential can also ride a URL's fragment (`#access_token=...`) or a `?pw=` parameter; both count as URL credentials under rule 2.
+4. `ANTHROPIC_AUTH_TOKEN` is sent only under an explicit model policy, never on the allowlist's say-so: `cliproxyTunnel` is on, `ANTHROPIC_BASE_URL` is the tunnel address (`http://127.0.0.1:<tunnelRemotePort>`, or the host-side tunnel target the plugin rewrites to it), and — when `modelProxyKeyFingerprint` is set — the token's SHA-256 matches it. Anything else is dropped (`model_credential_off_tunnel`, or `model_credential_not_dedicated` on a fingerprint mismatch). The base URL must be the one this same filter delivers (a dropped base URL cannot vouch for the token), and a session whose tunnel could not be opened withholds the token at staging time. This matters because Paperclip replaces the environment's token with a managed AI-connection pool credential (a real provider key, spendable from anywhere) when an agent has such a binding: agents on boat environments must not use managed AI connections, and the tunnel key must be a dedicated, low-limit proxy key used nowhere else. Without a fingerprint an on-tunnel token is delivered unverified and validation warns; an off-tunnel one is dropped either way.
+5. The managed-GitHub names (`PAPERCLIP_GITHUB_BROKER_TOKEN`, `ZDOTDIR`, `BASH_ENV`) are sent only when the operator set `managedGithub: true`; otherwise all three are dropped (`github_capability_disabled`) whatever the allowlist says. See [Managed GitHub](#the-built-in-list) below.
 
-Dropped keys are logged once per run as a warning, by name and reason (`not_allowlisted`, `denied_family`, `jwt`, `remote_database_or_credential_url`, `secret_name_needs_exact_entry`, `github_capability_rejected`, `github_launcher_mismatch`, `invalid_name`). Values are never logged.
+Dropped keys are logged once per run as a warning, by name and reason (`not_allowlisted`, `denied_family`, `jwt`, `remote_database_or_credential_url`, `secret_name_needs_exact_entry`, `secret_value`, `model_credential_not_dedicated`, `model_credential_off_tunnel`, `github_capability_disabled`, `github_capability_rejected`, `github_launcher_mismatch`, `invalid_name`). Values are never logged.
 
 The plugin also refuses every command of Paperclip's ACP process-session launcher, because that launcher starts the agent from a base64 envelope of its command and its whole launch env (project secrets included) that no env filter sees. An envelope up to 64 KiB rides the launch inline as `PAPERCLIP_PROCESS_SESSION_COMMAND_B64`. A larger one is uploaded through Execute as a file, `<runtime root>/process-sessions/<uuid>/command.b64`, in `printf '%s' <base64 chunk> >> ...` commands, and the launch then carries only `PAPERCLIP_PROCESS_SESSION_DIR`. So Execute refuses a command whose command or arguments name a `/process-sessions` directory or a `command.b64` file, or contain `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=` or `PAPERCLIP_PROCESS_SESSION_DIR=`, and a command whose env holds either variable. Every ACP step names that directory, starting with the wrapper-script sync, so an ACP run fails at its first step, before any envelope reaches the VM (error `BOAT_ACP_PROCESS_SESSION_REFUSED`). claude_local uses ACP unless its engine is set, so set `engine` to `cli` for agents on boat environments.
 
@@ -51,16 +54,16 @@ It covers a Claude Code run through the model-proxy tunnel and Paperclip's sandb
 
 | Group | Names |
 | - | - |
-| Model proxy | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the environment's dedicated model-proxy key), `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*` |
+| Model proxy | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (only under the model policy of rule 4: on the tunnel, and matching `modelProxyKeyFingerprint` when set), `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*` |
 | Claude Code | `CLAUDE_CODE_*`, `CLAUDE_CONFIG_DIR`, `API_TIMEOUT_MS`, `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MCP_TIMEOUT`, `MCP_TOOL_TIMEOUT`, `DISABLE_AUTOUPDATER`, `DISABLE_ERROR_REPORTING`, `DISABLE_TELEMETRY`, `DISABLE_NON_ESSENTIAL_MODEL_CALLS`, `IS_SANDBOX` |
 | Paperclip run context | `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_RUN_ID`, `PAPERCLIP_TASK_ID`, `PAPERCLIP_ISSUE_WORK_MODE`, `PAPERCLIP_WAKE_REASON`, `PAPERCLIP_WAKE_COMMENT_ID`, `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, `PAPERCLIP_LINKED_ISSUE_IDS`, `PAPERCLIP_WORKSPACE_CWD`, `PAPERCLIP_WORKSPACE_SOURCE`, `PAPERCLIP_WORKSPACE_STRATEGY`, `PAPERCLIP_WORKSPACE_ID`, `PAPERCLIP_WORKSPACE_REPO_URL`, `PAPERCLIP_WORKSPACE_REPO_REF`, `PAPERCLIP_WORKSPACE_BRANCH`, `PAPERCLIP_WORKSPACE_WORKTREE_PATH`, `PAPERCLIP_WORKSPACES_JSON`, `AGENT_HOME` |
 | Paperclip sandbox bridge | `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, `PAPERCLIP_API_BRIDGE_MODE`, `PAPERCLIP_BRIDGE_TOKEN`, `PAPERCLIP_BRIDGE_*`, `PAPERCLIP_SANDBOX_EXEC_CHANNEL` |
-| Managed GitHub | `PAPERCLIP_GITHUB_BROKER_TOKEN` (the one JWT let through), `ZDOTDIR`, `BASH_ENV` (only as the launcher dir; see below) |
+| Managed GitHub | `PAPERCLIP_GITHUB_BROKER_TOKEN` (the one JWT let through), `ZDOTDIR`, `BASH_ENV` (only as the launcher dir; see below) — all three only with `managedGithub: true` |
 | Shell | `PATH`, `HOME`, `TERM`, `LANG`, `LC_*`, `TZ` |
 
 In a sandbox run, `PAPERCLIP_API_KEY` and `PAPERCLIP_BRIDGE_TOKEN` hold the bridge token: a random per-run value that only the bridge inside this VM accepts, and the host forwards each bridged call with the real run token. When `PAPERCLIP_API_KEY` holds the run JWT itself (the commands Paperclip runs before the bridge starts), the JWT rule drops it.
 
-**Managed GitHub (`git push` from the VM).** Paperclip stages token-free `git` and `gh` launchers in the VM at `<workspace>/.paperclip-runtime/paperclip-runner/github/<run id>` and puts that dir first on `PATH`. For a push or fetch they ask Paperclip for a credential through the sandbox bridge (`POST /runtime-tools/github/credentials`, which the bridge allows), presenting the run's capability in `PAPERCLIP_GITHUB_BROKER_TOKEN`. That capability is a JWT (HS256, scope `github_credentials`, bound to the run, valid only while the run is live), so the JWT rule would drop it. The name is handled on its own: its value is sent only when the allowlist names `PAPERCLIP_GITHUB_BROKER_TOKEN` exactly (a prefix such as `PAPERCLIP_GITHUB_*` does not deliver it), the same env carries `PAPERCLIP_RUN_ID`, and the token has the shape Paperclip's `runtime-tools-token.ts` mints: a signature segment that is one 32-byte HMAC-SHA256 (43 base64url characters), only the header keys `alg`/`typ` and the claim keys `sub`, `company_id`, `run_id`, `responsible_user_id`, `scope`, `iat`, `exp` and `instance_id`, with `scope: github_credentials`, `run_id` equal to that run and an `exp` in the future. Any other value under that name, a raw `ghp_` or `github_pat_` token, a GitHub token in the signature segment of a capability-shaped value, extra claims or a malformed value included, is dropped (`github_capability_rejected`). A custom `envAllowlist` must add that exact name. No GitHub token is sent. `PAPERCLIP_GITHUB_BROKER_URL` (the controller's address, unreachable from the VM) is not on the list: without it the launcher falls back to `PAPERCLIP_API_URL`, the in-VM bridge.
+**Managed GitHub (`git push` from the VM).** This is off unless the operator sets `managedGithub: true` (default false, and validation warns when it is on): any process in the VM, not only the launcher, can exchange the capability for a GitHub credential with the run's grants while the run is live, so leave it off for boat environments used on public repos or PR branches; Paperclip's trust gate (`allowsGitHubCredentialExport`) is what limits which runs get a capability at all. With it off, `PAPERCLIP_GITHUB_BROKER_TOKEN`, `ZDOTDIR` and `BASH_ENV` are dropped (`github_capability_disabled`) and nobody has to rewrite `envAllowlist`. With it on, Paperclip stages token-free `git` and `gh` launchers in the VM at `<workspace>/.paperclip-runtime/paperclip-runner/github/<run id>` and puts that dir first on `PATH`. For a push or fetch they ask Paperclip for a credential through the sandbox bridge (`POST /runtime-tools/github/credentials`, which the bridge allows), presenting the run's capability in `PAPERCLIP_GITHUB_BROKER_TOKEN`. That capability is a JWT (HS256, scope `github_credentials`, bound to the run, valid only while the run is live), so the JWT rule would drop it. The name is handled on its own: its value is sent only when the allowlist names `PAPERCLIP_GITHUB_BROKER_TOKEN` exactly (a prefix such as `PAPERCLIP_GITHUB_*` does not deliver it), the same env carries `PAPERCLIP_RUN_ID`, and the token has the shape Paperclip's `runtime-tools-token.ts` mints: a signature segment that is one 32-byte HMAC-SHA256 (43 base64url characters), only the header keys `alg`/`typ` and the claim keys `sub`, `company_id`, `run_id`, `responsible_user_id`, `scope`, `iat`, `exp` and `instance_id`, with `scope: github_credentials`, `run_id` equal to that run and an `exp` in the future. Any other value under that name, a raw `ghp_` or `github_pat_` token, a GitHub token in the signature segment of a capability-shaped value, extra claims or a malformed value included, is dropped (`github_capability_rejected`). A custom `envAllowlist` must add that exact name. No GitHub token is sent. `PAPERCLIP_GITHUB_BROKER_URL` (the controller's address, unreachable from the VM) is not on the list: without it the launcher falls back to `PAPERCLIP_API_URL`, the in-VM bridge.
 
 A login shell can rebuild `PATH` from `/etc/profile` or `~/.profile` and lose the launcher dir, so `git` would be the image's own binary with no credential. Paperclip's launcher setup (adapter-utils `prepareGitHubOperationLaunchers`) covers that with `ZDOTDIR=<launcher dir>` and `BASH_ENV=<launcher dir>/.bashrc`: those profiles re-export the launcher `PATH` (and unset empty `GIT_AUTHOR_*`/`GIT_COMMITTER_*` identity values), so zsh and non-interactive bash, login or not, find the launcher first. Both names are on the built-in list and are sent only as exactly those VM paths for the launcher dir that `PATH` starts with. That dir must be an absolute path ending in `/.paperclip-runtime/paperclip-runner/github/<name>`, with that parent only once (a doubled or nested parent is not a dir Paperclip stages), where `<name>` is the `PAPERCLIP_RUN_ID` of the same env (Paperclip names a run's launcher dir after the run) or one of the native runner's own names (`anonymous-<agent id>-<16 hex>`, `native-session-<uuid>`), with no `.`, `..` or empty segment, no control character, and no `$`, backtick or backslash: bash runs parameter expansion, command substitution and arithmetic expansion on `BASH_ENV` before it opens the file, so such a path would run code in every non-interactive bash (`remoteWorkspaceDir` rejects these characters for the same reason). Spaces, quotes and non-ASCII characters in the workspace path are fine. Any other value is dropped (`github_launcher_mismatch`), since `BASH_ENV` runs a file in every non-interactive bash. A custom `envAllowlist` must add them to keep this. An interactive bash that is not a login shell reads neither, and inherits the launcher `PATH`. `GIT_*`, `SSH_ASKPASS`, `SSH_AUTH_SOCK` and `GH_CONFIG_DIR` (a denied `GH_` name) stay out: the launcher sets them itself for each operation and falls back to a temporary `gh` config dir, so sending the controller's values would only add host state.
 
@@ -68,7 +71,7 @@ Not on the list, on purpose: `ANTHROPIC_API_KEY` and any other model key (the Pa
 
 ### Adding names
 
-A list you set replaces the built-in one, so start from the table above and add what the work needs. An empty list (`envAllowlist: []`) sends no run env at all; validation keeps it and warns, since a Claude run cannot work without the model-proxy and bridge keys. A blank string counts as unset. Validation fails on an entry that is not `NAME` or `NAME_*`, and warns when the list no longer delivers `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY` or `PAPERCLIP_BRIDGE_TOKEN`, or names a family that is never sent. For a Rust card with a test database in a container on the VM, add for example `CARGO_*`, `RUSTUP_HOME` and `TWO_TEST_DATABASE_URL` (an exact entry, and its URL must point at the VM).
+A list you set replaces the built-in one, so start from the table above and add what the work needs. An empty list (`envAllowlist: []`) sends no run env at all; validation keeps it and warns, since a Claude run cannot work without the model-proxy and bridge keys. A blank string counts as unset. Validation fails on an entry that is not `NAME` or `NAME_*`, and warns when the list no longer delivers `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY` or `PAPERCLIP_BRIDGE_TOKEN`, or names a family that is never sent. A project-namespace prefix (for example `TWO_*`) is unsafe: project env holds that project's secrets, and although the secret name and value checks drop the obvious forms, a prefix forwards whatever the next binding adds. Validation warns on any prefix outside the vetted set (`CARGO_*`, `RUSTUP_*`, `LC_*`, `CLAUDE_CODE_*`, `ANTHROPIC_DEFAULT_*`, `PAPERCLIP_BRIDGE_*`); prefer exact names. For a Rust card with a test database in a container on the VM, add for example `CARGO_*`, `RUSTUP_HOME` and `TWO_TEST_DATABASE_URL` (an exact entry, and its URL must point at the VM).
 
 ## The run MCP config exception
 
@@ -117,6 +120,41 @@ The one exception: a VM whose disk may hold work that Paperclip still needs is *
 With the `~/.boatignore` rule in place, the stop snapshot of such a VM does not get the MCP config. A VM whose `~/.boatignore` lost the rule can keep the run JWT there for up to 14 days; that residual risk is accepted.
 
 What this does not cover: per-minute snapshots taken before a VM first got the rule (a VM set up by 0.1.0) can hold the JWT until boat drops them, usually within a day, or the VM is deleted. A VM that boat's auto-stop stops, or one the plugin cannot reach, is not scrubbed by that stop; with the rule its snapshots have nothing to scrub, but boat keeps its machine and disk for 10 minutes, so a resume in that time finds the file again until the next scrub. Inside a running VM the agent can read the file, as it can read its own env. The real fix belongs in Paperclip: give sandbox MCP servers a bridge-scoped, short-lived token instead of the host run JWT.
+
+## Sync-out receiver budgets
+
+Sync-out is the one place guest-produced bytes land on the host: the guest can
+replace its sender, so the host tar receiver treats the whole stream as
+hostile and bounds it before anything is written:
+
+* **Member types**: only regular files, directories and symlinks (plus GNU
+  long-name/long-link records up to 256 KiB). The type allowlist is checked
+  before tarfile processes the member, so a GNU sparse (`S`), PAX, hardlink,
+  device or FIFO member is refused at its first header — extended sparse
+  headers are never buffered.
+* **Bytes**: one archive's files may total at most `syncOutMaxBytes`
+  (default 8 GiB, hard bound 32 GiB). A member that would cross the budget is
+  refused before its file is opened.
+* **Entries**: at most `syncOutMaxFiles` members (default 200000, hard bound
+  1000000), counting files, directories, symlinks and dropped members alike;
+  parent directories a member implies count against the same 100000-directory
+  budget as explicit ones, and no member path may exceed 256 components.
+* **Disk reserve**: before each created member (file, directory or symlink),
+  `statvfs` must show that writing it
+  still leaves `syncOutDiskReserveBytes` free (default 10 GiB) and at least
+  5% of the filesystem, plus 8192 free inodes. These defaults are sized for a
+  legitimately large workspace sync — build output included — while making it
+  impossible for one archive to fill the filesystem Paperclip itself runs on.
+* Data after the tar end marker is drained only up to 1 MiB of record
+  padding; more fails the receive instead of holding the sync open.
+* A refusal (or any other receive failure) removes the partially received
+  tree, so refused bytes never stay on the host. Directory modes from the
+  guest are restored with owner `rwx` forced on, so a synced tree can always
+  be deleted again.
+* The host helper that parses these streams runs as `python3 -I` with a fixed
+  working directory (`/`) and a minimal environment (`PATH`, `LANG`): no
+  `PYTHON*` variables, no cwd or user-site imports, and none of the plugin
+  worker's own environment.
 
 ## Native task network-policy admission (not network isolation)
 
@@ -168,6 +206,39 @@ it is not a substitute for explicit stop-and-retain.
 Rollback must preserve unsupported-policy refusal: do not remove a requested grant
 or resume through an unrestricted older artifact. Full isolation and live
 forbidden/approved-destination before/after measurements remain unverified.
+
+## Offload source admission (tracked files only)
+
+The command-level offload transport syncs a frozen snapshot of the workspace
+to a pool VM. Only git-tracked files (the index, listed with
+`git ls-files -z --cached`, fsmonitor and hooks disabled so listing a hostile
+checkout runs no repo-configured code) minus the sync excludes may leave the
+host: untracked or ignored files — a local `.dev.vars`, a stray deploy key —
+are never listed or synced. A source that is not a git work tree, or whose
+tracked files cannot be listed, keeps the command local. Before admission
+(and again at push) the tracked syncable files go through a bounded scan for
+known credential shapes (cloud key ids, private-key headers, provider
+tokens, JWTs); a hit, an unreadable file or an over-budget tree keeps the
+command local. The scan recognizes well-known token formats only; it does
+not prove a workspace secret-free, so repository approval remains an operator
+decision about tracked content on an untrusted VM.
+
+## Local-run offload source authority
+
+A local run's execution-workspace row (`cwd`, `repoUrl`) is writable by the
+agent that owns the run, so the plugin never treats it as authority for which
+host directory offload may upload. The row only nominates a candidate: a
+local-run binding exists, and keeps dispatching, only while `realpath` of the
+nominated path lies inside an operator-listed `offloadLocalSourceRoots` entry
+and the checkout's own on-disk `remote.origin.url` (parsed from git config,
+never by running git) canonicalizes to the same repo id as the row's
+`repoUrl`, which the `offloadAllowedRepos` check then gates as usual. Both
+facts are re-proven on every executor resolve and again before each upload
+snapshots the source, not only at bind time, and the Boat secret is resolved
+only after they pass. This confines a row-rewriting
+agent to directories the operator already designated whose own git identity
+matches an allowlisted repo; it does not make the contents of such a checkout
+trusted — the tracked-file sync and secret-scan gates are separate.
 
 ## boat account settings
 

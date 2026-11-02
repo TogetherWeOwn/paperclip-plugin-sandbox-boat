@@ -37,7 +37,7 @@ Set this on a Paperclip sandbox environment with driver `boat`. Only `apiKey` is
 
 ## Install on a Paperclip host
 
-The worker must resolve `@paperclipai/plugin-sdk` from the host's own SDK. That is what the bundled providers do.
+The package is self-contained: its `node_modules` holds real copies of its runtime dependencies, `@paperclipai/plugin-sdk` included. The SDK is a pinned `dependencies` entry (the version the build and the host-contract tests ran against), not a peer the host supplies. That is the shape Paperclip's own publish flow produces for the bundled providers, and the only one a local-path install can load: the loader registers the path in place, installs nothing for it, and forks the worker with plain Node module resolution, so the worker finds the SDK by walking up from `dist/worker.js` into the package's own `node_modules`. A Paperclip upgrade therefore never swaps the SDK under a staged package; moving to a new SDK is a new release of this plugin, after the host-contract tests pass against it.
 
 Each tagged release has this staged package attached to its GitHub Release, with a `.sha256` file. To install one, or to cut a release, see [docs/releasing.md](docs/releasing.md).
 
@@ -52,7 +52,7 @@ scripts/stage-package.sh <commit> <plugin packages root>   # prints <root>/sandb
 The script:
 
 * exports the commit with `git archive`, then runs `npm ci` and `npm run check` (typecheck, tests, build) on that copy;
-* copies `dist`, `bin` (the offload shims), `package.json`, `README.md`, `docs`, `LICENSE` and `@boatdev/sdk` into the package, links `node_modules/@paperclipai/plugin-sdk` to `/app/packages/plugins/sdk` (the SDK path inside the Paperclip container; a third argument changes it), and writes the full sha to `.source-commit`;
+* copies `dist`, `bin` (the offload shims), `package.json`, `README.md`, `docs`, `LICENSE` and the runtime dependencies (`@boatdev/sdk`, `@paperclipai/plugin-sdk`, `@paperclipai/shared`, `zod`) into the package as real directories, and writes the full sha to `.source-commit`;
 * makes the package read-only, and uses `sudo` only for the final move when the root is not writable.
 
 It refuses:
@@ -63,10 +63,10 @@ It refuses:
 * a build that does not delete Paperclip's run MCP config before a stop, delete or capture. Without it the run JWT stays in boat snapshots;
 * a build that does not put the `.paperclip-runtime/` rule into `~/.boatignore`, or that does not tell every command's tar to skip `.paperclip-runtime`. Without the rule, the run JWT is in boat's per-minute snapshots while a run holds the VM. Without the tar exclude, Paperclip's workspace extract unpacks the host's runtime files over the run's;
 * a build that still links `.paperclip-runtime` into `/tmp` (0.2.0). Paperclip refuses that link and fails every run;
-* a host SDK path inside one versioned Paperclip install (`cli/installs/`). The next upgrade prunes it;
+* a package that holds a symlink (before 0.2.6 the SDK was an absolute link to the build host's SDK path, so the tarball could not load anywhere else), or whose `dist/index.js` does not import from the staged `node_modules` alone;
 * a destination that already exists.
 
-On a native npm install (no container), the SDK is at `~/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk`. Pass that path, through `current`, as the third argument. To stage a downloaded release tarball instead of building, use `scripts/stage-release.sh <tarball> <root>`: it checks the `.sha256` and re-points the tarball's `/app` SDK link at this host's SDK. [docs/operations/rbx1.md](docs/operations/rbx1.md) is the full install, config, shim and rollback runbook for rbx1.
+To stage a downloaded release tarball instead of building, use `scripts/stage-release.sh <tarball> <root>`: it checks the `.sha256` and the package contents, then lands it read-only, exactly as shipped. There is no host-specific step after it. [docs/operations/rbx1.md](docs/operations/rbx1.md) is the full install, config, shim and rollback runbook for rbx1.
 
 Then install it as an instance admin. `packageName` is the path as the server sees it:
 

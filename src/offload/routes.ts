@@ -11,6 +11,7 @@ import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDura
 import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
+import { probeDir } from "./probe-file.js";
 import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
 import { bodyTooLarge, cwdProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
 
@@ -22,8 +23,9 @@ async function recordRefusalOrConflict(
   reason: string,
 ): Promise<{ status: number; body: unknown } | null> {
   try {
-    await broker.recordRefusal(request, principal, reason);
-    return null;
+    // Non-null: the journal already knew this ID (a concurrent acceptance),
+    // so its verdict replaces the caller's fallback-safe refusal.
+    return await broker.recordRefusal(request, principal, reason);
   } catch (error) {
     if ((error as { code?: string }).code !== "OFFLOAD_IDEMPOTENCY_CONFLICT") throw error;
     return {
@@ -75,6 +77,8 @@ export interface OffloadSettings {
   offloadMinExpectedSeconds: number;
   /** Monthly cap on tracked offload VM-hours; 0 disables the extra cap. */
   offloadMonthlyVmHourCap: number;
+  /** Canonical repo ids under the ephemeral policy: one VM per command, deleted after collect. */
+  offloadEphemeralRepos: string[];
 }
 
 export interface OffloadRouteHost {
@@ -140,6 +144,7 @@ export const DEFAULT_SETTINGS: OffloadSettings = {
   offloadProfiles: ["rust-public-1"],
   offloadMinExpectedSeconds: 120,
   offloadMonthlyVmHourCap: 0,
+  offloadEphemeralRepos: [],
 };
 
 const KNOWN_PROFILE_IDS = new Set(["rust-public-1", "node-public-1", "python-public-1"]);
@@ -157,6 +162,9 @@ export function normalizeOffloadSettings(raw: unknown): OffloadSettings {
     offloadProfiles: profiles,
     offloadMinExpectedSeconds: Number.isFinite(min) && min >= 0 ? min : DEFAULT_SETTINGS.offloadMinExpectedSeconds,
     offloadMonthlyVmHourCap: Number.isFinite(cap) && cap > 0 ? cap : DEFAULT_SETTINGS.offloadMonthlyVmHourCap,
+    offloadEphemeralRepos: Array.isArray(record.offloadEphemeralRepos)
+      ? record.offloadEphemeralRepos.filter((id): id is string => typeof id === "string" && id !== "")
+      : [],
   };
 }
 
@@ -237,7 +245,12 @@ export async function classifyCargoWorkspace(profile: ServerProfile, argv: strin
   const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
   let pin = await readToolchainPin(root);
   for (let depth = segments.length; depth > 0; depth--) {
-    const nested = await readToolchainPin(path.join(root, ...segments.slice(0, depth)));
+    // A symlinked run-directory prefix would lead the probe outside the
+    // workspace: unreadable, so the command stays local.
+    const dir = await probeDir(root, segments.slice(0, depth));
+    if (dir.kind === "unreadable") { pin = { kind: "unreadable", file: "rust-toolchain" }; break; }
+    if (dir.kind === "missing") continue;
+    const nested = await readToolchainPin(dir.dir);
     if (nested.kind !== "none") { pin = nested; break; }
   }
   const mismatch = toolchainPinMismatch(pin, profile.toolchains);
@@ -256,7 +269,7 @@ function authed(actor: RouteActor): string | null {
   return actor.runId;
 }
 
-function principalFor(companyId: string, runId: string, workspace: OffloadWorkspaceMeta, profile: ServerProfile): BrokerPrincipal {
+function principalFor(companyId: string, runId: string, workspace: OffloadWorkspaceMeta, profile: ServerProfile, executionWorkspaceId: string): BrokerPrincipal {
   return {
     companyId,
     runId,
@@ -265,6 +278,10 @@ function principalFor(companyId: string, runId: string, workspace: OffloadWorksp
     cardId: "",
     repoId: canonicalRepoId(workspace),
     profileId: profile.id,
+    // Host-resolved trust domain: one per execution workspace. The workspace
+    // was fetched and authorized by the host above, so a pool VM is only ever
+    // reused by the same workspace, never across cards or trust levels.
+    trustDomainId: `workspace:${executionWorkspaceId}`,
   };
 }
 
@@ -296,6 +313,13 @@ export async function handleExec(
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
   const request = validated.value;
+  if (!request.dryRun) {
+    // A lost workspace binding is not proof that this ID never started. Consult
+    // the journal before any unjournaled 503 below; an unknown ID still returns
+    // null here and journals nothing.
+    const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+    if (known) return known;
+  }
   const tool = request.tool ?? profileTool(profile);
   const runner = request.runner ?? defaultRunnerFor(tool);
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
@@ -309,9 +333,24 @@ export async function handleExec(
   }
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
-    return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: request.commandId }) };
+    if (!request.dryRun) {
+      // The lookup above is async and the early journal check has released
+      // the run serialization: this ID may have been accepted while the
+      // lookup was in flight. Re-consult the journal so the fallback-safe
+      // answer below never covers a started command.
+      const raced = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+      if (raced) return raced;
+    }
+    // Never-bound or unknown workspace: the run has no offload source, so the
+    // shim must fall back locally, never fail the build. Not journaled, so the
+    // same command ID submits cleanly once the workspace resolves. Other-agent
+    // runs keep the 403 in plugin.ts; this path carries no agent identity claim.
+    return {
+      status: 503,
+      body: offloadError("OFFLOAD_UNAVAILABLE", "unknown execution workspace; running local", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
+    };
   }
-  const principal = principalFor(input.companyId, runId, workspace, profile);
+  const principal = principalFor(input.companyId, runId, workspace, profile, request.executionWorkspaceId);
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
     // or journal effect. A remote candidate is not a capacity promise.

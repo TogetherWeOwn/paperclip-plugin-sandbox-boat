@@ -46,8 +46,9 @@ There are independent gates; none enables another automatically:
    rather than guessing how to translate host paths.
 
 Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
-payload (whole-run leases) or from host-owned run, issue and workspace records
-(local runs, below), never from the offload request body. Paperclip's
+payload (whole-run leases) or, for local runs, from run/issue records plus
+operator-configured source roots and the checkout's own on-disk identity
+(below), never from the offload request body. Paperclip's
 `server/src/services/environment-run-orchestrator.ts` supplies
 `workspace.metadata.workspaceRealizationRequest`, built by
 `server/src/services/workspace-realization.ts`: its `heartbeatRunId`,
@@ -59,25 +60,43 @@ Bindings survive worker restart and cannot authorize another run or company.
 **Local runs (agent stays on the Paperclip host).** Paperclip calls
 `environmentRealizeWorkspace` only for runs on a plugin sandbox lease, so a local
 run gets no realization payload. With `offloadLocalRunsEnabled: true` the plugin
-builds the same payload from host-owned data only:
+builds the same payload as follows:
 
 1. the `agent.run.started` domain event gives the run id and its issue id;
 2. `ctx.issues.get` gives the issue's `executionWorkspaceId`;
 3. `ctx.executionWorkspaces.get` gives that workspace's local `path`, repository
-   and project;
+   and project — or, when the live issue shape leaves the execution workspace
+   id null, `ctx.projects.getWorkspaceForIssue` gives the issue's project
+   workspace instead, whose id is what the shim reports;
 4. `offloadLocalApiKeySecretRef` (a Paperclip secret) gives the scoped boat key,
    resolved per binding and never stored; `offloadLocalEnvironmentId` and
    `offloadLocalDriverConfig` give the pool identity and settings.
 
-The agent and the offload request body supply nothing. The started event usually
+The workspace row in step 3 is **not** authority: an agent with runtime access
+can rewrite its `cwd`/`repoUrl`, so the row only nominates a candidate source.
+The bind stands only when operator-owned facts prove it: `realpath(path)` lies
+inside an `offloadLocalSourceRoots` entry (required — empty refuses every
+local-run bind; list the managed workspaces directory), and the checkout's own
+on-disk `remote.origin.url`, parsed from its git config without executing git,
+canonicalizes to the same repo id as the row's `repoUrl` — the payload then
+carries the canonical path and the on-disk URL. Both facts are re-checked on
+every executor resolve, so re-pointing the row, the path or the origin after
+the bind stops dispatch (commands fall back locally). The offload request body
+supplies nothing, and the secret in step 4 is resolved last, after every
+check: a bind retried from an offload request runs only for a run with no
+existing binding and only for the workspace that request named, so probing
+with random workspace ids never spends secret resolutions. The started event usually
 arrives before Paperclip prepares the run's workspace, so the bind is retried when
 that run's first offload request arrives. A binding never replaces a whole-run
 realization for the same run and workspace. `agent.run.finished`, `failed` and
 `cancelled` drop the executor binding and the persisted workspace record, and fence
-the run: a late or slow start handler cannot bind it again. A missing host fact (no
-execution workspace, no local path, no secret) leaves the run unbound, and its
-commands get 403 before dispatch. This adds three capabilities to the 0.2.2
-set: `events.subscribe`, `execution.workspaces.read` and `secrets.read-ref`; the
+the run: a late or slow start handler cannot bind it again. A missing or refused
+host fact (no execution workspace, no local path, no source root, an origin that
+does not match, no secret) leaves the run unbound, and its
+own commands fall back locally (503) before dispatch; other-agent runs keep the
+403. This adds five capabilities to the 0.2.2
+set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
+`projects.read` and `project.workspaces.read`; the
 upgrade needs board approval of that capability change.
 
 A custom host integration can still call
@@ -119,11 +138,22 @@ default VM:
    Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
    with stdio and exit status unchanged.
 3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
-   guest PATH is fixed and has no `RUSTUP_HOME`.
+   guest PATH is fixed to root-owned directories and has no `RUSTUP_HOME`.
+   Each command also runs with a fresh per-command `HOME`, and its
+   `CARGO_HOME`/`PYTHONUSERBASE` point at a per-VM cache under the offload
+   state root (never on `PATH`), so nothing under a guest home directory may
+   be part of the toolchain setup.
 4. Install `rsync` on the template VM. Delta push shells out to the worker
    host's `rsync` over the pinned SSH transport, and the guest side needs the
    `rsync` binary too; without either end the push fails and the command stays
-   local. The worker host needs `rsync` installed as well.
+   local. The worker host needs `rsync` installed as well. A guest-side
+   `rsync` that stalls (or is replaced by repo code that ran in the VM)
+   cannot wedge the push: it is bounded by a fixed timeout, and on expiry
+   the push fails, its ssh transport is killed with it, and the per-mirror
+   lock is released for the next command. If the failed push's guest
+   receiver cannot be proven dead, the next command's push fences that
+   mirror first (kill, wipe, full resync), so expect one slower full sync
+   after such a failure rather than a delta.
 5. Reboot, then run the preflight with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
    `true`.
@@ -133,9 +163,31 @@ default VM:
    and the command stays local. The pool identity does not include the
    snapshot, so VMs recorded before a template change stay owned. They are
    never reused: VM reuse is keyed on the template name, and an idle VM from the old
-   image is retired through the normal stop path. Adding `rsync` to an existing
+   image is retired through the normal stop path and then deleted at the
+   provider, so its disk does not outlive pool retirement. Adding `rsync` to an existing
    template therefore means saving under a NEW snapshot name and updating
    `templateSnapshot`, so pre-rsync VMs are retired instead of served.
+
+   On the free trial named snapshots are blocked, so stop the template VM
+   (archived, never deleted) and set the driver `templateSourceSandboxId` to
+   its sandbox id instead. Offload pool VMs then fork from it, with the same
+   refusal semantics: a missing source is a refused start and the command
+   stays local. VM reuse is keyed on the source id apart from snapshot and
+   stock keys, and `templateSnapshot` wins when both are set.
+
+   A cargo `--offline` command (or `--frozen`, which implies offline) cannot
+   download missing crates, so the guest primes its cargo cache with
+   `cargo fetch --locked` (plus the profile's validated `+toolchain` selector
+   when the invocation carries one) before the command's supervisor exists; a
+   failing fetch fails the prepare and the command runs locally instead. The
+   fetch never invokes registry credential providers: cargo merges
+   array-valued config, so a CLI override cannot clear an inherited
+   provider, and the guest instead refuses to prime at all when any config
+   cargo would load names one (the prepare then fails and the command runs
+   locally). It also runs in its own session so a hung fetch is group-killed
+   at its fence. A source tree whose
+   cargo config points at a private registry, a source replacement, or stored
+   credentials stays local too, because the guest fetch could not satisfy it.
 
 ## Smoke procedures
 
@@ -198,7 +250,7 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 * **Stop on release.** Billing stops at the stop ([docs](https://docs.boat.dev/snapshots/stop)). In our trial a resume within 10 minutes of a stop got the same machine back and did not count as a start.
 * **One lock per card.** Acquire, ResumeLease, release, destroy, capture and the sweep's stop, stop confirmation (including usage closure) and delete take the same per-card lock, so a new run never reads the VM as running while the previous run's release stops it, and the sweep never stops or deletes a VM that a run is taking: under the lock it reads boat, plugin state and its own activity again and leaves the VM alone if anything changed. A VM of ours with no record (an orphan, after plugin state was lost) has no known card, so acquire and ResumeLease also take a lock on the VM's name, which the sweep takes for an orphan. A new run, a resumed lease or a command that finds the VM still stopping (`archiving`) waits up to `stopConfirmTimeoutMs` for the save to end, then resumes it, or fails with `BOAT_STOP_PENDING` without starting anything.
 * **Auto-stop is a deadline, not idle detection.** It counts from the start or resume ([docs](https://docs.boat.dev/long-running-tasks/auto-stop)). The plugin sets it to `autoStopMinutes` (120, the trial maximum) as a safety net. It extends the deadline only while a command is running and less than half of it is left. An idle VM is never extended.
-* **Idle sweep, every 5 minutes.** It runs outside any host request (`src/proactive.ts`), because the host refuses plugin state in a scheduled job's company-less request and in a request that already ended. A VM with no active run is stopped after `idleStopMinutes` (5) idle. A VM whose lease is held but sent no command for `staleLeaseMinutes` (20) is stopped too. Before each of these stops the sweep removes the run MCP config, the same as release, opening an SSH session when this worker has none; a VM where that fails is deleted instead, unless a run still holds it (an active run, or a resumed lease's open run window), which keeps its disk. A scrub that found nothing left but could not search the whole disk stops the VM with its disk kept. A stopped VM is deleted when its card is done or cancelled, or after `deleteAfterDays` (7) untouched. The sweep only touches sandboxes named with our prefix. While a company's plugin state cannot be read, a VM with no record may be that company's (with an active lease), so the sweep neither stops nor deletes such a VM until the state can be read again; companies whose state it reads are swept as usual.
+* **Idle sweep, every 5 minutes.** It runs outside any host request (`src/proactive.ts`), because the host refuses plugin state in a scheduled job's company-less request and in a request that already ended. A VM with no active run is stopped after `idleStopMinutes` (5) idle. A VM whose lease is held but sent no command for `staleLeaseMinutes` (20) is stopped too. Before each of these stops the sweep removes the run MCP config, the same as release, opening an SSH session when this worker has none; a VM where that fails is deleted instead, unless a run still holds it (an active run, or a resumed lease's open run window), which keeps its disk. A scrub that found nothing left but could not search the whole disk stops the VM with its disk kept. A stopped VM is deleted when its card is done or cancelled, or after `deleteAfterDays` (7) untouched. The sweep only touches sandboxes named with our prefix. While a company's plugin state cannot be read, a VM with no record may be that company's (with an active lease), so the sweep neither stops nor deletes such a VM until the state can be read again; companies whose state it reads are swept as usual. The sweep is single-flight and bounded, so one stalled call cannot freeze it: every Boat API request times out (30 s; 180 s for create, resume, fork and snapshot saves, `src/boat-client.ts`), all offload upkeep inside the sweep (the pool sweep and every company's broker retention) runs concurrently under one shared 60 s budget before it is reported unverified and the VM pass runs anyway, each VM's locked stop or delete gets 5 minutes before the sweep leaves that VM and moves on to the next, and the sweep as a whole gives up after 10 minutes so the next scheduled sweep starts fresh. A timed-out list or stop is reported in the sweep's `errors`, never treated as "no VMs".
 * **Budget guard.** Before every create or resume, the plugin reads `GET /limits` once. It refuses the start, fast and with a clear error, when any of these is true:
   * `maxActive` (2) VMs already run;
   * `maxStartsPerDay` (70) starts happened in the last 24 hours;

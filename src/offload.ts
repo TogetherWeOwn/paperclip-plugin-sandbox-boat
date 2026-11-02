@@ -110,6 +110,11 @@ export interface OffloadExecutorConfig {
   offloadMonthlyVmHourCap?: number;
   /** Named boat snapshot new pool VMs boot from (driver `templateSnapshot`); null = stock image. */
   templateSnapshot?: string | null;
+  /** Archived sandbox id new pool VMs fork from (driver `templateSourceSandboxId`); used only when `templateSnapshot` is unset. */
+  templateSourceSandboxId?: string | null;
+  /** Canonical repo ids under the ephemeral policy: one VM per command, deleted
+   * after collect, never warmed, stopped-and-resumed, or reused. */
+  ephemeralRepos?: string[];
 }
 
 export interface OffloadTimers {
@@ -202,7 +207,8 @@ export class OffloadExecutor {
   private readonly timers: OffloadTimers;
   private readonly config: Required<Pick<OffloadExecutorConfig, "maxOffloadVms" | "offloadIdleStopSeconds">> &
     Required<Pick<OffloadExecutorConfig, "queueLimit" | "queueTimeoutMs" | "size" | "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">> &
-    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot">;
+    Pick<OffloadExecutorConfig, "offloadMonthlyVmHourCap" | "templateSnapshot" | "templateSourceSandboxId"> &
+    Required<Pick<OffloadExecutorConfig, "ephemeralRepos">>;
   private readonly runCommand: (...args: Parameters<OffloadDeps["runCommand"]>) =>
     Promise<CommandExit & { syncBack?: OffloadSyncBack }>;
   private readonly recordDuration?: OffloadDeps["recordDuration"];
@@ -236,6 +242,8 @@ export class OffloadExecutor {
       minComputeHoursLeft: deps.config.minComputeHoursLeft ?? DEFAULTS.minComputeHoursLeft,
       offloadMonthlyVmHourCap: deps.config.offloadMonthlyVmHourCap ?? 0,
       templateSnapshot: deps.config.templateSnapshot ?? null,
+      templateSourceSandboxId: deps.config.templateSourceSandboxId ?? null,
+      ephemeralRepos: [...(deps.config.ephemeralRepos ?? [])],
     };
     const hasDurableDeps = deps.guest || deps.journalStore || deps.guestReceipts || deps.resolveRunState || deps.sync;
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
@@ -343,6 +351,9 @@ export class OffloadExecutor {
     await this.recover();
     await this.withAdmission(async () => {
       for (const vm of [...this.pool]) {
+        // A pending ephemeral delete is quarantined against reuse, but sweep
+        // still owns retrying it: skipped, it would bill until provider TTL.
+        if (vm.deletePending && !vm.busy && vm.sandboxId) { await this.retryPendingDelete(vm); continue; }
         if (vm.busy || vm.quarantined || !vm.sandboxId) continue;
         if (vm.stopping) {
           if (await this.observeStop(vm)) await this.stopVm(vm, true);
@@ -466,6 +477,10 @@ export class OffloadExecutor {
       const tasks = this.queue.map((entry) => this.refuseQueued(entry, "executor shutdown"));
       for (const vm of [...this.pool]) {
         this.clearIdleTimer(vm);
+        if (vm.deletePending && !vm.busy && vm.sandboxId) {
+          if (!await this.retryPendingDelete(vm)) this.stopFailures.add(vm.sandboxId);
+          continue;
+        }
         if (vm.busy || vm.quarantined) continue;
         if (vm.stopping) {
           if (await this.observeStop(vm)) await this.stopVm(vm, true);
@@ -564,21 +579,56 @@ export class OffloadExecutor {
   }
 
   /**
-   * The runtime caches one executor per pool, and the template is not part of
-   * the pool identity, so later native bindings deliver the current selection
-   * here. It applies to later claims and creates; recorded VMs keep the key
-   * they were created with and are retired if it no longer matches.
+   * The runtime caches one executor per pool, and neither template selection
+   * is part of the pool identity, so later native bindings deliver the current
+   * selection here. It applies to later claims and creates; recorded VMs keep
+   * the key they were created with and are retired if it no longer matches.
    */
   setTemplateSnapshot(name: string | null): void {
     this.config.templateSnapshot = name;
   }
 
+  setTemplateSourceSandboxId(id: string | null): void {
+    this.config.templateSourceSandboxId = id;
+  }
+
+  /**
+   * Same live-update contract as the template setters: the ephemeral repo
+   * policy is a company setting, not pool identity, so later resolves deliver
+   * the current list here and it applies to later claims on this pool.
+   */
+  setEphemeralRepos(repos: readonly string[]): void {
+    this.config.ephemeralRepos = [...repos];
+  }
+
   private compatibilityKey(command: OffloadCommand): string {
     // A VM booted from another guest image is never reused; it is retired like
     // any incompatible idle VM. Without a template the key is unchanged, so VMs
-    // recorded before templates existed stay reusable.
-    const base = [command.companyId, command.repoId, command.profileId, command.trustDomainId ?? null];
-    return JSON.stringify(this.config.templateSnapshot ? [...base, this.config.templateSnapshot] : base);
+    // recorded before templates existed stay reusable. The snapshot key also
+    // keeps its original bare-string layout, so an upgrade with an unchanged
+    // snapshot reuses its recorded VMs. Only the fork key (new, nothing
+    // persisted) is a tagged pair, so a snapshot named to collide can never
+    // produce it.
+    // Fail closed on trust: without an explicit host-resolved trust domain a
+    // command is isolated to its own execution workspace, so a pool VM that ran
+    // one workspace's (possibly untrusted PR-branch) code is never reused warm
+    // or resumed by another workspace. Repeat commands from the same workspace
+    // still reuse. Legacy identity-only callers with no workspace keep null.
+    // Ephemeral repos additionally key on the command (a tagged pair, like the
+    // fork key), so they never claim a warm or stopped VM at all: one fresh VM
+    // per command.
+    const trust = command.trustDomainId
+      ?? (command.executionWorkspaceId ? `workspace:${command.executionWorkspaceId}` : null);
+    const base = [command.companyId, command.repoId, command.profileId, trust];
+    const key: unknown[] = this.config.templateSnapshot ? [...base, this.config.templateSnapshot]
+      : this.config.templateSourceSandboxId ? [...base, ["fork", this.config.templateSourceSandboxId]]
+      : [...base];
+    if (this.isEphemeral(command)) key.push(["ephemeral", command.commandId]);
+    return JSON.stringify(key);
+  }
+
+  private isEphemeral(command: OffloadCommand): boolean {
+    return this.config.ephemeralRepos.includes(command.repoId);
   }
 
   private workspaceKey(command: OffloadCommand): string | null {
@@ -661,13 +711,25 @@ export class OffloadExecutor {
       }
       try { await this.persistStopTelemetry(retiring); }
       catch { return { kind: "unavailable", reason: "stop accounting persistence pending" }; }
+      // A retired VM's disk holds synced source. Delete it at the provider
+      // before forgetting it; a failed delete keeps the VM tracked (stopped)
+      // so a later claim retries instead of orphaning the disk.
+      try {
+        await this.deleteAtProvider(retiring.sandboxId);
+      } catch {
+        await this.persistPool();
+        return { kind: "unavailable", reason: "incompatible pool retirement delete pending; reconciliation required" };
+      }
       this.retireVm(retiring);
       await this.persistPool();
       return this.accountClaim(command, null, "create");
     }
     // An uncertain slot has no live release event to queue behind. Refuse
     // rather than strand callers waiting for a nonexistent safe handoff.
-    if (!this.pool.some((vm) => compatible(vm) && vm.busy && !vm.quarantined)) {
+    // Any busy non-quarantined VM does have a release event: even when it is
+    // incompatible with this command (another workspace's trust domain), its
+    // release lets the queued claim retire it and create a fresh VM.
+    if (!this.pool.some((vm) => vm.busy && !vm.quarantined)) {
       return { kind: "unavailable", reason: "no compatible pool capacity; guest reconciliation required" };
     }
     return { kind: "blocked" };
@@ -768,12 +830,27 @@ export class OffloadExecutor {
       if (operation === "create") {
         // Same semantics as whole-run leases (vm-manager): a configured named
         // snapshot is the guest image; a missing one is a refused start, so the
-        // command stays local.
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
-          ...(this.config.templateSnapshot ? { from: this.config.templateSnapshot } : {}) });
-        const id = sandboxIdOf(response);
-        if (!id) throw new Error("create returned no sandbox id");
-        vm.sandboxId = id;
+        // command stays local. Named snapshots are blocked on the trial, so a
+        // configured archived sandbox is forked instead; a failing fork is a
+        // refused start the same way.
+        if (this.config.templateSnapshot) {
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+            from: this.config.templateSnapshot });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("create returned no sandbox id");
+          vm.sandboxId = id;
+        } else if (this.config.templateSourceSandboxId) {
+          const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+            ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("fork returned no sandbox id");
+          vm.sandboxId = id;
+        } else {
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true });
+          const id = sandboxIdOf(response);
+          if (!id) throw new Error("create returned no sandbox id");
+          vm.sandboxId = id;
+        }
       } else if (operation === "resume") {
         await this.boat.resume({ sandboxId: vm.sandboxId, ttlSeconds });
       } else {
@@ -836,7 +913,9 @@ export class OffloadExecutor {
       }).catch(() => {
         this.logger.error("boat offload usage persistence failed; account reservation retained");
       });
-      await this.releaseVm(vm);
+      // Sync-in may already have pushed source before the cancellation won.
+      if (this.isEphemeral(command)) await this.deleteVm(vm);
+      else await this.releaseVm(vm);
       return result;
     }
     let accountingFailed = false;
@@ -870,6 +949,10 @@ export class OffloadExecutor {
     });
     if (result.status === "unknown" || accountingFailed) {
       await this.quarantineVm(vm, command);
+    } else if (this.isEphemeral(command)) {
+      // Ephemeral policy: the VM held this repo's source for exactly one
+      // command. Delete it now that collect finished; never warm or resume it.
+      await this.deleteVm(vm);
     } else {
       await this.releaseVm(vm);
     }
@@ -939,9 +1022,61 @@ export class OffloadExecutor {
 
   private retireVm(vm: PoolVm): void {
     this.clearIdleTimer(vm);
+    // Retirement ends the VM's stop obligation; a leftover failure entry
+    // could never be retried and would poison every later shutdown.
+    this.stopFailures.delete(vm.sandboxId);
     vm.generation += 1;
     const at = this.pool.indexOf(vm);
     if (at >= 0) this.pool.splice(at, 1);
+  }
+
+  /** Delete at the provider; a 404 already proves the disk is gone. */
+  private async deleteAtProvider(sandboxId: string): Promise<void> {
+    try {
+      await this.boat.deleteSandbox({ sandboxId, xAsciiConfirmDelete: sandboxId });
+    } catch (error) {
+      if ((await describeBoatError(error)).status === 404) return;
+      throw error;
+    }
+  }
+
+  /** Provider-delete a finished ephemeral VM and close its account-ledger
+   * reservation: a deleted VM whose intent stays active would exhaust the
+   * account's active-VM admission for every later command. On any failure
+   * the VM stays tracked as quarantined with a pending delete, so its disk
+   * is never silently forgotten or reused and sweep/shutdown retry it. */
+  private async deleteVm(vm: PoolVm): Promise<void> {
+    await this.withAdmission(async () => {
+      vm.busy = false;
+      vm.workspaceKey = null;
+      vm.generation += 1;
+      this.clearIdleTimer(vm);
+      if (!await this.retryPendingDelete(vm)) {
+        // Halt billing while deletion is pending; the command already
+        // finished and collected, so stopping cannot kill live work. The
+        // pending-delete retry, not this stop, owns terminal accounting.
+        await this.boat.stop({ sandboxId: vm.sandboxId }).catch(() => undefined);
+      }
+      await this.persistPool();
+      if (!this.closed) await this.dispatchQueued();
+    });
+  }
+
+  /** Admission must be held. Retires the VM only after the provider delete
+   * (404 included) and the terminal ledger receipt both succeed; otherwise
+   * marks it quarantined + deletePending for a later sweep/shutdown retry. */
+  private async retryPendingDelete(vm: PoolVm): Promise<boolean> {
+    try {
+      await this.deleteAtProvider(vm.sandboxId);
+      await this.ledger.stopped(vm.sandboxId, this.now(), vm.accountReservation?.id);
+    } catch {
+      vm.quarantined = true;
+      vm.deletePending = true;
+      this.logger.error("boat offload ephemeral delete failed; VM quarantined with delete pending", { sandboxId: vm.sandboxId });
+      return false;
+    }
+    this.retireVm(vm);
+    return true;
   }
 
   private scheduleIdleStop(vm: PoolVm, generation: number, delayMs: number): void {

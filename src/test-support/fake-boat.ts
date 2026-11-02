@@ -212,7 +212,25 @@ export class FakeBoat {
 
   async fork(args: Record<string, unknown>) {
     this.record("fork", args);
-    throw new Error("fork is not used by this plugin");
+    this.need(args.sandboxId);
+    this.counter += 1;
+    const id = `bx_fake${String(this.counter).padStart(4, "0")}`;
+    const ttl = (args.ttlSeconds as number | null | undefined) ?? 3600;
+    const now = new Date(this.clock.now());
+    const sandbox = this.addSandbox({
+      id,
+      name: id,
+      state: "ready",
+      type: (args.type as string) ?? "default",
+      ttlSeconds: ttl,
+      archiveAfter: ttl == null ? null : new Date(this.clock.now() + ttl * 1000),
+      createdAt: now,
+      updatedAt: now,
+      noEnv: args.noEnv !== false,
+      monitoring: args.monitoring !== false,
+      from: null,
+    });
+    return { ok: true, type: "sandbox.forked", status: "ready", ttlSeconds: ttl, sandbox: this.view(sandbox) };
   }
 
   async deleteSandbox(args: Record<string, unknown>) {

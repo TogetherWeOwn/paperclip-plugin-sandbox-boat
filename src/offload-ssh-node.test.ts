@@ -26,7 +26,13 @@ function stubGuest() {
     runStream: vi.fn(async (_session: unknown, _cmd: string, opts: { stdin?: AsyncIterable<Uint8Array> }) => {
       const chunks: Buffer[] = [];
       for await (const chunk of opts.stdin ?? []) chunks.push(Buffer.from(chunk as Uint8Array));
-      seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      seen.push(input);
+      // The cache-priming fetch carries no supervisor program; only the
+      // prepare does. A nonzero exit here would fail the prepare.
+      if (!("program" in input)) {
+        return { exitCode: 0, timedOut: false, signal: null, stdout: JSON.stringify({ exitCode: 0 }) };
+      }
       return {
         exitCode: 0, timedOut: false, signal: null,
         stdout: JSON.stringify({ guestBootId: "boot-1", processGroupId: 1, cgroupPath: "/sys/fs/cgroup/x", journalGeneration: 1, heartbeatDeadline: 1, guestDeadline: 1 }),
@@ -73,13 +79,32 @@ describe("node/python guest prepare", () => {
   it("applies the server-owned rust-public-1 build env under the request env", async () => {
     const { guest, seen } = stubGuest();
     await guest.prepare("vm-1", command({ tool: "cargo", runner: "cargo", profileId: "rust-public-1",
-      argv: ["test", "--offline", "--locked"], env: { CARGO_TERM_COLOR: "never" } }));
-    expect((seen[0] as { env: Record<string, string> }).env).toEqual({
+      argv: ["test", "--locked"], env: { CARGO_TERM_COLOR: "never" } }));
+    const env = (seen[0] as { env: Record<string, string> }).env;
+    expect(env).toMatchObject({
       CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0", CARGO_TERM_COLOR: "never",
     });
-    // Node commands never pick up the cargo profile env.
+    // Plus the fresh per-command HOME and the per-VM CARGO_HOME, nothing else.
+    expect(env.HOME).toMatch(/^\/tmp\/paperclip-boat-home-[0-9a-f]{32}$/);
+    expect(env.CARGO_HOME).toMatch(/^\/tmp\/paperclip-boat-toolchain-[0-9a-f]{32}\/cargo$/);
+    expect(env.CARGO_HOME.startsWith(env.HOME)).toBe(false);
+    expect(Object.keys(env).sort()).toEqual(["CARGO_HOME", "CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG", "CARGO_TERM_COLOR", "HOME"]);
+    // Node commands never pick up the cargo profile env (only HOME/CARGO_HOME).
     await guest.prepare("vm-1", command());
-    expect((seen[1] as { env: Record<string, string> }).env).toEqual({});
+    expect(Object.keys((seen[1] as { env: Record<string, string> }).env).sort()).toEqual(["CARGO_HOME", "HOME"]);
+  });
+
+  it("primes the guest cache with a fixed fetch before an offline prepare", async () => {
+    const { guest, seen } = stubGuest();
+    await guest.prepare("vm-1", command({ tool: "cargo", runner: "cargo", profileId: "rust-public-1",
+      argv: ["test", "--offline"] }));
+    expect(seen[0]).toMatchObject({ executable: "cargo", cwd: "/tmp/work",
+      path: "/usr/local/bin:/usr/bin:/bin" });
+    expect(seen[0]).not.toHaveProperty("program");
+    expect(seen[1]).toMatchObject({ executable: "cargo", program: expect.any(String) });
+    // Priming fills the same per-VM CARGO_HOME the command then runs with.
+    const prepareEnv = (seen[1] as { env: Record<string, string> }).env;
+    expect((seen[0] as Record<string, unknown>).cargoHome).toBe(prepareEnv.CARGO_HOME);
   });
 
   it("runs a uv python command inside the checkout venv with only VIRTUAL_ENV set", async () => {
@@ -144,7 +169,7 @@ describe("node/python guest prepare", () => {
     const input = seen[0] as Record<string, unknown>;
     expect(input).toMatchObject({ executable: "/tmp/guest-checkout/.venv/bin/python",
       env: { VIRTUAL_ENV: "/tmp/guest-checkout/.venv" } });
-    expect(input.path as string).toBe("/tmp/guest-checkout/.venv/bin:/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin");
+    expect(input.path as string).toBe("/tmp/guest-checkout/.venv/bin:/usr/local/bin:/usr/bin:/bin");
   });
 
   it("leaves the guest PATH alone without a uv venv", async () => {
@@ -152,7 +177,7 @@ describe("node/python guest prepare", () => {
     await guest.prepare("vm-1", command({ tool: "python", runner: "pytest", profileId: "python-public-1",
       argv: ["tests/"] }));
     const input = seen[0] as Record<string, unknown>;
-    expect(input.env).toEqual({});
-    expect(input.path as string).toBe("/home/user/.cargo/bin:/usr/local/bin:/usr/bin:/bin");
+    expect(Object.keys(input.env as Record<string, string>).sort()).toEqual(["CARGO_HOME", "HOME", "PYTHONUSERBASE"]);
+    expect(input.path as string).toBe("/usr/local/bin:/usr/bin:/bin");
   });
 });

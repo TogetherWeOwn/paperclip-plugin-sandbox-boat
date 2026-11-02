@@ -11,7 +11,7 @@ import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import { offloadError } from "./offload/errors.js";
 import type { RouteActor } from "./offload/routes.js";
-import { localRunRealization, localRunSettings } from "./local-run-binding.js";
+import { fsCanonicalPath, localRunRealization, localRunSettings, readGitOriginUrl } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -38,16 +38,28 @@ function toRouteActor(actor: PluginApiRequestInput["actor"]): RouteActor {
   return { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId ?? null };
 }
 
-let bindLocalRun: ((companyId: string, runId: string, issueId: string) => Promise<boolean>) | null = null;
+let bindLocalRun: ((companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => Promise<boolean>) | null = null;
+/** In-flight request-triggered binds per company+run, so parallel requests share one attempt (and one secret resolution). */
+const pendingBinds = new Map<string, Promise<boolean>>();
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Retry the local-run bind once the run asks to offload: by then Paperclip has prepared its workspace. */
 async function bindOnFirstRequest(boat: BoatVmManager, input: PluginApiRequestInput): Promise<void> {
   const runId = input.actor.actorType === "agent" ? input.actor.runId : null;
   const workspaceId = (input.body as { executionWorkspaceId?: unknown } | null)?.executionWorkspaceId;
-  if (!runId || typeof workspaceId !== "string" || !bindLocalRun) return;
+  if (!runId || typeof workspaceId !== "string" || !UUID.test(workspaceId) || !bindLocalRun) return;
   const issueId = boat.localRunIssue(input.companyId, runId);
-  if (!issueId || boat.hasOffloadBinding(input.companyId, runId, workspaceId)) return;
-  await bindLocalRun(input.companyId, runId, issueId);
+  // A run that already holds any offload binding never re-binds from a request:
+  // probing with random workspace ids must not spend secret resolutions.
+  if (!issueId || boat.hasAnyOffloadBinding(input.companyId, runId)) return;
+  const pendingKey = JSON.stringify([input.companyId, runId]);
+  let pending = pendingBinds.get(pendingKey);
+  if (!pending) {
+    pending = bindLocalRun(input.companyId, runId, issueId, workspaceId)
+      .finally(() => { pendingBinds.delete(pendingKey); });
+    pendingBinds.set(pendingKey, pending);
+  }
+  await pending;
 }
 
 const plugin = definePlugin({
@@ -80,18 +92,31 @@ const plugin = definePlugin({
     // Local runs: bind heavy-command offload from host-owned run, issue and workspace data.
     // The started event usually precedes workspace preparation, so the bind is retried
     // when the run's first offload request arrives (onApiRequest below).
-    bindLocalRun = async (companyId: string, runId: string, issueId: string) => {
+    bindLocalRun = async (companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => {
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
       if (!settings.enabled) return false;
       const params = await localRunRealization({ companyId, payload: { runId, issueId } }, settings, {
         issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
+        // The live issue shape leaves executionWorkspaceId null; the shim then
+        // reports the project workspace id, so bind that host-owned workspace.
+        issueProjectWorkspace: async (id, company) => {
+          const workspace = await ctx.projects.getWorkspaceForIssue(id, company);
+          return workspace ? {
+            id: typeof workspace.id === "string" ? workspace.id : "",
+            projectId: typeof workspace.projectId === "string" ? workspace.projectId : "",
+            path: typeof workspace.path === "string" ? workspace.path : null,
+            repoUrl: typeof workspace.repoUrl === "string" ? workspace.repoUrl : null,
+          } : null;
+        },
         workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
+        canonicalPath: fsCanonicalPath,
+        onDiskRepoUrl: readGitOriginUrl,
         apiKey: async (secretRef, company) => await ctx.secrets.resolve(secretRef as never, { companyId: company, configPath: "offloadLocalApiKeySecretRef" }),
-      }).catch((error: unknown) => {
+      }, { expectedWorkspaceId }).catch((error: unknown) => {
         ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
         return null;
       });
-      // A failed state write leaves the run unbound and retryable; the route answers 403, never a 500.
+      // A failed state write leaves the run unbound and retryable; the route answers 503 (local fallback), never a 500.
       const bound = params ? await requireManager().rememberLocalRun(params).catch((error: unknown) => {
         ctx.logger.warn("boat: local-run offload binding not persisted", { error: error instanceof Error ? error.message : String(error) });
         return false;
@@ -186,6 +211,7 @@ const plugin = definePlugin({
     if (normalizedConfig.costApiKey == null) delete normalizedConfig.costApiKey;
     // Unset means the built-in allowlist; keep it unset so it follows the plugin.
     if (normalizedConfig.envAllowlist == null) delete normalizedConfig.envAllowlist;
+    if (normalizedConfig.modelProxyKeyFingerprint == null) delete normalizedConfig.modelProxyKeyFingerprint;
     return { ok: true, warnings, normalizedConfig };
   },
 

@@ -609,7 +609,7 @@ sys.exit(code if code >= 0 else 128 - code)
 export function wrapRemoteCommand(command: string, runId: string, managed = false): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
   const record = managed ? remoteRunRecord(runId) : "";
-  return `exec env ${unset} python3 -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
 }
 
 function remoteRunRecord(runId: string): string {
@@ -666,7 +666,29 @@ with open_run_record(filename) as record:
 /** Revoke admission or stop the registered group, without needing channel output. */
 export function cancelRemoteCommand(runId: string): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
-  return `exec env ${unset} python3 -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+}
+
+const RUN_FINALIZE_SCRIPT = String.raw`
+${RUN_REGISTRY_SCRIPT}
+import sys
+
+filename = sys.argv[1]
+with open_run_record(filename) as record:
+    # Shape-check our own record, then drop the registration. The payload
+    # leader has already been reaped by its supervisor (the caller only
+    # finalizes after a clean channel exit) and nothing is signalled, so a
+    # stale or recycled leader identity cannot matter here.
+    load_run_record(record)
+    os.unlink(filename)
+`;
+
+/** Deregister a cleanly finished run without signalling its group: work the
+ * payload deliberately detached (a helper it backgrounded with its stdio
+ * redirected) outlives the command, exactly as it did unsupervised. */
+export function finalizeRemoteCommand(runId: string): string {
+  const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_FINALIZE_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
 }
 
 function isMarkerLine(line: string, prefix: string): boolean {

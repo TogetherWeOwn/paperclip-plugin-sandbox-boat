@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
-import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { SshOffloadRuntime, hasCargoRegistryAuth } from "./offload-ssh-runtime.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -43,7 +45,7 @@ beforeEach(async () => {
     offloadAllowedRepos: ["repo:https://github.com/example/public"] };
   boat = new FakeBoat({ now: Date.now });
   const harness = createFakeContext();
-  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
     boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
     guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
   runtime.remember(native());
@@ -90,7 +92,7 @@ describe("stock concrete executor factory", () => {
     const bin = path.join(ssh.root, "stub-bin");
     await mkdir(bin);
     await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
-    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session,
+    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked,
       guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
     await plugin.definition.onEnvironmentRealizeWorkspace!(native());
@@ -118,6 +120,83 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), settings)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("re-validates a local-run binding's roots and on-disk origin on every resolve", async () => {
+    await mkdir(path.join(source, ".git"));
+    const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    await origin("https://github.com/example/public");
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    expect(await runtime.resolve(command(), rooted)).not.toBe(null);
+    await origin("https://github.com/example/private");
+    expect(await runtime.resolve(command(), rooted)).toBe(null);
+    await origin("https://github.com/example/public");
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("refuses a queued local-run upload when the origin flips or the roots drop after resolve", async () => {
+    await mkdir(path.join(source, ".git"));
+    const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    await origin("https://github.com/example/public");
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    const executor = (await runtime.resolve(command(), rooted))!;
+    expect(executor).not.toBe(null);
+    const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
+    const sync = [...pools.values()][0]!.sync;
+    // The command sat queued after resolve; the checkout's origin flips before
+    // its snapshot. The push must refuse before anything is uploaded.
+    await origin("https://github.com/example/private");
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    // Restoring the origin but dropping the configured roots (observed by the
+    // next resolve) refuses the still-queued push the same way.
+    await origin("https://github.com/example/public");
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    expect(boat.calls).toHaveLength(0);
+    // End to end: with roots restored, a post-resolve origin flip makes the
+    // admitted command end not_started (fallback-safe) with no guest output.
+    expect(await runtime.resolve(command(), rooted)).toBe(executor);
+    await origin("https://github.com/example/private");
+    const cmd = command();
+    await executor.start(cmd);
+    let view = await executor.readOutput(companyId, runId, cmd.commandId);
+    await expect.poll(async () => {
+      view = await executor.readOutput(companyId, runId, cmd.commandId);
+      return view.state;
+    }, { timeout: 15_000 }).toBe("not_started");
+    expect(view.events).toHaveLength(0);
+  }, 20_000);
+  it("scopes queued-upload roots per company: another company's config neither cancels nor resurrects a queued push", async () => {
+    await mkdir(path.join(source, ".git"));
+    await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    const executor = (await runtime.resolve(command(), rooted))!;
+    expect(executor).not.toBe(null);
+    const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
+    const sync = [...pools.values()][0]!.sync;
+    const otherCompanyId = "cccccccc-cccc-4ccc-cccc-cccccccccccc";
+    // Config is per-company: company B resolving with empty roots (it has no
+    // binding, so resolve returns null) must not cancel company A's queued push.
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).resolves.toBeUndefined();
+    // Symmetrically, once A drops its own roots, B resolving with roots that
+    // cover the source must not resurrect A's queued push.
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, rooted)).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    expect(boat.calls).toHaveLength(0);
+  }, 20_000);
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
       expect(await runtime.resolve(command(), { ...config, [setting]: value })).toBe(null);
@@ -128,6 +207,55 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: [] })).toBe(null);
     expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: ["repo:another"] })).toBe(null);
     expect(boat.calls).toHaveLength(0);
+  });
+  // Real-git admission (no trackedFiles seam): the default listing gates resolve().
+  function realGitRuntime(): SshOffloadRuntime {
+    const harness = createFakeContext();
+    const rt = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
+    rt.remember(native());
+    return rt;
+  }
+  function gitIn(dir: string, ...args: string[]): void {
+    execFileSync("git", ["-C", dir, ...args], { stdio: "pipe" });
+  }
+  it("keeps a non-git source local: resolve returns null and no VM is spent", async () => {
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps a workspace with a tracked fake AWS key local", async () => {
+    gitIn(source, "init", "-q", ".");
+    await writeFile(path.join(source, "config.rs"), 'const K: &str = "AKIAIOSFODNN7EXAMPLE";\n');
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "config.rs");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("admits a clean git work tree with only tracked files syncable", async () => {
+    gitIn(source, "init", "-q", ".");
+    await writeFile(path.join(source, ".dev.vars"), "CF_API_TOKEN=untracked\n");
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).not.toBe(null);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps cargo local when a tracked secret-bearing file would be withheld from sync", async () => {
+    gitIn(source, "init", "-q", ".");
+    await mkdir(path.join(source, "tests/fixtures"), { recursive: true });
+    await writeFile(path.join(source, "tests/fixtures/ca.pem"), "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/ca.pem");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
   });
   it("binds only native company/run/workspace metadata and rejects path-bearing cargo escapes", async () => {
     expect(await runtime.resolve({ ...command(), runId: "another-run" }, config)).toBe(null);
@@ -216,6 +344,8 @@ describe("stock concrete executor factory", () => {
     expect(boat.calls).toHaveLength(0);
     await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
     expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config)).not.toBe(null);
+    expect(await runtime.resolve({ ...command(), cwdRelative: "./crates/foo" }, config)).not.toBe(null);
+    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo/." }, config)).not.toBe(null);
   });
   it("keeps a node command in a separately locked sub-project local", async () => {
     await writeFile(path.join(source, "package-lock.json"), "{}");
@@ -290,5 +420,146 @@ describe("templateSnapshot pool wiring", () => {
     expect(a.config.templateSnapshot).toBe("tmpl-a");
     expect(a.poolId).toBe(legacyPoolId());
     expect(boat.calls).toHaveLength(0);
+  });
+  it("forwards the configured fork source to a cached executor and keeps the pool identity", async () => {
+    const params = native();
+    params.config = { ...params.config, templateSourceSandboxId: "bx_archived-fork" };
+    runtime.remember(params);
+    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string;
+      config: { templateSnapshot: string | null; templateSourceSandboxId: string | null } };
+    expect(a.config.templateSnapshot).toBe(null);
+    expect(a.config.templateSourceSandboxId).toBe("bx_archived-fork");
+    expect(a.poolId).toBe(legacyPoolId());
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("pushes a changed or cleared fork source to the reused executor", async () => {
+    const view = async () => (await runtime.resolve(command(), config))! as unknown as
+      { poolId: string; config: { templateSourceSandboxId: string | null } };
+    const first = native();
+    first.config = { ...first.config, templateSourceSandboxId: "bx_archived-a" };
+    runtime.remember(first);
+    const a = await view();
+    expect(a.config.templateSourceSandboxId).toBe("bx_archived-a");
+    // A later binding with a different source updates the cached executor
+    // instead of leaving it forking from the stale sandbox.
+    const second = native();
+    second.config = { ...second.config, templateSourceSandboxId: "bx_archived-b" };
+    runtime.remember(second);
+    const b = await view();
+    expect(b).toBe(a);
+    expect(b.poolId).toBe(legacyPoolId());
+    expect(b.config.templateSourceSandboxId).toBe("bx_archived-b");
+    // Clearing the setting pushes null to the same executor.
+    runtime.remember(native());
+    expect((await view()).config.templateSourceSandboxId).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("offline cargo registry guard", () => {
+  const offline = (): BackendCommand => ({ ...command(), argv: ["test", "--offline"] });
+  it("resolves an offline command with a clean source", async () => {
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("keeps an offline command local when the source pins a private registry", async () => {
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    await mkdir(path.join(source, ".cargo"), { recursive: true });
+    await writeFile(path.join(source, ".cargo/config.toml"), '[source.crates-io]\nreplace-with = "private"\n');
+    expect(await runtime.resolve(offline(), config)).toBe(null);
+    // A non-offline command is unaffected: no guest fetch would run.
+    expect(await runtime.resolve(command(), config)).not.toBe(null);
+    expect(boat.calls).toHaveLength(0);
+    await rm(path.join(source, ".cargo"), { recursive: true, force: true });
+    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+  });
+  it("keeps an offline command local when a nested checkout overrides the registry", async () => {
+    await mkdir(path.join(source, "crates/foo/.cargo"), { recursive: true });
+    await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
+    await writeFile(path.join(source, "crates/foo/.cargo/config"), '[registries.private]\nindex = "https://example.com"\n');
+    expect(await runtime.resolve({ ...offline(), cwdRelative: "crates/foo" }, config)).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+});
+
+describe("hasCargoRegistryAuth", () => {
+  const clean = '[source.crates-io]\nregistry = "https://github.com/rust-lang/crates.io-index"\n';
+  async function configAt(relative: string, text: string) {
+    const dir = path.join(source, relative, ".cargo");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "config.toml"), text);
+  }
+  afterEach(async () => {
+    await rm(path.join(source, "scan"), { recursive: true, force: true });
+  });
+  it("passes a missing or clean config", async () => {
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(false);
+    await configAt("scan", clean);
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(false);
+  });
+  it.each([
+    ["registry table", '[registries.private]\nindex = "sparse+https://example.com/"\n'],
+    ["source replacement", '[source.crates-io]\nreplace-with = "vendored"\n'],
+    ["credential provider", '[credential-provider.cargo]\nargs = ["login"]\n'],
+    ["stored token", '[registry]\ntoken = "secret"\n'],
+  ])("flags %s", async (_name, text) => {
+    await configAt("scan", text);
+    expect(await hasCargoRegistryAuth(path.join(source, "scan"), ".")).toBe(true);
+  });
+  it("discovers the command directory upward but not sideways", async () => {
+    await configAt("scan", clean);
+    await configAt("scan/crates/foo", clean);
+    await mkdir(path.join(source, "scan/crates/bar"), { recursive: true });
+    await configAt("scan/other", '[registries.private]\nindex = "sparse+https://example.com/"\n');
+    const root = path.join(source, "scan");
+    expect(await hasCargoRegistryAuth(root, "crates/foo")).toBe(false);
+    expect(await hasCargoRegistryAuth(root, "crates/bar")).toBe(false);
+    await configAt("scan", '[registries.private]\nindex = "sparse+https://example.com/"\n');
+    expect(await hasCargoRegistryAuth(root, "crates/bar")).toBe(true);
+  });
+  it("fails closed on symlinked and over-limit configs", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(path.join(dir, ".cargo"), { recursive: true });
+    await writeFile(path.join(dir, "real.toml"), clean);
+    await symlink(path.join(dir, "real.toml"), path.join(dir, ".cargo/config.toml"));
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
+    await rm(path.join(dir, ".cargo/config.toml"), { force: true });
+    await writeFile(path.join(dir, ".cargo/config.toml"), `x = "${"y".repeat(70 * 1024)}"\n`);
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
+  });
+  it("fails closed on escaping and absolute command directories", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(dir, { recursive: true });
+    for (const cwd of ["..", "../other", "..\\other", "/etc", "/"]) {
+      expect(await hasCargoRegistryAuth(dir, cwd)).toBe(true);
+    }
+  });
+  it("fails closed on a symlinked ancestor directory", async () => {
+    const dir = path.join(source, "scan");
+    await mkdir(path.join(dir, "real/sub"), { recursive: true });
+    await symlink(path.join(dir, "real"), path.join(dir, "link"));
+    // The link itself is never descended through, even when it resolves inside
+    // the source root; the nested path below it cannot be attested either.
+    expect(await hasCargoRegistryAuth(dir, "link")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, "link/sub")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, "real/sub")).toBe(false);
+  });
+  it("fails closed on a symlinked .cargo directory", async () => {
+    const dir = path.join(source, "scan");
+    const outside = path.join(source, "outside");
+    await mkdir(path.join(dir, "sub"), { recursive: true });
+    await mkdir(outside, { recursive: true });
+    // A clean config behind the link must not clear the scan: O_NOFOLLOW only
+    // guards the final component, so the .cargo link itself is the escape.
+    await writeFile(path.join(outside, "config.toml"), "[build]\njobs = 4\n");
+    await symlink(outside, path.join(dir, ".cargo"));
+    expect(await hasCargoRegistryAuth(dir, "sub")).toBe(true);
+    expect(await hasCargoRegistryAuth(dir, ".")).toBe(true);
+  });
+  it("fails closed when nesting exhausts the walk budget", async () => {
+    const dir = path.join(source, "scan");
+    const deep = Array.from({ length: 40 }, (_, i) => `d${i}`).join("/");
+    await mkdir(path.join(dir, deep), { recursive: true });
+    expect(await hasCargoRegistryAuth(dir, deep)).toBe(true);
   });
 });

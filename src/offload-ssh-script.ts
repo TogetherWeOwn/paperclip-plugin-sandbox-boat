@@ -2,7 +2,7 @@
 // The detached supervisor/watchdog stays OUTSIDE the command cgroup. State and
 // output are private, bounded and ephemeral (/tmp, never a Boat snapshot).
 export const OFFLOAD_SSH_SCRIPT = String.raw`
-import base64, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
+import base64, contextlib, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
 
 MAX_OUTPUT = 1048576
 BOOT = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -147,6 +147,16 @@ def prepare(data):
         raise
 
 
+def scrub_cargo_config(cargo_home):
+    # The per-VM CARGO_HOME cache outlives the fresh per-command HOME, but its
+    # config is executable state: a rustc wrapper, alias or credential
+    # provider planted by one command would otherwise run for the next.
+    # Keep the registry and git caches; drop config before cargo reads it.
+    for name in ('config.toml', 'config'):
+        with contextlib.suppress(FileNotFoundError):
+            (pathlib.Path(cargo_home) / name).unlink()
+
+
 def supervise(root):
     request = load(root)['request']
     group = pathlib.Path(request['cgroupPath'])
@@ -156,6 +166,21 @@ def supervise(root):
     def join():
         (group / 'cgroup.procs').write_text(str(os.getpid()))
     environment = {'PATH': request['path'], 'HOME': os.environ.get('HOME', '/tmp'), **request['env']}
+    # The host assigns a fresh per-command HOME so nothing one command plants
+    # in its home persists to the next, plus per-VM toolchain cache dirs
+    # (CARGO_HOME, PYTHONUSERBASE) outside HOME so warm caches survive across
+    # commands without reaching PATH. Create exactly those directories, and
+    # only under the state root.
+    home = environment.get('HOME', '')
+    state_root = str(request.get('stateRoot') or '/tmp').rstrip('/')
+    if home.startswith(state_root + '/paperclip-boat-home-'):
+        os.makedirs(home, mode=0o700, exist_ok=True)
+    for cache_var in ('CARGO_HOME', 'PYTHONUSERBASE'):
+        cache_dir = environment.get(cache_var, '')
+        if cache_dir.startswith(state_root + '/paperclip-boat-toolchain-'):
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            if cache_var == 'CARGO_HOME':
+                scrub_cargo_config(cache_dir)
     child = subprocess.Popen([sys.executable, '-I', '-c', gate, str(read_gate), request['executable'], *request['args']],
         cwd=canonical(request['cwd']), env=environment, pass_fds=(read_gate,), start_new_session=True,
         preexec_fn=join, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -294,6 +319,88 @@ def rpc(action, data):
         finally:
             if probe.exists():
                 probe.rmdir()
+    if action == 'fetch':
+        # Prime the cargo cache from the lockfile before the command's
+        # supervisor exists. Fixed argv only; the host admits this action for
+        # cargo --offline commands alone. A nonzero exit fails the prepare, so
+        # the command falls back locally instead of failing remotely.
+        fetch_argv = [data['executable']]
+        toolchain = data.get('toolchain')
+        if toolchain is not None:
+            # The host sends only its validated leading +toolchain selector,
+            # but still refuse anything but a bare rustup toolchain name here so
+            # a compromised host path cannot turn cache priming into argv injection.
+            if (not isinstance(toolchain, str) or len(toolchain) < 2
+                    or not toolchain.startswith('+') or '/' in toolchain
+                    or '\\' in toolchain or '\0' in toolchain
+                    or any(char.isspace() or char in ';&|$(){}[]<>' + chr(96) for char in toolchain)):
+                raise ValueError('invalid toolchain selector')
+            fetch_argv.append(toolchain)
+        # Registry credentials stay out of priming entirely: the CLI --config
+        # override outranks every config file, so no credential-provider
+        # program can run during fetch even if a config defining one reached
+        # the guest. Sources needing one stay local host-side anyway.
+        fetch_argv += ['fetch', '--locked', '--config',
+            'registry.global-credential-providers=[]']
+        environment = {'PATH': data['path'], 'HOME': os.environ.get('HOME', '/tmp')}
+        # Prime into the same per-VM CARGO_HOME the command will run with;
+        # accept only an absolute path (the host derives it, never the agent).
+        requested_cargo_home = data.get('cargoHome')
+        if requested_cargo_home is not None:
+            if (not isinstance(requested_cargo_home, str)
+                    or not requested_cargo_home.startswith('/')
+                    or '\0' in requested_cargo_home):
+                raise ValueError('invalid cargo home')
+            environment['CARGO_HOME'] = requested_cargo_home
+            os.makedirs(requested_cargo_home, mode=0o700, exist_ok=True)
+        fetch_cwd = canonical(data['cwd'])
+        # The override above is not sufficient on its own: cargo merges
+        # array-valued config, so an inherited provider stays in the
+        # effective list (verified against cargo's config resolution), and
+        # per-registry providers are a separate key. A provider is a program
+        # cargo would run before the command cgroup exists, so refuse to
+        # prime when any config cargo would load names one; the nonzero exit
+        # fails the prepare and the command runs locally. Host-side such
+        # sources already stay local; this covers guest-only config such as
+        # a template HOME. Fetch never runs on refusal.
+        config_files = []
+        cursor = pathlib.Path(fetch_cwd)
+        for _ in range(64):
+            config_files += [cursor / '.cargo' / 'config.toml', cursor / '.cargo' / 'config']
+            if cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        cargo_home = pathlib.Path(environment.get('CARGO_HOME')
+            or pathlib.Path(environment['HOME']) / '.cargo')
+        config_files += [cargo_home / 'config.toml', cargo_home / 'config']
+        for config_file in config_files:
+            try:
+                blob = config_file.read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return {'exitCode': 1}
+            if len(blob) > 1048576 or b'credential-provider' in blob.lower():
+                return {'exitCode': 1}
+        # The scan above only refuses credential providers; the host-assigned
+        # CARGO_HOME is a cache we own, so drop its remaining executable
+        # config (wrappers, aliases, source replacement) before priming —
+        # and before the command that follows can inherit it.
+        if requested_cargo_home is not None:
+            scrub_cargo_config(requested_cargo_home)
+        # No command cgroup exists yet, so containment is the process group:
+        # run fetch in its own session and kill the whole group at the fence,
+        # so a hung child cannot outlive the prepare.
+        child = subprocess.Popen(fetch_argv,
+            cwd=fetch_cwd, env=environment, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            return {'exitCode': child.wait(timeout=540)}
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            raise
     if action == 'prepare':
         return prepare(data)
     root = pathlib.Path(canonical(data['root']))

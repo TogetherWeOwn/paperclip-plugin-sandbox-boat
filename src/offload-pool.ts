@@ -12,6 +12,9 @@ export interface PoolVm {
   stopped: boolean;
   stopping: boolean;
   quarantined: boolean;
+  // Ephemeral VM whose provider delete (or its ledger receipt) failed:
+  // quarantined against reuse, retried by sweep and shutdown until retired.
+  deletePending?: boolean;
   lastActiveAt: number;
   generation: number;
   idleHandle: unknown | null;
@@ -53,6 +56,7 @@ export class OffloadPoolStore {
       if (!vm || typeof vm.sandboxId !== "string" || (vm.sandboxId !== "" && ids.has(vm.sandboxId))
         || (vm.sandboxId === "" && !vm.accountReservation?.id)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
+        || (vm.deletePending !== undefined && typeof vm.deletePending !== "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0

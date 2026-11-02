@@ -12,13 +12,7 @@ Writing this procedure installed nothing. Run it only after the owner has:
 
 rbx1 runs Paperclip as a native npm install, not the container. The server runs from `~/.paperclip/cli/current`, a link to `~/.paperclip/cli/installs/npm/<version>`. `paperclipai update` installs the new version next to the old one, then renames `current` in one step. It keeps the two previous installs and deletes older ones. `paperclipai update --rollback` flips `current` back.
 
-So the plugin must reach the host SDK through `current`:
-
-```
-~/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk
-```
-
-A link to `installs/npm/<version>/...` would keep the old SDK after an upgrade, and break when that install is pruned. `stage-package.sh` and `stage-release.sh` refuse such a path. Node resolves the link each time the worker starts, so after a Paperclip upgrade and restart the worker loads the new SDK with no restaging.
+Since 0.2.6 the plugin package carries its own pinned `@paperclipai/plugin-sdk` copy under its `node_modules`, so nothing in it points into the host's install at all: the `cli/current` ↔ `cli/installs/` distinction no longer applies to the plugin. (Before 0.2.6 the package symlinked the SDK to a host path, the release tarball baked in the container's `/app/packages/plugins/sdk`, and every install on this host needed that link re-pointed by hand.) A Paperclip upgrade now leaves the staged package untouched; the worker keeps the SDK it was built and contract-tested against until a new plugin release pins a newer one.
 
 `PAPERCLIP_HOME` is `/home/ubuntu/.paperclip`. Paperclip agent runs get a different `HOME`. Run the steps below as `ubuntu` in a normal login shell, not from an agent run.
 
@@ -53,22 +47,22 @@ src/scripts/stage-release.sh "$PWD"/sandbox-boat-X.Y.Z-*.tgz /home/ubuntu/.paper
 # prints /home/ubuntu/.paperclip/plugin-packages/sandbox-boat-X.Y.Z-<sha>
 ```
 
-`stage-release.sh` checks the `.sha256`, checks that the tarball holds only the one package directory and its one SDK link, and checks `package.json` and `.source-commit` against the file name. It then points the SDK link at the path above, makes the package read-only, and moves it in under its own name. With no third argument it uses `$PAPERCLIP_HOME/cli/current/...`.
+`stage-release.sh` checks the `.sha256`, checks that the tarball holds only the one package directory, plain files and directories only (no links), with the bundled plugin-sdk inside it, and checks `package.json` and `.source-commit` against the file name. It makes the package read-only and moves it in under its own name, exactly as shipped. There is no SDK link to point anywhere.
 
-To build from source instead, give the SDK path as the third argument. `stage-package.sh` needs `origin/main`, which the shallow tag clone above lacks, so build from a full clone. The subshell keeps your shell in the temp dir for the later `src/scripts/...` steps:
+To build from source instead: `stage-package.sh` needs `origin/main`, which the shallow tag clone above lacks, so build from a full clone. The subshell keeps your shell in the temp dir for the later `src/scripts/...` steps:
 
 ```sh
 (git clone -q https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat build && cd build \
-  && scripts/stage-package.sh <commit on main> /home/ubuntu/.paperclip/plugin-packages \
-       /home/ubuntu/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk)
+  && scripts/stage-package.sh <commit on main> /home/ubuntu/.paperclip/plugin-packages)
 ```
 
 Check it before installing. Do not go on unless the last line prints `ready`:
 
 ```sh
 PKG=/home/ubuntu/.paperclip/plugin-packages/sandbox-boat-X.Y.Z-<sha>
-readlink "$PKG/node_modules/@paperclipai/plugin-sdk"   # the cli/current path
-cat "$PKG/.source-commit"                              # the tagged commit
+ls -ld "$PKG/node_modules/@paperclipai/plugin-sdk"   # a real directory, not a link
+find "$PKG" -type l                                  # prints nothing
+cat "$PKG/.source-commit"                            # the tagged commit
 test -f "$PKG/bin/boat-offload-cargo" && test -f "$PKG/dist/offload/shim-main.js" \
   && echo ready || echo 'STOP: this package has no Cargo shim'
 ```
@@ -94,6 +88,7 @@ The board approves these capabilities:
 | `jobs.schedule` | the idle sweep every 5 minutes |
 | `api.routes.register` | `/usage`, `/sweep` (board) and the `offload_*` routes (agent) |
 | `issues.read` | seeing whether a card is done, and the run's issue workspace |
+| `projects.read`, `project.workspaces.read` | the run's project workspace when the live issue shape has no execution workspace |
 | `events.subscribe` | `agent.run.started/finished/failed/cancelled` for local-run binding |
 | `execution.workspaces.read` | the local path and repository of the run's workspace |
 | `secrets.read-ref` | resolving `BOAT_CI_API_KEY` for each binding, never stored |
@@ -127,7 +122,8 @@ curl -fsS -X POST "$PAPERCLIP/api/plugins/$PLUGIN_ID/config" \
   "offloadLocalApiKeySecretRef": {"type": "secret_ref", "secretId": "$SECRET_ID"},
   "offloadLocalDriverConfig": {
     "size": "default",
-    "templateSnapshot": "<named snapshot from the guest template>",
+    "templateSnapshot": "<named snapshot from the guest template; set exactly one of the two template fields>",
+    "templateSourceSandboxId": "<archived template sandbox id; on the trial, set only this field and omit templateSnapshot>",
     "maxOffloadVms": 2,
     "offloadIdleStopSeconds": 15
   },
@@ -196,13 +192,13 @@ If the server's `PATH` changes later, or rustup moves, update the project `PATH`
 
 ## 7. After a Paperclip upgrade
 
-Nothing to restage: the SDK link goes through `current`. After the restart:
+Nothing to restage: the package bundles its pinned SDK, so the upgrade does not change what the worker loads. After the restart:
 
 * check that the plugin's `health` is ready;
 * run *Probe* on the pool environment;
 * run the dry-run check from step 6.
 
-The plugin's contract tests (`src/host-contract.test.ts`) pin one Paperclip version. Before enabling offload on a new Paperclip version, run them against that version's SDK.
+The plugin's contract tests (`src/host-contract.test.ts`) pin one Paperclip version, and the bundled SDK is that version. Before enabling offload on a new Paperclip version, run them against that version's SDK; if the pin has to move, that is a new plugin release, staged and installed like any other.
 
 To change the plugin version, stage the new release next to the old one. The host's upgrade route re-reads the path it recorded, so it cannot move the plugin to a new directory. Moving to a new directory is a reinstall. Plan it on its own card, then re-run `install-offload-shims.sh` with the new package. Delete the old package directory only after nothing uses it: `chmod -R u+w <dir> && rm -rf <dir>`.
 

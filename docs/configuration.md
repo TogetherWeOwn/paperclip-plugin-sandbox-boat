@@ -10,7 +10,8 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `size` | `small` | Fallback when this task class has no measurements. Existing explicitly configured sizes remain the fallback (set `default` for heavy builds); measured data takes precedence. |
 | `taskClass` | `default` | Class to look up in `sizeCostTable`. Acquire can override with `executionWorkspaceSettings.boatTaskClass`. |
 | `sizeCostTable` | `{}` | Completed-job measurements by class and size; cheapest computed cost wins. Refresh weekly as in [Operations](operations.md#weekly-refresh-from-the-pilot-cost-log). |
-| `templateSnapshot` | none | A named snapshot to create new card VMs from. |
+| `templateSnapshot` | none | A named snapshot to create new card VMs from. Wins over `templateSourceSandboxId` when both are set. |
+| `templateSourceSandboxId` | none | An archived sandbox id whose image new pool VMs fork from when `templateSnapshot` is unset (named snapshots are blocked on the trial). Blank: create from the base environment. |
 | `autoStopMinutes` | 120 | The trial allows at most 120. |
 | `idleStopMinutes` | 5 | |
 | `staleLeaseMinutes` | 20 | |
@@ -21,6 +22,8 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `tunnelRemotePort` | 8317 | |
 | `tunnelTargetHost` | `127.0.0.1` | **Inside the Paperclip container, set this to `cliproxy`**: the container's 127.0.0.1 is not the CLIProxy. |
 | `tunnelTargetPort` | 8317 | |
+| `modelProxyKeyFingerprint` | none | SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. `ANTHROPIC_AUTH_TOKEN` reaches the VM only when it is that key, spent through the tunnel; any other value (a managed AI-connection pool credential included) is dropped. Unset: an on-tunnel token is delivered unverified (validation warns), an off-tunnel one dropped either way. See [Run env allowlist](security.md#run-env-allowlist) rule 4. |
+| `managedGithub` | false | Deliver Paperclip's managed-GitHub capability and its `git`/`gh` launcher shells, so the agent can push. Off by default: any VM process can exchange the capability for a GitHub credential with the run's grants while the run is live. Leave off for public repos and PR branches. |
 | `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](security.md#run-env-allowlist). A list you set replaces the built-in one; an empty list (`[]`) sends nothing. |
 | `noEnv` | true | |
 | `monitoring` | true | Explicit opt-out: `false` for **new** VMs. Existing VMs keep their creation policy. Never changes an account-wide switch; see [monitoring privacy](security.md#monitoring-retention-and-privacy). |
@@ -29,6 +32,9 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
+| `syncOutMaxBytes` | 8589934592 (8 GiB) | Host safety: refuse a guest sync-out archive whose files total more than this. Hard bound 32 GiB. See [Sync-out receiver budgets](security.md#sync-out-receiver-budgets). |
+| `syncOutMaxFiles` | 200000 | Host safety: refuse a guest sync-out archive with more entries (files, directories, symlinks) than this. Hard bound 1000000. |
+| `syncOutDiskReserveBytes` | 10737418240 (10 GiB) | Host safety: refuse a sync-out member that would leave less than this free on the target filesystem (the receiver also always keeps 5% of the filesystem and 8192 inodes free). |
 | `maxOffloadVms` | 4 | Offload pool: at most this many shared VMs for heavy commands. Beyond it, commands queue. |
 | `offloadIdleStopSeconds` | 15 | Offload pool: stop a VM this many seconds after its last command ends. |
 | `allowPaidNamedSnapshots` | false | Allow template capture beyond boat's 10 free named snapshots ($1.70 a month each). |
@@ -46,12 +52,14 @@ Heavy-command offload is configured per company in the plugin config, not on the
 | `offloadExecutorEnabled` | false | Opt in to command-level offload through a lifecycle executor. Does not enable the Cargo shim or change whole-run leases. |
 | `offloadGuestTransportEnabled` | false | Enable the stock Linux SSH guest transport for explicitly approved public, secret-free workspaces. Requires `offloadExecutorEnabled`, native realization metadata and verified delegated cgroup v2. |
 | `offloadAllowedRepos` | `[]` | Exact canonical repository IDs approved for offload (`repo:https://github.com/example/public`). Empty denies every repository. |
+| `offloadEphemeralRepos` | `[]` | Exact canonical repository IDs under the ephemeral VM policy: one freshly created VM per command, deleted at the provider after collect, never warmed or resumed. Must also be in `offloadAllowedRepos`. |
 | `offloadCgroupParent` | none | Delegated cgroup v2 parent on the guest, below `/sys/fs/cgroup/`. See [Delegated guest template](operations.md#delegated-guest-template-required-for-remote-offload). |
 | `offloadArtifactRoot` | none | Operator-owned persistent host directory for frozen snapshots and staged returns. Required for stock offload. |
 | `offloadProfiles` | `["rust-public-1"]` | Server profiles admitted for remote dispatch. Add `node-public-1` and/or `python-public-1`; see [Node and Python offload](offload.md#node-and-python-offload-binboat-offload-node-binboat-offload-python). |
 | `offloadMinExpectedSeconds` | 120 | Node/Python commands go remote only when their recorded median meets this. Rust is not gated. |
 | `offloadMonthlyVmHourCap` | 0 (off) | Monthly cap on tracked offload VM-hours; see [Offload VM-hour cap](operations.md#offload-vm-hour-cap). |
-| `offloadLocalRunsEnabled` | false | Bind otherwise-local runs for offload; see [local runs](operations.md#enabling-the-executor-bridge). |
+| `offloadLocalRunsEnabled` | false | Bind otherwise-local runs for offload; see [local runs](operations.md#enabling-the-executor-bridge). The workspace row only nominates a source: roots and on-disk origin decide. |
+| `offloadLocalSourceRoots` | `[]` | Operator-owned absolute host directories a local-run source must live under (for example the managed workspaces directory). Required with `offloadLocalRunsEnabled`: empty refuses every local-run bind. |
 | `offloadLocalEnvironmentId` | none | Boat environment whose pool settings local-run offload uses. Required with `offloadLocalRunsEnabled`. |
 | `offloadLocalApiKeySecretRef` | none | Paperclip secret holding the scoped boat key for local-run offload. Resolved per binding, never stored. |
 | `offloadLocalDriverConfig` | `{}` | Driver settings for local-run offload pools (`maxOffloadVms`, `maxActive`, `offloadIdleStopSeconds`, `size`). `apiKey` is ignored here. |
