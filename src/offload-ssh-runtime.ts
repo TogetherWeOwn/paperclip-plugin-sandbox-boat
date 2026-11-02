@@ -1,8 +1,9 @@
 // Stock-worker integration. Authorization originates in native realization
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
-import { createHash } from "node:crypto";
+import { createHash, scrypt } from "node:crypto";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { promisify } from "node:util";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
@@ -23,11 +24,62 @@ import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offl
 import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
+import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
+
+/**
+ * Removes boat's `export ASCII_TOKEN=...` line from the guest's ~/.bashrc once
+ * per offload session, matching whole-run setup/resume. Best-effort: this
+ * only stops casual use (the guest is root and can restore the line), so a
+ * failure never fails the session.
+ */
+export async function scrubOffloadGuestBashrc(ssh: SshManager, session: SshSession): Promise<void> {
+  await ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+}
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number;
   /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
-  localRun: boolean };
+  localRun: boolean;
+  /** Memoized KDF digest of the bind-time credential (memory only). A binding's
+   * credential never changes mid-run, so the digest is computed once. */
+  credentialDigest?: Promise<string> };
+
+const scryptAsync = promisify(scrypt) as (
+  password: string,
+  salt: string,
+  keylen: number,
+  options: { N: number; r: number; p: number },
+) => Promise<Buffer>;
+
+/**
+ * Pool-identity version 1 scrypt parameters. The digest is baked into
+ * persisted poolIds, so these values are part of pool identity forever:
+ * changing any of them silently re-keys every pool and orphans its journals
+ * and VMs into retirement. Do not change without a pool migration. They are
+ * pinned explicitly rather than relying on Node's defaults, which could
+ * change in a future Node release (they currently equal those defaults).
+ */
+const POOL_CREDENTIAL_SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 } as const;
+
+/**
+ * The credential part of pool identity. The digest is persisted (inside the
+ * poolId) but the key never is, so derive it with a password KDF rather than
+ * a fast hash: a leaked pool journal then gives no cheap offline test for
+ * guessed API keys. That protection covers the pool journal only — the
+ * whole-run path still derives a persisted scope from the same key with a
+ * fast hash (see `VmManager.account`), so this is not a system-wide
+ * guarantee for every persisted derivation of the key. The salt binds the
+ * digest to this purpose and endpoint.
+ */
+async function poolCredentialDigest(config: BoatDriverConfig): Promise<string> {
+  const derived = await scryptAsync(
+    resolveApiKey(config),
+    `boat-offload-pool\u0000${config.apiBase}`,
+    32,
+    POOL_CREDENTIAL_SCRYPT_PARAMS,
+  );
+  return derived.toString("hex");
+}
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -297,6 +349,11 @@ const poolRegistryScope = (companyId: string) =>
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
   private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
+  /** Credential-free pool identity (the poolId fields minus the credential
+   * digest) to the live poolId, so a rotated or re-pointed API key presented
+   * by a new binding retires the pool bound to the old credential instead of
+   * silently reusing it. */
+  private readonly poolByBaseIdentity = new Map<string, string>();
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
   private registryTail: Promise<unknown> = Promise.resolve();
@@ -421,9 +478,40 @@ export class SshOffloadRuntime {
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
-    const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
-      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]))
+    // The credential digest is part of pool identity: persisted executor state
+    // stays credential-free (a KDF digest is not the key), and a rotated or
+    // re-pointed key must not keep operating pools, journals or VMs under the
+    // old account. A binding's config — credential included — is captured at
+    // bind time, so rotation takes effect when a new binding presents the new
+    // key (the next run or realization, or the first bind after a worker
+    // restart), never by switching a live binding's credential mid-run. That
+    // resolve retires the old credential's pool below instead of reusing it.
+    binding.credentialDigest ??= poolCredentialDigest(binding.config)
+      .catch((error: unknown) => { binding.credentialDigest = undefined; throw error; });
+    const credentialDigest = await binding.credentialDigest;
+    // The KDF await reopens the window the closing check above closed:
+    // shutdown may have taken its pool snapshot while the digest was pending.
+    // Re-fence here (and after every later await) so no executor can be
+    // registered after that snapshot; from the last check to pools.set the
+    // path is synchronous, so shutdown cannot interleave.
+    if (this.closing) return null;
+    const baseIdentity = JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
+      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]);
+    const poolId = createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest]))
       .digest("hex").slice(0, 24);
+    const supersededPoolId = this.poolByBaseIdentity.get(baseIdentity);
+    if (supersededPoolId && supersededPoolId !== poolId) {
+      this.poolByBaseIdentity.delete(baseIdentity);
+      const superseded = this.pools.get(supersededPoolId);
+      if (superseded) {
+        // Retire under the old credential while it may still work: sweep
+        // stops its idle VMs. The pool stays loaded and registered, so its
+        // journal is retained and ages out through collectRetiredPool; no
+        // new resolve can reach it because its poolId embeds the old digest.
+        await superseded.executor.sweep().catch(() => undefined);
+        if (this.closing) return null;
+      }
+    }
     // Neither template selection is deliberately part of the pool identity:
     // changing it must keep ownership of VMs already recorded under this pool
     // so they are retired through the normal stop path. The executor keys VM
@@ -431,12 +519,14 @@ export class SshOffloadRuntime {
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
+      if (this.closing) return null;
       existing = this.pools.get(poolId);
     }
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
       existing.executor.setTemplateSourceSandboxId(binding.config.templateSourceSandboxId ?? null);
       existing.executor.setEphemeralRepos(normalizeOffloadSettings(settings).offloadEphemeralRepos);
+      existing.executor.setMonitoring(binding.config.monitoring);
       return existing.executor;
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
@@ -449,6 +539,9 @@ export class SshOffloadRuntime {
       const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
       const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
         connectTimeoutSec: binding.config.sshConnectTimeoutSec });
+      // Once per opened session (sessions are cached; a refresh after resume
+      // re-opens and re-scrubs), before any dependency install runs guest code.
+      await scrubOffloadGuestBashrc(this.deps.ssh, opened);
       sessions.set(sandboxId, opened);
       return opened;
     });
@@ -492,7 +585,7 @@ export class SshOffloadRuntime {
     const executor = new OffloadExecutor({ boat: api, state: this.deps.state, accountId: this.deps.accountId, poolId,
       logger: this.deps.logger, now: Date.now,
       config: { maxOffloadVms: binding.config.maxOffloadVms, offloadIdleStopSeconds: binding.config.offloadIdleStopSeconds,
-        size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
+        size: binding.config.size, monitoring: binding.config.monitoring, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
         offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
         ephemeralRepos: normalizeOffloadSettings(settings).offloadEphemeralRepos,
@@ -524,6 +617,7 @@ export class SshOffloadRuntime {
         discard: (vm, cmd) => sync.discard(vm, cmd) },
     });
     this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
+    this.poolByBaseIdentity.set(baseIdentity, poolId);
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
     // lost write is retried by every sweep while the pool is loaded.
     void this.updateRegistry(command.companyId, (registry) => {

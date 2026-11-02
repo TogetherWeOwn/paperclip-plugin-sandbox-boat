@@ -394,6 +394,66 @@ describe("offload executor", () => {
   });
 });
 
+describe("offload monitoring opt-out", () => {
+  function executorFor(setup: ReturnType<typeof testSetup>, monitoring?: boolean) {
+    return new OffloadExecutor({
+      ...setup.account,
+      boat: setup.fake as unknown as BoatApiLike,
+      logger: setup.logger,
+      now: setup.now,
+      timers: { set: setup.set, clear: setup.clear },
+      config: { maxOffloadVms: 4, offloadIdleStopSeconds: 15, ...(monitoring === undefined ? {} : { monitoring }) },
+      runCommand: async () => ({ exitCode: 0, seconds: 1 }),
+    });
+  }
+
+  it("sends monitoring:false when opted out, and true by default", async () => {
+    const optedOut = testSetup();
+    const off = executorFor(optedOut, false);
+    expect((await off.execute(cmd({ commandId: "mon-off-1" }))).status).toBe("completed");
+    expect(optedOut.fake.callsOf("create")).toHaveLength(1);
+    expect(optedOut.fake.callsOf("create")[0]!.args).toMatchObject({ monitoring: false });
+    await off.shutdown();
+
+    const dflt = testSetup();
+    const on = executorFor(dflt);
+    expect((await on.execute(cmd({ commandId: "mon-default-1" }))).status).toBe("completed");
+    expect(dflt.fake.callsOf("create")[0]!.args).toMatchObject({ monitoring: true });
+    await on.shutdown();
+  });
+
+  it("never reuses a VM created under the other monitoring policy", async () => {
+    const setup = testSetup();
+    const executor = executorFor(setup, true);
+    const first = await executor.execute(cmd({ commandId: "mon-reuse-1" }));
+    expect(first.status).toBe("completed");
+    if (first.status !== "completed") throw new Error("expected completed");
+    // Same policy still reuses the warm VM.
+    const second = await executor.execute(cmd({ commandId: "mon-reuse-2" }));
+    if (second.status !== "completed") throw new Error("expected completed");
+    expect(second.sandboxId).toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(1);
+
+    // Flipping the policy (as a later resolve does) must not claim the
+    // monitored VM: it keeps its creation policy, so a new VM is created
+    // unmonitored instead.
+    executor.setMonitoring(false);
+    const third = await executor.execute(cmd({ commandId: "mon-reuse-3" }));
+    if (third.status !== "completed") throw new Error("expected completed");
+    expect(third.sandboxId).not.toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(2);
+    expect(setup.fake.callsOf("create")[1]!.args).toMatchObject({ monitoring: false });
+
+    // And flipping back must not claim the unmonitored VM either.
+    executor.setMonitoring(true);
+    const fourth = await executor.execute(cmd({ commandId: "mon-reuse-4" }));
+    if (fourth.status !== "completed") throw new Error("expected completed");
+    expect(fourth.sandboxId).toBe(first.sandboxId);
+    expect(setup.fake.callsOf("create")).toHaveLength(2);
+    await executor.shutdown();
+  });
+});
+
 describe("offload driver config", () => {
   it("defaults to a 4-VM pool with a 15 s idle stop", async () => {
     const { parseDriverConfig } = await import("./config.js");
