@@ -200,7 +200,7 @@ describe("operator ssh config is never applied (loopback sshd)", () => {
         return { privateKeyPath: keyPath, publicKey: (await readFile(`${keyPath}.pub`, "utf8")).trim() };
       }
     }
-    const manager = new LocalKeyManager({ info() {}, warn() {} });
+    const manager = new LocalKeyManager({ info() {}, warn() {} }, undefined, { runRecordDir: fixture.root });
     try {
       const session = await manager.openSession({
         sandboxId: "loopback-only",

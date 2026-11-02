@@ -144,11 +144,19 @@ export class SshManager {
 
   private readonly pause: (ms: number) => Promise<void>;
 
+  // Guest-side directory for the run-cancellation records. Production keeps
+  // the default (guest /tmp); test harnesses that execute the "remote"
+  // scripts on this host pin it inside their own temp root so tombstones
+  // from cancelled-before-admission runs cannot leak into host /tmp.
+  private readonly runRecordDir?: string;
+
   constructor(
     private readonly logger: SshLogger,
     pause?: (ms: number) => Promise<void>,
+    opts?: { runRecordDir?: string },
   ) {
     this.pause = pause ?? sleep;
+    this.runRecordDir = opts?.runRecordDir;
   }
 
   /**
@@ -403,7 +411,7 @@ export class SshManager {
     const runId = randomUUID().replace(/-/g, "");
     let result: SshExecutionResult | undefined;
     try {
-      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true)), options);
+      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true, this.runRecordDir)), options);
       return { ...result, stderr: stripRunMarker(result.stderr, runId) };
     } finally {
       // Local pipe/cap errors throw, while timeouts return a result. Both must
@@ -418,8 +426,8 @@ export class SshManager {
       // itself exits 255 therefore also loses its background helpers.)
       const cleanExit = result !== undefined && !result.timedOut && result.signal === null && result.exitCode !== 255;
       const cleanupCommand = cleanExit && !cancelGroupOnCleanExit
-        ? finalizeRemoteCommand(runId)
-        : cancelRemoteCommand(runId);
+        ? finalizeRemoteCommand(runId, this.runRecordDir)
+        : cancelRemoteCommand(runId, this.runRecordDir);
       try {
         const cleanup = await runStreamProcess("ssh", slave(cleanupCommand), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
         if (cleanup.timedOut || cleanup.exitCode !== 0) {

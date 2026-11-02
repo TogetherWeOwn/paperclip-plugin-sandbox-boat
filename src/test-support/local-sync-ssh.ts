@@ -61,7 +61,10 @@ export class LocalSyncSsh extends SshManager {
   remoteEnv: Record<string, string> = {};
 
   constructor(readonly root: string, private readonly actualSpawn: typeof spawn) {
-    super({ info() {}, warn() {} });
+    // The "remote" commands really execute here, so pin the guest-side run
+    // records in this root (removed by the owning test's cleanup) instead
+    // of leaking admission tombstones into host /tmp.
+    super({ info() {}, warn() {} }, undefined, { runRecordDir: root });
   }
 
   get archiveInjected(): string { return path.join(this.root, "archive-injected"); }

@@ -606,15 +606,26 @@ sys.exit(code if code >= 0 else 128 - code)
  * payload exec; the stderr marker is diagnostic only, never cancellation authority.
  * Their caller must finalize the record on every outcome (see SshManager).
  */
-export function wrapRemoteCommand(command: string, runId: string, managed = false): string {
+export function wrapRemoteCommand(command: string, runId: string, managed = false, recordDir?: string): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
-  const record = managed ? remoteRunRecord(runId) : "";
+  const record = managed ? remoteRunRecord(runId, recordDir) : "";
   return `exec env ${unset} python3 -I -c ${shellQuote(RUN_SUPERVISOR_SCRIPT)} ${shellQuote(`PCSYNC:${runId}:`)} ${shellQuote(command)} ${shellQuote(record)}`;
 }
 
-function remoteRunRecord(runId: string): string {
+// The record directory defaults to the guest's /tmp. It is a parameter only
+// so tests that execute these scripts against the host filesystem can pin
+// the records inside a per-test directory instead of leaking them in /tmp.
+// It must stay a plain absolute path: the value is handed to the guest
+// verbatim, and ../ or shell-significant spellings would become guest
+// filesystem effects nobody intended.
+const RUN_RECORD_DIR_PATTERN = /^\/[A-Za-z0-9_+\-./]*$/;
+
+function remoteRunRecord(runId: string, dir = "/tmp"): string {
   if (!/^[a-f0-9]{32}$/.test(runId)) throw new Error("Invalid remote cancellation identity.");
-  return `/tmp/paperclip-boat-run-${runId}`;
+  if (!RUN_RECORD_DIR_PATTERN.test(dir) || dir.split("/").some((part) => part === ".." || part === ".")) {
+    throw new Error("Invalid remote run record directory.");
+  }
+  return `${dir.replace(/\/+$/, "")}/paperclip-boat-run-${runId}`;
 }
 
 const RUN_CANCEL_SCRIPT = String.raw`
@@ -664,9 +675,9 @@ with open_run_record(filename) as record:
 `;
 
 /** Revoke admission or stop the registered group, without needing channel output. */
-export function cancelRemoteCommand(runId: string): string {
+export function cancelRemoteCommand(runId: string, recordDir?: string): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
-  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_CANCEL_SCRIPT)} ${shellQuote(remoteRunRecord(runId, recordDir))}`;
 }
 
 const RUN_FINALIZE_SCRIPT = String.raw`
@@ -686,9 +697,9 @@ with open_run_record(filename) as record:
 /** Deregister a cleanly finished run without signalling its group: work the
  * payload deliberately detached (a helper it backgrounded with its stdio
  * redirected) outlives the command, exactly as it did unsupervised. */
-export function finalizeRemoteCommand(runId: string): string {
+export function finalizeRemoteCommand(runId: string, recordDir?: string): string {
   const unset = BOAT_VM_CREDENTIAL_VARS.map((name) => `-u ${name}`).join(" ");
-  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_FINALIZE_SCRIPT)} ${shellQuote(remoteRunRecord(runId))}`;
+  return `exec env ${unset} python3 -I -c ${shellQuote(RUN_FINALIZE_SCRIPT)} ${shellQuote(remoteRunRecord(runId, recordDir))}`;
 }
 
 function isMarkerLine(line: string, prefix: string): boolean {
