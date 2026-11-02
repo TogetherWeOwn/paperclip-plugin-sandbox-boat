@@ -170,3 +170,95 @@ describe("deleteCardVmOnRelease", () => {
     expect(fake.boxes.has(lease.providerLeaseId!)).toBe(false);
   });
 });
+
+async function resume(lease: { providerLeaseId: string | null; metadata?: Record<string, unknown> }, config: Record<string, unknown> = {}) {
+  return await plugin.definition.onEnvironmentResumeLease!({
+    ...base(config),
+    issueId: ISSUE,
+    providerLeaseId: lease.providerLeaseId!,
+    leaseMetadata: lease.metadata,
+  } as never);
+}
+
+describe("review round: fail-safe reuse", () => {
+  it("does not stop a VM a resumed lease still holds: a policy change creates a fresh VM", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: false });
+    await release(first, { noEnv: false });
+    const resumed = await resume(first, { noEnv: false });
+    expect(resumed.metadata).toMatchObject({ resumedLease: true });
+    const stopsBefore = fake.callsOf("stop").length;
+    const second = await acquire("run-2", "agent-a", { noEnv: true });
+    expect(second.providerLeaseId).not.toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "create" });
+    expect(fake.callsOf("stop")).toHaveLength(stopsBefore);
+    expect(fake.boxes.get(first.providerLeaseId!)!.state).toBe("ready");
+  });
+
+  it("creates a fresh VM when the policy needs credentials a noEnv resume stripped", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    await release(first, { noEnv: true });
+    const second = await acquire("run-2", "agent-a", { noEnv: false, boatEnvironment: "proj-env" });
+    expect(second.providerLeaseId).not.toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "create" });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+    expect(fake.boxes.get(second.providerLeaseId!)).toMatchObject({ environment: "proj-env", holdsCreatorLogins: true });
+  });
+
+  it("fails a mid-lease reconnect closed when the stopped disk was stripped and the policy needs credentials", async () => {
+    const lease = await acquire("run-1", "agent-a", { noEnv: true });
+    await currentManager().shutdown();
+    fake.boxes.get(lease.providerLeaseId!)!.state = "archived";
+    // execute() reports a refused reconnect as a result, not a throw.
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_VM_GONE" } });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+  });
+
+  it("deletes instead of stopping when the conflict scrub cannot verify the disk", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    await release(first, { noEnv: true });
+    const box = fake.boxes.get(first.providerLeaseId!)!;
+    Object.assign(box, { state: "ready", noEnv: false, environment: "base", holdsCreatorLogins: true });
+    ssh.handler = (remote) => remote.includes("paperclip-boat-scrub") ? { code: 1, stdout: "" } : undefined;
+    const second = await acquire("run-2", "agent-a", { noEnv: true });
+    expect(second.providerLeaseId).not.toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "create" });
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(1);
+    expect(fake.boxes.has(first.providerLeaseId!)).toBe(false);
+  });
+
+  it("keeps the card disk on an unverified scan, resuming it under the policy", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    await release(first, { noEnv: true });
+    const box = fake.boxes.get(first.providerLeaseId!)!;
+    Object.assign(box, { state: "ready", noEnv: false, environment: "base", holdsCreatorLogins: true });
+    ssh.handler = (remote) =>
+      remote.includes("paperclip-boat-scrub") ? { code: 3, stdout: "paperclip-boat-scrub found=0 left=0 walk=incomplete\n" } : undefined;
+    const second = await acquire("run-2", "agent-a", { noEnv: true });
+    expect(second.providerLeaseId).toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+    expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(harness.logs.some((entry) => entry.level === "error" && entry.message.includes("keeping its disk"))).toBe(true);
+  });
+
+  it("treats an unreported login surface as a conflict under noEnv", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    await release(first, { noEnv: true });
+    const box = fake.boxes.get(first.providerLeaseId!)!;
+    Object.assign(box, { state: "ready", holdsCreatorLogins: null });
+    const stopsBefore = fake.callsOf("stop").length;
+    const second = await acquire("run-2", "agent-a", { noEnv: true });
+    expect(second.providerLeaseId).toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+    expect(fake.callsOf("stop").length).toBeGreaterThan(stopsBefore);
+    expect(fake.callsOf("resume")[0].args.noEnv).toBe(true);
+  });
+
+  it("refuses a cached session when the env policy changed mid-lease", async () => {
+    const lease = await acquire("run-1", "agent-a", { noEnv: false });
+    expect((await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never)).exitCode).toBe(0);
+    // execute() reports a refused reconnect as a result, not a throw.
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_POLICY_CONFLICT" } });
+  });
+});

@@ -239,10 +239,28 @@ export function resolveVmKey(params: {
  * choose for this lease.
  */
 function envPolicyConflict(config: BoatDriverConfig, sandbox: SandboxView): string | null {
-  if (config.noEnv && sandbox.holdsCreatorLogins === true) return "it still holds its creator's logins while noEnv is on";
+  // An unreported login surface (null: boat omitted the field) is a conflict
+  // too: a running VM with unverified credentials must never serve a noEnv run.
+  if (config.noEnv && sandbox.holdsCreatorLogins !== false) return "it may still hold its creator's logins while noEnv is on";
   if (config.noEnv && sandbox.environment != null) return `it is attached to boat environment "${sandbox.environment}" while noEnv is on`;
   if (config.boatEnvironment && sandbox.environment != null && sandbox.environment !== config.boatEnvironment) {
     return `it is attached to boat environment "${sandbox.environment}", not the configured "${config.boatEnvironment}"`;
+  }
+  return null;
+}
+
+/**
+ * Why a stopped VM cannot be resumed under the configured env policy. Boat's
+ * noEnv resume is one-way: the restored snapshot is scrubbed of the owner
+ * secrets and later resumes stay noEnv, so a stripped disk (no creator
+ * logins) resumed when the policy needs credentials again would run without
+ * them. Only positive evidence (holdsCreatorLogins === false) refuses the
+ * resume; an unreported field still resumes, or no VM would ever be reused.
+ */
+function resumeCannotRestorePolicy(config: BoatDriverConfig, sandbox: SandboxView): string | null {
+  const needsCreds = !config.noEnv || config.boatEnvironment != null;
+  if (needsCreds && sandbox.holdsCreatorLogins === false) {
+    return "it was stripped by an earlier noEnv resume and boat does not restore creator logins, so resuming it cannot provide the configured credentials";
   }
   return null;
 }
@@ -327,6 +345,8 @@ export class BoatVmManager {
   private readonly envDropsLogged = new Map<string, Set<string>>();
   /** Per VM, workspace roots already written to its state record (saves a state write per realize). */
   private readonly knownRoots = new Map<string, Set<string>>();
+  /** Per VM, the env policy its live SSH session was last validated for. A cached hit under the same policy skips the revalidation GET. */
+  private readonly sessionPolicy = new Map<string, { noEnv: boolean; environment: string | null }>();
   private lastSweepAt = 0;
   private sweeping: { scope: string | null; report: Promise<TaggedSweepReport> } | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
@@ -1158,7 +1178,7 @@ export class BoatVmManager {
     companyId: string;
     sandboxId: string;
     runId: string | null;
-    trigger: "release" | "stop lease" | "sweep" | "failed start";
+    trigger: "release" | "stop lease" | "sweep" | "failed start" | "env policy";
     reason: string;
   }): Promise<boolean> {
     const meta = { sandboxId: input.sandboxId, trigger: input.trigger, reason: input.reason };
@@ -1203,7 +1223,7 @@ export class BoatVmManager {
    * agent can edit it) may keep the run JWT there. The owner accepted that
    * residual risk.
    */
-  private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep" | "failed start"; keep: KeptDiskReason; reason: string }): void {
+  private logKeptDisk(input: { sandboxId: string; trigger: "release" | "stop lease" | "sweep" | "failed start" | "env policy"; keep: KeptDiskReason; reason: string }): void {
     const why = {
       stop_lease: "Paperclip's StopLease must keep the disk",
       stop_and_retain: "Paperclip asked to keep the disk (stop_and_retain)",
@@ -1381,15 +1401,18 @@ export class BoatVmManager {
         const conflict = envPolicyConflict(config, sandbox);
         if (conflict) {
           const recorded = existing && existing.sandboxId === sandbox.id ? existing : null;
+          // A resumed lease's open run window never joins activeRunIds, so it
+          // counts here too: stopping under it would pull the VM away mid-run.
           const othersActive = recorded ? recorded.activeRunIds.filter((id) => id !== params.runId).length : 0;
-          if (recorded && othersActive === 0) {
+          const othersSessionsOpen = recorded ? recorded.sessions.filter((entry) => !entry.endedAt && entry.runId !== params.runId).length : 0;
+          if (recorded && othersActive === 0 && othersSessionsOpen === 0) {
             this.logger.warn("boat: the card's running VM conflicts with the env policy; stopping it so the resume re-asserts the policy", {
               vmKey: key,
               runId: params.runId,
               sandboxId: sandbox.id,
               conflict,
             });
-            await this.scrubRuntimeSecrets({
+            const scrub = await this.scrubRuntimeSecrets({
               api,
               config,
               sandboxId: sandbox.id,
@@ -1398,21 +1421,35 @@ export class BoatVmManager {
               connect: true,
             });
             await this.ssh.closeSession(sandbox.id).catch(() => undefined);
-            const stopped = await this.stopAndConfirm(config, sandbox.id, config.stopConfirmTimeoutMs);
-            if (!stopped) {
-              await this.store
-                .update(params.companyId, (state) => {
-                  const record = findBySandboxId(state, sandbox!.id);
-                  if (record) record.status = "stopping";
-                })
-                .catch(() => undefined);
-              throw new BoatProviderError(
-                "BOAT_ENV_POLICY_CONFLICT",
-                `the card's running VM ${sandbox.id} conflicts with the env policy (${conflict}) and boat did not confirm its stop, so it cannot be resumed under the policy. Nothing was handed out; the sweep retries the stop.`,
-              );
+            // The stop snapshot keeps the disk for 14 days, so an unverified
+            // scrub follows the release policy: a failed scrub deletes the VM
+            // (a delete failure still falls through to the stop), while an
+            // incomplete scan keeps the card's disk and resumes it.
+            if (scrubUnverified(scrub)) {
+              const reason = unverifiedScrubReason(scrub);
+              if (scrub.status === "incomplete") {
+                this.logKeptDisk({ sandboxId: sandbox.id, trigger: "env policy", keep: "incomplete_scan", reason });
+              } else if (await this.deleteInsteadOfStop({ api, config, companyId: params.companyId, sandboxId: sandbox.id, runId: params.runId, trigger: "env policy", reason })) {
+                sandbox = null;
+              }
             }
-            sandbox = await this.getSandbox(api, sandbox.id);
-            if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
+            if (sandbox) {
+              const stopped = await this.stopAndConfirm(config, sandbox.id, config.stopConfirmTimeoutMs);
+              if (!stopped) {
+                await this.store
+                  .update(params.companyId, (state) => {
+                    const record = findBySandboxId(state, sandbox!.id);
+                    if (record) record.status = "stopping";
+                  })
+                  .catch(() => undefined);
+                throw new BoatProviderError(
+                  "BOAT_ENV_POLICY_CONFLICT",
+                  `the card's running VM ${sandbox.id} conflicts with the env policy (${conflict}) and boat did not confirm its stop, so it cannot be resumed under the policy. Nothing was handed out; the sweep retries the stop.`,
+                );
+              }
+              sandbox = await this.getSandbox(api, sandbox.id);
+              if (sandbox && (sandbox.dataExpiredAt || sandbox.state === "cancelled")) sandbox = null;
+            }
           } else {
             this.logger.warn("boat: a running VM conflicts with the env policy and another run may hold it; creating a fresh VM instead of reusing it", {
               vmKey: key,
@@ -1447,6 +1484,18 @@ export class BoatVmManager {
           await this.account(config).started(api, reservation, sandboxId);
         } else {
           let resumed = false;
+          // A disk boat stripped under noEnv can never serve a policy that
+          // needs credentials again: resuming it would run without them, so
+          // a fresh VM is created instead and this disk is left stopped.
+          const unrestorable = sandbox ? resumeCannotRestorePolicy(config, sandbox) : null;
+          if (sandbox && unrestorable) {
+            this.logger.warn("boat: the card's stopped VM cannot satisfy the env policy by resume; creating a fresh VM instead", {
+              ...context,
+              sandboxId: sandbox.id,
+              unrestorable,
+            });
+            sandbox = null;
+          }
           if (sandbox) {
             const target = sandbox;
             const sizeChange = target.state === "archived" && target.type !== config.size ? { type: config.size } : {};
@@ -1528,6 +1577,7 @@ export class BoatVmManager {
         const ready = toView(await waitReady(api, sandboxId, { timeoutMs: config.timeoutMs }));
         if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
         const session = this.ssh.getSession(sandboxId) ?? (await this.openSsh(api, config, sandboxId));
+        this.sessionPolicy.set(sandboxId, BoatVmManager.validatedPolicyOf(config));
         const remote = await this.prepareRemote(config, session);
         // Before the lease goes back to Paperclip, which then syncs the run's runtime assets (the MCP config with the run JWT among them).
         const runtimeDir = await this.prepareRuntimeDir(session, remote.remoteCwd);
@@ -1812,9 +1862,36 @@ export class BoatVmManager {
   }
 
   /** An SSH session to a running VM. Resumes a stopped VM first (budget-guarded): auto-stop or the sweep may have stopped it. */
+  /** The env policy a session validation stamps, so a later config can tell whether the policy changed since. */
+  private static validatedPolicyOf(config: BoatDriverConfig): { noEnv: boolean; environment: string | null } {
+    return { noEnv: config.noEnv, environment: config.boatEnvironment ?? null };
+  }
+
   private async liveSession(config: BoatDriverConfig, companyId: string, sandboxId: string, resize = false): Promise<SshSession> {
     const existing = this.ssh.getSession(sandboxId);
-    if (existing) return existing;
+    // A cached session must not outlive the env policy: the operator may
+    // have turned noEnv on after the lease started. When the policy changed
+    // since the session was validated, re-read the VM and fail closed; the
+    // next acquire stops and resumes it under the policy, or creates a fresh one.
+    if (existing) {
+      const stamped = this.sessionPolicy.get(sandboxId);
+      const current = BoatVmManager.validatedPolicyOf(config);
+      if (!stamped || stamped.noEnv !== current.noEnv || stamped.environment !== current.environment) {
+        const api = this.opsApi(config);
+        const sandbox = await this.getSandbox(api, sandboxId).catch(() => null);
+        if (sandbox && UP_STATES.has(sandbox.state)) {
+          const conflict = envPolicyConflict(config, sandbox);
+          if (conflict) {
+            throw new BoatProviderError(
+              "BOAT_ENV_POLICY_CONFLICT",
+              `boat VM ${sandboxId} conflicts with the env policy (${conflict}); refusing to run against it. The run must acquire a new lease.`,
+            );
+          }
+        }
+        this.sessionPolicy.set(sandboxId, current);
+      }
+      return existing;
+    }
     return await this.withLock(`sandbox:${sandboxId}`, async () => {
       const again = this.ssh.getSession(sandboxId);
       if (again) return again;
@@ -1839,7 +1916,17 @@ export class BoatVmManager {
           );
         }
       }
+      // A stopped disk boat stripped under noEnv cannot serve a reconnect
+      // that needs credentials again: fail closed so the run acquires a new
+      // (fresh) lease instead of running without them.
       if (resumed) {
+        const unrestorable = resumeCannotRestorePolicy(config, sandbox);
+        if (unrestorable) {
+          throw new BoatProviderError(
+            "BOAT_VM_GONE",
+            `boat VM ${sandboxId} cannot satisfy the env policy by resume (${unrestorable}); the run must acquire a new lease.`,
+          );
+        }
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
         const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
         const startConfig = { ...config, size };
@@ -1878,6 +1965,7 @@ export class BoatVmManager {
       const ready = toView(await waitReady(api, sandboxId, { timeoutMs: config.timeoutMs }));
       if (ready?.archiveAfter) this.noteDeadline(sandboxId, ready.archiveAfter);
       const session = await this.openSsh(api, config, sandboxId);
+      this.sessionPolicy.set(sandboxId, BoatVmManager.validatedPolicyOf(config));
       // This path (a resume for a command, or a new worker) skips acquire's setup step, and a resume
       // may give ~/.bashrc its ASCII_TOKEN line back, so scrub it here too.
       await this.ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
@@ -3181,6 +3269,7 @@ export class BoatVmManager {
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
     await this.nativeOffload.shutdown();
     await this.ssh.closeAll();
+    this.sessionPolicy.clear();
   }
 }
 
