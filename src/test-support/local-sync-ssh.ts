@@ -87,6 +87,7 @@ export class LocalSyncSsh extends SshManager {
       tunnelSpec: null,
       tunnelError: null,
       lastMasterStartAt: 0,
+      masterStarting: null,
     };
     this.sessionMap.set(input.sandboxId, session);
     return session;

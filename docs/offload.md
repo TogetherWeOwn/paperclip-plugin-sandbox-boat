@@ -40,6 +40,8 @@ A pool VM is only ever reused by the execution workspace that first claimed it: 
 
 The delta push does not trust the guest-side mirror marker alone: files the delta would skip are hashed on the guest against the host manifest on every push, and any missing or differing file is resent before the command runs, so a tampered mirror (including a poisoned lockfile) is repaired instead of executed or staged back.
 
+A released pool VM also releases its SSH session: a confirmed idle stop, retirement, quarantine, or failed pending delete closes and forgets that VM's cached control session (a next command re-opens on demand), and runtime shutdown closes any sessions left cached. Session cleanup never loses a stop receipt: hook failures are logged and swallowed.
+
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
 Rust offload above extends to long Node and Python commands on two more server

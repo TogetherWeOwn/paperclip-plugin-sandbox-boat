@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -45,6 +45,8 @@ export interface SshSession {
   tunnelError: string | null;
   connectTimeoutSec: number;
   lastMasterStartAt: number;
+  /** In-flight startMaster shared by concurrent ensureMaster callers. */
+  masterStarting: Promise<void> | null;
 }
 
 export interface SshExecutionResult {
@@ -132,8 +134,20 @@ export class SshManager {
 
   private async ensureDir(): Promise<string> {
     if (!this.keyDir) {
+      // Reap key dirs of dead workers before creating ours, so a crash loop
+      // cannot accumulate key material and control sockets in /tmp. Best
+      // effort: our own startup never fails because the sweep did.
+      await cleanupStaleKeyDirs(tmpdir()).catch(() => undefined);
       this.keyDir = await mkdtemp(path.join(tmpdir(), "pcboat-"));
+      // Owner marker for the startup sweep: same-uid processes may share the
+      // key dir (uid is the boundary), so liveness is tracked by pid, and a
+      // dir is only reaped once its creator is gone.
+      await writeFile(path.join(this.keyDir, "owner.pid"), `${process.pid}\n`, { mode: 0o600 });
     }
+    return this.keyDir;
+  }
+
+  get keyDirPath(): string | null {
     return this.keyDir;
   }
 
@@ -168,6 +182,7 @@ export class SshManager {
       tunnelError: null,
       connectTimeoutSec: input.connectTimeoutSec,
       lastMasterStartAt: 0,
+      masterStarting: null,
     };
     this.sessions.set(input.sandboxId, session);
     await this.startMaster(session);
@@ -178,11 +193,24 @@ export class SshManager {
     return !!session.master && session.master.exitCode === null && session.master.signalCode === null && !session.master.killed;
   }
 
-  /** Restart a dead control master (and its tunnel) at most every 10 s. */
+  /** Restart a dead control master (and its tunnel) at most every 10 s.
+   * Concurrent callers share one starter: exactly one `ssh -N` runs per
+   * restart, and a loser never overwrites the winner's master. */
   async ensureMaster(session: SshSession): Promise<void> {
     if (this.masterAlive(session)) return;
+    const ongoing = session.masterStarting;
+    if (ongoing) {
+      await ongoing;
+      return;
+    }
     if (Date.now() - session.lastMasterStartAt < MASTER_RESTART_MIN_INTERVAL_MS) return;
-    await this.startMaster(session);
+    const starting = this.startMaster(session);
+    session.masterStarting = starting;
+    try {
+      await starting;
+    } finally {
+      if (session.masterStarting === starting) session.masterStarting = null;
+    }
   }
 
   private async startMaster(session: SshSession): Promise<void> {
@@ -215,6 +243,14 @@ export class SshManager {
       });
       const ready = await waitForControlSocket(child, session.controlPath, (session.connectTimeoutSec + 5) * 1000);
       if (ready) {
+        // The session may have been closed or replaced while we waited for
+        // the socket (or a concurrent starter won first): never resurrect a
+        // dead session's master or overwrite the winner's.
+        if (this.sessions.get(session.sandboxId) !== session
+          || (session.master && session.master !== child && this.masterAlive(session))) {
+          killQuietly(child);
+          return;
+        }
         session.master = child;
         session.tunnel = tunnel ? "up" : session.tunnelSpec ? "down" : "disabled";
         if (!tunnel && session.tunnelSpec) {
@@ -347,6 +383,96 @@ export class SshManager {
     this.keyDir = null;
     this.keyPromise = null;
   }
+}
+
+/** Prefix for worker SSH key dirs under os.tmpdir(). */
+export const STALE_KEY_DIR_PREFIX = "pcboat-";
+/** Unmarked key dirs (no owner.pid, predating the marker) are only reaped past this age. */
+const UNMARKED_KEY_DIR_MAX_AGE_MS = 24 * 60 * 60_000;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM proves a live process we may not signal; anything else (ESRCH)
+    // means no such process.
+    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+/** SIGTERM every ssh client multiplexing on sockets inside a dead worker's key
+ * dir (Linux /proc scan). Best effort: a missed client only leaks until the
+ * next sweep, and /proc races are ignored. Never touches live dirs. */
+async function killStaleSshForDir(dir: string): Promise<void> {
+  if (process.platform !== "linux") return;
+  let pids;
+  try {
+    pids = await readdir("/proc");
+  } catch {
+    return;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      if ((await readFile(`/proc/${pid}/comm`, "utf8")).trim() !== "ssh") continue;
+      const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8");
+      if (!cmdline.split("\0").some((part) => part.includes(dir))) continue;
+      try {
+        process.kill(Number(pid), "SIGTERM");
+      } catch {
+        // Already gone.
+      }
+    } catch {
+      // /proc race: the process exited mid-scan.
+    }
+  }
+}
+
+/** Remove worker key dirs whose creator is gone: a dead owner pid, or (for
+ * dirs predating the owner.pid marker) an mtime older than a day, so a
+ * concurrently-creating worker's dir is never reaped. Only same-uid dirs are
+ * considered: the uid is the boundary, and another user's key material is
+ * never touched. Returns the removed dirs. Failures for one dir never block
+ * the others. */
+export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<string[]> {
+  const removed: string[] = [];
+  let entries;
+  try {
+    entries = await readdir(baseDir);
+  } catch {
+    return removed;
+  }
+  const uid = process.getuid?.();
+  for (const name of entries) {
+    if (!name.startsWith(STALE_KEY_DIR_PREFIX)) continue;
+    const dir = path.join(baseDir, name);
+    let stat;
+    try {
+      stat = await lstat(dir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    if (uid !== undefined && stat.uid !== uid) continue;
+    let owner: string | null = null;
+    try {
+      owner = (await readFile(path.join(dir, "owner.pid"), "utf8")).trim();
+    } catch {
+      owner = null;
+    }
+    const pid = owner !== null && /^\d+$/.test(owner) ? Number(owner) : NaN;
+    const stale = Number.isSafeInteger(pid) ? !pidAlive(pid) : Date.now() - stat.mtimeMs > UNMARKED_KEY_DIR_MAX_AGE_MS;
+    if (!stale) continue;
+    await killStaleSshForDir(dir);
+    try {
+      await rm(dir, { recursive: true, force: true });
+      removed.push(dir);
+    } catch {
+      // Race: someone else reaped it.
+    }
+  }
+  return removed;
 }
 
 function commonSshOptions(session: SshSession, privateKeyPath: string): string[] {
