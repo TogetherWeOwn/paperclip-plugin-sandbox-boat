@@ -29,6 +29,23 @@ describe("run-owner state retention", () => {
     expect(await currentManager().localRunOwnedBy(COMPANY, "run-1", "agent-2")).toBe(false);
   });
 
+  it("concurrent started bursts index every owner", async () => {
+    // trackRunOwner is a get-to-set on the per-company index: without the
+    // index lock, interleaved bursts lose entries, and an unindexed owner row
+    // is one the sweep can never age out.
+    const manager = currentManager();
+    await Promise.all(Array.from({ length: 20 }, (_, i) =>
+      manager.startLocalRun(COMPANY, `burst-${i}`, null, "agent-1", true)));
+    const index = harness.state.get(`company|${COMPANY}|boat-offload-runs|owners`) as {
+      version: number; runs: string[];
+    };
+    expect([...index.runs].sort()).toEqual(
+      Array.from({ length: 20 }, (_, i) => `burst-${i}`).sort());
+    for (let i = 0; i < 20; i += 1) {
+      expect(harness.state.has(`company|${COMPANY}|boat-offload-runs|burst-${i}`)).toBe(true);
+    }
+  });
+
   it("a 25 h old owner record is gone after the sweep", async () => {
     const recordKey = `company|${COMPANY}|boat-offload-runs|old-run`;
     const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;

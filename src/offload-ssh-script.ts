@@ -5,6 +5,13 @@ export const OFFLOAD_SSH_SCRIPT = String.raw`
 import base64, contextlib, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
 
 MAX_OUTPUT = 1048576
+# A guest read page must fit inside the host control RPC's own 128 KiB stdout
+# cap (see SshOffloadGuest.rpc): at most 64 events and at most 96 KiB of
+# encoded JSON, leaving headroom for one maximum-size event overshoot plus the
+# response envelope framing. A page that still outgrows the envelope fails
+# closed on the host as OFFLOAD_OUTPUT_LIMIT, never truncated success.
+READ_PAGE_MAX_EVENTS = 64
+READ_PAGE_MAX_ENCODED_BYTES = 98304
 BOOT = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 OWNERSHIP = ('guestBootId', 'processGroupId', 'cgroupPath', 'journalGeneration')
 
@@ -475,12 +482,18 @@ def rpc(action, data):
                             break
                         if index < data['after']:
                             continue
-                        if len(events) >= 64:
+                        if len(events) >= READ_PAGE_MAX_EVENTS:
                             break
                         event = json.loads(line)
+                        # Budget the encoded page size, not the raw line bytes:
+                        # the RPC response re-serializes these events with the
+                        # same encoding plus one comma each, so this total plus
+                        # a few hundred bytes of envelope framing is the stdout
+                        # the transport cap measures. Break-after keeps progress
+                        # when a single event alone exceeds the budget.
+                        total += len(json.dumps(event)) + 1
                         events.append(event)
-                        total += len(line)
-                        if total > 131072:
+                        if total > READ_PAGE_MAX_ENCODED_BYTES:
                             break
             return {'events': events, 'result': value['result'] if not events else None,
                     'supervisorAlive': start_time(value['supervisorPid']) == value['supervisorStart'],

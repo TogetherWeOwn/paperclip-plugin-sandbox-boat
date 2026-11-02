@@ -168,8 +168,10 @@ follows durable host intent. The watchdog kills the subtree on execution deadlin
 expired client interest or supervisor loss. Heartbeats renew the guest watchdog
 and host timer; reads renew neither. Losing a result/output channel is uncertain,
 not permission to replay. Output is capped at 1 MiB; overflow fails closed rather
-than returning truncated success. Guest read pages carry at most 64 events and stop after about
-128 KiB, and the host output poll backs off while the guest is quiet (100 ms,
+than returning truncated success. Guest read pages carry at most 64 events and about
+96 KiB of encoded JSON, so a page stays inside the control RPC's 128 KiB envelope;
+a page that still outgrows the envelope fails closed as output overflow. The host
+output poll backs off while the guest is quiet (100 ms,
 doubling to one poll per second) with a 10 ms floor when pages carry events, so
 a silent command costs about one SSH round trip per second instead of ten. New
 pool VMs follow the environment's

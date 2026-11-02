@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { command, fixture, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { SshOffloadGuest } from "./offload-ssh.js";
 import type { ExecutionIdentity } from "./offload-lifecycle.js";
 
@@ -152,5 +153,60 @@ describe("output poll backoff", () => {
     // 16 bounded pages plus start: far below one RPC per line.
     expect(calls.length).toBeLessThanOrEqual(32);
     await guest.shutdown();
+  });
+});
+
+describe("output overflow fails closed", () => {
+  function guestWithFailingReads(failure: () => unknown, now: () => number) {
+    const page = (body: unknown) => ({ exitCode: 0 as const, signal: null, timedOut: false,
+      stdout: JSON.stringify(body), stderr: "" });
+    let calls = 0;
+    return new SshOffloadGuest({
+      ssh: { runStream: async () => {
+        calls += 1;
+        if (calls === 1) return page({});
+        throw failure();
+      } } as never,
+      session: async () => ({ sandboxId: "vm-1" }) as never,
+      cgroupParent: PARENT,
+      workspace: async () => "/tmp/offload-poll-test",
+      now,
+    });
+  }
+
+  const run = (guest: SshOffloadGuest, t: number) => guest.runCommand("vm-1",
+    { commandId: "overflow", companyId: "c", runId: "r", argv: ["test"] } as never,
+    { identity: testIdentity(t), output: async () => {} });
+
+  it("a read page that outgrows the RPC envelope rejects with OFFLOAD_OUTPUT_LIMIT", async () => {
+    // A nonconforming page (or a budget bug) trips the control RPC's own byte
+    // cap instead of parsing: the host must still fail closed with the
+    // overflow code, never a generic transport error.
+    const t = 3_000_000;
+    const guest = guestWithFailingReads(() => Object.assign(
+      new Error("Streaming process control output exceeds its byte limit."),
+      { code: "SSH_CONTROL_OUTPUT_LIMIT" }), () => t);
+    await expect(run(guest, t)).rejects.toMatchObject({ code: "OFFLOAD_OUTPUT_LIMIT" });
+    await guest.shutdown();
+  });
+
+  it("other read failures keep their own code", async () => {
+    const t = 4_000_000;
+    const guest = guestWithFailingReads(
+      () => Object.assign(new Error("boom"), { code: "OFFLOAD_GUEST_TRANSPORT_UNKNOWN" }), () => t);
+    await expect(run(guest, t)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_TRANSPORT_UNKNOWN" });
+    await guest.shutdown();
+  });
+
+  it("guest read pages fit inside the control RPC envelope", () => {
+    const events = Number(OFFLOAD_SSH_SCRIPT.match(/READ_PAGE_MAX_EVENTS = (\d+)/)?.[1]);
+    const budget = Number(OFFLOAD_SSH_SCRIPT.match(/READ_PAGE_MAX_ENCODED_BYTES = (\d+)/)?.[1]);
+    expect(events).toBeLessThanOrEqual(64);
+    expect(budget).toBeGreaterThan(0);
+    // One maximum-size event overshoot (an 8 KiB chunk is ~11 KiB of base64
+    // JSON) plus envelope framing must still fit the 128 KiB transport cap, or
+    // overflow surfaces as a generic transport error instead of
+    // OFFLOAD_OUTPUT_LIMIT.
+    expect(budget + 16 * 1024).toBeLessThanOrEqual(128 * 1024);
   });
 });

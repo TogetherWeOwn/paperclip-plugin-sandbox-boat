@@ -600,7 +600,14 @@ export async function runStreamProcess(command: string, args: string[], options:
     let bytes = 0;
     return new Writable({ write(chunk: Buffer, _encoding, done) {
       bytes += chunk.length;
-      if (bytes > cap) done(new Error("Streaming process control output exceeds its byte limit."));
+      if (bytes > cap) {
+        // Carries a code so control-plane callers can fail closed on an
+        // overgrown page (output overflow) instead of surfacing a generic
+        // transport error. The message text is unchanged.
+        const limit = new Error("Streaming process control output exceeds its byte limit.") as Error & { code?: string };
+        limit.code = "SSH_CONTROL_OUTPUT_LIMIT";
+        done(limit);
+      }
       else { chunks.push(Buffer.from(chunk)); done(); }
     } });
   }

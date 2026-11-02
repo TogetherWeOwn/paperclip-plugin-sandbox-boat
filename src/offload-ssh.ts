@@ -193,9 +193,18 @@ export class SshOffloadGuest implements GuestController {
     let idleMs = POLL_IDLE_BASE_MS;
     for (;;) {
       if (now() > identity.guestDeadline + 15_000) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
-      const page = await this.call<{ events: Array<{ stream: "stdout" | "stderr"; dataBase64: string }>;
+      let page: { events: Array<{ stream: "stdout" | "stderr"; dataBase64: string }>;
         result: unknown; supervisorAlive: boolean;
-        outputLimitExceeded: boolean }>(sandboxId, "read", identity, { after });
+        outputLimitExceeded: boolean };
+      try {
+        page = await this.call<typeof page>(sandboxId, "read", identity, { after });
+      } catch (error) {
+        // A read page that outgrows the control RPC's own byte cap is output
+        // overflow, not a transport mystery: fail closed with the overflow
+        // code so a nonconforming page can never surface as truncated success.
+        if (isControlOutputLimit(error)) throw offloadError("OFFLOAD_OUTPUT_LIMIT");
+        throw error;
+      }
       if (page.outputLimitExceeded) throw offloadError("OFFLOAD_OUTPUT_LIMIT");
       if (!page.supervisorAlive && page.result == null && !page.events.length) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
       for (const event of page.events) {
@@ -230,6 +239,13 @@ export class SshOffloadGuest implements GuestController {
     this.prepared.clear();
     this.sessions.clear();
   }
+}
+
+/** True for the control-plane byte-cap refusal (see runStreamProcess): the
+ * response outgrew the RPC envelope, so the read caller fails it closed. */
+function isControlOutputLimit(error: unknown): boolean {
+  return typeof error === "object" && error !== null
+    && (error as { code?: unknown }).code === "SSH_CONTROL_OUTPUT_LIMIT";
 }
 
 /** Guest-reported exit facts are untrusted: only a safe-integer exit code in

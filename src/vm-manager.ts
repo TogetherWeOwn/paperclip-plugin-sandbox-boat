@@ -486,28 +486,39 @@ export class BoatVmManager {
     return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-runs", stateKey: "owners" };
   }
 
+  /** Serializes a company's owner-index read-modify-writes: concurrent
+   * agent.run.started bursts otherwise interleave get-to-set and lose index
+   * entries, and an unindexed owner row is one the sweep can never age out. */
+  private ownerIndexLockKey(companyId: string): string {
+    return `run-owner-index:${companyId}`;
+  }
+
   private async trackRunOwner(companyId: string, runId: string): Promise<void> {
-    try {
-      const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
-      const runs = raw && typeof raw === "object" && Array.isArray((raw as { runs?: unknown }).runs)
-        ? (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string") : [];
-      if (!runs.includes(runId)) await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...runs, runId] });
-    } catch (error) {
-      this.logger.warn("boat: could not index the local run's owner", { runId, error: errorText(error) });
-    }
+    await this.withLock(this.ownerIndexLockKey(companyId), async () => {
+      try {
+        const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+        const runs = raw && typeof raw === "object" && Array.isArray((raw as { runs?: unknown }).runs)
+          ? (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string") : [];
+        if (!runs.includes(runId)) await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...runs, runId] });
+      } catch (error) {
+        this.logger.warn("boat: could not index the local run's owner", { runId, error: errorText(error) });
+      }
+    });
   }
 
   private async untrackRunOwner(companyId: string, runId: string): Promise<void> {
-    try {
-      const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
-      if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) return;
-      const runs = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string" && entry !== runId);
-      // An empty index is deleted, not husked: no per-run rows may linger.
-      if (runs.length === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId));
-      else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs });
-    } catch (error) {
-      this.logger.warn("boat: could not unindex the local run's owner", { runId, error: errorText(error) });
-    }
+    await this.withLock(this.ownerIndexLockKey(companyId), async () => {
+      try {
+        const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+        if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) return;
+        const runs = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string" && entry !== runId);
+        // An empty index is deleted, not husked: no per-run rows may linger.
+        if (runs.length === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId));
+        else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs });
+      } catch (error) {
+        this.logger.warn("boat: could not unindex the local run's owner", { runId, error: errorText(error) });
+      }
+    });
   }
 
   /**
@@ -651,38 +662,42 @@ export class BoatVmManager {
   async collectRunOwnerGarbage(companyIds: Iterable<string>): Promise<void> {
     this.pruneLocalRunState();
     for (const companyId of new Set(companyIds)) {
-      let indexed: string[];
-      try {
-        const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
-        if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) continue;
-        indexed = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string");
-      } catch {
-        continue;
-      }
-      if (indexed.length === 0) continue;
-      const live = new Set<string>();
-      for (const runId of indexed) {
-        let record: unknown;
+      // Same index lock as track/untrack: the sweep's pruned rewrite must not
+      // clobber a concurrent burst's entry, nor lose one to it.
+      await this.withLock(this.ownerIndexLockKey(companyId), async () => {
+        let indexed: string[];
         try {
-          record = await this.offloadState.get(this.runOwnerScope(companyId, runId));
+          const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+          if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) return;
+          indexed = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string");
         } catch {
+          return;
+        }
+        if (indexed.length === 0) return;
+        const live = new Set<string>();
+        for (const runId of indexed) {
+          let record: unknown;
+          try {
+            record = await this.offloadState.get(this.runOwnerScope(companyId, runId));
+          } catch {
+            live.add(runId);
+            continue;
+          }
+          const saved = (record ?? null) as { ended?: unknown; startedAt?: unknown } | null;
+          const stale = saved !== null && typeof saved === "object" && saved.ended !== true
+            && typeof saved.startedAt === "number" && this.now() - saved.startedAt > LOCAL_RUN_STATE_MAX_AGE_MS;
+          if (record === null || (saved !== null && typeof saved === "object" && saved.ended === true) || stale) {
+            await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
+            await this.forgetRunOffload(companyId, runId);
+            continue;
+          }
           live.add(runId);
-          continue;
         }
-        const saved = (record ?? null) as { ended?: unknown; startedAt?: unknown } | null;
-        const stale = saved !== null && typeof saved === "object" && saved.ended !== true
-          && typeof saved.startedAt === "number" && this.now() - saved.startedAt > LOCAL_RUN_STATE_MAX_AGE_MS;
-        if (record === null || (saved !== null && typeof saved === "object" && saved.ended === true) || stale) {
-          await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
-          await this.forgetRunOffload(companyId, runId);
-          continue;
+        if (live.size !== indexed.length) {
+          if (live.size === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId)).catch(() => undefined);
+          else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...live] }).catch(() => undefined);
         }
-        live.add(runId);
-      }
-      if (live.size !== indexed.length) {
-        if (live.size === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId)).catch(() => undefined);
-        else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...live] }).catch(() => undefined);
-      }
+      });
     }
   }
 
