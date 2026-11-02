@@ -13,6 +13,18 @@ type Window = keyof typeof WINDOWS;
 // @boatdev/sdk 1.10 SandboxUsageResponse.billingMultiplier: seconds already
 // include this multiplier. Never infer it from wall time or apply it twice.
 const WEIGHT: Record<BoatSize, number> = { small: 0.5, default: 1, large: 2, xlarge: 50 / 9 };
+/**
+ * Stale-hold margin: a start whose provider TTL plus this margin has passed
+ * cannot still be running (boat auto-stops it), so an unsettled intent is
+ * retired instead of holding active capacity forever.
+ */
+const STALE_HOLD_MARGIN_MS = 10 * 60_000;
+/**
+ * Stop-observation grace: terminal receipts and open tails are clamped to the
+ * funded tail plus this. The provider TTL ends the VM by then, so anything
+ * later is stop-observation lag, not billed VM time.
+ */
+const STOP_OBSERVE_GRACE_S = 300;
 const locks = new Map<string, Promise<unknown>>();
 
 export interface PaidInterval {
@@ -81,6 +93,8 @@ interface Intent {
   size: BoatSize;
   jobSeconds: number;
   tailSeconds: number;
+  /** Provider TTL funded for this start; bounds the hold when the effect is ambiguous. */
+  ttlSeconds: number;
   reserveSeconds: number;
   endedAt: number | null;
   usageId: string | null;
@@ -171,7 +185,14 @@ function monthUsageSeconds(doc: AccountDoc, companyId: string, nowMs: number): n
       totalMs += Math.max(0, Math.min(until, nowMs) - Math.max(since, monthStart));
     }
     if (row.tailSince != null && Number.isFinite(row.tailSince)) {
-      totalMs += Math.max(0, nowMs - Math.max(row.tailSince, monthStart));
+      // An open tail bills at most its funded tail plus grace: the provider
+      // TTL stops the VM by then, so a tail still open days later is an
+      // unreconciled receipt, not VM time. Rows without a known intent keep
+      // the full count (fail closed) rather than assuming a bound.
+      const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
+      const fundedTailMs = intent == null || !Number.isFinite(intent.tailSeconds)
+        ? Infinity : (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000;
+      totalMs += Math.min(Math.max(0, nowMs - Math.max(row.tailSince, monthStart)), fundedTailMs);
     }
   }
   return totalMs / 1000;
@@ -354,23 +375,71 @@ export class AccountLedger {
       refuse("minComputeHoursLeft", "insufficient job plus tail compute and reserve");
     }
   }
+  /**
+   * Latest billable instant for an open tail: terminal evidence observed at
+   * `at`, but never later than the requested stop deadline, nor later than
+   * the funded tail plus grace when the stop receipt itself lagged.
+   */
+  private tailEnd(doc: AccountDoc, row: AccountUsageRow, at: number): number {
+    if (row.tailSince == null) return at;
+    const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
+    const tailBudget = intent != null && Number.isFinite(intent.tailSeconds)
+      ? row.tailSince + (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000 : null;
+    const cap = row.stopDueAt ?? tailBudget ?? at;
+    return Math.min(at, cap);
+  }
   private closeTail(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
     for (const row of doc.usage) {
       if (!this.owns(row, includeUnscoped) || row.sandboxId !== sandboxId || row.tailSince == null) continue;
-      if (at > row.tailSince) row.intervals.push({ since: new Date(row.tailSince).toISOString(), until: new Date(at).toISOString(), phase: "idle_tail" });
+      const end = this.tailEnd(doc, row, at);
+      if (end > row.tailSince) row.intervals.push({ since: new Date(row.tailSince).toISOString(), until: new Date(end).toISOString(), phase: "idle_tail" });
       row.tailSince = null;
       const intent = doc.intents.find((i) => i.usageId === row.usageRecordId);
-      if (intent) { intent.endedAt = at; intent.compute = Math.min(intent.compute, Math.max(0, (at - intent.at) / 1000) * WEIGHT[intent.size]); }
+      if (intent) { intent.endedAt = end; intent.compute = Math.min(intent.compute, Math.max(0, (end - intent.at) / 1000) * WEIGHT[intent.size]); }
+    }
+  }
+  /**
+   * Retire starts whose provider TTL plus margin has passed while their
+   * effect stayed ambiguous (or was never reported, e.g. a crash between
+   * reserve and started/failed). Boat auto-stops such VMs, so the hold is
+   * dead capacity: release it, cap its compute at the TTL envelope, and leave
+   * an aborted_start interval that ends no later than at + ttl. Only intents
+   * this ledger owns are touched; settled and running intents never are.
+   */
+  private expireStaleHolds(doc: AccountDoc, now: number, includeUnscoped = false): void {
+    for (const intent of doc.intents) {
+      if (!this.owns(intent, includeUnscoped) || (intent.status !== "intent" && intent.status !== "ambiguous")) continue;
+      if (intent.settledAt != null && intent.sandboxId != null) continue;
+      const ttlSeconds = Number.isFinite(intent.ttlSeconds) && intent.ttlSeconds > 0
+        ? intent.ttlSeconds : intent.jobSeconds + intent.tailSeconds;
+      if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) continue;
+      if (now <= intent.at + ttlSeconds * 1000 + STALE_HOLD_MARGIN_MS) continue;
+      intent.active = false;
+      intent.settledAt = now;
+      intent.endedAt ??= Math.min(now, intent.at + ttlSeconds * 1000);
+      intent.compute = Math.min(intent.compute, Math.max(0, ttlSeconds) * WEIGHT[intent.size]);
+      const row = intent.usageId != null ? doc.usage.find((r) => r.usageRecordId === intent.usageId) : undefined;
+      if (row != null && now > intent.at) {
+        row.kind = "aborted_start";
+        const end = Math.min(now, intent.at + ttlSeconds * 1000);
+        row.intervals = [{ since: new Date(intent.at).toISOString(), until: new Date(end).toISOString(), phase: "command" }];
+      }
     }
   }
 
   async reserve(api: BoatApiLike, req: AdmissionRequest): Promise<AccountReservation> {
     return await this.locked(async () => {
       const doc = await this.read();
+      // A restart may have left ambiguous or never-reported starts behind;
+      // retire them before they refuse this admission as phantom capacity.
+      this.expireStaleHolds(doc, this.now());
       if (req.monthlyCap && req.monthlyCap.capHours > 0 && req.monthlyCap.companyId) {
+        // Strict: the new request's own envelope counts too. The old
+        // used-only check admitted one full extra envelope past the cap.
+        const envelopeSeconds = req.jobSeconds + req.tailSeconds;
         const used = monthUsageSeconds(doc, req.monthlyCap.companyId, req.monthlyCap.nowMs)
           + pendingCapSeconds(doc, req.monthlyCap.companyId);
-        if (used / 3600 >= req.monthlyCap.capHours) {
+        if ((used + envelopeSeconds) / 3600 > req.monthlyCap.capHours) {
           throw new BoatBudgetError({ limit: "minComputeHoursLeft",
             message: `monthly offload VM-hour cap reached (${req.monthlyCap.capHours}h); new commands run local until next month`,
             details: {} });
@@ -406,7 +475,8 @@ export class AccountLedger {
       const intent: Intent = { id, providerScope: this.providerScope, poolId: req.poolId ?? null, sandboxId: req.sandboxId ?? null, operation: req.operation, at,
         settledAt: null, status: "intent", active: req.operation !== "warm", activeReflected: false, starts,
         compute: (req.jobSeconds + tailSeconds) * WEIGHT[req.size], computeReflected: 0, size: req.size, jobSeconds: req.jobSeconds,
-        tailSeconds, reserveSeconds: req.minComputeHoursLeft * 3600, endedAt: null, usageId: req.command ? id : null };
+        tailSeconds, ttlSeconds: Math.max(60, Math.ceil(req.jobSeconds + tailSeconds)),
+        reserveSeconds: req.minComputeHoursLeft * 3600, endedAt: null, usageId: req.command ? id : null };
       candidate.intents.push(intent);
       if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, providerScope: this.providerScope, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
@@ -569,6 +639,10 @@ export class AccountLedger {
     poolId?: string): Promise<void> {
     const ids = await this.locked(async () => {
       const doc = await this.read();
+      // Retire ambiguous or never-reported starts whose provider TTL plus
+      // margin has passed, including intents with no sandboxId that terminal
+      // receipts can never settle (e.g. a crash between reserve and create).
+      this.expireStaleHolds(doc, this.now(), includeUnscoped);
       try { await this.observe(api, doc, allowCachedLimits); } catch { /* Never free a reservation on unreadable limits. */ }
       // A pool client has no credential-group inventory for the rest of the
       // shared journal. Limit both receipt checks and subsequent metering to
