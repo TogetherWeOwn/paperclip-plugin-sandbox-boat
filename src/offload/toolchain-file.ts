@@ -4,8 +4,8 @@
 // compiler than the host. The nearest file from the run directory
 // (cwdRelative) up to the workspace root wins, as with rustup.
 
-import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { readProbeFile } from "./probe-file.js";
 
 export type ToolchainPin =
   | { kind: "none" }
@@ -17,18 +17,15 @@ const FILES = ["rust-toolchain", "rust-toolchain.toml"];
 const MAX_BYTES = 16 * 1024;
 const CHANNEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** The channel a toolchain file pins; `none` when there is no file. */
+/** The channel a toolchain file pins; `none` when there is no file. The file
+ * is repo-controlled, so it is read no-follow with a size cap (probe-file.ts):
+ * a symlink, FIFO, device or oversized file is `unreadable`, never opened. */
 export async function readToolchainPin(root: string): Promise<ToolchainPin> {
   for (const file of FILES) {
-    let text: string;
-    try {
-      const bytes = await readFile(path.join(root, file));
-      if (bytes.length > MAX_BYTES) return { kind: "unreadable", file };
-      text = bytes.toString("utf8");
-    } catch (error) {
-      if ((error as { code?: string }).code === "ENOENT") continue;
-      return { kind: "unreadable", file };
-    }
+    const probe = await readProbeFile(path.join(root, file), MAX_BYTES);
+    if (probe.kind === "missing") continue;
+    if (probe.kind === "unreadable") return { kind: "unreadable", file };
+    const text = probe.bytes.toString("utf8");
     const channel = parseChannel(text, file);
     return channel === null ? { kind: "unreadable", file } : { kind: "pinned", channel, file };
   }

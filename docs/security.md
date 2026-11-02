@@ -191,6 +191,22 @@ Rollback must preserve unsupported-policy refusal: do not remove a requested gra
 or resume through an unrestricted older artifact. Full isolation and live
 forbidden/approved-destination before/after measurements remain unverified.
 
+## Offload source admission (tracked files only)
+
+The command-level offload transport syncs a frozen snapshot of the workspace
+to a pool VM. Only git-tracked files (the index, listed with
+`git ls-files -z --cached`, fsmonitor and hooks disabled so listing a hostile
+checkout runs no repo-configured code) minus the sync excludes may leave the
+host: untracked or ignored files — a local `.dev.vars`, a stray deploy key —
+are never listed or synced. A source that is not a git work tree, or whose
+tracked files cannot be listed, keeps the command local. Before admission
+(and again at push) the tracked syncable files go through a bounded scan for
+known credential shapes (cloud key ids, private-key headers, provider
+tokens, JWTs); a hit, an unreadable file or an over-budget tree keeps the
+command local. The scan recognizes well-known token formats only; it does
+not prove a workspace secret-free, so repository approval remains an operator
+decision about tracked content on an untrusted VM.
+
 ## boat account settings
 
 These are the settings the plugin expects, with the docs (docs.boat.dev) that back them. Check yours with `boat env info <env>`, `boat data-retention status` and `boat limits`. The AI-proxy and auto-refill switches need an admin key or the dashboard to read.

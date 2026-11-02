@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
+import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
 import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
@@ -19,6 +20,8 @@ export interface SshOffloadSyncDeps {
   workRoot?: string;
   /** Test seam for the rsync delta spawn. */
   spawn?: SpawnFn;
+  /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  trackedFiles?: TrackedFilesFn;
   /** Clock for upload and artifact retention. */
   now?: () => number;
 }
@@ -69,7 +72,14 @@ export class SshOffloadSync implements OffloadSync {
     try {
       const frozen = path.join(scratch, "source");
       await mkdir(frozen, { mode: 0o700 });
-      const { manifest } = await captureSnapshot(source, frozen);
+      // Tracked files only, re-checked at push time (resolve() already gated
+      // admission): a source that stopped being a git work tree, or gained a
+      // secret-shaped tracked file, since admission never reaches the guest.
+      const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(source).catch(() => null);
+      if (!tracked || tracked.size === 0) {
+        throw new SyncError("SYNC_NOT_GIT_WORKTREE", `refusing to sync ${source}: not a git work tree with tracked files; the command stays local.`);
+      }
+      const { manifest } = await captureSnapshot(source, frozen, { onlyPaths: tracked, scanForSecrets: true });
       const guestDir = this.directory(command);
       const mirrorKey = this.mirrorKey(command);
       await this.withMirrorLock(mirrorKey, async () => {
@@ -131,6 +141,12 @@ export class SshOffloadSync implements OffloadSync {
       stored = null;
     } else if (verification.suspect !== null) {
       await store.wipeMirror(guestDir);
+    } else if (stored === null && marker !== null) {
+      // A marker without a stored manifest predates this worker (restart or
+      // upgrade): the mirror may hold files no current admission would send,
+      // and no delta base exists to prune them. Wipe before the full resync.
+      await store.wipeMirror(guestDir);
+      marker = null;
     }
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
