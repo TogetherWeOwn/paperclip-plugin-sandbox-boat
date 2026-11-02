@@ -209,40 +209,57 @@ const URL_LIKE_RES: readonly RegExp[] = [
  * no `@`. A `:` arms a later `@` only in its own `/`-segment — or across
  * segments when it sits in the token's first segment, where a scheme-less
  * DSN's password can carry slashes (`default:Ab/Cd@host`, even starting with
- * one: `user:/password@host`). Two `:` forms never arm: the `://` scheme
- * separator, and a `:/` PATH separator outside the first segment. That
- * keeps colon-joined paths (`/opt/python@3.11/bin` in a PATH) and `@` or `:`
- * in separate URL path segments from reading as userinfo, while a
- * `user:password@` tucked into one path segment still counts.
+ * one: `user:/password@host`). Two `:` forms never arm at all: the `://`
+ * scheme separator, and a `:/` PATH separator outside the first segment.
+ * A first-segment `:/` arms only weakly (slash-led): it is indistinguishable
+ * from a PATH separator after a relative first entry (`bin:/opt/...`), so
+ * its `@` counts only in the token's final segment — a versioned directory
+ * mid-path (`bin:/opt/python@3.11/bin`) is a path, while
+ * `user:/password@host` ends at its host. That keeps colon-joined paths and
+ * `@` or `:` in separate URL path segments from reading as userinfo, while
+ * a `user:password@` tucked into one path segment still counts.
  */
 function hasSchemeLessUserinfo(text: string): boolean {
   let colonInSegment = false;
   let colonInFirstSegment = false;
+  let slashLedColonInFirstSegment = false;
+  // An `@` reached only through the slash-led arm: userinfo unless a `/`
+  // follows it in this token, which puts it mid-path instead.
+  let slashLedAtPending = false;
   let seenSlash = false;
   let previous = 0;
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
     if (code === 32 || code === 9 || code === 10 || code === 13) {
+      if (slashLedAtPending) return true;
       colonInSegment = false;
       colonInFirstSegment = false;
+      slashLedColonInFirstSegment = false;
       seenSlash = false;
     } else if (code === 47) {
       seenSlash = true;
       colonInSegment = false;
+      slashLedAtPending = false;
     } else if (code === 58) {
       const next = text.charCodeAt(i + 1);
       const schemeSeparator = next === 47 && text.charCodeAt(i + 2) === 47;
-      const pathSeparator = next === 47 && seenSlash;
-      if (!schemeSeparator && !pathSeparator) {
-        colonInSegment = true;
-        if (!seenSlash) colonInFirstSegment = true;
+      if (!schemeSeparator) {
+        if (next === 47) {
+          if (!seenSlash) slashLedColonInFirstSegment = true;
+        } else {
+          colonInSegment = true;
+          if (!seenSlash) colonInFirstSegment = true;
+        }
       }
     }
     // An `@` that opens a path segment (`/@vendor/...` in a PATH) is no userinfo.
-    else if (code === 64 && (colonInSegment || colonInFirstSegment) && previous !== 47) return true;
+    else if (code === 64 && previous !== 47) {
+      if (colonInSegment || colonInFirstSegment) return true;
+      if (slashLedColonInFirstSegment) slashLedAtPending = true;
+    }
     previous = code;
   }
-  return false;
+  return slashLedAtPending;
 }
 // One whole URL, in characters every URL parser reads the same way: no space
 // or control character, no quote, backslash, `<>`, backtick, `{}`, `|` or `^`.

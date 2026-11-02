@@ -177,6 +177,10 @@ describe("env policy", () => {
       ["PATH", "/usr/bin:/home/user/node_modules/@vendor/cli/bin"],
       // Versioned `@` directories (Homebrew python@3.11, node@20) are paths, not userinfo.
       ["PATH", "/usr/bin:/opt/homebrew/opt/python@3.11/bin:/usr/local/opt/node@20/bin"],
+      // A relative first PATH entry makes the separator a first-segment `:/`;
+      // the `@` still sits mid-path, not in a final credential segment.
+      ["PATH", "bin:/opt/python@3.11/bin"],
+      ["PATH", "bin:/opt/python@3.11/bin:/usr/bin"],
       // An `@` in a URL path is not userinfo either: the authority already ended.
       ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/projects/release@v2"],
       ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/at/10:30/release@v2"],
