@@ -10,6 +10,9 @@ import type {
 
 export interface ExecutorPort extends Pick<OffloadExecutor, "readOutput" | "heartbeatCommand" | "cancelCommand"> {
   start(command: OffloadCommand): Promise<OffloadReadView>;
+  // Resolves when the executor's in-process task for the command settles.
+  // Optional for backward compatibility; never rejects when implemented.
+  waitSettled?(companyId: string, runId: string, commandId: string): Promise<void>;
 }
 export interface ExecutorBackendDeps {
   /** Trusted host binding only. Resolution must not dispatch a command itself.
@@ -86,6 +89,18 @@ export class ExecutorBackend implements OffloadBackend {
         sawStart = active.initial.remoteStarted === true || active.initial.state === "starting"
           || active.initial.state === "syncing_out" || active.initial.events.length > 0;
         if (sawStart) sink.started();
+        // Task-settled signal: when the in-process task has settled but the
+        // durable view is still non-terminal (a lost finish commit), one more
+        // read decides — terminal settles normally, otherwise uncertainty.
+        let taskSettled = false;
+        let settled: Promise<boolean> | null = null;
+        try {
+          settled = active.executor.waitSettled
+            ? active.executor.waitSettled(command.companyId, command.runId, command.commandId).then(() => true, () => true)
+            : null;
+        } catch {
+          settled = null;
+        }
         let cursor = 0;
         for (;;) {
           const view = await active.executor.readOutput(command.companyId, command.runId, command.commandId, cursor);
@@ -113,7 +128,16 @@ export class ExecutorBackend implements OffloadBackend {
             else sink.complete(result.result);
             return;
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, this.pollIntervalMs));
+          // The task settled but the durable view is still non-terminal: the
+          // finish commit was lost and the sweep owns retrying it. Report
+          // uncertainty now instead of polling until the run ends.
+          if (taskSettled) throw uncertain();
+          if (settled) {
+            const wait = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.pollIntervalMs));
+            if (await Promise.race([wait, settled])) taskSettled = true;
+          } else {
+            await new Promise<void>((resolve) => setTimeout(resolve, this.pollIntervalMs));
+          }
         }
       } catch {
         if (!dispatched) {

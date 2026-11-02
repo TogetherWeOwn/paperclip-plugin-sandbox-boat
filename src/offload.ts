@@ -354,6 +354,9 @@ export class OffloadExecutor {
   // deadline, or treats a receipt/leader exit as proof of descendant cleanup.
   async sweep(): Promise<void> {
     await this.recover();
+    // Best effort: a failed finish commit is retried here (and in retention)
+    // until the store accepts it. Never throws; the next sweep retries.
+    await this.durable?.settlePending().catch(() => undefined);
     await this.withAdmission(async () => {
       for (const vm of [...this.pool]) {
         // A pending ephemeral delete is quarantined against reuse, but sweep
@@ -410,6 +413,19 @@ export class OffloadExecutor {
     await this.recoverPool();
     const view = await this.requireDurable().start(snapshot, () => this.executeVolatile(snapshot));
     return { ...view, events: [], nextCursor: 0 };
+  }
+  // Task-settled signal for the executor backend pump: resolves when the
+  // in-process task for this command settles, either way. Never rejects, so
+  // a settled task over a still-non-terminal durable view (a lost finish
+  // commit) ends the pump with uncertainty instead of polling forever.
+  async waitSettled(companyId: string, runId: string, commandId: string): Promise<void> {
+    try {
+      await this.durable?.settled(`command/${companyId}/${runId}/${commandId}`).catch(() => undefined);
+      const key = this.durable ? `command/${companyId}/${runId}/${commandId}` : commandId;
+      await this.inFlight.get(key)?.then(() => undefined, () => undefined);
+    } catch {
+      // A settle signal must never fail the pump itself.
+    }
   }
   private requireDurable(): OffloadJournal {
     if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");

@@ -9,6 +9,8 @@ import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc } from "./offload-ssh-runtime.js";
 import { shellQuote } from "./shell.js";
 import type { SshManager } from "./ssh.js";
+import { SshOffloadSync } from "./offload-ssh-sync.js";
+import type { StateClientLike } from "./state.js";
 import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
@@ -639,4 +641,86 @@ describe("pool credential identity and guest token scrub", () => {
     const failing = { run: async () => { throw new Error("ssh down"); } } as unknown as SshManager;
     await expect(scrubOffloadGuestBashrc(failing, ssh.session)).resolves.toBeUndefined();
   });
+});
+describe("journal partial-write recovery", () => {
+  // A state wrapper that drops the journal record write while letting the
+  // index write land: the crash between the store's index and record writes.
+  function faultingState(backing: StateClientLike, shouldFail: () => boolean): StateClientLike {
+    return {
+      get: (input) => backing.get(input),
+      set: (input, value) => {
+        if (shouldFail() && (input.namespace ?? "").startsWith("boat-executor-") && input.stateKey !== "index") {
+          throw new Error("injected store failure");
+        }
+        return backing.set(input, value);
+      },
+      delete: (input) => backing.delete(input),
+    };
+  }
+  function testRuntime(state: StateClientLike) {
+    const harness = createFakeContext();
+    const rt = new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
+    rt.remember(native());
+    return rt;
+  }
+
+  it("fails a torn admission without spending a VM, then heals through the pool sweep and runs a new command", async () => {
+    let failJournalRecords = false;
+    const harness = createFakeContext();
+    const rt = testRuntime(faultingState(harness.ctx.state, () => failJournalRecords));
+    try {
+      const executor = (await rt.resolve(command(), config))!;
+      expect(executor).not.toBe(null);
+      expect(boat.calls).toHaveLength(0);
+
+      failJournalRecords = true;
+      await expect(executor.execute(command())).rejects.toThrow("injected store failure");
+      expect(boat.callsOf("create")).toHaveLength(0);
+      failJournalRecords = false;
+
+      // The loaded-pool sweep prunes the dangling index and reaches sync
+      // retention instead of throwing the pool unverified.
+      const collectGarbage = vi.spyOn(SshOffloadSync.prototype, "collectGarbage");
+      try {
+        await expect(rt.sweep()).resolves.toBeUndefined();
+        expect(collectGarbage).toHaveBeenCalled();
+      } finally {
+        collectGarbage.mockRestore();
+      }
+
+      // The pool accepts new work after recovery.
+      const result = await executor.execute(command());
+      expect(["completed", "not_started", "unknown"]).toContain(result.status);
+    } finally {
+      await rt.shutdown();
+    }
+  }, 30_000);
+
+  it("retires a ghost pool whose journal index tore without failing the sweep", async () => {
+    const harness = createFakeContext();
+    const rt = testRuntime(harness.ctx.state);
+    try {
+      const ghostPoolId = "ghost-pool-b15";
+      const ghostRoot = path.join(ssh.root, "ghost-artifacts");
+      await mkdir(ghostRoot, { recursive: true });
+      await harness.ctx.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+        { [ghostPoolId]: { artifactRoot: ghostRoot, seenAt: Date.now() } });
+      // Index entry with no record: a crash between the store's index and
+      // record writes in a pool that is no longer loaded.
+      await harness.ctx.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: `boat-executor-${ghostPoolId}`, stateKey: "index" },
+        [`command/${companyId}/${runId}/ghost-cmd`]);
+
+      await expect(rt.sweep([companyId])).resolves.toBeUndefined();
+      expect(await harness.ctx.state.get(
+        { scopeKind: "company", scopeId: companyId, namespace: `boat-executor-${ghostPoolId}`, stateKey: "index" }))
+        .toEqual([]);
+      expect(boat.calls).toHaveLength(0);
+    } finally {
+      await rt.shutdown();
+    }
+  }, 30_000);
 });

@@ -66,6 +66,13 @@ and override `ManagerDeps.offloadExecutor`; the stock worker uses
 * ID-only `read`, `cancel` and `heartbeat` helpers apply only to commands this
   executor admitted and reject ambiguous IDs. External routes must use the
   run/company-scoped methods and supply authenticated bindings.
+* The journal store writes its index before the record, so a crash between the
+  two leaves either an index entry with no record or a record no index lists.
+  Recovery and retention prune dangling index entries instead of throwing, so a
+  torn write never wedges later submits; orphan records stay invisible until
+  retention ages them out. A terminal finish commit lost to a store blip keeps
+  its computed result in memory, and retention and the pool sweep retry the
+  commit (bounded, then unknown with hold), so one sweep heals a failed finish.
 
 Lifecycle-enabled executors persist pool ownership, funded idle tails, absolute
 stop deadlines, stop requests and guest identities in instance-scoped plugin
@@ -142,6 +149,9 @@ conflicting changes and draining shutdown output before publishing the terminal
 receipt; it cannot grant fallback while sync-in still reads source. A live
 command held as `unknown` after a heartbeat failure remains cancellable and
 subject to expiry; missing handles after restart still require reconciliation.
+Once the executor's in-process task has settled, the pump reads once more and
+then reports uncertainty instead of polling a still non-terminal view
+indefinitely; the sweep retry of a lost finish commit is what heals it.
 A rejected/lost start acknowledgement, uncertain execution, unreadable output
 or unverified cancellation becomes an `unknown` hold with **no local replay**.
 Only an authoritative never-started receipt (or a binding refusal before calling
