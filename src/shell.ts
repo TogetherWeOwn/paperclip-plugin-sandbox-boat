@@ -618,7 +618,7 @@ export function wrapRemoteCommand(command: string, runId: string, managed = fals
 // It must stay a plain absolute path: the value is handed to the guest
 // verbatim, and ../ or shell-significant spellings would become guest
 // filesystem effects nobody intended.
-const RUN_RECORD_DIR_PATTERN = /^\/[A-Za-z0-9_\-./]*$/;
+const RUN_RECORD_DIR_PATTERN = /^\/[A-Za-z0-9_+\-./]*$/;
 
 function remoteRunRecord(runId: string, dir = "/tmp"): string {
   if (!/^[a-f0-9]{32}$/.test(runId)) throw new Error("Invalid remote cancellation identity.");

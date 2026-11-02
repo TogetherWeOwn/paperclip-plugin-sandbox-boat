@@ -11,24 +11,35 @@ import { readdirSync } from "node:fs";
 
 const RECORD_PATTERN = /^paperclip-boat-run-[0-9a-f]{32}$/;
 
-function snapshot(): Set<string> {
+// Null on a read failure: the guard must fail closed, never pass unseen.
+function snapshot(): Set<string> | null {
   try {
     return new Set(readdirSync("/tmp").filter((name) => RECORD_PATTERN.test(name)));
   } catch {
-    return new Set();
+    return null;
   }
+}
+
+function fail(message: string): void {
+  process.stderr.write(`\n${message}\n`);
+  if (process.env.GITHUB_ACTIONS === "true") process.stdout.write(`::error title=run-record guard::${message}\n`);
+  // A teardown throw only logs "error during close"; vitest never lowers
+  // the exit code, so this survives to the shell (same as the cgroup gate).
+  process.exitCode = 1;
 }
 
 export default function setup(): () => void {
   const before = snapshot();
+  if (before === null) throw new Error("run-record guard: cannot read /tmp to snapshot run records");
   return () => {
-    const leaked = [...snapshot()].filter((name) => !before.has(name));
-    if (leaked.length === 0) return;
-    const failure = `tests leaked ${leaked.length} run-record file(s) into host /tmp: ${leaked.join(", ")}`;
-    process.stderr.write(`\n${failure}\n`);
-    if (process.env.GITHUB_ACTIONS === "true") process.stdout.write(`::error title=run-record guard::${failure}\n`);
-    // A teardown throw only logs "error during close"; vitest never lowers
-    // the exit code, so this survives to the shell (same as the cgroup gate).
-    process.exitCode = 1;
+    const after = snapshot();
+    if (after === null) {
+      fail("run-record guard: cannot read /tmp after the suite; leaks cannot be ruled out");
+      return;
+    }
+    const leaked = [...after].filter((name) => !before.has(name));
+    if (leaked.length > 0) {
+      fail(`tests leaked ${leaked.length} run-record file(s) into host /tmp: ${leaked.join(", ")}`);
+    }
   };
 }
