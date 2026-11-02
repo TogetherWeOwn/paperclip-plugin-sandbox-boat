@@ -149,6 +149,7 @@ describe("round-1 fence pins", () => {
         push: async () => { syncEffects.push("push"); pushing.release(); await releasePush.promise; },
         collect: async () => { syncEffects.push("collect"); },
         stage: async () => { syncEffects.push("stage"); },
+        markSuspect: async () => {},
       },
     });
     const execution = track(runner.execute(cmd));
@@ -205,6 +206,7 @@ describe("round-1 fence pins", () => {
         push: async () => { pushing.release(); await releasePush.promise; },
         collect: async () => {},
         stage: async () => {},
+        markSuspect: async () => {},
       },
     });
     const execution = track(executor.execute(cmd));

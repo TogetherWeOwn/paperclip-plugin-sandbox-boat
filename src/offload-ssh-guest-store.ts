@@ -18,6 +18,7 @@ import {
   renderFilesFromList,
   SyncError,
   type GuestFileState,
+  type GuestScanResult,
   type GuestStore,
   type SourceManifest,
   type SyncFileEntry,
@@ -56,12 +57,23 @@ export const MAX_GUEST_SCAN_ENTRIES = 100_000;
  * The scan result is guest output: re-check what our own script promises
  * before any key reaches a host path. Bad names or shapes fail closed;
  * default-excluded names (runtime state, secrets) are dropped, never collected.
+ * The script prints an envelope {files, truncated}; a bare file map is the
+ * pre-envelope shape and reads as a complete scan.
  */
-export function validateGuestScan(raw: unknown): Map<string, GuestFileState> {
+export function validateGuestScan(raw: unknown): GuestScanResult {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new SyncError("SYNC_GUEST_READ", "Offload guest scan returned a non-object result.");
   }
-  const entries = Object.entries(raw as Record<string, unknown>);
+  const record = raw as Record<string, unknown>;
+  let fileMap: Record<string, unknown> = record;
+  let truncated = false;
+  if (typeof record.truncated === "boolean" && record.files !== null
+    && typeof record.files === "object" && !Array.isArray(record.files)
+    && Object.keys(record).every((key) => key === "files" || key === "truncated")) {
+    fileMap = record.files as Record<string, unknown>;
+    truncated = record.truncated;
+  }
+  const entries = Object.entries(fileMap);
   if (entries.length > MAX_GUEST_SCAN_ENTRIES) {
     throw new SyncError("SYNC_GUEST_READ", "Offload guest scan exceeded its entry limit.");
   }
@@ -71,19 +83,31 @@ export function validateGuestScan(raw: unknown): Map<string, GuestFileState> {
     if (isDefaultSyncExcluded(rel)) continue;
     out.set(rel, guestFileState(rel, value));
   }
-  return out;
+  return { files: out, truncated };
 }
 
 function guestFileState(rel: string, value: unknown): GuestFileState {
   const bad = () => new SyncError("SYNC_GUEST_READ", `Offload guest scan returned an invalid entry for ${JSON.stringify(rel)}.`);
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw bad();
-  const { size, mtimeMs, sha256, symlink, escaping } = value as Record<string, unknown>;
+  const { size, mtimeMs, sha256, symlink, escaping, special, unhashed } = value as Record<string, unknown>;
   if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) throw bad();
   if (typeof mtimeMs !== "number" || !Number.isFinite(mtimeMs)) throw bad();
   if (escaping !== undefined && escaping !== true) throw bad();
+  if (special !== undefined && special !== true) throw bad();
+  if (unhashed !== undefined && unhashed !== true) throw bad();
+  const flags = [escaping, special, unhashed].filter((flag) => flag === true).length;
+  if (flags > 1) throw bad();
   if (escaping) {
     if (sha256 !== "" || symlink !== undefined) throw bad();
     return { size, mtimeMs, sha256: "", escaping: true };
+  }
+  if (special) {
+    if (sha256 !== "" || symlink !== undefined) throw bad();
+    return { size, mtimeMs, sha256: "", special: true };
+  }
+  if (unhashed) {
+    if (sha256 !== "" || symlink !== undefined) throw bad();
+    return { size, mtimeMs, sha256: "", unhashed: true };
   }
   if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) throw bad();
   if (symlink === undefined) return { size, mtimeMs, sha256 };
@@ -484,7 +508,10 @@ print(json.dumps({'ok': True}))
 
 // Read-only guest inspection. No guest-supplied path becomes a host filename.
 // Hash large files in chunks; only return-eligible bytes cross the bounded read.
-const GUEST_INSPECT_SCRIPT = String.raw`
+// Special files and files past the hash budget are metadata only, and hitting
+// the entry/directory limits truncates the scan: one command's output must
+// never make every later collect in this mirror throw.
+export const GUEST_INSPECT_SCRIPT = String.raw`
 # boat-offload-inspect v1
 import base64, fnmatch, hashlib, json, os, stat, sys
 root, action, argument, excludes = json.load(sys.stdin)
@@ -517,14 +544,20 @@ if action == 'read':
             result = base64.b64encode(contents).decode() if len(contents) <= cap else None
 else:
     result = {}
-    total = 0
+    truncated = False
+    hashed = 0
+    budget = 268435456
+    emitted = 0
     stack = ['']
-    while stack:
+    while stack and not truncated:
         relative = stack.pop()
         directory = root + ('/' + relative if relative else '')
         if os.path.realpath(directory) != directory:
             raise ValueError('symlinked scan directory')
         for entry in os.scandir(directory):
+            if len(result) >= 100000:
+                truncated = True
+                break
             name = relative + '/' + entry.name if relative else entry.name
             if excluded(name):
                 continue
@@ -532,11 +565,9 @@ else:
             if stat.S_ISDIR(info.st_mode):
                 stack.append(name)
                 if len(stack) > 100000:
-                    raise ValueError('guest directory limit')
+                    truncated = True
+                    break
                 continue
-            total += info.st_size
-            if total > 268435456 or len(result) >= 100000:
-                raise ValueError('guest scan limit')
             value = {'size': info.st_size, 'mtimeMs': info.st_mtime * 1000}
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(entry.path)
@@ -546,22 +577,41 @@ else:
                 else:
                     value.update({'symlink': target, 'sha256': hashlib.sha256(('offload-symlink\0' + target).encode()).hexdigest()})
             elif stat.S_ISREG(info.st_mode):
-                digest = hashlib.sha256()
-                fd = open_file(name)
-                with os.fdopen(fd, 'rb') as source:
-                    remaining = 268435456 - total + info.st_size
-                    while True:
-                        chunk = source.read(65536)
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        if remaining < 0:
-                            raise ValueError('guest file grew past scan limit')
-                        digest.update(chunk)
-                value['sha256'] = digest.hexdigest()
+                if info.st_size > budget or hashed + info.st_size > budget:
+                    value.update({'unhashed': True, 'sha256': ''})
+                else:
+                    digest = hashlib.sha256()
+                    remaining = info.st_size
+                    grew = False
+                    fd = open_file(name)
+                    with os.fdopen(fd, 'rb') as source:
+                        while True:
+                            chunk = source.read(65536)
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                            if remaining < 0:
+                                grew = True
+                                break
+                            digest.update(chunk)
+                    if grew:
+                        value.update({'unhashed': True, 'sha256': ''})
+                    else:
+                        hashed += info.st_size - remaining
+                        value['sha256'] = digest.hexdigest()
             else:
-                raise ValueError('special guest file')
+                value.update({'special': True, 'sha256': ''})
+            # Bound the serialized response, not just the entry count: long
+            # paths, and symlink targets on non-escaping links, can outgrow
+            # the transport output cap well before 100000 entries. Count the
+            # whole serialized value so variable-length fields are never
+            # missed; 4 bytes covers the key/value framing.
+            emitted += len(json.dumps(name)) + len(json.dumps(value)) + 4
+            if emitted > 12582912:
+                truncated = True
+                break
             result[name] = value
+    result = {'files': result, 'truncated': truncated}
 print(json.dumps(result))
 `;
 
@@ -717,7 +767,7 @@ export class SshGuestStore implements GuestStore {
     return { removed: result.removed };
   }
 
-  async scan(guestDir: string): Promise<Map<string, GuestFileState>> {
+  async scan(guestDir: string): Promise<GuestScanResult> {
     return validateGuestScan(await this.inspect<unknown>("scan", null, 16 * 1024 * 1024, guestDir));
   }
 
@@ -778,12 +828,23 @@ export class SshGuestStore implements GuestStore {
   }
 
   private async inspect<T>(action: string, argument: unknown, maxOutputBytes: number, guestDir: string): Promise<T> {
-    return (await this.runScript(
-      GUEST_INSPECT_SCRIPT,
-      [guestDir, action, argument, DEFAULT_SYNC_EXCLUDES],
-      60_000,
-      maxOutputBytes,
-    )) as T;
+    try {
+      return (await this.runScript(
+        GUEST_INSPECT_SCRIPT,
+        [guestDir, action, argument, DEFAULT_SYNC_EXCLUDES],
+        60_000,
+        maxOutputBytes,
+      )) as T;
+    } catch (error) {
+      // The inspect script exiting 1 is a deterministic guest-content failure
+      // (its own ValueError checks), identical on every retry: surface it as
+      // a SyncError so collect can tell it from a lost transport.
+      const failure = error as { guestExitCode?: unknown; guestTimedOut?: unknown; guestSignal?: unknown } | null;
+      if (failure?.guestExitCode === 1 && failure.guestTimedOut === false && failure.guestSignal === null) {
+        throw new SyncError("SYNC_GUEST_READ", "Offload guest inspection refused the mirror contents.");
+      }
+      throw error;
+    }
   }
 
   private async runScript(script: string, stdin: unknown, timeoutMs: number, maxOutputBytes = 1024 * 1024): Promise<unknown> {
@@ -794,9 +855,13 @@ export class SshGuestStore implements GuestStore {
     );
     if (response.exitCode !== 0 || response.timedOut || response.signal) {
       // Guest output can contain file bytes. Never echo it into the error.
-      throw new Error(
+      const failure = new Error(
         `Offload guest mirror operation failed (exit=${response.exitCode}, signal=${response.signal}, timedOut=${response.timedOut}).`,
-      );
+      ) as Error & { guestExitCode?: unknown; guestTimedOut?: unknown; guestSignal?: unknown };
+      failure.guestExitCode = response.exitCode;
+      failure.guestTimedOut = response.timedOut;
+      failure.guestSignal = response.signal;
+      throw failure;
     }
     return JSON.parse(response.stdout) as unknown;
   }

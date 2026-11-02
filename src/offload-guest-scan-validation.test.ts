@@ -31,8 +31,9 @@ describe("SshGuestStore.scan validates guest output on the host", () => {
       "link": { size: 4, mtimeMs: 2, sha256: SHA, symlink: "src/a.rs" },
       "out": { size: 0, mtimeMs: 3, sha256: "", escaping: true },
     }).scan("/guest/mirror");
-    expect([...scanned.keys()].sort()).toEqual(["link", "out", "src/a.rs"]);
-    expect(scanned.get("out")).toEqual({ size: 0, mtimeMs: 3, sha256: "", escaping: true });
+    expect([...scanned.files.keys()].sort()).toEqual(["link", "out", "src/a.rs"]);
+    expect(scanned.files.get("out")).toEqual({ size: 0, mtimeMs: 3, sha256: "", escaping: true });
+    expect(scanned.truncated).toBe(false);
   });
 
   for (const rel of ["../escape", "/etc/passwd", "a/../../b", "a//b", "./a", "a/.", "", "a\0b"]) {
@@ -50,7 +51,20 @@ describe("SshGuestStore.scan validates guest output on the host", () => {
       ".env": { size: 1, mtimeMs: 1, sha256: SHA },
       "pkg/.npmrc": { size: 1, mtimeMs: 1, sha256: SHA },
     }).scan("/guest/mirror");
-    expect([...scanned.keys()]).toEqual(["keep.txt"]);
+    expect([...scanned.files.keys()]).toEqual(["keep.txt"]);
+  });
+
+  it("accepts special and unhashed entries and the truncated envelope", async () => {
+    const scanned = await guestPrinting({
+      files: {
+        "pipe": { size: 0, mtimeMs: 1, sha256: "", special: true },
+        "big.bin": { size: 300_000_000, mtimeMs: 2, sha256: "", unhashed: true },
+      },
+      truncated: true,
+    }).scan("/guest/mirror");
+    expect(scanned.truncated).toBe(true);
+    expect(scanned.files.get("pipe")).toEqual({ size: 0, mtimeMs: 1, sha256: "", special: true });
+    expect(scanned.files.get("big.bin")).toEqual({ size: 300_000_000, mtimeMs: 2, sha256: "", unhashed: true });
   });
 
   const malformed: Array<[string, unknown]> = [
@@ -64,6 +78,10 @@ describe("SshGuestStore.scan validates guest output on the host", () => {
     ["short hash", { a: { size: 1, mtimeMs: 1, sha256: "abc" } }],
     ["empty hash without escaping", { a: { size: 1, mtimeMs: 1, sha256: "" } }],
     ["non-boolean escaping", { a: { size: 0, mtimeMs: 1, sha256: "", escaping: "yes" } }],
+    ["non-boolean special", { a: { size: 0, mtimeMs: 1, sha256: "", special: "yes" } }],
+    ["special with a hash", { a: { size: 0, mtimeMs: 1, sha256: SHA, special: true } }],
+    ["unhashed with a link target", { a: { size: 0, mtimeMs: 1, sha256: "", unhashed: true, symlink: "x" } }],
+    ["two metadata flags at once", { a: { size: 0, mtimeMs: 1, sha256: "", special: true, unhashed: true } }],
     ["escaping with a link target", { a: { size: 0, mtimeMs: 1, sha256: "", escaping: true, symlink: "/etc" } }],
     ["non-string link", { a: { size: 1, mtimeMs: 1, sha256: SHA, symlink: 7 } }],
   ];
