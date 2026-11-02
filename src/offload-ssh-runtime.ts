@@ -465,6 +465,12 @@ export class SshOffloadRuntime {
     binding.credentialDigest ??= poolCredentialDigest(binding.config)
       .catch((error: unknown) => { binding.credentialDigest = undefined; throw error; });
     const credentialDigest = await binding.credentialDigest;
+    // The KDF await reopens the window the closing check above closed:
+    // shutdown may have taken its pool snapshot while the digest was pending.
+    // Re-fence here (and after every later await) so no executor can be
+    // registered after that snapshot; from the last check to pools.set the
+    // path is synchronous, so shutdown cannot interleave.
+    if (this.closing) return null;
     const baseIdentity = JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]);
     const poolId = createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest]))
@@ -489,6 +495,7 @@ export class SshOffloadRuntime {
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
+      if (this.closing) return null;
       existing = this.pools.get(poolId);
     }
     if (existing) {

@@ -84,6 +84,23 @@ describe("stock concrete executor factory", () => {
     expect(await resolving).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("fences a resolution awaiting the credential digest when shutdown starts", async () => {
+    const resolving = runtime.resolve(command(), config);
+    // Park resolve on the async KDF before starting shutdown: the digest
+    // promise is memoized on the binding before it is awaited, so observing it
+    // means resolve is inside the digest await, past the earlier closing check.
+    const view = runtime as unknown as { bindings: Map<string, { credentialDigest?: Promise<string> }>, pools: Map<string, unknown> };
+    let settled = false;
+    void resolving.then(() => { settled = true; }, () => { settled = true; });
+    while (!settled && ![...view.bindings.values()].some((binding) => binding.credentialDigest !== undefined)) {
+      await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+    }
+    expect([...view.bindings.values()].some((binding) => binding.credentialDigest !== undefined)).toBe(true);
+    await runtime.shutdown();
+    expect(await resolving).toBe(null);
+    expect(view.pools.size).toBe(0);
+    expect(boat.calls).toHaveLength(0);
+  });
   it("wires the stock worker from native params without injecting a lifecycle executor", async () => {
     const harness = createFakeContext({ workspaces: new Map([[executionWorkspaceId, {
       repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: source, cwd: source,
