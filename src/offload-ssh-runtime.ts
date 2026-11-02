@@ -371,19 +371,13 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
-  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
-  hasRun(companyId: string, runId: string): boolean {
-    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
-    return false;
-  }
-
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
   forgetRun(companyId: string, runId: string): string[] {
-    const dropped: string[] = [];
+    const dropped = new Set<string>();
     for (const [id, entry] of this.bindings) {
-      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.push(entry.workspaceId); }
+      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.add(entry.workspaceId); }
     }
-    return dropped;
+    return [...dropped];
   }
 
   remember(params: PluginEnvironmentRealizeWorkspaceParams): void {
@@ -393,12 +387,19 @@ export class SshOffloadRuntime {
       || request.environmentId !== params.environmentId || !plain(request.heartbeatRunId) || !plain(request.executionWorkspaceId)
       || !plain(source.localPath) || !path.isAbsolute(source.localPath) || source.localPath !== params.workspace.localPath) return;
     const config = parseDriverConfig(params.config);
-    this.bindings.set(key(params.companyId, request.heartbeatRunId, request.executionWorkspaceId), {
+    const binding: Binding = {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
       config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
-    });
+    };
+    this.bindings.set(key(params.companyId, binding.runId, binding.workspaceId), binding);
+    // The shim reports PAPERCLIP_WORKSPACE_ID, which carries the project
+    // workspace id even for execution workspaces, so the same binding must
+    // answer under that host-owned id too (mirrors NativeOffloadWorkspaces).
+    if (plain(source.projectWorkspaceId) && source.projectWorkspaceId !== binding.workspaceId) {
+      this.bindings.set(key(params.companyId, binding.runId, source.projectWorkspaceId), binding);
+    }
   }
 
   /** Re-prove a local-run binding's operator-owned facts: the source still sits

@@ -40,7 +40,7 @@ export interface LocalRunHost {
   issueWorkspaceId(issueId: string, companyId: string): Promise<string | null>;
   issueProjectWorkspace(issueId: string, companyId: string): Promise<LocalRunProjectWorkspace | null>;
   workspace(workspaceId: string, companyId: string): Promise<{
-    projectId: string; projectWorkspaceId: string | null; path: string | null; repoUrl: string | null;
+    projectId: string; projectWorkspaceId: string | null; path: string | null; cwd?: string | null; repoUrl: string | null;
   } | null>;
   /** Real path of a local path, or null when it does not resolve. */
   canonicalPath(localPath: string): Promise<string | null>;
@@ -79,17 +79,19 @@ export function localRunSettings(raw: unknown): LocalRunSettings {
   };
 }
 
-/** Returns the realization payload for a started local run, or null when any host fact is missing. */
+/** Returns the realization payload for a started local run, or null when any host fact is missing.
+ * Every refusal reports its reason through `options.onRefuse` so the caller can log it. */
 export async function localRunRealization(
   event: { companyId: string; payload: unknown },
   settings: LocalRunSettings,
   host: LocalRunHost,
-  options: { expectedWorkspaceId?: string } = {},
+  options: { expectedWorkspaceId?: string; onRefuse?: (reason: string) => void } = {},
 ): Promise<PluginEnvironmentRealizeWorkspaceParams | null> {
-  if (!settings.enabled || !settings.environmentId || !settings.apiKeySecretRef) return null;
+  const refuse = (reason: string): null => { options.onRefuse?.(reason); return null; };
+  if (!settings.enabled || !settings.environmentId || !settings.apiKeySecretRef) return refuse("local-run offload is not enabled or not fully configured");
   const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
   const { companyId } = event;
-  if (!id(companyId) || !id(payload.runId) || !id(payload.issueId)) return null;
+  if (!id(companyId) || !id(payload.runId) || !id(payload.issueId)) return refuse("run event is missing a run or issue id");
   // Isolated workspaces bind the issue's execution workspace exactly as before.
   // Otherwise the live issue shape has no execution workspace id, and the shim
   // reports PAPERCLIP_WORKSPACE_ID, the project workspace id: bind that.
@@ -100,7 +102,8 @@ export async function localRunRealization(
     const workspace = await host.workspace(executionWorkspaceId, companyId);
     if (workspace) {
       workspaceId = executionWorkspaceId;
-      source = { localPath: workspace.path, repoUrl: workspace.repoUrl,
+      // The SDK metadata exposes both spellings; some rows carry only cwd.
+      source = { localPath: workspace.path ?? workspace.cwd ?? null, repoUrl: workspace.repoUrl,
         projectId: workspace.projectId, projectWorkspaceId: workspace.projectWorkspaceId };
     }
   } else {
@@ -111,26 +114,31 @@ export async function localRunRealization(
         projectId: projectWorkspace.projectId, projectWorkspaceId: projectWorkspace.id };
     }
   }
-  if (!workspaceId || !source) return null;
+  if (!workspaceId || !source) return refuse("issue has no execution or project workspace");
   // A bind retried from an offload request serves only the workspace that
-  // request named; anything else returns before the secret is resolved.
-  if (options.expectedWorkspaceId && workspaceId !== options.expectedWorkspaceId) return null;
+  // request named; anything else returns before the secret is resolved. The
+  // name may be either host-owned id of the same workspace: the bind keys on
+  // the execution workspace id, but the shim reports PAPERCLIP_WORKSPACE_ID,
+  // which carries the project workspace id even for execution workspaces.
+  if (options.expectedWorkspaceId && workspaceId !== options.expectedWorkspaceId
+    && source.projectWorkspaceId !== options.expectedWorkspaceId) return refuse("requested workspace does not match the run's workspace");
   const localPath = source.localPath;
-  if (typeof localPath !== "string" || !path.isAbsolute(localPath) || localPath.includes("\0")) return null;
+  if (typeof localPath !== "string" || !path.isAbsolute(localPath) || localPath.includes("\0")) return refuse("workspace is not locally realized");
   // The workspace row is agent-mutable: the source must sit under an
   // operator-listed root and the checkout itself must prove the repo.
-  if (settings.sourceRoots.length === 0 || typeof source.repoUrl !== "string" || !source.repoUrl.trim()) return null;
+  if (settings.sourceRoots.length === 0) return refuse("no local source roots are configured");
+  if (typeof source.repoUrl !== "string" || !source.repoUrl.trim()) return refuse("workspace has no repoUrl");
   const canonical = await host.canonicalPath(localPath).catch(() => null);
-  if (!canonical) return null;
+  if (!canonical) return refuse("source path does not resolve");
   const canonicalRoots = (await Promise.all(settings.sourceRoots.map((root) => host.canonicalPath(root).catch(() => null))))
     .filter((root): root is string => root !== null);
-  if (!withinRoots(canonical, canonicalRoots)) return null;
+  if (!withinRoots(canonical, canonicalRoots)) return refuse("source is outside the configured roots");
   const onDiskRepoUrl = await host.onDiskRepoUrl(canonical).catch(() => null);
-  if (!onDiskRepoUrl) return null;
+  if (!onDiskRepoUrl) return refuse("checkout has no on-disk origin");
   const repoId = canonicalRepoId({ repoUrl: source.repoUrl, projectId: source.projectId });
-  if (!repoId.startsWith("repo:") || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: source.projectId }) !== repoId) return null;
+  if (!repoId.startsWith("repo:") || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: source.projectId }) !== repoId) return refuse("on-disk origin does not match the workspace repoUrl");
   const apiKey = await host.apiKey(settings.apiKeySecretRef, companyId);
-  if (!apiKey) return null;
+  if (!apiKey) return refuse("secret did not resolve");
   return {
     driverKey: "boat",
     companyId,

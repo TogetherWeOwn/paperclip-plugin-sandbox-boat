@@ -72,6 +72,39 @@ describe("local-run offload binding", () => {
     expect(apiKey).not.toHaveBeenCalled();
   });
 
+  it("accepts the project workspace id the shim reports for an execution-branch bind", async () => {
+    // The live smoke failure: the bind keys on the execution
+    // workspace id, but PAPERCLIP_WORKSPACE_ID carries the project workspace id.
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      workspace: async () => ({ projectId: "project", projectWorkspaceId, path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
+    }), { expectedWorkspaceId: projectWorkspaceId });
+    expect(params).toMatchObject({
+      workspace: { localPath: "/srv/work/repo", metadata: { workspaceRealizationRequest: {
+        heartbeatRunId: runId, executionWorkspaceId: workspaceId, localRun: true,
+        source: { localPath: "/srv/work/repo", repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId },
+      } } },
+    });
+  });
+
+  it("falls back to the execution workspace cwd when its path is null", async () => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      workspace: async () => ({ projectId: "project", projectWorkspaceId, path: null, cwd: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
+    }));
+    expect(params).toMatchObject({ workspace: { localPath: "/srv/work/repo" } });
+  });
+
+  it.each([
+    ["disabled", { ...enabled, offloadLocalRunsEnabled: false }, host(), {}, "not enabled"],
+    ["outside the roots", enabled, host({ workspace: async () => ({ projectId: "p", projectWorkspaceId: null, path: "/home/other/repo", repoUrl: "https://github.com/example/public" }) }), {}, "outside the configured roots"],
+    ["expected workspace differs", enabled, host(), { expectedWorkspaceId: projectWorkspaceId }, "does not match"],
+    ["on-disk origin differs", enabled, host({ onDiskRepoUrl: async () => "https://github.com/example/private" }), {}, "does not match"],
+  ])("reports a refusal reason the caller can log: %s", async (_name, settings, fakeHost, options, reason) => {
+    const reasons: string[] = [];
+    expect(await localRunRealization(started, localRunSettings(settings), fakeHost, { ...options, onRefuse: (r) => reasons.push(r) })).toBe(null);
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain(reason);
+  });
+
   it("binds the project workspace when the live issue shape leaves executionWorkspaceId null", async () => {
     const params = await localRunRealization(started, localRunSettings(enabled), host({
       issueWorkspaceId: async () => null,
@@ -179,6 +212,46 @@ describe("plugin wiring", () => {
     expect((await exec(runId)).status).toBe(200);
     expect((await exec(randomUUID())).status).toBe(403);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
+  });
+
+  it("answers under the project workspace id the shim reports for an execution-branch bind", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    await harness.emit("agent.run.started", started);
+    const bound = harness.logs.find((entry) => entry.message === "boat: bound local run for offload");
+    expect(bound?.meta).toMatchObject({ runId, workspaceId });
+    const response = await exec(runId, projectWorkspaceId);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ mode: "remote_candidate" });
+    expect((await exec(runId, workspaceId)).status).toBe(200);
+    const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+    // A workspace id the host never named for this run still refuses.
+    expect((await exec(runId, randomUUID())).status).toBe(503);
+  });
+
+  it("completes the bind on request when the started bind registered only the execution id", async () => {
+    const harness = await setup(enabled);
+    // The started bind sees no project workspace link yet: primary id only.
+    await harness.emit("agent.run.started", started);
+    const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(false);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+    // Probing afterwards with random ids still spends no secret resolution.
+    let resolutions = 0;
+    const originalResolve = harness.ctx.secrets.resolve;
+    harness.ctx.secrets.resolve = async (ref: { secretId?: string } | null) => { resolutions += 1; return originalResolve(ref); };
+    try {
+      for (let i = 0; i < 10; i += 1) expect((await exec(runId, randomUUID())).status).toBe(503);
+      expect(resolutions).toBe(0);
+    } finally {
+      harness.ctx.secrets.resolve = originalResolve;
+    }
   });
 
   it("binds on the first offload request when the workspace was prepared after the started event", async () => {

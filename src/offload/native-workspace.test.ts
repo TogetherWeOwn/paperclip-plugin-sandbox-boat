@@ -60,6 +60,28 @@ describe("native workspace binding", () => {
     expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
   });
 
+  it("answers under the host payload's project workspace id as well", async () => {
+    // The shim reports PAPERCLIP_WORKSPACE_ID, which carries the project
+    // workspace id, while the realization keys on the execution workspace id.
+    const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
+    await setup();
+    await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace({
+      source: { localPath: "/work/public-rust", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" },
+    }));
+    const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
+    expect(response).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+  });
+
+  it("logs the run, workspace and reason when the exec route refuses with 503", async () => {
+    const harness = await setup();
+    expect((await submit()).status).toBe(503);
+    expect(harness.logs.some((entry) => entry.message === "boat: offload exec refused"
+      && entry.meta?.runId === runId && entry.meta?.workspaceId === workspaceId
+      && String(entry.meta?.reason).includes("unknown execution workspace"))).toBe(true);
+  });
+
   it("persists only source metadata and survives a worker restart", async () => {
     const t = await setup();
     const params = nativeWorkspace({ runtimeOverlay: { provisionCommand: "sensitive-not-to-persist" } });

@@ -65,16 +65,25 @@ export class NativeOffloadWorkspaces {
       path: localPath,
       cwd: localPath,
     };
+    // The realization keys on the execution workspace id, but the shim reports
+    // PAPERCLIP_WORKSPACE_ID, which carries the project workspace id even for
+    // execution workspaces. Both ids are host-owned fields of this same
+    // payload, so register the binding under the project workspace id too.
+    const aliasId = workspace.projectWorkspaceId;
+    const ids = aliasId && aliasId !== workspaceId ? [workspaceId, aliasId] : [workspaceId];
     // Index first, and write the binding under the same lock: a binding must
     // never exist that forgetRun cannot find, even when forgetRun runs meanwhile.
     await this.withIndex(params.companyId, runId, async () => {
       const workspaces = await this.indexed(params.companyId, runId);
-      if (!workspaces.includes(workspaceId)) {
-        await this.state.set(runIndexScope(params.companyId, runId), { version: 1, workspaces: [...workspaces, workspaceId] });
+      const missing = ids.filter((id) => !workspaces.includes(id));
+      if (missing.length > 0) {
+        await this.state.set(runIndexScope(params.companyId, runId), { version: 1, workspaces: [...workspaces, ...missing] });
       }
-      await this.state.set(scope(params.companyId, workspaceId, runId), {
-        version: 1, companyId: params.companyId, runId, workspaceId, workspace,
-      });
+      for (const id of ids) {
+        await this.state.set(scope(params.companyId, id, runId), {
+          version: 1, companyId: params.companyId, runId, workspaceId: id, workspace,
+        });
+      }
     });
   }
 
