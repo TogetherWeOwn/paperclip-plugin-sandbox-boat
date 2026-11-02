@@ -80,6 +80,8 @@ export class FakeBoat {
   namedAllowance = { free: 10, used: 0 };
   /** Shared with FakeSsh.timeline: each API method, in call order. */
   timeline: string[] | null = null;
+  /** Idempotency-Key replay: the provider-side id of the key's first effect. */
+  private readonly idempotency = new Map<string, string>();
   private counter = 0;
 
   constructor(private readonly clock: { now: () => number }) {}
@@ -137,13 +139,24 @@ export class FakeBoat {
 
   // ---- SDK surface (flat request form) ----
 
-  async create(args: Record<string, unknown> = {}) {
-    this.record("create", args);
+  private idempotencyKeyOf(args: Record<string, unknown>): string | null {
+    const key = args.idempotencyKey;
+    return typeof key === "string" && key.length > 0 ? key : null;
+  }
+
+  private replay(key: string): { ok: boolean; type: string; status: string; ttlSeconds: number | null; sandbox: Record<string, unknown> } | null {
+    const prior = this.idempotency.get(key);
+    const sandbox = prior ? this.boxes.get(prior) : undefined;
+    if (!sandbox) return null;
+    return { ok: true, type: "sandbox.replayed", status: "ready", ttlSeconds: sandbox.ttlSeconds, sandbox: this.view(sandbox) };
+  }
+
+  private makeBox(args: Record<string, unknown>): FakeSandbox {
     this.counter += 1;
     const id = `bx_fake${String(this.counter).padStart(4, "0")}`;
     const ttl = (args.ttlSeconds as number | null | undefined) ?? 3600;
     const now = new Date(this.clock.now());
-    const sandbox = this.addSandbox({
+    return this.addSandbox({
       id,
       name: id,
       state: "ready",
@@ -160,7 +173,26 @@ export class FakeBoat {
       environment: args.noEnv === true ? null : ((args.environment as string) ?? "base"),
       holdsCreatorLogins: args.noEnv !== true,
     });
-    return { ok: true, type: "sandbox.created", status: "ready", ttlSeconds: ttl, sandbox: this.view(sandbox) };
+  }
+
+  /** Provider-side effect of a create whose reply is then lost: the box exists
+   * and the idempotency key maps to it, so a same-key retry replays it instead
+   * of billing a second VM. Use as a failNext handler for lost-reply tests. */
+  loseCreateReply(args: Record<string, unknown>): Error {
+    const sandbox = this.makeBox(args);
+    const key = this.idempotencyKeyOf(args);
+    if (key) this.idempotency.set(key, sandbox.id);
+    return responseError(500, { code: "internal", message: "lost create reply" });
+  }
+
+  async create(args: Record<string, unknown> = {}) {
+    this.record("create", args);
+    const key = this.idempotencyKeyOf(args);
+    const replayed = key ? this.replay(key) : null;
+    if (replayed) return replayed;
+    const sandbox = this.makeBox(args);
+    if (key) this.idempotency.set(key, sandbox.id);
+    return { ok: true, type: "sandbox.created", status: "ready", ttlSeconds: sandbox.ttlSeconds, sandbox: this.view(sandbox) };
   }
 
   async get(args: { sandboxId: string }) {
@@ -212,6 +244,9 @@ export class FakeBoat {
 
   async fork(args: Record<string, unknown>) {
     this.record("fork", args);
+    const key = this.idempotencyKeyOf(args);
+    const replayed = key ? this.replay(key) : null;
+    if (replayed) return { ...replayed, type: "sandbox.forked" };
     this.need(args.sandboxId);
     this.counter += 1;
     const id = `bx_fake${String(this.counter).padStart(4, "0")}`;
@@ -230,6 +265,7 @@ export class FakeBoat {
       monitoring: args.monitoring !== false,
       from: null,
     });
+    if (key) this.idempotency.set(key, sandbox.id);
     return { ok: true, type: "sandbox.forked", status: "ready", ttlSeconds: ttl, sandbox: this.view(sandbox) };
   }
 
@@ -300,6 +336,7 @@ export class FakeBoat {
     this.record("saveNamedSnapshot", args);
     this.need(args.sandboxId);
     const name = String(args.name);
+    if (!this.named.has(name)) this.namedAllowance.used += 1;
     this.named.set(name, { name, status: "saving", sourceSandboxId: String(args.sandboxId), createdAt: new Date(this.clock.now()), polls: 0 });
     return { ok: true, type: "named_snapshot.saving", status: "saving", snapshot: { name, status: "saving", sourceSandboxId: args.sandboxId } };
   }
@@ -317,6 +354,7 @@ export class FakeBoat {
     this.record("deleteNamedSnapshot", args);
     if (!this.named.has(args.name)) throw responseError(404, { code: "snapshot_not_found" });
     this.named.delete(args.name);
+    this.namedAllowance.used = Math.max(0, this.namedAllowance.used - 1);
     return { ok: true, type: "named_snapshot.deleted" };
   }
 

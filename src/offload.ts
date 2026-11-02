@@ -693,6 +693,19 @@ export class OffloadExecutor {
     if (this.lifecycle && this.pool.some((vm) => vm.quarantined && vm.workspaceKey === undefined)) {
       return { kind: "unavailable", reason: "recovered workspace ownership unknown; reconciliation required" };
     }
+    // Resolve lost create replies before selecting: each iteration retires at
+    // least one uncertain placeholder (adopted runs return at once), so the
+    // loop ends when none remain or a replay stays uncertain.
+    for (;;) {
+      const uncertain = this.pool.find((vm) => vm.quarantined && vm.sandboxId === "" && vm.accountReservation);
+      if (!uncertain) break;
+      const resolved = await this.resolveUncertainCreate(uncertain, command);
+      if (resolved) {
+        if (resolved.kind === "freed") continue;
+        return resolved;
+      }
+      break;
+    }
     const workspace = this.workspaceKey(command);
     const held = workspace === null ? undefined : this.pool.find((vm) =>
       vm.workspaceKey === workspace && (vm.busy || vm.quarantined));
@@ -825,6 +838,75 @@ export class OffloadExecutor {
     return entry.refusal;
   }
 
+  /**
+   * Adopt (or stop) a create whose reply was lost. The placeholder stays
+   * quarantined with no provider id but a retained reservation; re-issuing the
+   * create under the same idempotency key replays the original effect instead
+   * of billing a second VM. A compatible retry adopts the replayed VM and runs
+   * on it; an incompatible one stops the replayed VM and retires the slot so a
+   * fresh create can proceed. Returns the run claim, "freed" when the slot was
+   * retired, or null when the replay itself is still uncertain (the placeholder
+   * stays quarantined for a later claim to retry).
+   */
+  private async resolveUncertainCreate(vm: PoolVm, command: OffloadCommand): Promise<Reservation | { kind: "freed" } | null> {
+    const ledger = this.ledger!;
+    const reservation = vm.accountReservation;
+    if (!vm.quarantined || vm.sandboxId !== "" || !reservation) return null;
+    const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+    const ttlSeconds = Math.max(60, Math.ceil(jobSeconds + reservation.tailSeconds));
+    const idempotencyKey = `pcboatoff-${reservation.id}`;
+    let id: string;
+    try {
+      if (this.config.templateSnapshot) {
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true,
+          from: this.config.templateSnapshot, idempotencyKey });
+        const replayed = sandboxIdOf(response);
+        if (!replayed) throw new Error("create returned no sandbox id");
+        id = replayed;
+      } else if (this.config.templateSourceSandboxId) {
+        const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+          ttlSeconds, monitoring: true, failFast: true, noEnv: true, idempotencyKey });
+        const replayed = sandboxIdOf(response);
+        if (!replayed) throw new Error("fork returned no sandbox id");
+        id = replayed;
+      } else {
+        const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: true, failFast: true, noEnv: true, idempotencyKey });
+        const replayed = sandboxIdOf(response);
+        if (!replayed) throw new Error("create returned no sandbox id");
+        id = replayed;
+      }
+    } catch (error) {
+      if (!await definitiveStartRejection(error)) return null;
+      await ledger.failed(reservation, true).catch(() => undefined);
+      this.retireVm(vm);
+      await this.persistPool().catch(() => undefined);
+      return { kind: "freed" };
+    }
+    if (vm.compatibilityKey === this.compatibilityKey(command)) {
+      vm.sandboxId = id;
+      vm.quarantined = false;
+      vm.stopped = false;
+      vm.lastActiveAt = this.now();
+      vm.workspaceKey = this.workspaceKey(command);
+      try {
+        vm.tailSeconds = await ledger.started(this.boat, reservation, id);
+      } catch {
+        // The receipt write failed; the provider effect is tracked by the
+        // idempotency key, so a later claim replays and adopts it.
+        return null;
+      }
+      await this.persistPool().catch(() => undefined);
+      return { kind: "run", vm, warm: "cold" };
+    }
+    // Another trust domain's retry must not adopt the replayed VM; stop it so
+    // it never bills untracked, close the retained reservation, and free the slot.
+    await this.boat.stop({ sandboxId: id }).catch(() => undefined);
+    await ledger.stopped(id, this.now(), reservation.id).catch(() => undefined);
+    this.retireVm(vm);
+    await this.persistPool().catch(() => undefined);
+    return { kind: "freed" };
+  }
+
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
     // Monthly VM-hour cap, when configured, is enforced atomically with
@@ -866,20 +948,24 @@ export class OffloadExecutor {
         // command stays local. Named snapshots are blocked on the trial, so a
         // configured archived sandbox is forked instead; a failing fork is a
         // refused start the same way.
+        // The idempotency key is the retained reservation: a create whose reply
+        // is lost replays under the same key instead of billing a second VM,
+        // and resolveUncertainCreate adopts (or stops) the replayed VM.
+        const idempotencyKey = `pcboatoff-${reservation.id}`;
         if (this.config.templateSnapshot) {
           const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true,
-            from: this.config.templateSnapshot });
+            from: this.config.templateSnapshot, idempotencyKey });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("create returned no sandbox id");
           vm.sandboxId = id;
         } else if (this.config.templateSourceSandboxId) {
           const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
-            ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true });
+            ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("fork returned no sandbox id");
           vm.sandboxId = id;
         } else {
-          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true });
+          const response = await this.boat.create({ type: this.config.size, ttlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
           const id = sandboxIdOf(response);
           if (!id) throw new Error("create returned no sandbox id");
           vm.sandboxId = id;
