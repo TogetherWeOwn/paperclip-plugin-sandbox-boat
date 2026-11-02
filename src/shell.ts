@@ -60,16 +60,28 @@ export function newRemoteEnvStage(): RemoteEnvStage {
  * The remote command that writes stdin into the env file. `mkdir` without -p
  * fails when the path exists, so the file only ever lands in a directory that
  * this command made itself.
+ *
+ * It goes through buildRemoteCommand like every payload: sshd's `$SHELL -c`
+ * may source guest shell hooks (`~/.bashrc` function definitions such as a
+ * planted `cat(){ tee ...; }`) before the first word runs, so the staging
+ * itself must not execute in that shell. The exec'd `sh` inherits no shell
+ * functions, and every tool is an absolute path, so neither a function nor a
+ * PATH trojan planted by an earlier run on this disk can intercept the write.
+ * This is defense in depth only: the guest has root, the outer shell still
+ * runs its hooks before the exec, and a watcher it starts can see the env
+ * file land. What keeps another principal's credentials off a planted disk
+ * is the host-side reuse boundary (the principal-scoped VM key in
+ * vm-manager.ts), never this command.
  */
 export function stageRemoteEnvCommand(stage: RemoteEnvStage): string {
   const dir = shellQuote(stage.dir);
   const file = shellQuote(stage.path);
-  return `umask 077 && mkdir -m 700 ${dir} && cat > ${file} && chmod 600 ${file}`;
+  return buildRemoteCommand(`umask 077 && /bin/mkdir -m 700 ${dir} && /bin/cat > ${file} && /bin/chmod 600 ${file}`);
 }
 
-/** Removes the env file and its directory. Safe to run when they are gone. */
+/** Removes the env file and its directory. Safe to run when they are gone. Absolute paths, for the same reason as stageRemoteEnvCommand. */
 export function removeRemoteEnvCommand(stage: RemoteEnvStage): string {
-  return `rm -f ${shellQuote(stage.path)}; rmdir ${shellQuote(stage.dir)} 2>/dev/null`;
+  return `/bin/rm -f ${shellQuote(stage.path)}; /bin/rmdir ${shellQuote(stage.dir)} 2>/dev/null`;
 }
 
 /**
@@ -98,14 +110,28 @@ export const SCRUB_BASHRC_ASCII_TOKEN = `{ f="$HOME/.bashrc"; if [ -f "$f" ] && 
 // credentials again (a sourced profile can export ASCII_TOKEN from ~/.bashrc),
 // tells GNU tar to skip `.paperclip-runtime` members (TAR_SKIP_RUNTIME_DIR;
 // after the env file, so a TAR_OPTIONS from the run env keeps the exclude),
-// and only then runs the payload. The payload runs as a child, not exec'd:
-// this shell never had the credentials in its startup environment
-// (buildRemoteCommand), so it may stay alive as the payload's parent, and its
-// `exit $rc` hands sshd the payload's status, 128+n for a signal. The payload
-// is never the script's last command, so no shell turns it into an implicit
-// exec. The trailing remove is a fallback for a script that stopped before the
-// first one (a failed `cd` or a failed source); after the payload the file is
-// already gone.
+// and only then runs the payload.
+//
+// Order, and why the env file is NOT sourced before the $HOME profiles: the
+// run env must override the profiles (a Debian-style profile rebuilds PATH,
+// which would hide the managed-GitHub launcher dir the run env puts first,
+// and a profile TAR_OPTIONS must not replace the run's). Sourcing the env
+// file first would not protect its values anyway: profile code runs in this
+// same shell, so before the source it could read the file and after it it
+// can read the exported values. What this ordering does still guarantee is
+// mechanical: the file is removed (by absolute path, immune to a planted
+// `rm` function or PATH entry) before the payload starts. Keeping another
+// principal's credentials away from a planted profile is the host-side
+// reuse boundary's job (vm-manager.ts), not this script's.
+//
+// The payload runs as a child, not exec'd: this shell never had the
+// credentials in its startup environment (buildRemoteCommand), so it may
+// stay alive as the payload's parent, and its `exit $rc` hands sshd the
+// payload's status, 128+n for a signal. The payload is never the script's
+// last command, so no shell turns it into an implicit exec. The trailing
+// remove is a fallback for a script that stopped before the first one (a
+// failed `cd` or a failed source); after the payload the file is already
+// gone.
 export function envSourcingScriptLines(stage: RemoteEnvStage, payloadScript: string): string[] {
   const file = shellQuote(stage.path);
   const remove = removeRemoteEnvCommand(stage);

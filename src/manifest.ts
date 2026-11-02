@@ -389,6 +389,13 @@ const manifest: PaperclipPluginManifestV1 = {
             description: "Allow template capture beyond boat's 10 free named snapshots ($1.70 a month each).",
             ...advanced("VM"),
           },
+          deleteCardVmOnRelease: {
+            type: "boolean",
+            default: false,
+            description:
+              "Delete a card's VM on release (once no other run holds it) instead of stopping it for the next run to resume. Every run then starts on a fresh disk. Set true for environments that run untrusted, public or PR-branch work; leave false for the stop-and-resume cost model. stop_and_retain and StopLease still keep the disk.",
+            ...advanced("VM"),
+          },
           costApiKey: {
             type: "string",
             format: "secret-ref",

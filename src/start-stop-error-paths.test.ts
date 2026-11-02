@@ -17,6 +17,7 @@ import { DRIVER_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { FakeBoat, responseError } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext } from "./test-support/harness.js";
+import { resolveVmKey } from "./vm-manager.js";
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const ENV = "22222222-2222-4222-8222-222222222222";
@@ -78,7 +79,8 @@ async function release(lease: { providerLeaseId: string | null; metadata?: Recor
 }
 
 function vmRecord(): { sandboxId: string; status: string } {
-  return (harness.state.get(VMS_KEY) as { vms: Record<string, { sandboxId: string; status: string }> }).vms[`ew:${WORKSPACE}`];
+  const { key } = resolveVmKey({ executionWorkspaceId: WORKSPACE, issueId: ISSUE, runId: "record-lookup", agentId: "agent-1" });
+  return (harness.state.get(VMS_KEY) as { vms: Record<string, { sandboxId: string; status: string }> }).vms[key];
 }
 
 describe("boat start refusals", () => {

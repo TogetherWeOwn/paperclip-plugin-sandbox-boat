@@ -10,6 +10,7 @@ vi.mock("node:child_process", async () => {
 import { setBoatApiFactoryForTests, type BoatApiLike } from "./boat-client.js";
 import { DRIVER_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
+import { resolveVmKey } from "./vm-manager.js";
 import type { StateDoc, VmRecord } from "./state.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext } from "./test-support/harness.js";
@@ -82,7 +83,7 @@ async function release(lease: Lease) {
 }
 
 function record(): VmRecord {
-  return (harness.state.get(STATE_KEY) as StateDoc).vms[`ew:${WORKSPACE}`];
+  return (harness.state.get(STATE_KEY) as StateDoc).vms[resolveVmKey({ executionWorkspaceId: WORKSPACE, issueId: ISSUE, runId: "key", agentId: "test-agent" }).key];
 }
 
 function confirmationLogs() {
