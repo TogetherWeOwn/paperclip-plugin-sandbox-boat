@@ -170,6 +170,7 @@ with tempfile.TemporaryDirectory(prefix='boat-fetch-', dir=request['scratch']) a
             'cargoHome': str(cargo_home) if cargo_home is not None else None,
             'argv': (stub / 'argv').read_text() if (stub / 'argv').exists() else None,
             'cargohome': (stub / 'cargohome').read_text() if (stub / 'cargohome').exists() else None,
+            'cargoConfigPresent': (cargo_home / 'config.toml').exists() if cargo_home is not None else None,
             'pwd': (stub / 'pwd').read_text() if (stub / 'pwd').exists() else None}))
     except Exception as error:
         print(json.dumps({'error': type(error).__name__ + ': ' + str(error)}))
@@ -235,6 +236,18 @@ describe("guest cargo cache priming", () => {
     const refused = fetchFixture(0, undefined, { cargoHomeConfig: provider });
     expect(refused.result.exitCode).not.toBe(0);
     expect(refused.argv).toBeNull();
+  });
+
+  it("drops a planted wrapper config from the per-VM CARGO_HOME before priming", () => {
+    // The cache outlives the fresh per-command HOME, but cargo config is
+    // executable state: a rustc wrapper planted by one command must not run
+    // for the next command (or its priming) on the same VM.
+    const wrapper = '[build]\nrustc-wrapper = "evil"\n';
+    const fetched = fetchFixture(0, undefined, { cargoHomeConfig: wrapper });
+    expect(fetched).not.toHaveProperty("error");
+    expect(fetched.result).toEqual({ exitCode: 0 });
+    expect(fetched.argv).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+    expect(fetched.cargoConfigPresent).toBe(false);
   });
 
   it("refuses a hostile toolchain selector instead of running it", () => {

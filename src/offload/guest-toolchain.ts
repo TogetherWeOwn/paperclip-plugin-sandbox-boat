@@ -19,7 +19,10 @@ export function guestCommandHome(stateRoot: string, command: { companyId: string
 /** Per-VM toolchain cache root, outside HOME. Pool VMs are never shared
  * across trust domains and PATH never includes this tree, so cached crates
  * or user-site packages cannot become a trojan toolchain for another
- * workspace; within one VM they keep cargo/pip caches warm across commands. */
+ * workspace; within one VM they keep cargo/pip caches warm across commands.
+ * Cargo config in that cache is executable state, so the guest supervisor
+ * deletes `config.toml`/`config` from CARGO_HOME before each command and
+ * before cache priming — only the registry/git caches ride across commands. */
 export function guestToolchainRoot(stateRoot: string, sandboxId: string): string {
   return path.posix.join(stateRoot, `paperclip-boat-toolchain-${key([sandboxId])}`);
 }

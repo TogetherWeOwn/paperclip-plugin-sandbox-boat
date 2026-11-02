@@ -86,6 +86,22 @@ describe("pool workspace isolation", () => {
     expect(s.boat.boxes.has(orphan)).toBe(false);
   });
 
+  it("a delete that succeeds on shutdown retry clears the earlier shutdown failure", async () => {
+    const ex = s.make({ maxOffloadVms: 2, ephemeralRepos: ["repo-a"] });
+    s.boat.failNext("deleteSandbox", responseError(503, { code: "http_503" }));
+    expect(await s.execute(command("eph-del", { ...untrusted, executionWorkspaceId: "workspace-a" }), ex))
+      .toMatchObject({ status: "completed" });
+    const orphan = s.starts[0]!.sandboxId;
+    s.boat.failNext("deleteSandbox", responseError(503, { code: "http_503" }));
+    await expect(ex.shutdown()).rejects.toThrow(/OFFLOAD_SHUTDOWN_INCOMPLETE/);
+    expect(s.boat.boxes.has(orphan)).toBe(true);
+    await expect(ex.shutdown()).resolves.toBeUndefined();
+    expect(s.boat.boxes.has(orphan)).toBe(false);
+    expect(s.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId))
+      .toEqual([orphan, orphan, orphan]);
+    await expect(ex.shutdown()).resolves.toBeUndefined();
+  });
+
   it("setEphemeralRepos applies the live policy to an existing pool", async () => {
     const ex = s.make({ maxOffloadVms: 2 });
     await s.execute(command("before", { ...untrusted, executionWorkspaceId: "workspace-a" }), ex);

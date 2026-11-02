@@ -147,6 +147,16 @@ def prepare(data):
         raise
 
 
+def scrub_cargo_config(cargo_home):
+    # The per-VM CARGO_HOME cache outlives the fresh per-command HOME, but its
+    # config is executable state: a rustc wrapper, alias or credential
+    # provider planted by one command would otherwise run for the next.
+    # Keep the registry and git caches; drop config before cargo reads it.
+    for name in ('config.toml', 'config'):
+        with contextlib.suppress(FileNotFoundError):
+            (pathlib.Path(cargo_home) / name).unlink()
+
+
 def supervise(root):
     request = load(root)['request']
     group = pathlib.Path(request['cgroupPath'])
@@ -169,6 +179,8 @@ def supervise(root):
         cache_dir = environment.get(cache_var, '')
         if cache_dir.startswith(state_root + '/paperclip-boat-toolchain-'):
             os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            if cache_var == 'CARGO_HOME':
+                scrub_cargo_config(cache_dir)
     child = subprocess.Popen([sys.executable, '-I', '-c', gate, str(read_gate), request['executable'], *request['args']],
         cwd=canonical(request['cwd']), env=environment, pass_fds=(read_gate,), start_new_session=True,
         preexec_fn=join, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -370,6 +382,12 @@ def rpc(action, data):
                 return {'exitCode': 1}
             if len(blob) > 1048576 or b'credential-provider' in blob.lower():
                 return {'exitCode': 1}
+        # The scan above only refuses credential providers; the host-assigned
+        # CARGO_HOME is a cache we own, so drop its remaining executable
+        # config (wrappers, aliases, source replacement) before priming —
+        # and before the command that follows can inherit it.
+        if requested_cargo_home is not None:
+            scrub_cargo_config(requested_cargo_home)
         # No command cgroup exists yet, so containment is the process group:
         # run fetch in its own session and kill the whole group at the fence,
         # so a hung child cannot outlive the prepare.

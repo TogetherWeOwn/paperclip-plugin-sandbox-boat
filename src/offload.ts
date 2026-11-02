@@ -1022,6 +1022,9 @@ export class OffloadExecutor {
 
   private retireVm(vm: PoolVm): void {
     this.clearIdleTimer(vm);
+    // Retirement ends the VM's stop obligation; a leftover failure entry
+    // could never be retried and would poison every later shutdown.
+    this.stopFailures.delete(vm.sandboxId);
     vm.generation += 1;
     const at = this.pool.indexOf(vm);
     if (at >= 0) this.pool.splice(at, 1);
