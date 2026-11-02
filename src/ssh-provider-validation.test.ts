@@ -99,13 +99,38 @@ describe("buildRsyncPushArgs validation", () => {
     expect(transport.startsWith("ssh -F /dev/null ")).toBe(true);
   });
 
-  it("throws before spawning on option payloads in any -e component", () => {
+  it("accepts host paths with splitter-inert characters, refuses ones either parser acts on", () => {
+    // Host paths live under tmpdir(): rsync's -e splitter and ssh's -o
+    // parser act on whitespace and quotes (rsync also on backslash, ssh
+    // also expands ${VAR} and %-tokens in these path options), and neither
+    // runs a shell — verified against rsync 3.2.7 / OpenSSH 9.6. So a
+    // shell-looking but inert spelling keeps working exactly as before
+    // this validation, while a spaced or quoted one (which ssh itself
+    // rejects in -o ControlPath) fails closed here.
+    const inert = {
+      ...spec,
+      controlPath: "/tmp/w#1;>x;/abc.ctl",
+      privateKeyPath: "/tmp/w#1;>x;/id_x",
+      knownHostsPath: "/tmp/w#1;>x;/known_hosts_abc",
+    };
+    const args = buildRsyncPushArgs(inert, "/tmp/snap", "/home/user/card-1", []);
+    const transport = args[args.indexOf("-e") + 1];
+    expect(transport).toContain("ControlPath=/tmp/w#1;>x;/abc.ctl");
+    expect(transport).toContain("UserKnownHostsFile=/tmp/w#1;>x;/known_hosts_abc");
+    expect(transport).toContain("-i /tmp/w#1;>x;/id_x");
+
+    expect(() => buildRsyncPushArgs({ ...spec, controlPath: "/tmp/a b.ctl" }, "/tmp/snap", "/g", [])).toThrow(/controlPath/);
+    expect(() => buildRsyncPushArgs({ ...spec, privateKeyPath: "/tmp/k'x" }, "/tmp/snap", "/g", [])).toThrow(/privateKeyPath/);
+    expect(() => buildRsyncPushArgs({ ...spec, knownHostsPath: "/tmp/k\\h" }, "/tmp/snap", "/g", [])).toThrow(/knownHostsPath/);
+    expect(() => buildRsyncPushArgs({ ...spec, controlPath: "/tmp/${HOME}/a.ctl" }, "/tmp/snap", "/g", [])).toThrow(/controlPath/);
+    expect(() => buildRsyncPushArgs({ ...spec, controlPath: "/tmp/%h/a.ctl" }, "/tmp/snap", "/g", [])).toThrow(/controlPath/);
+  });
+
+  it("throws before spawning on option payloads in any provider -e component", () => {
     expect(() => buildRsyncPushArgs({ ...spec, hostKeyAlias: "x '-oProxyCommand=touch /tmp/p'" }, "/tmp/snap", "/g", [])).toThrow(/hostKeyAlias/);
     expect(() => buildRsyncPushArgs({ ...spec, hostKeyAlias: "x\\ -oProxyCommand=touch${IFS}/tmp/p" }, "/tmp/snap", "/g", [])).toThrow(/hostKeyAlias/);
     expect(() => buildRsyncPushArgs({ ...spec, user: "-oProxyCommand=x" }, "/tmp/snap", "/g", [])).toThrow(/sshUser/);
     expect(() => buildRsyncPushArgs({ ...spec, host: "-oFoo=bar" }, "/tmp/snap", "/g", [])).toThrow(/host/);
-    expect(() => buildRsyncPushArgs({ ...spec, controlPath: "/tmp/a b.ctl" }, "/tmp/snap", "/g", [])).toThrow(/controlPath/);
-    expect(() => buildRsyncPushArgs({ ...spec, privateKeyPath: "/tmp/k';touch${IFS}/tmp/p;'" }, "/tmp/snap", "/g", [])).toThrow(/privateKeyPath/);
     expect(() => buildRsyncPushArgs(spec, "/tmp/snap", "/g;touch /tmp/p", [])).toThrow(/guestDir/);
     expect(() => buildRsyncPushArgs({ ...spec, port: 0 }, "/tmp/snap", "/g", [])).toThrow(/port/);
   });
@@ -224,5 +249,53 @@ describe("operator ssh config is never applied (loopback sshd)", () => {
     expect(result.exitCode).toBe(0);
     expect(await readFile(path.join(guestDir, "file.txt"), "utf8")).toBe("payload");
     expect(existsSync(marker)).toBe(false);
+  }, 30_000);
+
+  it("the rsync push works when its key dir is shell-flavoured but splitter-inert", async () => {
+    // Neither rsync's -e splitter nor ssh's -o parser runs a shell, and
+    // both treat #;> spellings literally: the push must succeed end-to-end
+    // and the embedded redirection must never create its file.
+    const { session } = fixture;
+    const keyDir = path.join(fixture.root, "w#1;>pwned-rsync;x");
+    await mkdir(keyDir, { recursive: true });
+    const privateKeyPath = path.join(keyDir, "client");
+    const knownHostsPath = path.join(keyDir, "known_hosts");
+    await writeFile(privateKeyPath, await readFile(path.join(fixture.root, "client")), { mode: 0o600 });
+    await writeFile(knownHostsPath, await readFile(session.knownHostsPath), { mode: 0o600 });
+    const pwned = path.join(process.cwd(), "pwned-rsync");
+    await rm(pwned, { force: true });
+
+    const snapshot = path.join(fixture.root, "snapshot-spaced");
+    const guestDir = path.join(fixture.root, "guest-spaced");
+    await mkdir(snapshot, { recursive: true });
+    await mkdir(guestDir, { recursive: true });
+    await writeFile(path.join(snapshot, "file.txt"), "payload");
+    const argv = buildRsyncPushArgs(
+      {
+        controlPath: path.join(keyDir, "no-master.ctl"),
+        user: session.endpoint.user,
+        host: session.endpoint.host,
+        port: session.endpoint.port,
+        privateKeyPath,
+        knownHostsPath,
+        hostKeyAlias: session.sandboxId,
+        connectTimeoutSec: session.connectTimeoutSec,
+      },
+      snapshot,
+      guestDir,
+      ["file.txt"],
+    );
+    try {
+      const result = await runStreamProcess("rsync", argv.slice(1), {
+        stdin: Readable.from([renderFilesFromList([{ path: "file.txt" }])]),
+        timeoutMs: 15_000,
+        killProcessGroup: true,
+      });
+      expect(result.exitCode, JSON.stringify(result)).toBe(0);
+      expect(await readFile(path.join(guestDir, "file.txt"), "utf8")).toBe("payload");
+      expect(existsSync(pwned)).toBe(false);
+    } finally {
+      await rm(pwned, { force: true });
+    }
   }, 30_000);
 });
