@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
 import { containsSecretContent } from "./offload-secret-scan.js";
+import { assertValidSshEndpoint } from "./ssh.js";
 
 export const SYNC_MANIFEST_VERSION = 1;
 
@@ -812,9 +813,53 @@ export function renderFilesFromList(entries: ReadonlyArray<Pick<SyncFileEntry, "
  * delta list comes on stdin (--files-from=- --from0); there is deliberately
  * no --delete flag: obsolete inputs are pruned by explicit bounded paths only.
  */
+// rsync word-splits the -e string itself, so provider-derived components
+// (hostKeyAlias is the sandbox id; user/host go through the endpoint
+// validator above) may contain nothing the splitter or a shell could act
+// on. guestDir is held to the same rule: it travels inside the
+// user@host:path word the remote side parses. Throwing here means push()
+// never spawns rsync on hostile data.
+// Host-generated paths (the key, known_hosts and control socket under the
+// host's tmpdir()) are refused only for the characters either parser acts
+// on — whitespace and quotes split/group in both rsync's -e splitter and
+// ssh's -o values, backslash escapes in rsync's, and ssh expands ${VAR}
+// and %-tokens inside these path options — so every tmpdir spelling that
+// worked before this validation still works, and one that never could
+// (ssh itself rejects a spaced -o ControlPath) fails here with a clear
+// message instead of a mangled transport word.
+const RSYNC_UNSAFE_COMPONENT = /[\s"'`\\$;|&<>(){}[\]*?~#!\x00-\x1f\x7f]/;
+const RSYNC_UNSAFE_LOCAL_PATH = /[\s"'\\$%\x00-\x1f\x7f]/;
+
+function assertRsyncComponent(name: string, value: string): void {
+  if (!value || RSYNC_UNSAFE_COMPONENT.test(value)) {
+    throw new Error(`rsync push refused: ${name} contains whitespace, quotes or shell characters: ${JSON.stringify(value)}`);
+  }
+}
+
+function assertRsyncLocalPath(name: string, value: string): void {
+  if (!value || RSYNC_UNSAFE_LOCAL_PATH.test(value)) {
+    throw new Error(`rsync push refused: ${name} contains whitespace, quotes, backslashes or expansion characters: ${JSON.stringify(value)}`);
+  }
+}
+
 export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, guestDir: string, files: readonly string[]): string[] {
+  // hostKey is unused by rsync (the pinned known_hosts file is); the dummy
+  // valid value lets the endpoint validator check user, host and port.
+  assertValidSshEndpoint({ host: spec.host, port: spec.port, user: spec.user, hostKey: "ssh-ed25519 AAAA" });
+  assertRsyncComponent("hostKeyAlias", spec.hostKeyAlias);
+  assertRsyncLocalPath("controlPath", spec.controlPath);
+  assertRsyncLocalPath("knownHostsPath", spec.knownHostsPath);
+  assertRsyncLocalPath("privateKeyPath", spec.privateKeyPath);
+  assertRsyncComponent("guestDir", guestDir);
+  const connectTimeoutSec = spec.connectTimeoutSec ?? 10;
+  if (!Number.isInteger(connectTimeoutSec) || connectTimeoutSec < 1 || connectTimeoutSec > 3600) {
+    throw new Error(`rsync push refused: connectTimeoutSec outside 1-3600: ${connectTimeoutSec}`);
+  }
   const ssh = [
     "ssh",
+    // Same rule as ssh.ts: the operator's ssh config never applies here.
+    "-F",
+    "/dev/null",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -834,7 +879,7 @@ export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, gue
     "-o",
     "PreferredAuthentications=publickey",
     "-o",
-    `ConnectTimeout=${spec.connectTimeoutSec ?? 10}`,
+    `ConnectTimeout=${connectTimeoutSec}`,
     "-o",
     `ControlPath=${spec.controlPath}`,
     "-o",

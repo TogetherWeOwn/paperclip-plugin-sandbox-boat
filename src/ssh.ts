@@ -15,6 +15,7 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -64,6 +65,48 @@ const SIGKILL_GRACE_MS = 250;
 const MASTER_RESTART_MIN_INTERVAL_MS = 10_000;
 const REMOTE_CANCEL_TIMEOUT_MS = 10_000;
 
+// Provider data is untrusted input to host processes: the sandbox id becomes
+// the HostKeyAlias (a space-joined rsync -e word and a known_hosts pattern),
+// the host key is written verbatim into known_hosts, and user@host is ssh's
+// destination word, where a leading '-' is parsed as an option. These checks
+// run where provider data becomes an SSH target — the sshkey answer parse and
+// every openSession — so a malformed or hostile value throws before any ssh
+// or rsync process spawns, whatever state it was read back from.
+const SANDBOX_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const SSH_USER_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
+const HOST_KEY_PATTERN = /^(?:ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|rsa-sha2-(?:256|512)|ssh-rsa) [A-Za-z0-9+/]+={0,2}$/;
+const HOSTNAME_PATTERN = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+/** Throw unless a provider-supplied sandbox id is safe in every SSH context. */
+export function assertValidSandboxId(sandboxId: string): string {
+  if (!SANDBOX_ID_PATTERN.test(sandboxId)) {
+    throw new Error(`boat returned a sandbox id that is not [A-Za-z0-9_-]{1,64}: ${JSON.stringify(sandboxId)}`);
+  }
+  return sandboxId;
+}
+
+/** An IP literal or an RFC 1123 hostname; never an option-looking word. */
+export function isValidSshHost(host: string): boolean {
+  return isIP(host) !== 0 || HOSTNAME_PATTERN.test(host);
+}
+
+/** Throw unless every field of a connect target is safe to hand to ssh. */
+export function assertValidSshEndpoint(endpoint: SshEndpoint): SshEndpoint {
+  if (!HOST_KEY_PATTERN.test(endpoint.hostKey)) {
+    throw new Error("boat returned an SSH host key that is not a single `<type> <base64>` line; cannot pin it.");
+  }
+  if (!SSH_USER_PATTERN.test(endpoint.user)) {
+    throw new Error(`boat returned an sshUser that is not a plain login name: ${JSON.stringify(endpoint.user)}`);
+  }
+  if (!isValidSshHost(endpoint.host)) {
+    throw new Error(`boat returned an SSH host that is not an IP address or hostname: ${JSON.stringify(endpoint.host)}`);
+  }
+  if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+    throw new Error(`boat returned an SSH port outside 1-65535: ${endpoint.port}`);
+  }
+  return endpoint;
+}
+
 /** Parse the POST /sandboxes/{id}/sshkey answer into a connect target. */
 export function endpointFromSshKeyResponse(response: {
   machineIp?: string | null;
@@ -77,17 +120,17 @@ export function endpointFromSshKeyResponse(response: {
   const endpoint = response.sshEndpoint?.trim();
   if (endpoint) {
     const bracketed = endpoint.match(/^\[([^\]]+)\]:(\d+)$/);
-    if (bracketed) return { host: bracketed[1], port: Number(bracketed[2]), user, hostKey };
+    if (bracketed) return assertValidSshEndpoint({ host: bracketed[1], port: Number(bracketed[2]), user, hostKey });
     const index = endpoint.lastIndexOf(":");
     if (index > 0) {
       const port = Number(endpoint.slice(index + 1));
-      if (Number.isInteger(port) && port > 0) return { host: endpoint.slice(0, index), port, user, hostKey };
+      if (Number.isInteger(port) && port > 0) return assertValidSshEndpoint({ host: endpoint.slice(0, index), port, user, hostKey });
     }
     throw new Error(`boat returned an sshEndpoint that is not host:port: ${endpoint}`);
   }
   const ip = response.machineIp?.trim();
   if (!ip) throw new Error("boat returned neither sshEndpoint nor machineIp for the sandbox.");
-  return { host: ip, port: 22, user, hostKey };
+  return assertValidSshEndpoint({ host: ip, port: 22, user, hostKey });
 }
 
 export class SshManager {
@@ -151,6 +194,10 @@ export class SshManager {
     tunnel: TunnelSpec | null;
     connectTimeoutSec: number;
   }): Promise<SshSession> {
+    // Validate before touching any existing session or writing known_hosts:
+    // endpoints can also arrive from persisted state, not only the parse above.
+    assertValidSandboxId(input.sandboxId);
+    assertValidSshEndpoint(input.endpoint);
     await this.closeSession(input.sandboxId);
     const dir = await this.ensureDir();
     const safeId = input.sandboxId.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 40);
@@ -351,6 +398,12 @@ export class SshManager {
 
 function commonSshOptions(session: SshSession, privateKeyPath: string): string[] {
   return [
+    // Never read the operator's ~/.ssh/config or /etc/ssh/ssh_config(.d):
+    // a Host-* IdentityFile, RemoteForward or LocalCommand written for other
+    // work must not ride connections to an untrusted guest. -F /dev/null
+    // replaces both files; every setting the plugin needs is given below.
+    "-F",
+    "/dev/null",
     "-o",
     "BatchMode=yes",
     "-o",
