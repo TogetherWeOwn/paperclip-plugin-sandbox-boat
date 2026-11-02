@@ -45,9 +45,12 @@ const log = (level) => (message, meta) => {
   console.log(`[${new Date().toISOString()}] ${level} ${message}${meta ? " " + JSON.stringify(meta) : ""}`);
 };
 const manager = new BoatVmManager({
+  // The full host state contract (plugin.state.write): release deletes the
+  // run's offload workspace bindings, so get/set alone is not enough.
   state: {
     get: async (input) => (state.has(key(input)) ? structuredClone(state.get(key(input))) : null),
     set: async (input, value) => void state.set(key(input), structuredClone(value)),
+    delete: async (input) => void state.delete(key(input)),
   },
   logger: { info: log("info"), warn: log("warn"), error: log("error") },
   issues: null,
@@ -64,6 +67,11 @@ const config = {
   envAllowlist: [...DEFAULT_ENV_ALLOWLIST, "SMOKE_SENTINEL"],
 };
 const base = { driverKey: "boat", companyId: "smoke-company", environmentId: "smoke-env", config };
+// One agent principal for every acquire: the VM key is scoped to it (plus the
+// execution workspace), which is what makes this a card VM that release stops
+// for the next run to resume. Without a principal the key falls back to the
+// run id, release deletes the VM, and no later acquire can find it again.
+const AGENT = "smoke-agent";
 // Names of boat's in-VM credentials, matched at the start of an environ line (names only, never values).
 const BOAT_TOKEN_NAMES = "^(ASCII_TOKEN|BOAT_[A-Z0-9_]+)=";
 const workspace = `smoke-ws-${stamp}`;
@@ -117,7 +125,7 @@ try {
   console.log(JSON.stringify({ ok: probe.ok, diagnostics: probe.diagnostics }, null, 1));
 
   step("acquire run 1 (create)");
-  const lease1 = await manager.acquire({ ...base, runId: `smoke-run-1-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+  const lease1 = await manager.acquire({ ...base, runId: `smoke-run-1-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
   sandboxId = lease1.providerLeaseId;
   console.log(JSON.stringify(lease1.metadata));
 
@@ -311,7 +319,7 @@ try {
   };
 
   step("acquire run 2 (resume the same card VM within 10 minutes: the same machine)");
-  const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+  const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
   console.log(JSON.stringify(lease2.metadata));
   if (lease2.providerLeaseId !== sandboxId) throw new Error("expected the same VM on resume");
   const skills2 = await checkRuntimeAfterResume(lease2, "run 2");
@@ -326,7 +334,7 @@ try {
   if (process.env.SMOKE_NEW_MACHINE === "1") {
     step("wait 11 minutes (boat keeps the stopped machine 10 minutes, unbilled), then resume on a new machine");
     await sleep(11 * 60_000);
-    const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+    const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
     console.log(JSON.stringify(lease3.metadata));
     const skills3 = await checkRuntimeAfterResume(lease3, "run 3");
     if (skills3 !== "skills=gone skill_mcp_config=gone") throw new Error("smoke check failed: the restored snapshot had files below .paperclip-runtime");
