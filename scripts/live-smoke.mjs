@@ -221,8 +221,16 @@ try {
   );
   console.log(`capture_refused=${refused?.code ?? "no"}`);
   if (refused?.code !== "BOAT_RUNTIME_SCRUB_FAILED") throw new Error(`smoke check failed: expected BOAT_RUNTIME_SCRUB_FAILED, got ${refused?.code ?? "a capture"}`);
-  if (!logs.slice(savesBefore).some((entry) => entry.message.includes("could not verify") && String(entry.meta?.detail ?? "").includes("smoke-locked"))) {
-    throw new Error("smoke check failed: the refusal did not name the unreadable directory");
+  // The plugin never names the unreadable directory: guest stderr is
+  // untrusted, so the scrub withholds it by design (the unit tests assert
+  // the path never reaches the logs). Check for the withheld detail, and
+  // that no log from the refused capture leaks the guest path.
+  const refusalLogs = logs.slice(savesBefore);
+  if (!refusalLogs.some((entry) => entry.message.includes("could not verify") && entry.meta?.detail === "walk incomplete (diagnostics withheld)")) {
+    throw new Error("smoke check failed: the refusal was not logged as an incomplete walk with diagnostics withheld");
+  }
+  if (JSON.stringify(refusalLogs).includes("smoke-locked")) {
+    throw new Error("smoke check failed: the refusal log leaked the unreadable guest directory");
   }
   // The refused capture's scrub still removed what it could reach, the stand-in included: put it back for the release check.
   const unlocked = await exec(
