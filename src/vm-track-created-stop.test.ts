@@ -66,6 +66,11 @@ const release = (lease: { providerLeaseId: string | null; metadata?: Record<stri
   } as never);
 const destroy = (lease: { providerLeaseId: string | null }) =>
   plugin.definition.onEnvironmentDestroyLease!({ ...base(), providerLeaseId: lease.providerLeaseId } as never);
+const stoppedVm = async (runId: string, extra: Record<string, unknown> = {}) => {
+  const lease = await acquire(runId, extra);
+  await release(lease, runId);
+  return lease;
+};
 const capture = (providerLeaseId: string, templateLabel: string) =>
   plugin.definition.onEnvironmentCaptureTemplate!({ ...base(), providerLeaseId, templateLabel } as never);
 // A manager that never saw the lease, sharing the persisted state: a restart.
@@ -128,11 +133,10 @@ describe("failed deletes", () => {
 
 describe("hard deadlines across workers", () => {
   it("restores the persisted cap after a restart and clears it on deadline-free re-acquire", async () => {
-    const first = await acquire("run-1", { requestedExpiresAt: new Date(clock.t + 30 * 60 * 1000).toISOString() });
+    const first = await stoppedVm("run-1", { requestedExpiresAt: new Date(clock.t + 30 * 60 * 1000).toISOString() });
     const sandboxId = first.providerLeaseId!;
     const createdTtl = fake.callsOf("create")[0]!.args.ttlSeconds as number;
     expect(createdTtl).toBe(1800);
-    await release(first, "run-1");
 
     // A worker that never saw the lease caps the resume from the record.
     const restarted = restartedManager();
@@ -144,10 +148,9 @@ describe("hard deadlines across workers", () => {
 
     // The new lease has no deadline, so its own resume is uncapped and the
     // re-acquire clears the previous lease's cap from the map and record.
-    const second = await acquire("run-2");
+    const second = await stoppedVm("run-2");
     expect(second.providerLeaseId).toBe(sandboxId);
     expect(fake.callsOf("resume")[1]!.args.ttlSeconds).toBe(120 * 60);
-    await release(second, "run-2");
 
     // So the next restart's resume is uncapped too.
     await restartedManager().resumeLease({
@@ -175,9 +178,7 @@ describe("template capture", () => {
   });
 
   it("stops a VM the capture resumed, after the snapshot is ready", async () => {
-    const lease = await acquire("run-1");
-    const sandboxId = lease.providerLeaseId!;
-    await release(lease, "run-1");
+    const sandboxId = (await stoppedVm("run-1")).providerLeaseId!;
     const timeline: string[] = [];
     fake.timeline = timeline;
     expect((await capture(sandboxId, "warm")).templateRef).toBe("warm");
@@ -190,9 +191,7 @@ describe("template capture", () => {
   });
 
   it("stops a resumed VM even when the scrub refuses the capture", async () => {
-    const lease = await acquire("run-1");
-    const sandboxId = lease.providerLeaseId!;
-    await release(lease, "run-1");
+    const sandboxId = (await stoppedVm("run-1")).providerLeaseId!;
     ssh.handler = (remoteCommand) => remoteCommand.includes("paperclip-boat-scrub")
       ? { code: 3, stdout: "paperclip-boat-scrub found=0 left=0 walk=incomplete\n", stderr: "find: denied" }
       : undefined;
