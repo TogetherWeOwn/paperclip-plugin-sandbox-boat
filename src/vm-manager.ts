@@ -465,6 +465,11 @@ export class BoatVmManager {
     return this.nativeOffload.has(companyId, runId, workspaceId);
   }
 
+  /** True when the run holds any offload binding, so request-triggered binds (and secret resolutions) stop. */
+  hasAnyOffloadBinding(companyId: string, runId: string): boolean {
+    return this.nativeOffload.hasRun(companyId, runId);
+  }
+
   /** Local-run binding built from host-owned event and workspace data (local-run-binding.ts).
    * Only for a live local run; a native whole-run realization for the same run and workspace is never replaced.
    * The workspace record is persisted first, so a failed write leaves nothing half-installed and a later bind can retry. */

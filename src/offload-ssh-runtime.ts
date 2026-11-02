@@ -22,9 +22,12 @@ import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
 import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
+import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
-  config: BoatDriverConfig; environmentId: string; seenAt: number };
+  config: BoatDriverConfig; environmentId: string; seenAt: number;
+  /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
+  localRun: boolean };
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -297,6 +300,11 @@ export class SshOffloadRuntime {
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
   private registryTail: Promise<unknown> = Promise.resolve();
+  /** Latest operator-configured local-run roots seen by resolve, per company.
+   * Upload-time revalidation reads the pushing command's own company entry, so
+   * dropping a root also refuses that company's pushes already queued — and
+   * another company's config can neither cancel nor resurrect them. */
+  private readonly localRunRootsByCompany = new Map<string, string[]>();
   private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
@@ -304,6 +312,12 @@ export class SshOffloadRuntime {
   /** True when this run/workspace already has a native binding (whole-run realization wins). */
   has(companyId: string, runId: string, workspaceId: string): boolean {
     return this.bindings.has(key(companyId, runId, workspaceId));
+  }
+
+  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
+  hasRun(companyId: string, runId: string): boolean {
+    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
+    return false;
   }
 
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
@@ -326,17 +340,35 @@ export class SshOffloadRuntime {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
-      config, environmentId: params.environmentId, seenAt: Date.now(),
+      config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
     });
   }
 
+  /** Re-prove a local-run binding's operator-owned facts: the source still sits
+   * under a configured root (and was not swapped for a symlink), and the
+   * checkout's own origin still names the bound repo. */
+  private async revalidateLocalRun(binding: Binding, roots: string[]): Promise<boolean> {
+    if (roots.length === 0) return false;
+    const canonical = await realpath(binding.source).catch(() => null);
+    if (!canonical || canonical !== binding.source) return false;
+    const canonicalRoots = (await Promise.all(roots.map((root) => realpath(root).catch(() => null))))
+      .filter((root): root is string => root !== null);
+    if (!withinRoots(canonical, canonicalRoots)) return false;
+    const onDiskRepoUrl = await readGitOriginUrl(canonical).catch(() => null);
+    return !!onDiskRepoUrl && canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) === binding.repoId;
+  }
+
   async resolve(command: BackendCommand, settings: Record<string, unknown>) {
+    this.localRunRootsByCompany.set(command.companyId, localSourceRoots(settings));
     if (this.closing || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
       || !plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")
       || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
       || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
     const binding = this.bindings.get(key(command.companyId, command.runId, command.executionWorkspaceId));
     if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
+    // The workspace row behind a local-run binding is agent-mutable, so the
+    // operator-owned facts are re-proven on every resolve, not only at bind.
+    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) return null;
     const profile = profileForId(command.profileId);
     if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
     const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
@@ -423,6 +455,14 @@ export class SshOffloadRuntime {
     const sourceRoot = async (cmd: OffloadCommand) => {
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
       if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) throw new Error("Native offload binding unavailable");
+      // A queued command can snapshot long after resolve approved it, so a
+      // local-run binding is re-proven again at upload time against the latest
+      // roots configured for its own company. Throwing fails the push before
+      // transport, which the journal records as not_started (fallback-safe,
+      // runs locally).
+      if (native.localRun && !await this.revalidateLocalRun(native, this.localRunRootsByCompany.get(cmd.companyId) ?? [])) {
+        throw new Error("Local-run offload source no longer passes roots/origin validation");
+      }
       return native.source;
     };
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot: settings.offloadArtifactRoot,

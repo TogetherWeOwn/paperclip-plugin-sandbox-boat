@@ -120,6 +120,83 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), settings)).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
+  it("re-validates a local-run binding's roots and on-disk origin on every resolve", async () => {
+    await mkdir(path.join(source, ".git"));
+    const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    await origin("https://github.com/example/public");
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    expect(await runtime.resolve(command(), rooted)).not.toBe(null);
+    await origin("https://github.com/example/private");
+    expect(await runtime.resolve(command(), rooted)).toBe(null);
+    await origin("https://github.com/example/public");
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("refuses a queued local-run upload when the origin flips or the roots drop after resolve", async () => {
+    await mkdir(path.join(source, ".git"));
+    const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    await origin("https://github.com/example/public");
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    const executor = (await runtime.resolve(command(), rooted))!;
+    expect(executor).not.toBe(null);
+    const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
+    const sync = [...pools.values()][0]!.sync;
+    // The command sat queued after resolve; the checkout's origin flips before
+    // its snapshot. The push must refuse before anything is uploaded.
+    await origin("https://github.com/example/private");
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    // Restoring the origin but dropping the configured roots (observed by the
+    // next resolve) refuses the still-queued push the same way.
+    await origin("https://github.com/example/public");
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    expect(boat.calls).toHaveLength(0);
+    // End to end: with roots restored, a post-resolve origin flip makes the
+    // admitted command end not_started (fallback-safe) with no guest output.
+    expect(await runtime.resolve(command(), rooted)).toBe(executor);
+    await origin("https://github.com/example/private");
+    const cmd = command();
+    await executor.start(cmd);
+    let view = await executor.readOutput(companyId, runId, cmd.commandId);
+    await expect.poll(async () => {
+      view = await executor.readOutput(companyId, runId, cmd.commandId);
+      return view.state;
+    }, { timeout: 15_000 }).toBe("not_started");
+    expect(view.events).toHaveLength(0);
+  }, 20_000);
+  it("scopes queued-upload roots per company: another company's config neither cancels nor resurrects a queued push", async () => {
+    await mkdir(path.join(source, ".git"));
+    await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    const executor = (await runtime.resolve(command(), rooted))!;
+    expect(executor).not.toBe(null);
+    const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
+    const sync = [...pools.values()][0]!.sync;
+    const otherCompanyId = "cccccccc-cccc-4ccc-cccc-cccccccccccc";
+    // Config is per-company: company B resolving with empty roots (it has no
+    // binding, so resolve returns null) must not cancel company A's queued push.
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).resolves.toBeUndefined();
+    // Symmetrically, once A drops its own roots, B resolving with roots that
+    // cover the source must not resurrect A's queued push.
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, rooted)).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    expect(boat.calls).toHaveLength(0);
+  }, 20_000);
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
       expect(await runtime.resolve(command(), { ...config, [setting]: value })).toBe(null);

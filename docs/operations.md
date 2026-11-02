@@ -46,8 +46,9 @@ There are independent gates; none enables another automatically:
    rather than guessing how to translate host paths.
 
 Workspace authority comes from Paperclip's native `environmentRealizeWorkspace`
-payload (whole-run leases) or from host-owned run, issue and workspace records
-(local runs, below), never from the offload request body. Paperclip's
+payload (whole-run leases) or, for local runs, from run/issue records plus
+operator-configured source roots and the checkout's own on-disk identity
+(below), never from the offload request body. Paperclip's
 `server/src/services/environment-run-orchestrator.ts` supplies
 `workspace.metadata.workspaceRealizationRequest`, built by
 `server/src/services/workspace-realization.ts`: its `heartbeatRunId`,
@@ -59,7 +60,7 @@ Bindings survive worker restart and cannot authorize another run or company.
 **Local runs (agent stays on the Paperclip host).** Paperclip calls
 `environmentRealizeWorkspace` only for runs on a plugin sandbox lease, so a local
 run gets no realization payload. With `offloadLocalRunsEnabled: true` the plugin
-builds the same payload from host-owned data only:
+builds the same payload as follows:
 
 1. the `agent.run.started` domain event gives the run id and its issue id;
 2. `ctx.issues.get` gives the issue's `executionWorkspaceId`;
@@ -71,13 +72,27 @@ builds the same payload from host-owned data only:
    resolved per binding and never stored; `offloadLocalEnvironmentId` and
    `offloadLocalDriverConfig` give the pool identity and settings.
 
-The agent and the offload request body supply nothing. The started event usually
+The workspace row in step 3 is **not** authority: an agent with runtime access
+can rewrite its `cwd`/`repoUrl`, so the row only nominates a candidate source.
+The bind stands only when operator-owned facts prove it: `realpath(path)` lies
+inside an `offloadLocalSourceRoots` entry (required — empty refuses every
+local-run bind; list the managed workspaces directory), and the checkout's own
+on-disk `remote.origin.url`, parsed from its git config without executing git,
+canonicalizes to the same repo id as the row's `repoUrl` — the payload then
+carries the canonical path and the on-disk URL. Both facts are re-checked on
+every executor resolve, so re-pointing the row, the path or the origin after
+the bind stops dispatch (commands fall back locally). The offload request body
+supplies nothing, and the secret in step 4 is resolved last, after every
+check: a bind retried from an offload request runs only for a run with no
+existing binding and only for the workspace that request named, so probing
+with random workspace ids never spends secret resolutions. The started event usually
 arrives before Paperclip prepares the run's workspace, so the bind is retried when
 that run's first offload request arrives. A binding never replaces a whole-run
 realization for the same run and workspace. `agent.run.finished`, `failed` and
 `cancelled` drop the executor binding and the persisted workspace record, and fence
-the run: a late or slow start handler cannot bind it again. A missing host fact (no
-execution workspace, no local path, no secret) leaves the run unbound, and its
+the run: a late or slow start handler cannot bind it again. A missing or refused
+host fact (no execution workspace, no local path, no source root, an origin that
+does not match, no secret) leaves the run unbound, and its
 own commands fall back locally (503) before dispatch; other-agent runs keep the
 403. This adds five capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
