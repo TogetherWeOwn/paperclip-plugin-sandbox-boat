@@ -9,8 +9,8 @@
 // requirements.txt stays local like a missing lockfile.
 
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { probeDir, probeFileExists, readProbeFile, type ProbeRead } from "./probe-file.js";
 
 export interface DepInstall {
   /** Lockfile relative path, e.g. package-lock.json. */
@@ -64,15 +64,17 @@ function isPinnedRequirements(bytes: Buffer): boolean {
   return true;
 }
 
-async function readIfFile(root: string, rel: string): Promise<Buffer | null> {
-  const abs = path.join(root, rel);
-  try {
-    const info = await stat(abs);
-    if (!info.isFile()) return null;
-    return await readFile(abs);
-  } catch {
-    return null;
-  }
+/** Lockfiles above this stay local: the bytes are hashed in worker memory. */
+const MAX_LOCKFILE_BYTES = 32 * 1024 * 1024;
+
+/** Probe one lockfile candidate, keeping "missing" distinct from
+ * "unreadable". Lockfiles are repo-controlled, so reads are no-follow with a
+ * size cap (probe-file.ts). A candidate that exists but cannot be read
+ * safely (symlink, non-regular, oversized) must refuse the plan for its
+ * ecosystem rather than be treated as absent: otherwise it would silently
+ * select another readable lockfile's installer. */
+async function readIfFile(root: string, rel: string): Promise<ProbeRead> {
+  return readProbeFile(path.join(root, rel), MAX_LOCKFILE_BYTES);
 }
 
 /**
@@ -84,9 +86,14 @@ export async function nestedLockfile(sourceRoot: string, cwdRelative: string, to
   const files = tool === "python" ? [...PYTHON_LOCKFILES.map((entry) => entry.file), "requirements.txt"] : NODE_LOCKFILES.map((entry) => entry.file);
   const segments = path.posix.normalize(cwdRelative).split("/").filter((part) => part !== "" && part !== ".");
   for (let depth = segments.length; depth > 0; depth--) {
+    const prefix = segments.slice(0, depth);
+    // Existence only, never a read. A symlinked prefix cannot be probed
+    // safely, so fail closed: report the prefix itself as the blocker.
+    const dir = await probeDir(sourceRoot, prefix);
+    if (dir.kind === "unreadable") return path.posix.join(...prefix);
+    if (dir.kind === "missing") continue;
     for (const file of files) {
-      const rel = path.posix.join(...segments.slice(0, depth), file);
-      if (await readIfFile(sourceRoot, rel) !== null) return rel;
+      if (await probeFileExists(path.join(dir.dir, file))) return path.posix.join(...prefix, file);
     }
   }
   return null;
@@ -105,28 +112,36 @@ export async function planDependencies(sourceRoot: string, tool?: string): Promi
   const found: DepInstall[] = [];
   const hash = createHash("sha256");
   let ambiguous = false;
+  // Only tables for the selected tool are built above, so an unreadable
+  // candidate in the other ecosystem is never probed and cannot block here.
+  let unreadable = false;
   for (const table of tables) {
     let matched: { file: string; install: string[] } | null = null;
     let count = 0;
     for (const candidate of table.entries) {
-      const bytes = await readIfFile(sourceRoot, candidate.file);
-      if (bytes === null) continue;
+      const probe = await readIfFile(sourceRoot, candidate.file);
+      if (probe.kind === "missing") continue;
+      if (probe.kind === "unreadable") { unreadable = true; continue; }
       count += 1;
       matched = candidate;
       hash.update(candidate.file);
       hash.update("\0");
-      hash.update(bytes);
+      hash.update(probe.bytes);
       hash.update("\0");
     }
     if (table.kind === "python") {
-      const reqBytes = await readIfFile(sourceRoot, "requirements.txt");
-      if (reqBytes !== null) {
-        if (isPinnedRequirements(reqBytes)) {
+      const reqProbe = await readIfFile(sourceRoot, "requirements.txt");
+      if (reqProbe.kind === "unreadable") {
+        // Present but not safely readable: cannot tell whether it is the
+        // pinned lockfile, so refuse rather than plan from uv.lock alone.
+        unreadable = true;
+      } else if (reqProbe.kind === "ok") {
+        if (isPinnedRequirements(reqProbe.bytes)) {
           count += 1;
           if (count === 1) matched = { file: "requirements.txt", install: PINNED_REQUIREMENTS_INSTALL };
           hash.update("requirements.txt");
           hash.update("\0");
-          hash.update(reqBytes);
+          hash.update(reqProbe.bytes);
           hash.update("\0");
         }
         // An unpinned requirements.txt is an unlocked manifest: ignored, so a
@@ -138,6 +153,6 @@ export async function planDependencies(sourceRoot: string, tool?: string): Promi
     if (count > 1) ambiguous = true;
     if (matched && count === 1) found.push({ lockfile: matched.file, install: matched.install });
   }
-  if (ambiguous || found.length === 0) return null;
+  if (ambiguous || unreadable || found.length === 0) return null;
   return { installs: found, hash: hash.digest("hex") };
 }

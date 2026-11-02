@@ -2,7 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { BOAT_SIZES } from "./size-policy.js";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
-export const PLUGIN_VERSION = "0.2.5";
+export const PLUGIN_VERSION = "0.2.6";
 export const DRIVER_KEY = "boat";
 export const SWEEP_JOB_KEY = "boat-idle-sweep";
 
@@ -246,6 +246,24 @@ const manifest: PaperclipPluginManifestV1 = {
             default: 15,
             description: "Offload pool: stop a VM this many seconds after its last command ends (default 15).",
             ...advanced("Offload pool"),
+          },
+          syncOutMaxBytes: {
+            type: "number",
+            default: 8589934592,
+            description: "Host safety: refuse a guest sync-out archive whose files total more than this many bytes (default 8 GiB, at most 32 GiB). The partially received tree is removed.",
+            ...advanced("Budget guard"),
+          },
+          syncOutMaxFiles: {
+            type: "number",
+            default: 200000,
+            description: "Host safety: refuse a guest sync-out archive with more than this many entries (files, directories and symlinks; default 200000, at most 1000000).",
+            ...advanced("Budget guard"),
+          },
+          syncOutDiskReserveBytes: {
+            type: "number",
+            default: 10737418240,
+            description: "Host safety: refuse a guest sync-out member that would leave less than this many bytes free on the target filesystem (default 10 GiB; the receiver also always keeps 5% of the filesystem free).",
+            ...advanced("Budget guard"),
           },
           maxActive: {
             type: "number",

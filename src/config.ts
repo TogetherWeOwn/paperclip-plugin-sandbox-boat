@@ -44,6 +44,10 @@ export interface BoatDriverConfig {
   allowPaidNamedSnapshots: boolean;
   maxOffloadVms: number;
   offloadIdleStopSeconds: number;
+  /** Host receiver budgets for one guest-produced sync-out archive. */
+  syncOutMaxBytes: number;
+  syncOutMaxFiles: number;
+  syncOutDiskReserveBytes: number;
   /**
    * Paperclip's own envelope flag (not a boat setting). The host passes it to
    * the plugin and keeps only what the plugin returns as normalized config, so
@@ -84,6 +88,12 @@ export const CONFIG_DEFAULTS = {
   reuseLease: false,
   maxOffloadVms: 4,
   offloadIdleStopSeconds: 15,
+  // 8 GiB / 200k entries per archive covers a large workspace sync including
+  // build output; the 10 GiB reserve (never below 5% of the filesystem) keeps
+  // one hostile archive from filling the disk Paperclip itself runs on.
+  syncOutMaxBytes: 8 * 1024 * 1024 * 1024,
+  syncOutMaxFiles: 200_000,
+  syncOutDiskReserveBytes: 10 * 1024 * 1024 * 1024,
 };
 
 function str(value: unknown): string | null {
@@ -154,6 +164,9 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     allowPaidNamedSnapshots: bool(raw.allowPaidNamedSnapshots, CONFIG_DEFAULTS.allowPaidNamedSnapshots),
     maxOffloadVms: Math.trunc(num(raw.maxOffloadVms, CONFIG_DEFAULTS.maxOffloadVms)),
     offloadIdleStopSeconds: num(raw.offloadIdleStopSeconds, CONFIG_DEFAULTS.offloadIdleStopSeconds),
+    syncOutMaxBytes: Math.trunc(num(raw.syncOutMaxBytes, CONFIG_DEFAULTS.syncOutMaxBytes)),
+    syncOutMaxFiles: Math.trunc(num(raw.syncOutMaxFiles, CONFIG_DEFAULTS.syncOutMaxFiles)),
+    syncOutDiskReserveBytes: Math.trunc(num(raw.syncOutDiskReserveBytes, CONFIG_DEFAULTS.syncOutDiskReserveBytes)),
     reuseLease: bool(raw.reuseLease, CONFIG_DEFAULTS.reuseLease),
     envAllowlist: parseEnvAllowlist(raw.envAllowlist),
   };
@@ -254,6 +267,17 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (config.maxOffloadVms < 1) errors.push("maxOffloadVms must be at least 1.");
   if (config.offloadIdleStopSeconds < 1 || config.offloadIdleStopSeconds > 3600) {
     errors.push("offloadIdleStopSeconds must be between 1 and 3600.");
+  }
+  if (config.syncOutMaxBytes < 1024 * 1024 || config.syncOutMaxBytes > 32 * 1024 * 1024 * 1024) {
+    errors.push("syncOutMaxBytes must be between 1048576 (1 MiB) and 34359738368 (32 GiB).");
+  }
+  if (config.syncOutMaxFiles < 1 || config.syncOutMaxFiles > 1_000_000) {
+    errors.push("syncOutMaxFiles must be between 1 and 1000000.");
+  }
+  if (config.syncOutDiskReserveBytes < 0 || config.syncOutDiskReserveBytes > 1024 * 1024 * 1024 * 1024) {
+    errors.push("syncOutDiskReserveBytes must be between 0 and 1099511627776 (1 TiB).");
+  } else if (config.syncOutDiskReserveBytes === 0) {
+    warnings.push("syncOutDiskReserveBytes is 0: the host tar receiver still keeps 5% of the target filesystem free, but no fixed reserve beyond it.");
   }
   if (config.minComputeHoursLeft < 0) errors.push("minComputeHoursLeft cannot be negative.");
   if (config.timeoutMs < 10_000 || config.timeoutMs > 86_400_000) {

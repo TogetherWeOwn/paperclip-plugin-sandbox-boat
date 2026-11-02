@@ -30,6 +30,9 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
+| `syncOutMaxBytes` | 8589934592 (8 GiB) | Host safety: refuse a guest sync-out archive whose files total more than this. Hard bound 32 GiB. See [Sync-out receiver budgets](security.md#sync-out-receiver-budgets). |
+| `syncOutMaxFiles` | 200000 | Host safety: refuse a guest sync-out archive with more entries (files, directories, symlinks) than this. Hard bound 1000000. |
+| `syncOutDiskReserveBytes` | 10737418240 (10 GiB) | Host safety: refuse a sync-out member that would leave less than this free on the target filesystem (the receiver also always keeps 5% of the filesystem and 8192 inodes free). |
 | `maxOffloadVms` | 4 | Offload pool: at most this many shared VMs for heavy commands. Beyond it, commands queue. |
 | `offloadIdleStopSeconds` | 15 | Offload pool: stop a VM this many seconds after its last command ends. |
 | `allowPaidNamedSnapshots` | false | Allow template capture beyond boat's 10 free named snapshots ($1.70 a month each). |

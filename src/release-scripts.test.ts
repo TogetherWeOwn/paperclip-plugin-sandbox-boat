@@ -67,6 +67,17 @@ describe("check-release-version.sh", () => {
     const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
     expect(PLUGIN_VERSION).toBe(pkg.version);
   });
+
+  // The staged package bundles a real copy of the SDK its build used, since a
+  // local-path install supplies none. That only stays true while the SDK is a
+  // pinned runtime dependency: as a peer it was an absolute symlink to the
+  // build host in every tarball before 0.2.6.
+  it("pins @paperclipai/plugin-sdk as a runtime dependency, never a peer", () => {
+    const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
+    expect(pkg.dependencies["@paperclipai/plugin-sdk"]).toMatch(/^\d{4}\.\d+\.\d+$/);
+    expect(pkg.peerDependencies?.["@paperclipai/plugin-sdk"]).toBeUndefined();
+    expect(pkg.devDependencies?.["@paperclipai/plugin-sdk"]).toBeUndefined();
+  });
 });
 
 describe("release-notes.sh", () => {

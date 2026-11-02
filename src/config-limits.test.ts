@@ -49,6 +49,11 @@ describe("validateDriverConfig limits", () => {
     ["a tunnelTargetHost with shell characters", { tunnelTargetHost: "cliproxy;id" }, /^tunnelTargetHost must be a hostname or an IP address\.$/],
     ["an apiBase that is not a URL", { apiBase: "not a url" }, /^apiBase must be a valid URL\.$/],
     ["deleteAfterDays past boat's 14-day disk deletion", { deleteAfterDays: 14 }, /^deleteAfterDays must be between 1 and 13/],
+    ["syncOutMaxBytes below 1 MiB", { syncOutMaxBytes: 1024 * 1024 - 1 }, /^syncOutMaxBytes must be between/],
+    ["syncOutMaxBytes above the 32 GiB hard bound", { syncOutMaxBytes: 32 * 1024 * 1024 * 1024 + 1 }, /^syncOutMaxBytes must be between/],
+    ["syncOutMaxFiles below 1", { syncOutMaxFiles: 0 }, /^syncOutMaxFiles must be between 1 and 1000000\.$/],
+    ["syncOutMaxFiles above the hard bound", { syncOutMaxFiles: 1_000_001 }, /^syncOutMaxFiles must be between 1 and 1000000\.$/],
+    ["a negative syncOutDiskReserveBytes", { syncOutDiskReserveBytes: -1 }, /^syncOutDiskReserveBytes must be between/],
   ];
   for (const [name, raw, message] of cases) {
     it(`refuses ${name}`, () => {
@@ -73,6 +78,9 @@ describe("validateDriverConfig limits", () => {
       tunnelTargetPort: 1,
       tunnelTargetHost: "fd00::1",
       deleteAfterDays: 13,
+      syncOutMaxBytes: 32 * 1024 * 1024 * 1024,
+      syncOutMaxFiles: 1_000_000,
+      syncOutDiskReserveBytes: 0,
     })).toEqual([]);
   });
 

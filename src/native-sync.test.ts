@@ -720,6 +720,21 @@ describe("outbound untrusted archive boundary (when using tar)", () => {
   }, TIMEOUT);
 });
 
+describe("host python helper isolation", () => {
+  it("never imports a planted stdlib shadow from the working directory during inbound preflight", async () => {
+    const marker = path.join(root, "planted-json-ran");
+    await put(path.join(root, "json.py"), `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+    const source = path.join(root, "host", "source");
+    const target = path.join(root, "sandbox", "target");
+    await put(path.join(source, "safe"), "safe");
+    await requireHook("in")(params([{ operationId: "isolated-helper", files: [
+      { sourcePath: source, targetPath: target, kind: "directory" },
+    ] }]));
+    expect(existsSync(marker)).toBe(false);
+    expect(await readFile(path.join(target, "safe"), "utf8")).toBe("safe");
+  }, TIMEOUT);
+});
+
 describe("production streaming SSH seam", () => {
   it("streams both binary directions without decoding bytes or accumulating stdout", async () => {
     const transport = requireStreaming();

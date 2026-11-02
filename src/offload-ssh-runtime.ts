@@ -20,7 +20,8 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
-import { DEFAULT_SYNC_EXCLUDES, snapshotHasDirectory } from "./offload-sync.js";
+import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
+import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
@@ -36,9 +37,25 @@ export interface SshOffloadRuntimeDeps {
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
   guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain">;
+  /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  trackedFiles?: TrackedFilesFn;
 }
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
+
+/** Secret-bearing names beyond registry config: never synced, and their presence keeps commands local. */
+const STAY_LOCAL_EXACT = [".envrc", ".dev.vars", ".git-credentials"];
+const STAY_LOCAL_DIRS = new Set([".aws", ".docker", ".kube"]);
+
+/** Basename test mirroring the sync-exclude globs for secret-bearing files. */
+function isSecretBearingName(name: string): boolean {
+  if (STAY_LOCAL_EXACT.includes(name)) return true;
+  if (name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".tfvars")) return true;
+  if (name.startsWith("id_rsa") || name.startsWith("id_ed25519") || name.startsWith("id_ecdsa")) return true;
+  if (name.includes(".tfstate")) return true;
+  if (name.endsWith(".json") && (name.includes("credentials") || name.startsWith("service-account"))) return true;
+  return false;
+}
 
 /** Sync-excluded directory names: never descended when looking for stay-local config. */
 const SKIP_DIRS = new Set(
@@ -62,9 +79,11 @@ function isUvAuthPyproject(text: string): boolean {
 }
 
 /** True when the source holds stay-local config at any depth: a registry
- * credential file (matched by basename, like the sync exclude), a uv.toml, or
- * a pyproject.toml with uv auth. Bounded and skips excluded dirs such as
- * node_modules; unreadable or over-limit sources fail closed to local. */
+ * credential file (matched by basename, like the sync exclude), a uv.toml, a
+ * pyproject.toml with uv auth, or any secret-bearing name or credential
+ * directory (.aws/, .docker/, .kube/, *.pem, id_rsa*, ...). Bounded and skips
+ * excluded dirs such as node_modules; unreadable or over-limit sources fail
+ * closed to local. */
 export async function hasRegistryCredentials(sourceRoot: string): Promise<boolean> {
   let entriesSeen = 0;
   const stack: Array<{ dir: string; depth: number }> = [{ dir: sourceRoot, depth: 0 }];
@@ -82,6 +101,8 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
       if (entriesSeen > MAX_CREDENTIAL_ENTRIES) return true;
       const name = entry.name;
       if (REGISTRY_CREDENTIAL_FILES.includes(name) || name === "uv.toml") return true;
+      if (isSecretBearingName(name)) return true;
+      if (entry.isDirectory() && STAY_LOCAL_DIRS.has(name)) return true;
       if (name === "pyproject.toml") {
         try {
           const abs = path.join(dir, name);
@@ -363,6 +384,24 @@ export class SshOffloadRuntime {
     // The guest runs in the mirrored cwd: an empty or sync-excluded directory
     // is absent there, so the command could not start remotely.
     if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) return null;
+    // Tracked files only, for every tool: a non-git source, an empty index,
+    // or a tracked file carrying a known credential shape keeps the command
+    // local before any VM is reserved. The push re-checks both (the tree can
+    // change after admission); this gate keeps a secret-bearing or untracked
+    // workspace from ever spending a VM.
+    const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(binding.source).catch(() => null);
+    if (!tracked || tracked.size === 0) return null;
+    const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel));
+    if (syncable.length === 0) return null;
+    // A tracked secret-bearing name (a public test cert, a .docker/ context)
+    // is withheld from sync, so the guest tree would silently lack a file the
+    // build may read: stay local for every tool, cargo included.
+    if ([...tracked].some((rel) => { const parts = rel.split("/");
+      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) return null;
+    // Git lists normalized paths: "./src" or "src/." name the same directory.
+    const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
+    if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) return null;
+    if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) return null;
     // An --offline build cannot download missing crates: a private-registry
     // config in the source would fail the guest fetch, so the command stays
     // local. This is prepare-time's stay-local decision; the guest cannot see
@@ -425,7 +464,7 @@ export class SshOffloadRuntime {
       }
       return native.source;
     };
-    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, artifactRoot: settings.offloadArtifactRoot,
+    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot: settings.offloadArtifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
       // Warm commands reuse the cached session and its control master. After a
       // resume (new machine, IP and host key) the first guest op fails on the
