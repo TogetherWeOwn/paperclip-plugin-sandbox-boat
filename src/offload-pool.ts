@@ -42,8 +42,18 @@ export class OffloadPoolStore {
       stateKey: createHash("sha256").update(JSON.stringify([accountId, poolId])).digest("hex") };
   }
   async load(): Promise<PoolVm[]> {
+    try {
+      return (await this.loadDoc()).vms;
+    } catch (error) {
+      if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return [];
+      throw error;
+    }
+  }
+  /** The persisted pool including its config, so an unloaded pool's sweep can
+   * save back without losing the settings recovery relies on. */
+  async loadDoc(): Promise<{ config: OffloadExecutorConfig; vms: PoolVm[] }> {
     const raw = await this.state.get(this.key);
-    if (raw === null) return [];
+    if (raw === null) throw new Error("OFFLOAD_POOL_ABSENT");
     const doc = raw as PoolDoc;
     if (!doc || doc.version !== 1 || !Array.isArray(doc.vms) || !doc.config
       || !finite(doc.config.offloadIdleStopSeconds) || !Number.isSafeInteger(doc.config.maxOffloadVms)
@@ -72,10 +82,11 @@ export class OffloadPoolStore {
       if (vm.sandboxId) ids.add(vm.sandboxId);
       if (vm.accountReservation) reservations.add(vm.accountReservation.id);
     }
-    return structuredClone(doc.vms).map((vm) => ({ ...vm,
+    const vms = structuredClone(doc.vms).map((vm) => ({ ...vm,
       // Recovery uses the funded per-VM tail or its saved pool setting, never
       // the restarting caller's default. The original absolute due time wins.
       tailSeconds: vm.tailSeconds ?? doc.config.offloadIdleStopSeconds, idleHandle: null }));
+    return { config: structuredClone(doc.config), vms };
   }
   async save(config: OffloadExecutorConfig, vms: readonly PoolVm[]): Promise<void> {
     const doc: PoolDoc = { version: 1, config: structuredClone(config),

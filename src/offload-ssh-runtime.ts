@@ -8,8 +8,11 @@ import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 import { boatApi, waitReady, type BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./config.js";
+import { AccountLedger } from "./account-ledger.js";
+import { describeBoatError } from "./errors.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
+import { OffloadPoolStore } from "./offload-pool.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
@@ -592,8 +595,94 @@ export class SshOffloadRuntime {
     return true;
   }
 
+  /** Provider client for an unloaded pool: a binding config first, else the
+   * caller's company client. Null when neither resolves, and the pool waits. */
+  private poolBoatFor(companyId: string, boatFor?: (companyId: string) => BoatApiLike | null): BoatApiLike | null {
+    for (const binding of this.bindings.values()) {
+      if (binding.companyId !== companyId) continue;
+      try {
+        return this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config), apiBase: binding.config.apiBase });
+      } catch { /* no usable key on this binding; try the next */ }
+    }
+    try {
+      return boatFor?.(companyId) ?? null;
+    } catch { return null; }
+  }
+
+  /**
+   * Upkeep for a registered pool that is not loaded: stop past-due VMs,
+   * confirm stopping VMs, settle provider-gone VMs (journal to terminal-read
+   * unknown, never replayed), then reconcile the ledger for that poolId.
+   * Never creates a VM. Throws on an unreadable pool document (absent is
+   * nothing to do) so the sweep reports unverified, never silent.
+   */
+  private async sweepUnloadedPool(companyId: string, poolId: string, seenAt: number, boat: BoatApiLike): Promise<void> {
+    const poolStore = new OffloadPoolStore(this.deps.state, this.deps.accountId, poolId);
+    let doc;
+    try {
+      doc = await poolStore.loadDoc();
+    } catch (error) {
+      if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return;
+      throw error;
+    }
+    const pool = doc.vms;
+    const inert = async (): Promise<never> => { throw new Error("Unloaded offload pool is not executable"); };
+    const journal = new OffloadJournal({ journalStore: journalStore(this.deps.state, companyId, poolId),
+      guestReceipts: { read: inert },
+      resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
+        tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
+      sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
+    const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
+    const now = Date.now();
+    let changed = false;
+    for (const vm of [...pool]) {
+      if (!vm.sandboxId) continue; // a lost create reply: no provider handle until a command resolves this pool
+      let state: string | null = null;
+      try {
+        const response = (await boat.get({ sandboxId: vm.sandboxId })) as { sandbox?: { id?: unknown; state?: unknown } };
+        state = response?.sandbox?.id === vm.sandboxId && typeof response.sandbox.state === "string" ? response.sandbox.state : null;
+      } catch (error) {
+        if ((await describeBoatError(error)).status === 404) state = "deleted";
+        else continue; // unreadable: leave it, retry next sweep
+      }
+      if (state === null) continue;
+      if (["archived", "cancelled", "deleted"].includes(state)) {
+        vm.stopObservedAt ??= now;
+        await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id).catch(() => undefined);
+        if (state === "deleted") pool.splice(pool.indexOf(vm), 1);
+        else {
+          vm.busy = false;
+          vm.stopping = false;
+          vm.stopped = true;
+          vm.quarantined = false;
+          vm.workspaceKey = null;
+        }
+        await journal.settleSandboxUnknown(vm.sandboxId).catch(() => undefined);
+        changed = true;
+        continue;
+      }
+      if (!["ready", "idle", "running"].includes(state)) continue; // archiving and the like: retry next sweep
+      if (vm.stopped) continue;
+      const pastDue = vm.stopDueAt !== null && now >= vm.stopDueAt;
+      // A fenced VM with no verifiable identity still bills: stop it past due
+      // while it stays fenced, and the terminal observation above releases its
+      // slot once Boat archives it. VMs with an identity need a guest observe
+      // this path cannot do, so they wait for a loaded executor.
+      if (!vm.stopping && !pastDue) continue;
+      if (vm.quarantined && vm.identity) continue;
+      try {
+        await boat.stop({ sandboxId: vm.sandboxId });
+      } catch { continue; }
+      vm.stopRequestedAt ??= now;
+      vm.stopping = true;
+      changed = true;
+    }
+    if (changed) await poolStore.save(doc.config, pool);
+    await ledger.reconcile(boat, undefined, false, false, poolId).catch(() => undefined);
+  }
+
   /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */
-  async sweep(companyIds: Iterable<string> = []): Promise<void> {
+  async sweep(companyIds: Iterable<string> = [], opts: { boatFor?: (companyId: string) => BoatApiLike | null } = {}): Promise<void> {
     const outcomes = await Promise.allSettled([...this.pools.values()].map(async ({ executor, sync }) => {
       await executor.sweep();
       await executor.collectGarbage();
@@ -607,9 +696,21 @@ export class SshOffloadRuntime {
         if (loaded.companyId === companyId) registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now() };
       }
       const roots = new Set<string>();
+      const unloadedBoat = this.poolBoatFor(companyId, opts.boatFor);
       for (const [poolId, entry] of Object.entries(registry)) {
         if (this.pools.has(poolId)) continue;
         if (!entry || typeof entry.artifactRoot !== "string" || !Number.isFinite(entry.seenAt)) { delete registry[poolId]; continue; }
+        // Upkeep before retention: a restarted worker stops past-due VMs and
+        // settles provider-gone slots without waiting for a new command to
+        // resolve this poolId. Without a client the pool waits, still covered
+        // by retention below.
+        if (unloadedBoat) {
+          try {
+            await this.sweepUnloadedPool(companyId, poolId, entry.seenAt, unloadedBoat);
+          } catch {
+            failed = true;
+          }
+        }
         const task = this.collectRetiredPool(companyId, poolId, entry.seenAt);
         this.retiredSweeps.set(poolId, task.then(() => undefined, () => undefined));
         try {

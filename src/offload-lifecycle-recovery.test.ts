@@ -106,6 +106,45 @@ describe("offload lifecycle: persisted reconciliation", () => {
   });
 });
 
+// Quarantine reconciliation after a restart: a gone guest (archived TTL box)
+// releases its slot instead of fencing it forever, while its old command
+// still reads unknown with fallbackSafe=false and is never replayed.
+describe("offload lifecycle: quarantine reconciles after a restart", () => {
+  it("crash in the idle tail, archive, restart and sweep frees the slot for a new command", async () => {
+    const first = await s.execute(command("tail"));
+    expect(first).toMatchObject({ status: "completed" });
+    const sandboxId = s.starts[0]!.sandboxId;
+    s.clock.crashWorker();
+    s.boat.boxes.get(sandboxId)!.state = "archived";
+    await s.clock.advance(60_000);
+    const restarted = s.make({}, new DiskState(s.state.path));
+    await s.api(restarted).recover?.();
+    await s.api(restarted).sweep?.();
+    const next = await s.execute(command("next-tail", { cardId: "card-b", executionWorkspaceId: "workspace-b" }), restarted);
+    expect(next).toMatchObject({ status: "completed" });
+  });
+
+  it("an archived quarantined VM releases its slot on sweep while its command still reads unknown", async () => {
+    s.fail.add("exec:doomed");
+    const cmd = command("doomed");
+    const original = await s.execute(cmd);
+    expect(original).toMatchObject({ status: "unknown", fallbackSafe: false });
+    const sandboxId = s.starts[0]!.sandboxId;
+    s.clock.crashWorker();
+    s.fail.clear();
+    s.boat.boxes.get(sandboxId)!.state = "archived";
+    const restarted = s.make({ queueLimit: 0 }, new DiskState(s.state.path));
+    await s.api(restarted).recover?.();
+    await s.api(restarted).sweep?.();
+    // The old command is preserved byte-for-byte and never replays.
+    const replay = await s.execute(cmd, restarted);
+    expect(replay).toEqual(original);
+    expect(replay).toMatchObject({ status: "unknown", fallbackSafe: false });
+    const next = await s.execute(command("next", { cardId: "card-b", executionWorkspaceId: "workspace-b" }), restarted);
+    expect(next).toMatchObject({ status: "completed" });
+  });
+});
+
 // slice b: persisted stop-observation telemetry and worker-death sweep.
 describe("offload lifecycle: stop acceptance is not measured termination", () => {
   it("keeps stoppedAt and actual stop lag pending while the provider is still archiving", async () => {

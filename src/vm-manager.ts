@@ -68,7 +68,7 @@ import type { SshSession } from "./ssh.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { syncFiles } from "./file-sync.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
-import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
+import type { RunSession, StartKind, StateClientLike, StateDoc, SweepDescriptor, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
@@ -636,6 +636,9 @@ export class BoatVmManager {
   }
 
   async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
+    // Remember the company so an unscoped sweep after a restart still covers
+    // its pools even when no whole-run hook ever cached a config for it.
+    void this.store.rememberCompany(companyId).catch(() => undefined);
     return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
   }
 
@@ -745,9 +748,76 @@ export class BoatVmManager {
     return boatApi({ apiKey: resolveCostApiKey(config), apiBase: config.apiBase });
   }
 
-  /** Keep the latest resolved config per environment in memory for the sweeper. Never persisted. */
+  /**
+   * Keep the latest resolved config per environment in memory for the sweeper,
+   * and persist its non-secret fields alongside it. After a worker restart the
+   * in-memory map is empty, so the sweep rehydrates these descriptors
+   * (ensureSweepConfigs) instead of reporting no_config_seen. Secrets are
+   * never persisted: a rehydrated entry authenticates through the host key,
+   * and an environment with an inline key needs a hook to re-cache it.
+   */
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
     this.configs.set(environmentId, { companyId, environmentId, config, seenAt: this.now() });
+    void this.persistSweepDescriptor(companyId, environmentId, config).catch((error) =>
+      this.logger.warn("boat: could not persist the sweep config", { environmentId, error: errorText(error) }),
+    );
+  }
+
+  /** Last persisted descriptor per environment, so hot hooks skip redundant writes. */
+  private readonly persistedSweeps = new Map<string, string>();
+
+  private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
+    const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
+    const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields };
+    const encoded = JSON.stringify(descriptor);
+    if (this.persistedSweeps.get(environmentId) === encoded) return;
+    await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
+    await this.store.rememberCompany(companyId);
+    this.persistedSweeps.set(environmentId, encoded);
+  }
+
+  /**
+   * Rehydrate persisted sweep descriptors into the in-memory map after a
+   * restart. Live (keyed) entries always win; rehydrated ones carry no key.
+   */
+  private async ensureSweepConfigs(scope: string | null): Promise<void> {
+    const companies = new Set<string>();
+    if (scope !== null) companies.add(scope);
+    else {
+      for (const companyId of await this.store.companies().catch(() => [] as string[])) companies.add(companyId);
+      for (const entry of this.configs.values()) companies.add(entry.companyId);
+    }
+    for (const companyId of companies) {
+      let saved: Record<string, SweepDescriptor>;
+      try {
+        saved = await this.store.sweepDescriptors(companyId);
+      } catch {
+        continue;
+      }
+      for (const [environmentId, descriptor] of Object.entries(saved)) {
+        if (this.configs.has(environmentId)) continue;
+        try {
+          const config = parseDriverConfig({ ...descriptor.config, apiKey: null, costApiKey: null });
+          this.configs.set(environmentId, { companyId, environmentId, config, seenAt: descriptor.seenAt });
+        } catch {
+          // An invalid descriptor is only a cache: the next hook re-caches it.
+        }
+      }
+    }
+  }
+
+  /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */
+  private sweepBoatFor(companyId: string): BoatApiLike | null {
+    const cached = [...this.configs.values()].filter((entry) => entry.companyId === companyId)
+      .sort((a, b) => Number(b.config.apiKey != null) - Number(a.config.apiKey != null));
+    for (const entry of cached) {
+      try {
+        return this.opsApi(entry.config);
+      } catch {
+        // No usable key on this environment; try the next.
+      }
+    }
+    return null;
   }
 
   private ttlSeconds(config: BoatDriverConfig, hardDeadlineMs: number | null): number {
@@ -2985,17 +3055,29 @@ export class BoatVmManager {
   private async doSweep(reason: string, scope: string | null): Promise<TaggedSweepReport> {
     const report: TaggedSweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
     const tag = (companyId: string | null, value: string) => ({ companyId, value });
+    // The in-memory config map is empty after a restart: rehydrate the
+    // persisted sweep descriptors first, so idle/stale stops and the company
+    // list below do not wait for the next whole-run hook.
+    await this.ensureSweepConfigs(scope).catch((error) =>
+      this.logger.warn("boat: sweep config rehydration failed", { error: errorText(error) }));
     // Offload upkeep spans companies: unscoped sweeps only.
+    // Retention: after a restart a company's broker and pools exist only once
+    // a command or config is seen again, so cover every known company: live
+    // brokers, cached configs, and every remembered company (offload routes
+    // remember theirs, so an offload-only company is covered too).
+    const offloadCompanies = scope !== null ? new Set<string>()
+      : new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId),
+        ...(await this.store.companies().catch(() => [] as string[]))]);
     if (scope === null) {
-      // Retention: after a restart a company's broker and pools exist only once
-      // a command or config is seen again, so cover every known company.
-      const offloadCompanies = new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId)]);
       // Existing native job owns stop retry/reconciliation; no host pacer.
       // All upkeep runs concurrently under one shared budget: a blocked pool
       // sweep or broker chain is reported unverified and must not delay the
       // whole-run VM stops below, however many companies are blocked.
+      // Unloaded pools get a company client (a rehydrated config through the
+      // host key) so past-due VMs stop without a new command resolving them.
       await Promise.all([
-        withDeadline(this.nativeOffload.sweep(offloadCompanies), this.offloadUpkeepTimeoutMs, "offload pool sweep")
+        withDeadline(this.nativeOffload.sweep(offloadCompanies, { boatFor: (companyId) => this.sweepBoatFor(companyId) }),
+          this.offloadUpkeepTimeoutMs, "offload pool sweep")
           .catch(() => report.errors.push(tag(null, "offload pool sweep unverified"))),
         ...[...offloadCompanies].map((companyId) =>
           withDeadline(this.offloadBroker(companyId).collectGarbage(), this.offloadUpkeepTimeoutMs, "offload broker retention")
@@ -3003,7 +3085,9 @@ export class BoatVmManager {
         ),
       ]);
     }
-    if (this.configs.size === 0) {
+    // Offload-only companies have upkeep above but no whole-run config: they
+    // sweep pools without reporting no_config_seen.
+    if (this.configs.size === 0 && offloadCompanies.size === 0) {
       report.skipped = "no_config_seen";
       return report;
     }

@@ -1,0 +1,164 @@
+// After a worker restart the sweep keeps stopping VMs without a hook
+// re-caching config, and an unreadable VM document fails closed.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const spawnMock = vi.hoisted(() => vi.fn());
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return { ...actual, spawn: spawnMock };
+});
+
+import type { BoatApiLike } from "./boat-client.js";
+import { setBoatApiFactoryForTests } from "./boat-client.js";
+import { OffloadPoolStore } from "./offload-pool.js";
+import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
+import { VmStateStore } from "./state.js";
+import { FakeBoat } from "./test-support/fake-boat.js";
+import { FakeSsh, createFakeContext } from "./test-support/harness.js";
+
+const companyId = "company-sweep-restart";
+const environmentId = "environment-sweep-restart";
+const fakeKey = "boat_test_key_not_real";
+const baseConfig = { apiKey: fakeKey, cliproxyTunnel: false };
+let fake: FakeBoat;
+let clock: number;
+let harness: ReturnType<typeof createFakeContext>;
+let savedHostKey: string | undefined;
+
+function overrides() {
+  return {
+    now: () => clock,
+    sleep: async (ms: number) => { clock += ms; },
+    sweepDeadlineMs: 5_000,
+    offloadUpkeepTimeoutMs: 500,
+    sweepVmTimeoutMs: 500,
+  };
+}
+
+const workspaceId = "33333333-3333-4333-8333-333333333333";
+const issue = "issue-sweep-restart";
+
+async function acquire(runId = "run-1") {
+  return await plugin.definition.onEnvironmentAcquireLease!({
+    companyId, environmentId, driverKey: "boat", config: baseConfig, runId,
+    issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+  });
+}
+
+async function release(lease: Awaited<ReturnType<typeof acquire>>) {
+  return await plugin.definition.onEnvironmentReleaseLease!({
+    companyId, environmentId, driverKey: "boat", config: baseConfig, issueId: issue,
+    providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata,
+  });
+}
+
+/** A worker restart: a fresh manager on the same durable state with empty in-memory configs. */
+async function restart() {
+  await currentManager().sweepInFlight()?.catch(() => undefined);
+  setManagerOverridesForTests(overrides());
+  await plugin.definition.setup(harness.ctx as never);
+}
+
+async function untilSweepDescriptor() {
+  const key = { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" } as const;
+  for (let n = 0; n < 1000; n += 1) {
+    const doc = await harness.ctx.state.get(key) as { envs?: Record<string, unknown> } | null;
+    if (doc?.envs && Object.keys(doc.envs).length > 0) return doc;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("sweep descriptor was never persisted");
+}
+
+beforeEach(async () => {
+  clock = Date.parse("2026-10-23T08:00:00Z");
+  fake = new FakeBoat({ now: () => clock });
+  const ssh = new FakeSsh();
+  spawnMock.mockReset();
+  spawnMock.mockImplementation(ssh.spawn);
+  setBoatApiFactoryForTests(() => fake as unknown as BoatApiLike);
+  setManagerOverridesForTests(overrides());
+  savedHostKey = process.env.BOAT_API_KEY;
+  process.env.BOAT_API_KEY = fakeKey;
+  harness = createFakeContext();
+  await plugin.definition.setup(harness.ctx as never);
+});
+afterEach(async () => {
+  await plugin.definition.onShutdown?.();
+  setBoatApiFactoryForTests(null);
+  if (savedHostKey === undefined) delete process.env.BOAT_API_KEY;
+  else process.env.BOAT_API_KEY = savedHostKey;
+});
+
+describe("sweep after a worker restart", () => {
+  it("stops a VM left stopping by an unconfirmed release instead of reporting no_config_seen", async () => {
+    const lease = await acquire();
+    const sandboxId = lease.providerLeaseId!;
+    // The release's stop is accepted but never takes effect: the record stays stopping.
+    fake.stopMode = "stays_up";
+    await expect(release(lease)).resolves.toBeUndefined();
+    // Only non-secret fields are persisted for the sweep, never the resolved key.
+    const saved = await untilSweepDescriptor();
+    expect(JSON.stringify(saved)).not.toContain(fakeKey);
+
+    await restart();
+    fake.stopMode = "immediate";
+    clock += 10 * 60_000;
+    const report = await currentManager().sweep("schedule", { force: true });
+    expect(report.skipped).toBeNull();
+    expect(report.stopped).toContain(sandboxId);
+    expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).toContain(sandboxId);
+  });
+
+  it("stops a past-due pool VM with no new command after a restart", async () => {
+    const poolId = "pool-restart-1";
+    const box = fake.addSandbox({ id: "bx_poolrestart0001", state: "ready" });
+    const accountId = "account-restart";
+    await new OffloadPoolStore(harness.ctx.state, accountId, poolId).save(
+      { maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+      [{ sandboxId: box.id, busy: false, stopped: false, stopping: false, quarantined: false,
+        lastActiveAt: clock - 60_000, generation: 1, idleHandle: null,
+        stopDueAt: clock - 1_000, stopRequestedAt: null, stopAttempts: 0, identity: null }],
+    );
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts", seenAt: clock - 60_000 } },
+    );
+
+    // A restarted runtime: no bindings, no loaded pools, no new command.
+    const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+      ssh: {} as never, accountId });
+    await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+    expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([box.id]);
+    await runtime.shutdown();
+  });
+
+  it("fails closed on an unknown-version VM document: update rejects, the stored value is unchanged", async () => {
+    const store = new VmStateStore(harness.ctx.state);
+    const seeded = { version: 2, vms: { "orphan-key": { sandboxId: "bx_never" } } };
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" }, seeded);
+    await expect(store.update(companyId, () => undefined)).rejects.toThrow(/unreadable/);
+    expect(await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" })).toEqual(seeded);
+  });
+
+  it("leaves name-matching VMs alone when the VM document is unreadable", async () => {
+    await acquire();
+    // Roll back to a document this version cannot read; the sweep must report
+    // it and leave matching VMs alone rather than treating them as orphans.
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" },
+      { version: 2, vms: {} });
+    fake.addSandbox({ id: "bx_orphan00000001", name: "paperclip-0123456789abcdef", state: "ready",
+      updatedAt: new Date(clock - 60 * 60_000) });
+    clock += 10 * 60_000;
+    const report = await currentManager().sweep("schedule", { force: true });
+    expect(report.skipped).toBeNull();
+    expect(report.stopped).toEqual([]);
+    expect(report.deleted).toEqual([]);
+    expect(fake.callsOf("stop")).toEqual([]);
+    expect(fake.callsOf("deleteSandbox")).toEqual([]);
+    expect(report.errors.join("\n")).toMatch(/unreadable/);
+  });
+});

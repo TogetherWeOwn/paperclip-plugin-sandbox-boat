@@ -254,12 +254,41 @@ export class OffloadJournal {
     if (run.permanentlyTerminal) throw offloadError("OFFLOAD_FORBIDDEN");
   }
 
+  /**
+   * Settle every non-terminal record bound to this sandbox as terminal-read
+   * `unknown`: the guest rebooted or is gone (archived/cancelled/deleted), so
+   * no command processes survive and the old command must never replay. An
+   * existing unknown reply is preserved byte-for-byte; the settled marker is
+   * resultAt (crash-pending unknown keeps resultAt null), so replay returns
+   * the result without re-holding and retention stays neutral (unknown is
+   * never tombstoned). Returns the settled count.
+   */
+  async settleSandboxUnknown(sandboxId: string): Promise<number> {
+    return this.serialize(async () => {
+      let settled = 0;
+      for (const key of await this.deps.journalStore.list("command/")) {
+        const record = parseRecord(await this.deps.journalStore.get(key), key);
+        if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state)) continue;
+        if (record.state === "unknown" && record.resultAt !== null) continue; // already settled
+        const result = record.result?.status === "unknown" ? record.result : this.unknown(record);
+        await this.deps.journalStore.set(key, { ...record, state: "unknown", result,
+          resultAt: this.now(), remoteStarted: null, fallbackSafe: false, updatedAt: this.now() });
+        // Only this command's hold is dropped: a hold for another command on
+        // the same sandbox (a reused slot) is never ours to release here.
+        this.held.delete(key);
+        settled += 1;
+      }
+      return settled;
+    });
+  }
+
   async recover(): Promise<void> {
     if (!this.startup) {
       this.startup = this.serialize(async () => {
         for (const key of await this.deps.journalStore.list("command/")) {
           const record = parseRecord(await this.deps.journalStore.get(key), key);
           if (record.identity) this.lifecycle?.remember?.(record.identity);
+          if (this.settled(record)) continue; // settled unknown: terminal-read, never re-held
           if (!TERMINAL.has(record.state) && record.identity) await this.hold(record);
           if (!TERMINAL.has(record.state) && !PRE_START.has(record.state) && !record.identity) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         }
@@ -450,6 +479,12 @@ export class OffloadJournal {
       reason: "guest receipt verification required; execution must not be replayed" };
   }
 
+  /** A settled unknown (resultAt set by settleSandboxUnknown) reads terminally,
+   * unlike crash-pending unknown (resultAt null) which still awaits receipts. */
+  private settled(record: OffloadRecord): boolean {
+    return record.state === "unknown" && record.resultAt !== null;
+  }
+
   private async hold(record: OffloadRecord): Promise<void> {
     if (record.identity) {
       this.held.set(commandKey(record), record.identity);
@@ -467,6 +502,11 @@ export class OffloadJournal {
       throw offloadError("OFFLOAD_RESULT_EXPIRED");
     }
     if (TERMINAL.has(record.state)) {
+      if (!record.result) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      return record.result;
+    }
+    if (this.settled(record)) {
+      // The sandbox is gone; the preserved unknown never replays or re-holds.
       if (!record.result) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
       return record.result;
     }

@@ -275,6 +275,59 @@ export class OffloadExecutor {
     await this.requireDurable().recover();
   }
 
+  /**
+   * Provider-state reconciliation for a quarantined pool VM, provider first,
+   * before any SSH observe. A gone guest (archived/cancelled/deleted) holds
+   * no command processes, so the slot is released (stop stamped, journal
+   * settled to terminal-read unknown, never replayed). A running VM stays
+   * fenced unless observe verifies it clean with known workspace ownership;
+   * a past-due running VM with no verifiable identity is still stopped, and
+   * the terminal observation releases it once Boat archives it.
+   */
+  private async reconcileQuarantined(vm: PoolVm): Promise<void> {
+    if (!vm.sandboxId || vm.deletePending) return;
+    let state: string | null = null;
+    try {
+      state = sandboxStateOf(await this.boat.get({ sandboxId: vm.sandboxId }), vm.sandboxId);
+    } catch (error) {
+      if ((await describeBoatError(error)).status === 404) state = "deleted";
+    }
+    if (state === null) return; // unreadable: stay fenced, retry next sweep
+    if (["archived", "cancelled", "deleted"].includes(state)) {
+      vm.stopObservedAt ??= this.now();
+      await this.persistStopTelemetry(vm).catch(() => {
+        this.logger.error("boat offload terminal receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
+      });
+      if (state === "deleted") {
+        this.retireVm(vm);
+      } else {
+        vm.stopping = false;
+        vm.stopped = true;
+        vm.quarantined = false;
+        vm.workspaceKey = null;
+      }
+      if (this.durable) await this.durable.settleSandboxUnknown(vm.sandboxId).catch(() => undefined);
+      await this.persistPool().catch(() => undefined);
+      return;
+    }
+    if (!["ready", "idle", "running"].includes(state)) return; // archiving and the like: stay fenced
+    if (this.lifecycle && vm.identity) {
+      try {
+        // Unknown workspace ownership stays fenced even when the guest looks
+        // clean: reuse must not mix workspaces it cannot tell apart. Once
+        // Boat archives the VM the terminal branch above still frees its slot.
+        if (!(await this.lifecycle.observe(vm.identity)).populated && vm.workspaceKey !== undefined) {
+          vm.quarantined = false;
+          await this.persistPool().catch(() => undefined);
+        }
+      } catch { /* observe failed: stay fenced */ }
+      return;
+    }
+    if (!vm.identity && vm.stopDueAt !== null && this.now() >= vm.stopDueAt && !vm.stopped && !vm.stopping) {
+      await this.stopVm(vm, false, true).catch(() => undefined);
+    }
+  }
+
   private async recoverPool(): Promise<void> {
     if (!this.poolStore) return;
     if (!this.poolStartup) {
@@ -284,6 +337,9 @@ export class OffloadExecutor {
           // An in-flight allocation (including an unknown create ID) or guest
           // reservation cannot become idle just because its worker disappeared.
           if (vm.busy || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
+          // Provider state first: an archived VM is stopped, not quarantined,
+          // and no SSH observe runs against a gone guest.
+          if (vm.quarantined && vm.sandboxId) await this.reconcileQuarantined(vm).catch(() => undefined);
           if (!vm.stopped && !vm.stopping && !vm.quarantined) {
             try {
               if (!vm.identity || (await this.lifecycle!.observe(vm.identity)).populated) vm.quarantined = true;
@@ -354,6 +410,13 @@ export class OffloadExecutor {
         // A pending ephemeral delete is quarantined against reuse, but sweep
         // still owns retrying it: skipped, it would bill until provider TTL.
         if (vm.deletePending && !vm.busy && vm.sandboxId) { await this.retryPendingDelete(vm); continue; }
+        // Quarantine is reconciled, not permanent: a gone guest releases the
+        // slot (journal settled to unknown, never replayed), a verified-clean
+        // running VM rejoins, and a past-due identity-less idle VM is stopped.
+        if (vm.quarantined && !vm.busy && vm.sandboxId) {
+          await this.reconcileQuarantined(vm).catch(() => undefined);
+          if (vm.quarantined) continue;
+        }
         if (vm.busy || vm.quarantined || !vm.sandboxId) continue;
         if (vm.stopping) {
           if (await this.observeStop(vm)) await this.stopVm(vm, true);
@@ -1112,8 +1175,11 @@ export class OffloadExecutor {
     this.scheduleIdleStop(vm, generation, retryMs);
   }
 
-  private async stopVm(vm: PoolVm, retryPending = false): Promise<boolean> {
-    if ((vm.stopping && !retryPending) || vm.stopped || vm.quarantined || vm.busy) return true;
+  private async stopVm(vm: PoolVm, retryPending = false, forceQuarantined = false): Promise<boolean> {
+    // forceQuarantined is only for quarantine reconciliation of a running VM
+    // with no verifiable identity: the stop halts billing while the fence
+    // stays, and the terminal observation releases the slot once archived.
+    if ((vm.stopping && !retryPending) || vm.stopped || (vm.quarantined && !forceQuarantined) || vm.busy) return true;
     vm.stopAttempts += 1;
     vm.stopRequestedAt ??= this.now();
     // Request intent is durable before the RPC; it is not a stopped receipt.
