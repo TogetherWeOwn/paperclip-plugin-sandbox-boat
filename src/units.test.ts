@@ -24,6 +24,7 @@ import {
   effectiveEnvAllowlist,
   filterRunEnv,
   isAcpProcessSessionCommand,
+  modelProxyKeyFingerprintOf,
   parseEnvAllowlist,
 } from "./env-policy.js";
 import { describeBoatError } from "./errors.js";
@@ -102,11 +103,26 @@ describe("config", () => {
       failFast: true,
       apiBase: "https://boat.dev/api/v1",
       templateSnapshot: null,
+      managedGithub: false,
+      modelProxyKeyFingerprint: null,
       templateSourceSandboxId: null,
     });
     expect(parseDriverConfig({ templateSourceSandboxId: "bx_archived1" })).toMatchObject({
       templateSourceSandboxId: "bx_archived1",
     });
+  });
+
+  it("credentials need explicit policy: managedGithub warns when on, the model key warns unverified or off-tunnel, a bad fingerprint fails", () => {
+    const warningsFor = (raw: Record<string, unknown>) => validateDriverConfig(parseDriverConfig({ apiKey: "k", ...raw }), { apiKey: "k", ...raw }).warnings.join("\n");
+    const errorsFor = (raw: Record<string, unknown>) => validateDriverConfig(parseDriverConfig({ apiKey: "k", ...raw }), { apiKey: "k", ...raw }).errors.join("\n");
+    expect(warningsFor({ managedGithub: true })).toMatch(/managedGithub is on: any process in the VM/);
+    expect(warningsFor({ managedGithub: false })).not.toMatch(/managedGithub is on/);
+    expect(warningsFor({})).toMatch(/modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is delivered unverified/);
+    expect(warningsFor({ modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated") })).not.toMatch(/delivered unverified/);
+    expect(warningsFor({ cliproxyTunnel: false })).toMatch(/cliproxyTunnel is off: ANTHROPIC_AUTH_TOKEN is always dropped/);
+    expect(errorsFor({ modelProxyKeyFingerprint: "not-a-sha256" })).toMatch(/modelProxyKeyFingerprint must be the SHA-256/);
+    expect(errorsFor({ modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated").toUpperCase() })).toBe("");
+    expect(warningsFor({ envAllowlist: ["TWO_*", "CARGO_*", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_BRIDGE_TOKEN"] })).toMatch(/envAllowlist prefix TWO_\* can carry project secrets/);
   });
 
   // The workspace root must be where the home ~/.boatignore applies, or every start fails at the runtime directory (and spends a start).
@@ -146,7 +162,8 @@ describe("env policy", () => {
   it("keeps what a Claude run needs through the model-proxy tunnel and the Paperclip bridge", () => {
     for (const [name, value] of [
       ["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"],
-      ["ANTHROPIC_AUTH_TOKEN", "sk-pilot-proxy-key"],
+      // ANTHROPIC_AUTH_TOKEN is not here: it needs the explicit model policy
+      // (tunnel + base URL, matching fingerprint), tested below.
       ["ANTHROPIC_DEFAULT_SONNET_MODEL", "muse-spark"],
       ["CLAUDE_CODE_SUBAGENT_MODEL", "muse-spark"],
       ["CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000"],
@@ -157,6 +174,17 @@ describe("env policy", () => {
       ["PAPERCLIP_WORKSPACES_JSON", '[{"repoUrl":"https://github.com/o/r"}]'],
       ["LC_ALL", "C.UTF-8"],
       ["PATH", "/usr/local/bin:/usr/bin:/bin"],
+      ["PATH", "/usr/bin:/home/user/node_modules/@vendor/cli/bin"],
+      // Versioned `@` directories (Homebrew python@3.11, node@20) are paths, not userinfo.
+      ["PATH", "/usr/bin:/opt/homebrew/opt/python@3.11/bin:/usr/local/opt/node@20/bin"],
+      // A relative first PATH entry makes the separator a first-segment `:/`;
+      // what follows the `@` is a version, not a host, so it stays a path.
+      ["PATH", "bin:/opt/python@3.11/bin"],
+      ["PATH", "bin:/opt/python@3.11/bin:/usr/bin"],
+      ["PATH", "bin:/python@3.11/bin"],
+      // An `@` in a URL path is not userinfo either: the authority already ended.
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/projects/release@v2"],
+      ["PAPERCLIP_WORKSPACE_REPO_URL", "https://example.com/at/10:30/release@v2"],
     ] as const) {
       expect([name, decide(name, value)]).toEqual([name, "kept"]);
     }
@@ -189,13 +217,13 @@ describe("env policy", () => {
       })}.${sig}`;
     };
     const deliver = (token: string, allowlist: readonly string[] = DEFAULT_ENV_ALLOWLIST, extra: Record<string, string> = { PAPERCLIP_RUN_ID: "run-1" }) => {
-      const result = filterRunEnv({ PAPERCLIP_GITHUB_BROKER_TOKEN: token, ...extra }, allowlist);
+      const result = filterRunEnv({ PAPERCLIP_GITHUB_BROKER_TOKEN: token, ...extra }, allowlist, { managedGithub: true });
       return result.kept.some(([name]) => name === "PAPERCLIP_GITHUB_BROKER_TOKEN")
         ? "kept"
         : result.dropped.find((entry) => entry.name === "PAPERCLIP_GITHUB_BROKER_TOKEN")?.reason;
     };
 
-    it("delivers the run's github_credentials capability by default", () => {
+    it("delivers the run's github_credentials capability when managedGithub is on", () => {
       expect(deliver(capability())).toBe("kept");
     });
 
@@ -272,6 +300,30 @@ describe("env policy", () => {
       }
     });
 
+    it("drops the capability and both launcher shells unless managedGithub is explicitly on", () => {
+      const dir = "/home/user/paperclip-workspace/.paperclip-runtime/paperclip-runner/github/run-1";
+      const env = {
+        PAPERCLIP_RUN_ID: "run-1",
+        PATH: `${dir}:/usr/bin`,
+        PAPERCLIP_GITHUB_BROKER_TOKEN: capability(),
+        ZDOTDIR: dir,
+        BASH_ENV: `${dir}/.bashrc`,
+      };
+      for (const options of [undefined, {}, { managedGithub: false }] as const) {
+        const result = options === undefined ? filterRunEnv(env, DEFAULT_ENV_ALLOWLIST) : filterRunEnv(env, DEFAULT_ENV_ALLOWLIST, options);
+        expect(result.dropped).toEqual(
+          expect.arrayContaining([
+            { name: "PAPERCLIP_GITHUB_BROKER_TOKEN", reason: "github_capability_disabled" },
+            { name: "ZDOTDIR", reason: "github_capability_disabled" },
+            { name: "BASH_ENV", reason: "github_capability_disabled" },
+          ]),
+        );
+        expect(result.kept.map(([name]) => name)).not.toContain("PAPERCLIP_GITHUB_BROKER_TOKEN");
+      }
+      const on = filterRunEnv(env, DEFAULT_ENV_ALLOWLIST, { managedGithub: true });
+      expect(on.kept.map(([name]) => name)).toEqual(expect.arrayContaining(["PAPERCLIP_GITHUB_BROKER_TOKEN", "ZDOTDIR", "BASH_ENV"]));
+    });
+
     it("keeps every other JWT dropped, and never sends the controller's broker URL (the launcher then uses the in-VM bridge)", () => {
       const result = filterRunEnv(
         {
@@ -311,7 +363,7 @@ describe("env policy", () => {
     });
     // Paperclip's run env always carries the run id the launcher dir is named after.
     const outcome = (env: Record<string, string>, allowlist: readonly string[] = DEFAULT_ENV_ALLOWLIST) => {
-      const result = filterRunEnv({ PAPERCLIP_RUN_ID: "run-1", ...env }, allowlist);
+      const result = filterRunEnv({ PAPERCLIP_RUN_ID: "run-1", ...env }, allowlist, { managedGithub: true });
       return Object.fromEntries(
         ["ZDOTDIR", "BASH_ENV"].map((name) => [
           name,
@@ -321,7 +373,7 @@ describe("env policy", () => {
     };
 
     it("delivers them when they are the launcher dir that leads PATH", () => {
-      const result = filterRunEnv({ PAPERCLIP_RUN_ID: "run-1", ...launcherEnv() }, DEFAULT_ENV_ALLOWLIST);
+      const result = filterRunEnv({ PAPERCLIP_RUN_ID: "run-1", ...launcherEnv() }, DEFAULT_ENV_ALLOWLIST, { managedGithub: true });
       expect(result.kept).toEqual([
         ["PAPERCLIP_RUN_ID", "run-1"],
         ["PATH", `${dir}:/usr/local/bin:/usr/bin:/bin`],
@@ -358,7 +410,7 @@ describe("env policy", () => {
       expect(outcome(launcherEnv({ PAPERCLIP_RUN_ID: "run-2" }))).toEqual(mismatch);
       expect(outcome(launcherEnv({ PAPERCLIP_RUN_ID: "" }))).toEqual(mismatch);
       expect(outcome(launcherEnv({ PAPERCLIP_RUN_ID: "run" }))).toEqual(mismatch);
-      const result = filterRunEnv(launcherEnv(), DEFAULT_ENV_ALLOWLIST);
+      const result = filterRunEnv(launcherEnv(), DEFAULT_ENV_ALLOWLIST, { managedGithub: true });
       expect(result.dropped).toEqual([
         { name: "ZDOTDIR", reason: "github_launcher_mismatch" },
         { name: "BASH_ENV", reason: "github_launcher_mismatch" },
@@ -413,6 +465,7 @@ describe("env policy", () => {
       const result = filterRunEnv(
         { PAPERCLIP_RUN_ID: "run-1", PATH: `/home/user/w/${parent}/x/${parent}/run-1:/usr/bin`, ZDOTDIR: `/home/user/w/${parent}/x/${parent}/run-1`, BASH_ENV: `/home/user/w/${parent}/x/${parent}/run-1/.bashrc` },
         DEFAULT_ENV_ALLOWLIST,
+        { managedGithub: true },
       );
       expect(result.dropped).toEqual([
         { name: "ZDOTDIR", reason: "github_launcher_mismatch" },
@@ -477,6 +530,7 @@ describe("env policy", () => {
       const result = filterRunEnv(
         launcherEnv({ GH_CONFIG_DIR: `${dir}/gh-config`, GIT_CONFIG_GLOBAL: "/dev/null", SSH_AUTH_SOCK: "", PAPERCLIP_GITHUB_LAUNCHER_DIR: dir, PAPERCLIP_RUN_ID: "run-1" }),
         DEFAULT_ENV_ALLOWLIST,
+        { managedGithub: true },
       );
       expect(result.kept.map(([name]) => name)).toEqual(["PATH", "ZDOTDIR", "BASH_ENV", "PAPERCLIP_RUN_ID"]);
       expect(outcome(launcherEnv(), ["PATH"])).toEqual({ ZDOTDIR: "not_allowlisted", BASH_ENV: "not_allowlisted" });
@@ -525,7 +579,7 @@ describe("env policy", () => {
           PAPERCLIP_GITHUB_BROKER_URL: "http://paperclip.internal:3100",
           PAPERCLIP_GITHUB_BROKER_TOKEN: capability,
         };
-        const kept = filterRunEnv(hostEnv, DEFAULT_ENV_ALLOWLIST).kept.filter(([name]) => !dropFromStaged.includes(name) && !forceStaged.includes(name));
+        const kept = filterRunEnv(hostEnv, DEFAULT_ENV_ALLOWLIST, { managedGithub: true }).kept.filter(([name]) => !dropFromStaged.includes(name) && !forceStaged.includes(name));
         const staged: Array<[string, string]> = [...kept, ...forceStaged.map((name) => [name, hostEnv[name as keyof typeof hostEnv]] as [string, string])];
         const stageDir = path.join(root, "stage");
         const stage = { dir: stageDir, path: path.join(stageDir, "env.sh") };
@@ -586,8 +640,155 @@ describe("env policy", () => {
     });
   });
 
+  describe("model credential (ANTHROPIC_AUTH_TOKEN)", () => {
+    const dedicated = "sk-dedicated-sandbox-proxy-key";
+    const fingerprint = modelProxyKeyFingerprintOf(dedicated);
+    const tunnel = { cliproxyTunnel: true, tunnelRemotePort: 8317, tunnelTargetHost: "cliproxy", tunnelTargetPort: 8317 };
+    const tokenOutcome = (env: Record<string, string>, options?: Parameters<typeof filterRunEnv>[2]) => {
+      const result = options === undefined ? filterRunEnv(env, DEFAULT_ENV_ALLOWLIST) : filterRunEnv(env, DEFAULT_ENV_ALLOWLIST, options);
+      return {
+        result,
+        token: result.kept.some(([name]) => name === "ANTHROPIC_AUTH_TOKEN")
+          ? "kept"
+          : result.dropped.find((entry) => entry.name === "ANTHROPIC_AUTH_TOKEN")?.reason,
+      };
+    };
+
+    it("drops a provider key on a non-tunnel base URL, and the dropped value never reaches the staged env", () => {
+      const { result, token } = tokenOutcome(
+        { ANTHROPIC_BASE_URL: "https://openrouter.ai/api", ANTHROPIC_AUTH_TOKEN: "sk-or-v1-x" },
+        { ...tunnel, modelProxyKeyFingerprint: fingerprint },
+      );
+      expect(token).toBe("model_credential_off_tunnel");
+      expect(buildRemoteEnvFileContents(result.kept)).not.toContain("sk-or-v1-x");
+      expect(JSON.stringify(result.dropped)).not.toContain("sk-or-v1-x");
+    });
+
+    it("drops a token whose fingerprint differs from the dedicated key, even on the tunnel URL", () => {
+      expect(
+        tokenOutcome(
+          { ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "sk-some-pool-credential" },
+          { ...tunnel, modelProxyKeyFingerprint: fingerprint },
+        ).token,
+      ).toBe("model_credential_not_dedicated");
+    });
+
+    it("keeps the matching dedicated key on the tunnel URL, in its rewritten and host-side forms", () => {
+      for (const baseUrl of ["http://127.0.0.1:8317", "http://127.0.0.1:8317/v1", "http://cliproxy:8317"]) {
+        expect([baseUrl, tokenOutcome({ ANTHROPIC_BASE_URL: baseUrl, ANTHROPIC_AUTH_TOKEN: dedicated }, { ...tunnel, modelProxyKeyFingerprint: fingerprint }).token]).toEqual([baseUrl, "kept"]);
+      }
+    });
+
+    it("without a fingerprint, keeps an on-tunnel token unverified but still drops an off-tunnel one", () => {
+      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "sk-anything" }, tunnel).token).toBe("kept");
+      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_AUTH_TOKEN: "sk-anything" }, tunnel).token).toBe("model_credential_off_tunnel");
+    });
+
+    it("fails closed with no tunnel, no base URL, a wrong tunnel port, or no policy at all", () => {
+      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: dedicated }, { ...tunnel, cliproxyTunnel: false, modelProxyKeyFingerprint: fingerprint }).token).toBe("model_credential_off_tunnel");
+      expect(tokenOutcome({ ANTHROPIC_AUTH_TOKEN: dedicated }, { ...tunnel, modelProxyKeyFingerprint: fingerprint }).token).toBe("model_credential_off_tunnel");
+      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:9999", ANTHROPIC_AUTH_TOKEN: dedicated }, { ...tunnel, modelProxyKeyFingerprint: fingerprint }).token).toBe("model_credential_off_tunnel");
+      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: dedicated }).token).toBe("model_credential_off_tunnel");
+      // A base URL the filter itself drops cannot vouch for the token.
+      const jwtBase = filterRunEnv({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln", ANTHROPIC_AUTH_TOKEN: dedicated }, DEFAULT_ENV_ALLOWLIST, { ...tunnel, modelProxyKeyFingerprint: fingerprint });
+      expect(jwtBase.dropped).toEqual(expect.arrayContaining([{ name: "ANTHROPIC_BASE_URL", reason: "jwt" }, { name: "ANTHROPIC_AUTH_TOKEN", reason: "model_credential_off_tunnel" }]));
+      const unlistedBase = filterRunEnv({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: dedicated }, ["ANTHROPIC_AUTH_TOKEN"], { ...tunnel, modelProxyKeyFingerprint: fingerprint });
+      expect(unlistedBase.kept).toEqual([]);
+    });
+  });
+
+  it("drops secret names and secret values through a project prefix, while an exact VM-local database URL still passes", () => {
+    const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+    const serviceAccount = JSON.stringify({ type: "service_account", private_key: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg==\n-----END PRIVATE KEY-----\n", client_email: "a@b.example" });
+    const cases: Array<[string, string, readonly string[]]> = [
+      ["TWO_MYSQL_PWD", "x", ["secret_name_needs_exact_entry"]],
+      ["TWO_SMTP_PASS", "x", ["secret_name_needs_exact_entry"]],
+      ["TWO_DB_PASS", "x", ["secret_name_needs_exact_entry"]],
+      ["TWO_GCP_CREDS", serviceAccount, ["secret_value", "secret_name_needs_exact_entry"]],
+      ["TWO_PRIVKEY", "x", ["secret_name_needs_exact_entry"]],
+      ["TWO_SSH_ID_ED25519", pem, ["secret_value"]],
+      ["TWO_PG_CONN", "host=db.prod.example password=s3cret", ["secret_value"]],
+      // Keyword-DSN assignments glued to a separator are the canonical forms:
+      // `;Password=` (ADO.NET), `;Pwd=` (ODBC), `&password=`, an identifier
+      // suffix (`db_password=`), and a single-quoted JSON-style key.
+      ["TWO_SETTINGS", "Server=db.example;Database=app;User Id=svc;Password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "Driver={SQL Server};Server=db.example;Uid=svc;Pwd=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "a=1&password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "db_password=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", "{'password': 'hunter2'}", ["secret_value"]],
+      ["TWO_SETTINGS", "host=db,pwd=hunter2", ["secret_value"]],
+      ["TWO_SETTINGS", '{"db_password":"hunter2"}', ["secret_value"]],
+      ["TWO_SETTINGS", "passwd: hunter2", ["secret_value"]],
+      // A long whitespace run before the `=` is still an assignment.
+      ["TWO_SETTINGS", `password${" ".repeat(64)}=hunter2`, ["secret_value"]],
+      ["TWO_REDIS", "default:Ab/Cd+ef==@redis.prod:6379", ["remote_database_or_credential_url"]],
+      // A password starting with `/` must not hide behind the separator rule:
+      // the `:` is in the token's first segment and is no `://` separator.
+      ["TWO_CONFIG", "user:/password@db.prod.example:5432", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/pa/ss@db.prod.example", ["remote_database_or_credential_url"]],
+      // A path after the host does not launder it either: what follows the
+      // `@` reads as a host, not as a versioned directory (`python@3.11`).
+      ["TWO_CONFIG", "user:/password@db.example/path", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/pa/ss@db.prod.example/path", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/password@10.11.12.13/path", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user://password@db.prod.example", ["remote_database_or_credential_url"]],
+      ["TWO_API_URL", "https://api.example/x?pw=hunter2", ["remote_database_or_credential_url"]],
+      ["TWO_CALLBACK", "https://a.example/cb#access_token=ghp_abc", ["remote_database_or_credential_url"]],
+      ["TWO_SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T000/B000/xyz", ["secret_name_needs_exact_entry"]],
+      ["TWO_AZURE", "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=abc123==", ["secret_value"]],
+      ["TWO_DEPLOY", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", ["secret_value"]],
+    ];
+    for (const [name, value, reasons] of cases) {
+      expect(reasons, name).toContain(decide(name, value, ["TWO_*"]));
+    }
+    expect(decide("CLAUDE_CODE_DB_PWD", "x", ["CLAUDE_CODE_*"])).toBe("secret_name_needs_exact_entry");
+    // A secret JSON key behind a \u escape is a secret key once decoded.
+    expect(decide("CLAUDE_CODE_CONFIG", '{"\\u0070assword":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
+    expect(decide("CLAUDE_CODE_CONFIG", '{"\\u0070wd":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
+    expect(decide("CLAUDE_CODE_CONFIG", '{"db_\\u0070assword":"x"}', ["CLAUDE_CODE_*"])).toBe("secret_value");
+    // A benign value through the same prefix, and the exact-entry local database URL, still pass.
+    expect(decide("TWO_FEATURE_FLAG", "on", ["TWO_*"])).toBe("kept");
+    expect(decide("TWO_TEST_DATABASE_URL", "postgres://u:p@127.0.0.1/two", ["TWO_TEST_DATABASE_URL"])).toBe("kept");
+    expect(decide("TWO_TEST_DATABASE_URL", "postgres://u:p@127.0.0.1/two", ["TWO_*"])).toBe("secret_name_needs_exact_entry");
+  });
+
+  it("finds JWTs and JWEs whose JSON does not start with `{\"`, embedded in JSON or text, and newline-split tokens", () => {
+    const b64u = (text: string) => Buffer.from(text, "utf8").toString("base64url");
+    const header = b64u('{"alg":"HS256","typ":"JWT"}');
+    const payload = b64u('{"sub":"x"}');
+    const cases: Array<[string, string]> = [
+      // (a) A payload of `{ "sub"`, behind Bearer, inside plain JSON (no backslash anywhere).
+      ["PAPERCLIP_WORKSPACES_JSON", JSON.stringify({ Authorization: `Bearer ${header}.${b64u('{ "sub": "x" }')}.c2ln` })],
+      // (b) A whole JWT whose header is `{ "alg"` (base64url starts `eyAi`, not `eyJ`).
+      ["PAPERCLIP_API_KEY", `${b64u('{ "alg": "HS256" }')}.${payload}.c2ln`],
+      // (c) A payload of `{"1"...`, embedded in text.
+      ["PAPERCLIP_API_KEY", `Token ${header}.${b64u('{"1":"x"}')}.c2ln`],
+      // (d) A 5-segment JWE with an empty encrypted-key segment.
+      ["PAPERCLIP_API_KEY", `${header}..aXY.Y2lwaGVy.dGFn`],
+      // (e) Newline-split: before a dot, and inside the header segment.
+      ["PAPERCLIP_API_KEY", `${header}\n.${payload}.c2ln`],
+      ["PAPERCLIP_API_KEY", `${header.slice(0, 6)}\n${header.slice(6)}.${payload}.c2ln`],
+      // A header whose JSON starts with whitespace, a header segment over
+      // 4 KiB, and a token glued behind several `ey` look-alikes.
+      ["PAPERCLIP_API_KEY", `${b64u(' {"alg":"HS256"}')}.${b64u('{ "sub": "x" }')}.c2ln`],
+      ["PAPERCLIP_API_KEY", `${b64u(JSON.stringify({ alg: "RSA-OAEP", kid: "k".repeat(5000) }))}..aXY.Y2lwaGVy.dGFn`],
+      ["PAPERCLIP_API_KEY", `eyeyeyey${header}.${payload}.c2ln`],
+    ];
+    for (const [name, value] of cases) {
+      expect([value, containsJwt(value)]).toEqual([value, true]);
+      expect([value, decide(name, value)]).toEqual([value, "jwt"]);
+    }
+    // Dotted base64 that is no JWT still passes the detector.
+    for (const value of ["eyJvayI6dHJ1ZX0=.e30.c2ln", "Zm9v.YmFy.YmF6", "v1.2.3"]) {
+      expect([value, containsJwt(value)]).toEqual([value, false]);
+    }
+    // A large plain JSON array is inspected without a stack or spread crash.
+    expect(decide("PAPERCLIP_WORKSPACES_JSON", JSON.stringify(Array(150_000).fill(0)))).toBe("kept");
+  });
+
   it("a NAME_* prefix never delivers a secret-looking name; an exact entry does", () => {
-    expect(decide("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")).toBe("secret_name_needs_exact_entry");
+    expect(decide("CLAUDE_CODE_OAUTH_TOKEN", "x")).toBe("secret_name_needs_exact_entry");
+    expect(decide("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-x")).toBe("secret_value");
     expect(decide("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "not-a-number")).toBe("secret_name_needs_exact_entry");
     for (const name of ["CARGO_REGISTRY_TOKEN", "CARGO_SECRET", "CARGO_PASSWORD", "CARGO_API_KEY", "CARGO_PRIVATE_KEY", "CARGO_CREDENTIALS"]) {
       expect([name, decide(name, "x", ["CARGO_*"])]).toEqual([name, "secret_name_needs_exact_entry"]);
@@ -672,6 +873,10 @@ describe("env policy", () => {
       ["eyJ. repeated (header then dot, no payload)", fill("eyJ."), "kept"],
       ["one header, then a payload run with no closing dot", `eyJa.eyJ${fill("a")}`, "kept"],
       ["letters with no ://", fill("a"), "kept"],
+      // A credential keyword followed by a whitespace run and no assignment:
+      // the two whitespace runs either side of the optional quote must not
+      // partition the run between them (quadratic on a long run).
+      ["password then a whitespace run, no assignment", `password${fill(" ")}x`, "kept"],
       ["scheme characters, no letter", fill("1+.-"), "kept"],
       // URL-like but not one parseable URL: dropped (fail closed), and decided fast.
       ["one URL whose authority is all colons", `a://${fill(":")}`, "remote_database_or_credential_url"],
@@ -694,7 +899,7 @@ describe("env policy", () => {
     }
   });
 
-  it("finds JWTs exactly where the old backtracking pattern did, and never keeps a credential shape outside a VM-local URL authority (fuzzed)", () => {
+  it("finds every JWT the old backtracking pattern did, and never keeps a credential shape outside a VM-local URL authority (fuzzed)", () => {
     const oldJwt = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./;
     let seed = 20261022;
     const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
@@ -705,7 +910,8 @@ describe("env policy", () => {
     let keptWithAt = 0;
     for (let i = 0; i < 20_000; i += 1) {
       const a = text(["e", "y", "J", "eyJ", "eyJ", "a", "Z", "9", ".", ".", "-", "_", " ", '"', "="]);
-      expect([a, containsJwtInText(a)]).toEqual([a, oldJwt.test(a)]);
+      // The detector is a superset of the old pattern (alg-header chains count too).
+      if (oldJwt.test(a)) expect([a, containsJwtInText(a)]).toEqual([a, true]);
       const b = text(["a", "Z", "1", "+", ".", "-", ":", "/", "//", "://", "://", " ", '"', "'", "\\/", "<", "@", "p", "localhost", "127.0.0.1", "?", "#", "%3A%2F%2F"]);
       if (decide("TEST_DATABASE_URL", b, ["TEST_DATABASE_URL"]) !== "kept" && decide("PAPERCLIP_WORKSPACE_REPO_URL", b) !== "kept") continue;
       if (b.includes("@")) keptWithAt += 1;

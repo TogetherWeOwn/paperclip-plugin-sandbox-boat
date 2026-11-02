@@ -1,3 +1,5 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+
 // Default-deny run environment. Paperclip hands a sandbox provider the whole
 // run env: the agent's env, the environment's envVars, every project and
 // routine env binding with its secrets resolved, and, for some probe commands,
@@ -30,14 +32,34 @@
 //        database URL whatever its value, so it must be one such URL.
 //   3. Delivered only when the allowlist names it exactly, never through a
 //      prefix: a name with TOKEN, SECRET, PASSWORD, PASSWD, PASSPHRASE,
-//      PRIVATE_KEY, API_KEY, APIKEY, ACCESS_KEY, CREDENTIAL, COOKIE, SIGNING,
-//      HMAC or SALT in it, or ending in KEY (_KEY, or the whole name), _AUTH or
-//      _PAT, and a VM-local database URL or URL with credentials. A `..._TOKENS`
-//      name with a whole-number value is a token budget
-//      (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
+//      PRIVATE_KEY, PRIVKEY, API_KEY, APIKEY, ACCESS_KEY, CREDENTIAL(S),
+//      COOKIE, SIGNING, HMAC, SALT, PWD, _PASS_, SEED, MNEMONIC, a
+//      CONN(ECTION)STR(ING), WEBHOOK or DSN in it, or ending in KEY (_KEY, or
+//      the whole name), KEYS, _AUTH or _PAT; a value that is itself a secret
+//      whatever its name (a PEM private key, JSON with a private_key,
+//      client_secret or password key, a keyword DSN with a `password=` or
+//      `pwd=` assignment, glued forms (`;Password=`) included, an
+//      AccountKey/SharedAccessKey, or a well-known token prefix such as sk-,
+//      ghp_, AKIA, xoxb- or glpat-); and a VM-local database URL or URL with
+//      credentials. A `..._TOKENS` name with a whole-number value is a token
+//      budget (CLAUDE_CODE_MAX_OUTPUT_TOKENS), not a credential.
 //
-//   4. Managed GitHub names are exclusive: each is delivered only in its one
-//      expected shape, any other value is dropped whatever the allowlist says.
+//   4. ANTHROPIC_AUTH_TOKEN is delivered only under an explicit model
+//      policy: the reverse tunnel is on, ANTHROPIC_BASE_URL (after the
+//      tunnel rewrite) is http://127.0.0.1:<tunnelRemotePort>, and, when the
+//      operator configured `modelProxyKeyFingerprint`, the token's SHA-256
+//      matches it. Anything else — a provider key on some other base URL, a
+//      token that is not the dedicated sandbox proxy key — is dropped.
+//      Paperclip replaces the environment's token with a managed
+//      AI-connection pool credential when an agent has such a binding, so
+//      the value alone is never trusted.
+//
+//   5. Managed GitHub names are delivered only when the operator set
+//      `managedGithub: true` (deny by default: any process in the VM, not
+//      only the launcher, can exchange the capability for a GitHub
+//      credential with the run's grants while the run is live). Then each is
+//      exclusive: delivered only in its one expected shape, any other value
+//      dropped whatever the allowlist says.
 //      PAPERCLIP_GITHUB_BROKER_TOKEN, named exactly, only when it is the run's
 //      own managed-GitHub capability (isRunGithubCapability), the one JWT let
 //      through; a raw GitHub token or any other value is dropped. Paperclip's
@@ -59,8 +81,10 @@
 export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   // Model proxy: 127.0.0.1:<tunnelRemotePort> in the VM is the reverse tunnel.
   "ANTHROPIC_BASE_URL",
-  // The dedicated model-proxy key of the sandbox environment. The only TOKEN
-  // name a model needs; any other *TOKEN* name is dropped.
+  // The model-proxy key, delivered only under the explicit model policy
+  // (rule 4 above): on the tunnel URL, and matching modelProxyKeyFingerprint
+  // when one is configured. The only TOKEN name a model needs; any other
+  // *TOKEN* name is dropped.
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_MODEL",
   "ANTHROPIC_SMALL_FAST_MODEL",
@@ -115,7 +139,8 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   "PAPERCLIP_SANDBOX_EXEC_CHANNEL",
   // Managed GitHub: the run-scoped capability that Paperclip's git/gh launchers
   // (staged in the VM, first on PATH) present to the broker through the bridge
-  // above. Delivered only when it is this run's github_credentials capability
+  // above. Delivered only when the operator set managedGithub: true, and then
+  // only when it is this run's github_credentials capability
   // (isRunGithubCapability). PAPERCLIP_GITHUB_BROKER_URL is deliberately absent:
   // it names the controller, which the VM cannot reach, and without it the
   // launcher falls back to PAPERCLIP_API_URL, the bridge. ZDOTDIR and BASH_ENV
@@ -139,7 +164,29 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
 const DENIED_NAME_PREFIXES = ["PLANETSCALE_", "CLOUDFLARE_", "CF_", "DISCORD_", "GH_", "GITHUB_", "BOAT_", "ASCII_"] as const;
 
 const SECRET_NAME_RE =
-  /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PRIVATE_?KEY|API_?KEY|ACCESS_?KEY|CREDENTIAL|COOKIE|(?:^|_)KEY$|SIGNING|HMAC|SALT|_AUTH$|_PAT$/i;
+  /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|(?:^|_)PWD(?:_|$)|(?:^|_)PASS(?:_|$)|PRIVATE_?KEY|PRIVKEY|API_?KEY|ACCESS_?KEY|CRED(?:S|ENTIALS?)?(?:_|$)|CREDENTIAL|COOKIE|(?:^|_)KEYS?$|SIGNING|HMAC|SALT|SEED|MNEMONIC|CONN(?:ECTION)?_?STR(?:ING)?|WEBHOOK|(?:^|_)DSN(?:_|$)|_AUTH$|_PAT$/i;
+// A value that is a secret whatever its name says. Applied to prefix matches
+// only (an exact entry is the operator naming that one variable on purpose);
+// each pattern is linear in the value.
+const SECRET_VALUE_RES: readonly RegExp[] = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+  // A credential keyword assignment in any of its glued or spaced forms:
+  // a JSON-style key (`"password":`, single-quoted too), a keyword DSN
+  // assignment glued to its separator (`;Password=`, `;Pwd=`, `&password=`),
+  // or an identifier ending in the keyword (`db_password=`). No leading
+  // boundary is required: this runs on prefix matches only, where dropping
+  // a benign look-alike is the safe side. The quote and the whitespace after
+  // it form one optional group, so a bare whitespace run after the keyword
+  // cannot be partitioned between two `\s*`s (that backtracks quadratically
+  // when no assignment follows).
+  /(?:private_key|client_secret|password|passwd|passphrase|pwd)\s*(?:["']\s*)?[:=]/i,
+  /(?:AccountKey|SharedAccessKey)=/i,
+  /(?:^|[^A-Za-z0-9])(?:sk-ant-|sk-or-|sk-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[abpr]-|glpat-)/,
+];
+
+export function looksLikeSecretValue(value: string): boolean {
+  return SECRET_VALUE_RES.some((re) => re.test(value));
+}
 const TOKEN_BUDGET_NAME_RE = /TOKENS$/i;
 const WHOLE_NUMBER_RE = /^\d+$/;
 // Every value pattern below runs in time linear in the value: the host passes
@@ -162,9 +209,128 @@ const URL_NAME_RE = /(?:_URL|_URI|_DSN|^DSN)$/i;
 const URL_LIKE_RES: readonly RegExp[] = [
   // A scheme separator `://`, also JSON-escaped (`:\/\/`, `/`) or percent-encoded.
   /(?::|%3a|\\u003a)(?:\\?\/|%2f|\\u002f){2}/i,
-  // `user:password@` with or without a scheme: a `:`, then an `@` before any space, `/` or other `:`.
-  /:[^\s/@:]*@/,
 ];
+
+/**
+ * The segment tail between a slash-led `@` and the next `/` (a `:` — port
+ * or PATH separator — ends it early), read as a version: an optional `v`,
+ * then dot-separated digit groups with an optional `-`/`+` suffix, as in
+ * `python@3.11`, `node@20`, `release@v2`. Four bare groups are a dotted
+ * IPv4 host, not a version. One scan over a segment the caller's pass
+ * already walked, so the whole check stays linear.
+ */
+function isVersionLikeSegmentTail(text: string, start: number, end: number): boolean {
+  let limit = start;
+  while (limit < end && text.charCodeAt(limit) !== 58) limit += 1;
+  let i = start;
+  if (
+    i + 1 < limit &&
+    (text.charCodeAt(i) === 118 || text.charCodeAt(i) === 86) &&
+    text.charCodeAt(i + 1) >= 48 &&
+    text.charCodeAt(i + 1) <= 57
+  ) {
+    i += 1;
+  }
+  let groups = 0;
+  let suffixed = false;
+  for (;;) {
+    const groupStart = i;
+    while (i < limit && text.charCodeAt(i) >= 48 && text.charCodeAt(i) <= 57) i += 1;
+    if (i === groupStart) return false;
+    groups += 1;
+    if (i < limit && text.charCodeAt(i) === 46) {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (i < limit) {
+    const marker = text.charCodeAt(i);
+    if (marker !== 45 && marker !== 43) return false;
+    i += 1;
+    const suffixStart = i;
+    while (i < limit) {
+      const code = text.charCodeAt(i);
+      const ok =
+        (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 46 || code === 45 || code === 95;
+      if (!ok) return false;
+      i += 1;
+    }
+    if (i === suffixStart) return false;
+    suffixed = true;
+  }
+  return i === limit && (groups !== 4 || suffixed);
+}
+
+/**
+ * `user:password@` with or without a scheme. One pass, so a password may
+ * itself hold `/` or `:` (a scheme-less `default:p/a:ss@host` DSN) without
+ * the quadratic retry a `:[^\s@]*@` pattern makes on a long colon run with
+ * no `@`. A `:` arms a later `@` only in its own `/`-segment — or across
+ * segments when it sits in the token's first segment, where a scheme-less
+ * DSN's password can carry slashes (`default:Ab/Cd@host`, even starting with
+ * one: `user:/password@host`). Two `:` forms never arm at all: the `://`
+ * scheme separator, and a `:/` PATH separator outside the first segment.
+ * A first-segment `:/` arms only weakly (slash-led): it is indistinguishable
+ * from a PATH separator after a relative first entry (`bin:/opt/...`), so
+ * its `@` counts in the token's final segment — `user:/password@host` ends
+ * at its host — and a following `/` is no reprieve either when what follows
+ * the `@` reads as a host: `user:/password@db.example/path` is userinfo
+ * with a path, not a directory. Only a version-shaped tail escapes
+ * (`bin:/opt/python@3.11/bin`): a versioned directory mid-path is a path.
+ * That keeps colon-joined paths and `@` or `:` in separate URL path
+ * segments from reading as userinfo, while a `user:password@` tucked into
+ * one path segment still counts.
+ */
+function hasSchemeLessUserinfo(text: string): boolean {
+  let colonInSegment = false;
+  let colonInFirstSegment = false;
+  let slashLedColonInFirstSegment = false;
+  // An `@` reached only through the slash-led arm: userinfo unless a `/`
+  // follows it in this token and puts it in a versioned directory mid-path.
+  let slashLedAtPending = false;
+  let slashLedAtIndex = -1;
+  let seenSlash = false;
+  let previous = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 32 || code === 9 || code === 10 || code === 13) {
+      if (slashLedAtPending) return true;
+      colonInSegment = false;
+      colonInFirstSegment = false;
+      slashLedColonInFirstSegment = false;
+      seenSlash = false;
+    } else if (code === 47) {
+      // A host-shaped tail before this `/` is userinfo with a path; only a
+      // version-shaped one (`@3.11/bin`) was a directory all along.
+      if (slashLedAtPending && !isVersionLikeSegmentTail(text, slashLedAtIndex + 1, i)) return true;
+      seenSlash = true;
+      colonInSegment = false;
+      slashLedAtPending = false;
+    } else if (code === 58) {
+      const next = text.charCodeAt(i + 1);
+      const schemeSeparator = next === 47 && text.charCodeAt(i + 2) === 47;
+      if (!schemeSeparator) {
+        if (next === 47) {
+          if (!seenSlash) slashLedColonInFirstSegment = true;
+        } else {
+          colonInSegment = true;
+          if (!seenSlash) colonInFirstSegment = true;
+        }
+      }
+    }
+    // An `@` that opens a path segment (`/@vendor/...` in a PATH) is no userinfo.
+    else if (code === 64 && previous !== 47) {
+      if (colonInSegment || colonInFirstSegment) return true;
+      if (slashLedColonInFirstSegment) {
+        slashLedAtPending = true;
+        slashLedAtIndex = i;
+      }
+    }
+    previous = code;
+  }
+  return slashLedAtPending;
+}
 // One whole URL, in characters every URL parser reads the same way: no space
 // or control character, no quote, backslash, `<>`, backtick, `{}`, `|` or `^`.
 const WHOLE_URL_RE = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([A-Za-z0-9\-._~!$&()*+,;=:@%[\]]*)((?:[/?#][A-Za-z0-9\-._~!$&()*+,;=:@%[\]/?#]*)?)$/;
@@ -175,7 +341,7 @@ const ENDPOINT_PARAM_RE = /host|addr|server|service|socket|proxy|dsn|url|uri|end
 // Of those, the ones that name a unix socket when their value is an absolute path.
 const SOCKET_PARAM_RE = /^(?:host|socket)$/i;
 // Query parameters that carry a credential.
-const CREDENTIAL_PARAM_RE = /pass|pwd|token|secret|key|auth|cred|signature|^sig$|session|jwt|bearer/i;
+const CREDENTIAL_PARAM_RE = /pass|pwd|(?:^|_)pw(?:_|$)|token|secret|key|auth|cred|signature|^sig$|session|jwt|bearer/i;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ALLOWLIST_ENTRY_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:_\*)?$/;
 
@@ -185,6 +351,10 @@ export type EnvDropReason =
   | "jwt"
   | "remote_database_or_credential_url"
   | "secret_name_needs_exact_entry"
+  | "secret_value"
+  | "model_credential_not_dedicated"
+  | "model_credential_off_tunnel"
+  | "github_capability_disabled"
   | "github_capability_rejected"
   | "github_launcher_mismatch"
   | "invalid_name";
@@ -242,7 +412,7 @@ function compile(entries: readonly string[]): CompiledAllowlist {
 
 /** Does the text hold anything URL-like: a scheme separator (also escaped) or a `user:password@`? */
 export function looksUrlLike(text: string): boolean {
-  return URL_LIKE_RES.some((re) => re.test(text));
+  return URL_LIKE_RES.some((re) => re.test(text)) || hasSchemeLessUserinfo(text);
 }
 
 /** What one whole URL carries and where it leads. */
@@ -290,13 +460,20 @@ function wholeUrlFacts(text: string): UrlFacts | null {
   const hostport = at >= 0 ? authority.slice(at + 1) : authority;
   let credential = at >= 0;
   const endpoints: Array<[string, string]> = [];
+  // Query parameters, and the fragment's `key=value` pairs (`#access_token=...`
+  // is how implicit-flow callbacks carry a credential).
+  const fragmentAt = rest.indexOf("#");
+  const paramTexts: Array<{ text: string; keyValueOnly: boolean }> = [];
   const queryAt = rest.indexOf("?");
-  if (queryAt >= 0) {
-    const fragmentAt = rest.indexOf("#", queryAt);
-    const query = rest.slice(queryAt + 1, fragmentAt >= 0 ? fragmentAt : undefined);
-    for (const pair of query.split(/[&;]/)) {
+  if (queryAt >= 0 && (fragmentAt < 0 || queryAt < fragmentAt)) {
+    paramTexts.push({ text: rest.slice(queryAt + 1, fragmentAt >= 0 ? fragmentAt : undefined), keyValueOnly: false });
+  }
+  if (fragmentAt >= 0) paramTexts.push({ text: rest.slice(fragmentAt + 1), keyValueOnly: true });
+  for (const { text: paramText, keyValueOnly } of paramTexts) {
+    for (const pair of paramText.split(/[&;]/)) {
       if (pair.length === 0) continue;
       const eq = pair.indexOf("=");
+      if (keyValueOnly && eq < 0) continue;
       const name = decodeUrlPart(eq >= 0 ? pair.slice(0, eq) : pair);
       const value = decodeUrlPart(eq >= 0 ? pair.slice(eq + 1) : "");
       if (name == null || value == null) return null;
@@ -322,24 +499,35 @@ interface ValueInspection {
   urls: UrlFacts[];
   /** A JWT that only shows once JSON escapes are decoded. */
   jwt: boolean;
+  /** A secret-looking value (looksLikeSecretValue) in the value or a decoded JSON string. */
+  secretValue: boolean;
 }
 
-/** Every string (keys included) in a parsed JSON value, iteratively (no recursion limit). */
-function jsonStrings(root: unknown): string[] {
-  const out: string[] = [];
+const SECRET_JSON_KEY_RE = /(?:^|[_-])(?:private_key|client_secret|password|passwd|passphrase|pwd)(?:[_-]|$)/i;
+
+/**
+ * Every string (keys included) in a parsed JSON value, iteratively (no
+ * recursion limit, no argument spreading), and whether an object key is a
+ * secret key once decoded (`"password"` is `password`).
+ */
+function jsonParts(root: unknown): { strings: string[]; secretKey: boolean } {
+  const strings: string[] = [];
+  let secretKey = false;
   const stack: unknown[] = [root];
   while (stack.length > 0) {
     const item = stack.pop();
-    if (typeof item === "string") out.push(item);
-    else if (Array.isArray(item)) stack.push(...item);
-    else if (item && typeof item === "object") {
+    if (typeof item === "string") strings.push(item);
+    else if (Array.isArray(item)) {
+      for (const entry of item) stack.push(entry);
+    } else if (item && typeof item === "object") {
       for (const [key, value] of Object.entries(item)) {
-        out.push(key);
+        strings.push(key);
+        if (SECRET_JSON_KEY_RE.test(key)) secretKey = true;
         stack.push(value);
       }
     }
   }
-  return out;
+  return { strings, secretKey };
 }
 
 /**
@@ -354,21 +542,28 @@ function jsonStrings(root: unknown): string[] {
 function inspectValue(value: string): ValueInspection {
   const text = value.trim();
   const urlLike = looksUrlLike(text);
+  const secretValue = looksLikeSecretValue(text);
   if (urlLike) {
     const whole = wholeUrlFacts(text);
-    if (whole) return { unsafe: false, whole: true, urls: [whole], jwt: false };
+    if (whole) return { unsafe: false, whole: true, urls: [whole], jwt: false, secretValue };
   }
-  if (!urlLike && !text.includes("\\")) return { unsafe: false, whole: false, urls: [], jwt: false };
+  // JSON is always decoded when the value opens like JSON, escapes or not:
+  // gating on a backslash let a JWT or a secret ride in a plain JSON string.
+  const jsonLike = /^[[{"]/.test(text);
+  if (!urlLike && !jsonLike && !text.includes("\\")) return { unsafe: false, whole: false, urls: [], jwt: false, secretValue };
   let parsed: unknown;
   try {
-    parsed = /^[[{"]/.test(text) ? JSON.parse(text) : undefined;
+    parsed = jsonLike ? JSON.parse(text) : undefined;
   } catch {
     parsed = undefined;
   }
-  if (parsed === undefined) return { unsafe: urlLike, whole: false, urls: [], jwt: false };
-  const inspection: ValueInspection = { unsafe: false, whole: false, urls: [], jwt: false };
-  for (const entry of jsonStrings(parsed)) {
+  if (parsed === undefined) return { unsafe: urlLike, whole: false, urls: [], jwt: false, secretValue };
+  const inspection: ValueInspection = { unsafe: false, whole: false, urls: [], jwt: false, secretValue };
+  const parts = jsonParts(parsed);
+  if (parts.secretKey) inspection.secretValue = true;
+  for (const entry of parts.strings) {
     if (containsJwt(entry)) inspection.jwt = true;
+    if (looksLikeSecretValue(entry)) inspection.secretValue = true;
     if (!looksUrlLike(entry)) continue;
     const facts = wholeUrlFacts(entry.trim());
     if (facts) inspection.urls.push(facts);
@@ -381,18 +576,74 @@ function isBase64UrlChar(code: number): boolean {
   return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 45 || code === 95;
 }
 
+interface JwtSegment {
+  start: number;
+  end: number;
+}
+
+// A header worth decoding is at least a short `{"alg":...}` object.
+const JWT_HEADER_MIN_LENGTH = 10;
+
+function base64UrlSextet(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  if (code === 45) return 62;
+  if (code === 95) return 63;
+  return -1;
+}
+
 /**
- * Is there a JWT in the text: a JSON header and a JSON payload (both base64url
- * of `{"`), as in "Bearer eyJ...", a JSON blob or an MCP header? The same
- * matches as /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\./, in one pass: the text
- * is cut into maximal base64url runs, and a JWT is a run that holds `eyJ` with
- * at least one character after it, then `.`, then a run that starts with `eyJ`
- * and has at least one more character, then `.`.
+ * Does this segment (or a suffix of it, for a token glued to a prefix) decode
+ * to a JSON object with an `alg` key? Every offset is gated arithmetically
+ * on its first decoded byte (`{` or JSON whitespace, so ` {"alg"` counts),
+ * and at most 16 gated candidates are fully decoded: the scan stays linear
+ * in the segment, however long the header is.
+ */
+function decodesToAlgHeader(value: string, segment: JwtSegment): boolean {
+  if (segment.end - segment.start < JWT_HEADER_MIN_LENGTH) return false;
+  const text = value.slice(segment.start, segment.end);
+  let attempts = 0;
+  for (let offset = 0; offset + JWT_HEADER_MIN_LENGTH <= text.length && attempts < 16; offset += 1) {
+    const s0 = base64UrlSextet(text.charCodeAt(offset));
+    const s1 = base64UrlSextet(text.charCodeAt(offset + 1));
+    if (s0 < 0 || s1 < 0) continue;
+    const first = (s0 << 2) | (s1 >> 4);
+    if (first !== 0x7b && first !== 0x20 && first !== 0x09 && first !== 0x0a && first !== 0x0d) continue;
+    attempts += 1;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(text.slice(offset), "base64url").toString("utf8"));
+    } catch {
+      continue;
+    }
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as Record<string, unknown>).alg === "string"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is there a JWT or JWE in the text, as in "Bearer eyJ...", a JSON blob or an
+ * MCP header? One pass over the maximal base64url runs. Two shapes count:
+ * the classic one (a run holding `eyJ`, `.`, a run starting `eyJ`, `.`), and
+ * a dotted chain of 3 segments (JWT) or 5 (JWE, whose second segment may be
+ * empty) whose first segment decodes to a JSON object with an `alg` key —
+ * which also catches payloads and headers whose JSON does not start `{"`
+ * (pretty-printed `{ "alg"`, a payload of `{ "sub"` or `{"1"`).
  */
 export function containsJwtInText(value: string): boolean {
   const length = value.length;
   // The run that ended at the `.` just before the current run can start a JWT.
   let previousRunOpensJwt = false;
+  // The current chain of runs joined by single dots, last five at most.
+  let chain: JwtSegment[] = [];
   let index = 0;
   while (index <= length) {
     const start = index;
@@ -408,6 +659,15 @@ export function containsJwtInText(value: string): boolean {
     const endsAtDot = index < length && value.charCodeAt(index) === 46;
     if (previousRunOpensJwt && endsAtDot && eyj === 0 && runLength >= 4) return true;
     previousRunOpensJwt = endsAtDot && eyj >= 0 && eyj + 3 < runLength;
+    chain.push({ start, end: index });
+    if (chain.length > 5) chain = chain.slice(-5);
+    for (const total of [3, 5] as const) {
+      if (chain.length < total) continue;
+      const segments = chain.slice(-total);
+      const shaped = segments.every((segment, at) => segment.end > segment.start || (total === 5 && at === 1));
+      if (shaped && decodesToAlgHeader(value, segments[0])) return true;
+    }
+    if (!endsAtDot) chain = [];
     // Step over the one character that ended the run (a `.` or any other).
     index += 1;
   }
@@ -416,7 +676,14 @@ export function containsJwtInText(value: string): boolean {
 
 /** Does the value carry a JWT anywhere (bare, behind "Bearer ", or inside JSON or a header)? */
 export function containsJwt(value: string): boolean {
-  return containsJwtInText(value) || JWT_WHOLE_VALUE_RE.test(value.trim());
+  if (containsJwtInText(value) || JWT_WHOLE_VALUE_RE.test(value.trim())) return true;
+  // A token split by whitespace (a newline before a `.` or inside a segment)
+  // is one token again once the whitespace is gone.
+  if (/\s/.test(value)) {
+    const compact = value.replace(/\s+/g, "");
+    if (compact !== value && (containsJwtInText(compact) || JWT_WHOLE_VALUE_RE.test(compact))) return true;
+  }
+  return false;
 }
 
 /** A provider-credential family (PLANETSCALE_, GITHUB_, ...) that never reaches a VM. */
@@ -531,17 +798,92 @@ export function isGithubLauncherShellValue(name: string, value: string, launcher
   return suffix !== undefined && launcherDir !== undefined && value === `${launcherDir}${suffix}`;
 }
 
+const MODEL_TOKEN_NAME = "ANTHROPIC_AUTH_TOKEN";
+const MODEL_BASE_URL_NAME = "ANTHROPIC_BASE_URL";
+// The tunnel defaults of CONFIG_DEFAULTS (config.ts imports this file, so
+// they are repeated here for callers that pass a partial policy).
+const DEFAULT_TUNNEL_TARGET_HOST = "127.0.0.1";
+const DEFAULT_TUNNEL_PORT = 8317;
+
+/**
+ * The explicit credential policy a run env is filtered under, from driver
+ * config. Everything unset is deny: no managed GitHub, and no model token
+ * (the tunnel counts as off until a caller says it is on).
+ */
+export interface EnvFilterOptions {
+  /** Deliver the managed-GitHub capability and its launcher shells. Default false. */
+  managedGithub?: boolean;
+  /** The model-proxy reverse tunnel is open for this run. Default false. */
+  cliproxyTunnel?: boolean;
+  tunnelTargetHost?: string;
+  tunnelTargetPort?: number;
+  tunnelRemotePort?: number;
+  /** SHA-256 (hex) of the one dedicated sandbox model-proxy key, or null/unset for unverified. */
+  modelProxyKeyFingerprint?: string | null;
+}
+
+/** The SHA-256 (hex) an operator puts in `modelProxyKeyFingerprint` for a dedicated key. */
+export function modelProxyKeyFingerprintOf(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function fingerprintMatches(value: string, configured: string): boolean {
+  const actual = Buffer.from(modelProxyKeyFingerprintOf(value), "utf8");
+  const expected = Buffer.from(configured.toLowerCase(), "utf8");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/**
+ * Why ANTHROPIC_AUTH_TOKEN may not reach the VM, or null. It is delivered
+ * only when it will be spent through this plugin's tunnel — the tunnel is
+ * on and ANTHROPIC_BASE_URL is the tunnel address (127.0.0.1:<remote port>,
+ * or the host-side tunnel target routeModelProxyThroughTunnel rewrites to
+ * it) — and, when a fingerprint is configured, it is the dedicated key.
+ * Without a fingerprint an on-tunnel token is delivered unverified;
+ * validateConfig warns about that. The value is never logged.
+ */
+function modelCredentialProblem(value: string, options: EnvFilterOptions, baseUrl: string | undefined): EnvDropReason | null {
+  if (options.cliproxyTunnel !== true || baseUrl == null) return "model_credential_off_tunnel";
+  let url: URL;
+  try {
+    url = new URL(baseUrl.trim());
+  } catch {
+    return "model_credential_off_tunnel";
+  }
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  const remotePort = options.tunnelRemotePort ?? DEFAULT_TUNNEL_PORT;
+  const targetHost = options.tunnelTargetHost ?? DEFAULT_TUNNEL_TARGET_HOST;
+  const targetPort = options.tunnelTargetPort ?? DEFAULT_TUNNEL_PORT;
+  const onTunnel =
+    url.protocol === "http:" &&
+    ((url.hostname === "127.0.0.1" && port === remotePort) || (url.hostname === targetHost.toLowerCase() && port === targetPort));
+  if (!onTunnel) return "model_credential_off_tunnel";
+  const fingerprint = options.modelProxyKeyFingerprint?.trim();
+  if (fingerprint && !fingerprintMatches(value, fingerprint)) return "model_credential_not_dedicated";
+  return null;
+}
+
 interface RunContext {
   runId?: string;
   githubLauncherDir?: string;
+  modelBaseUrl?: string;
+  options: EnvFilterOptions;
+  /** allowlistDelivers probes naming only, with a dummy value: skip value-bound credential rules. */
+  probe?: boolean;
 }
 
 /** Decide one entry. Returns null when it may reach the VM. */
-function decide(name: string, value: string, allow: CompiledAllowlist, run: RunContext = {}): EnvDropReason | null {
+function decide(name: string, value: string, allow: CompiledAllowlist, run: RunContext = { options: {} }): EnvDropReason | null {
   if (!ENV_NAME_RE.test(name)) return "invalid_name";
   const exact = allow.exact.has(name);
   if (!exact && !allow.prefixes.some((prefix) => name.startsWith(prefix))) return "not_allowlisted";
   if (isDeniedEnvFamily(name)) return "denied_family";
+  // Managed GitHub is off unless the operator turned it on: any process in
+  // the VM can exchange the capability for a GitHub credential with the
+  // run's grants while the run is live, so the allowlist alone never enables it.
+  if ((name === GITHUB_BROKER_TOKEN_NAME || Object.hasOwn(GITHUB_LAUNCHER_SHELL_FILES, name)) && run.options.managedGithub !== true && !run.probe) {
+    return "github_capability_disabled";
+  }
   // Exclusive: the run's capability, named exactly, or nothing. Never falls
   // through to the rules below, which would pass a raw GitHub token.
   if (name === GITHUB_BROKER_TOKEN_NAME) {
@@ -559,6 +901,14 @@ function decide(name: string, value: string, allow: CompiledAllowlist, run: RunC
   const databaseName = DATABASE_NAME_RE.test(name) && URL_NAME_RE.test(name);
   if (databaseName && !(inspection.whole && inspection.urls[0].local)) return "remote_database_or_credential_url";
 
+  // The model credential goes only where the explicit model policy sends it
+  // (dedicated key, through the tunnel), never on the allowlist's say-so.
+  if (name === MODEL_TOKEN_NAME && !run.probe) {
+    const problem = modelCredentialProblem(value, run.options, run.modelBaseUrl);
+    if (problem) return problem;
+  }
+
+  if (!exact && inspection.secretValue) return "secret_value";
   const tokenBudget = TOKEN_BUDGET_NAME_RE.test(name) && WHOLE_NUMBER_RE.test(value.trim());
   const secretName = SECRET_NAME_RE.test(name) && !tokenBudget;
   const sensitive = secretName || inspection.urls.some((url) => url.credential || url.database) || databaseName;
@@ -571,7 +921,11 @@ function decide(name: string, value: string, allow: CompiledAllowlist, run: RunC
  * Only string values are considered; anything else is ignored (the old
  * behaviour). The result never carries a dropped value.
  */
-export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist: readonly string[]): EnvFilterResult {
+export function filterRunEnv(
+  env: Record<string, unknown> | undefined,
+  allowlist: readonly string[],
+  options: EnvFilterOptions = {},
+): EnvFilterResult {
   const allow = compile(allowlist);
   const kept: Array<[string, string]> = [];
   const dropped: EnvDrop[] = [];
@@ -579,7 +933,13 @@ export function filterRunEnv(env: Record<string, unknown> | undefined, allowlist
   const run: RunContext = {
     runId,
     githubLauncherDir: githubLauncherDirOf(typeof env?.PATH === "string" ? env.PATH : undefined, runId),
+    options,
   };
+  // The model token is approved against the base URL that will actually be
+  // delivered: a base URL this same filter drops (not allowlisted, a JWT in
+  // it) must not vouch for the token.
+  const rawBaseUrl = typeof env?.[MODEL_BASE_URL_NAME] === "string" ? (env[MODEL_BASE_URL_NAME] as string) : undefined;
+  if (rawBaseUrl != null && decide(MODEL_BASE_URL_NAME, rawBaseUrl, allow, run) == null) run.modelBaseUrl = rawBaseUrl;
   for (const [name, value] of Object.entries(env ?? {})) {
     if (typeof value !== "string") continue;
     const reason = decide(name, value, allow, run);
@@ -596,7 +956,7 @@ export function effectiveEnvAllowlist(configured: readonly string[] | null): rea
 
 /** Would `name` (with a harmless value) reach the VM under this allowlist? */
 export function allowlistDelivers(name: string, allowlist: readonly string[]): boolean {
-  return decide(name, "1", compile(allowlist)) == null;
+  return decide(name, "1", compile(allowlist), { options: {}, probe: true }) == null;
 }
 
 /** Names a Claude run through the bridge and the model-proxy tunnel cannot work without. */
@@ -661,7 +1021,8 @@ export function routeModelProxyThroughTunnel(
     let url: URL;
     try { url = new URL(value); } catch { return [name, value]; }
     const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
-    if (url.hostname !== tunnel.tunnelTargetHost || port !== tunnel.tunnelTargetPort) return [name, value];
+    // URL parsing lowercases a DNS hostname; the configured target may not be.
+    if (url.hostname !== tunnel.tunnelTargetHost.toLowerCase() || port !== tunnel.tunnelTargetPort) return [name, value];
     url.hostname = "127.0.0.1";
     url.port = String(tunnel.tunnelRemotePort);
     const rewritten = url.toString();

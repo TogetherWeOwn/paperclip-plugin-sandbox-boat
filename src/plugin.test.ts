@@ -215,6 +215,26 @@ describe("AcquireLease", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("withholds the model token when the reverse tunnel is down, and stages the rest of the env", async () => {
+    ssh.masterFailures = 2;
+    const lease = await acquire("run-1");
+    expect(lease.metadata).toMatchObject({ tunnel: "down" });
+    const before = ssh.spawned.length;
+    const result = await plugin.definition.onEnvironmentExecute!({
+      ...base(),
+      lease,
+      command: "true",
+      env: { ANTHROPIC_AUTH_TOKEN: SECRET, ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", PAPERCLIP_RUN_ID: "run-1" },
+    } as never);
+    expect(result.exitCode).toBe(0);
+    const staging = ssh.spawned.slice(before).find((call) => call.args.at(-1)!.includes("umask 077 && mkdir -m 700"));
+    expect(staging?.stdin).toContain("export ANTHROPIC_BASE_URL=");
+    expect(staging?.stdin).not.toContain("ANTHROPIC_AUTH_TOKEN");
+    expect(staging?.stdin).not.toContain(SECRET);
+    const drop = harness.logs.find((entry) => entry.message.includes("not allowed into the VM"));
+    expect((drop?.meta?.dropped as Record<string, string[]>).model_credential_off_tunnel).toEqual(["ANTHROPIC_AUTH_TOKEN"]);
+  });
+
   it("creates from the configured named snapshot", async () => {
     await acquire("run-1", {}, { templateSnapshot: "two-bot-next-warm" });
     expect(fake.callsOf("create")[0].args).toMatchObject({ from: "two-bot-next-warm" });
@@ -697,7 +717,7 @@ describe("Execute", () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     ssh.handler = (remoteCommand) => (remoteCommand.startsWith(PAYLOAD_PREFIX) ? { code: 255, stderr: "Connection reset" } : undefined);
-    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET, ANTHROPIC_BASE_URL: "http://127.0.0.1:8317" } } as never);
     expect(result.exitCode).toBe(255);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
     const envDir = commands.find((command) => command.includes("mkdir -m 700"))!.match(/'(\/tmp\/paperclip-boat-env-[0-9a-f]{32})'/)![1];
@@ -708,7 +728,7 @@ describe("Execute", () => {
     const lease = await acquire("run-1");
     const before = ssh.spawned.length;
     ssh.handler = (remoteCommand) => (remoteCommand.includes("mkdir -m 700") ? { code: 1, stderr: "No space left on device" } : undefined);
-    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET } } as never);
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(), lease, command: "true", env: { ANTHROPIC_AUTH_TOKEN: SECRET, ANTHROPIC_BASE_URL: "http://127.0.0.1:8317" } } as never);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/could not stage the run environment/);
     const commands = ssh.spawned.slice(before).map((call) => call.args.at(-1)!);
@@ -842,7 +862,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
   // forwards /runtime-tools/github/credentials) with the run capability in
   // `x-paperclip-github-capability`; without the token it prints
   // `GitHub capability_missing` and git push asks for a Username.
-  it("stages the run's managed-GitHub capability and nothing else of the launcher env, so git push in the VM reaches the bridge", async () => {
+  it("with managedGithub on, stages the run's managed-GitHub capability and nothing else of the launcher env, so git push in the VM reaches the bridge", async () => {
     const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const now = Math.floor(Date.now() / 1000);
     const capability = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ sub: "agent-1", company_id: "c-1", run_id: "run-1", responsible_user_id: "u-1", scope: "github_credentials", iat: now, exp: now + 3600 })}.${Buffer.alloc(32, 7).toString("base64url")}`;
@@ -862,7 +882,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
       GH_CONFIG_DIR: `${launcherDir}/gh-config`,
     };
     const vmPath = `${launcherDir}:/usr/local/bin:/usr/bin:/bin`;
-    const { result, staged, script } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_RUN_ID: "run-1", PATH: vmPath, ...launcherEnv });
+    const { result, staged, script } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_RUN_ID: "run-1", PATH: vmPath, ...launcherEnv }, { managedGithub: true });
     expect(result.exitCode).toBe(0);
     const exported = new Map([...staged.matchAll(/^export ([A-Za-z_][A-Za-z0-9_]*)='(.*)';$/gm)].map((match) => [match[1], match[2]] as const));
     // What the launcher needs in the VM: the capability, and no controller URL (so it falls back to PAPERCLIP_API_URL, the bridge).
@@ -888,7 +908,7 @@ describe("run env allowlist (incident TOG-37420)", () => {
     const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const now = Math.floor(Date.now() / 1000);
     const other = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ run_id: "run-OTHER", scope: "github_credentials", exp: now + 3600 })}.${Buffer.alloc(32, 7).toString("base64url")}`;
-    const config = { envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), "PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"] };
+    const config = { managedGithub: true, envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), "PAPERCLIP_RUN_ID", "PAPERCLIP_GITHUB_BROKER_TOKEN"] };
     const { staged } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_GITHUB_BROKER_TOKEN: other }, config);
     expect(staged).not.toContain("PAPERCLIP_GITHUB_BROKER_TOKEN");
     expect(staged).not.toContain(other);
@@ -899,10 +919,10 @@ describe("run env allowlist (incident TOG-37420)", () => {
   // Review of PR #30: a value under that name that is no JWT at all (a raw
   // GitHub token, a malformed value) must not fall through to the allowlist.
   it("never stages a raw GitHub token or a malformed value under PAPERCLIP_GITHUB_BROKER_TOKEN, by default or from a list that names it", async () => {
-    const exactList = { envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), "PAPERCLIP_GITHUB_BROKER_TOKEN"] };
+    const exactList = { managedGithub: true, envAllowlist: [...Object.keys(ALLOWED_RUN_ENV), "PAPERCLIP_GITHUB_BROKER_TOKEN"] };
     const values = [`ghp_${"A".repeat(36)}`, `github_pat_11ABCDEFG0${"x".repeat(70)}`, "not.a.jwt", "plain-value"];
     for (const value of values) {
-      for (const config of [{}, exactList]) {
+      for (const config of [{ managedGithub: true }, exactList]) {
         const { result, staged, script } = await runWithEnv({ ...ALLOWED_RUN_ENV, PAPERCLIP_GITHUB_BROKER_TOKEN: value }, config);
         expect(result.exitCode).toBe(0);
         expect(staged).not.toContain("PAPERCLIP_GITHUB_BROKER_TOKEN");
@@ -950,9 +970,10 @@ describe("run env allowlist (incident TOG-37420)", () => {
     expect(drops[0].level).toBe("warn");
     const dropped = drops[0].meta?.dropped as Record<string, string[]>;
     // Default deny: none of these is on the allowlist. CLAUDE_CODE_OAUTH_TOKEN
-    // matches the CLAUDE_CODE_* prefix, but a prefix never delivers a secret name.
+    // matches the CLAUDE_CODE_* prefix, but a prefix never delivers a secret
+    // value (its sk-ant- token) either.
     const notListed = Object.keys({ ...PROJECT_SECRETS, ...SERVER_SECRETS }).filter((name) => name !== "CLAUDE_CODE_OAUTH_TOKEN");
-    expect(dropped).toEqual({ not_allowlisted: [...notListed].sort(), secret_name_needs_exact_entry: ["CLAUDE_CODE_OAUTH_TOKEN"] });
+    expect(dropped).toEqual({ not_allowlisted: [...notListed].sort(), secret_value: ["CLAUDE_CODE_OAUTH_TOKEN"] });
   });
 
   it("sends PAPERCLIP_API_KEY only as the per-run bridge token, never as the host-verifiable run JWT", async () => {
