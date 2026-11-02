@@ -9,6 +9,8 @@ const guestWatchdogSuites = ["src/offload-ssh.test.ts", "src/offload-ssh-runtime
 export default defineConfig({
   test: {
     environment: "node",
+    // Fail the run if any test leaves a run-cancellation record in host /tmp.
+    globalSetup: ["./src/test-support/run-record-guard.ts"],
     // Setting reporters replaces the defaults, so keep the GitHub failure
     // annotations vitest would otherwise add on Actions.
     reporters: [

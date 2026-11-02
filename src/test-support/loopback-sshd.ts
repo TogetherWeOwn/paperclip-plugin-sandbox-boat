@@ -78,7 +78,9 @@ export class LoopbackSsh {
       class LocalKeyManager extends SshManager {
         override async ensureKey() { return { privateKeyPath: key, publicKey }; }
       }
-      this.manager = new LocalKeyManager({ info() {}, warn() {} });
+      // The "guest" is this host: keep run records inside the fixture root
+      // (removed by cleanup()) rather than leaking them into host /tmp.
+      this.manager = new LocalKeyManager({ info() {}, warn() {} }, undefined, { runRecordDir: this.root });
       this.session = {
         sandboxId: "loopback-only", endpoint: { host: "127.0.0.1", port, user: userInfo().username, hostKey },
         knownHostsPath, controlPath: path.join(this.root, "ctl"), master: null,
