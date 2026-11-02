@@ -31,7 +31,17 @@ export interface SshOffloadGuestDeps {
   /** Guest supervisor source, default OFFLOAD_SSH_SCRIPT. Tests override it to
    * emulate a skewed guest clock; production never does. */
   script?: string;
+  /** Test seams for the output-poll backoff; defaults are wall clock + setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
 }
+
+/** First idle delay between output polls; doubles while the guest stays quiet. */
+const POLL_IDLE_BASE_MS = 100;
+/** Idle backoff ceiling: a quiet command costs about one poll per second, not ten. */
+const POLL_IDLE_MAX_MS = 1_000;
+/** Floor spacing even when a page carried events, so a trickling guest cannot spin RPCs. */
+const POLL_BUSY_FLOOR_MS = 10;
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
  * No process-group-only execution is advertised as equivalent containment. */
@@ -176,10 +186,13 @@ export class SshOffloadGuest implements GuestController {
   async runCommand(sandboxId: string, _command: OffloadCommand, context?: OffloadRunContext) {
     if (!context) throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
     const { identity } = context;
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const now = this.deps.now ?? Date.now;
     await this.call(sandboxId, "start", identity);
     let after = 0;
+    let idleMs = POLL_IDLE_BASE_MS;
     for (;;) {
-      if (Date.now() > identity.guestDeadline + 15_000) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      if (now() > identity.guestDeadline + 15_000) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
       const page = await this.call<{ events: Array<{ stream: "stdout" | "stderr"; dataBase64: string }>;
         result: unknown; supervisorAlive: boolean;
         outputLimitExceeded: boolean }>(sandboxId, "read", identity, { after });
@@ -193,7 +206,13 @@ export class SshOffloadGuest implements GuestController {
         after++;
       }
       if (page.result != null) return validatedGuestResult(page.result);
-      if (!page.events.length) await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      if (!page.events.length) {
+        await sleep(idleMs);
+        idleMs = Math.min(POLL_IDLE_MAX_MS, idleMs * 2);
+      } else {
+        idleMs = POLL_IDLE_BASE_MS;
+        await sleep(POLL_BUSY_FLOOR_MS);
+      }
     }
   }
 

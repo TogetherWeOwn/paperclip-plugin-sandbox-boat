@@ -199,7 +199,11 @@ export class OffloadBroker {
   private chain<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.chains.get(key) ?? Promise.resolve();
     const next = previous.then(fn, fn);
-    this.chains.set(key, next.catch(() => undefined));
+    const tail = next.catch(() => undefined);
+    this.chains.set(key, tail);
+    // A settled chain with no waiter holds no state: drop it so a long-lived
+    // worker's map does not grow with every command and run.
+    void tail.then(() => { if (this.chains.get(key) === tail) this.chains.delete(key); });
     return next;
   }
 

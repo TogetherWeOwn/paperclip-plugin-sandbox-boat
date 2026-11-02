@@ -94,7 +94,12 @@ the run: a late or slow start handler cannot bind it again. A missing or refused
 host fact (no execution workspace, no local path, no source root, an origin that
 does not match, no secret) leaves the run unbound, and its
 own commands fall back locally (503) before dispatch; other-agent runs keep the
-403. This adds five capabilities to the 0.2.2
+403. The persisted per-run owner row is written only when the company uses Boat
+at all (local-run offload enabled or a seen whole-run config), so idle
+companies add no per-run state; the in-memory owner gate is always recorded.
+Every sweep (scoped or scheduled) ages out owner records older than 24 hours
+and ended tombstones via the persisted per-company owner index, so terminal
+events lost to a restart cannot accumulate rows. This adds five capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
 `projects.read` and `project.workspaces.read`; the
 upgrade needs board approval of that capability change.

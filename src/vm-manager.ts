@@ -459,7 +459,7 @@ export class BoatVmManager {
   }
 
   /** Local runs seen through agent.run.started (local-run-binding.ts), keyed by company and run. */
-  private readonly localRuns = new Map<string, { issueId: string | null; agentId: string | null }>();
+  private readonly localRuns = new Map<string, { issueId: string | null; agentId: string | null; startedAt: number }>();
   /** Runs whose terminal event arrived; a delayed start or bind must never revive them. */
   private readonly endedLocalRuns = new Map<string, number>();
   /** Whole-run realizations by company/run/workspace, so a racing local bind can restore their record. */
@@ -469,6 +469,7 @@ export class BoatVmManager {
     const cutoff = this.now() - LOCAL_RUN_STATE_MAX_AGE_MS;
     for (const [ended, at] of this.endedLocalRuns) if (at < cutoff) this.endedLocalRuns.delete(ended);
     for (const [id, entry] of this.wholeRunRealizations) if (entry.at < cutoff) this.wholeRunRealizations.delete(id);
+    for (const [id, entry] of this.localRuns) if (entry.startedAt < cutoff) this.localRuns.delete(id);
   }
 
   private localRunKey(companyId: string, runId: string): string {
@@ -480,19 +481,58 @@ export class BoatVmManager {
     return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-runs", stateKey: runId };
   }
 
-  /** Record a started local run and the agent the host started it for. Returns false for a run that already ended. */
-  async startLocalRun(companyId: string, runId: string, issueId: string | null, agentId: string | null = null): Promise<boolean> {
+  /** Persisted index of runs with an owner record, so the sweep can age them out without a list port. */
+  private runOwnerIndexScope(companyId: string) {
+    return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-runs", stateKey: "owners" };
+  }
+
+  private async trackRunOwner(companyId: string, runId: string): Promise<void> {
+    try {
+      const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+      const runs = raw && typeof raw === "object" && Array.isArray((raw as { runs?: unknown }).runs)
+        ? (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string") : [];
+      if (!runs.includes(runId)) await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...runs, runId] });
+    } catch (error) {
+      this.logger.warn("boat: could not index the local run's owner", { runId, error: errorText(error) });
+    }
+  }
+
+  private async untrackRunOwner(companyId: string, runId: string): Promise<void> {
+    try {
+      const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+      if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) return;
+      const runs = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string" && entry !== runId);
+      // An empty index is deleted, not husked: no per-run rows may linger.
+      if (runs.length === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId));
+      else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs });
+    } catch (error) {
+      this.logger.warn("boat: could not unindex the local run's owner", { runId, error: errorText(error) });
+    }
+  }
+
+  /**
+   * Record a started local run and the agent the host started it for. Returns false for a run that already ended.
+   * The in-memory entry is always kept (it gates offload routes); the persisted
+   * owner write happens only when persist is true, so companies with Boat
+   * unused add no per-run rows to plugin state.
+   */
+  async startLocalRun(companyId: string, runId: string, issueId: string | null, agentId: string | null = null, persist = true): Promise<boolean> {
     const id = this.localRunKey(companyId, runId);
     this.pruneLocalRunState();
     if (this.endedLocalRuns.has(id)) return false;
-    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId });
-    if (agentId) {
+    if (!this.localRuns.has(id)) this.localRuns.set(id, { issueId, agentId, startedAt: this.now() });
+    if (agentId && persist) {
       await this.offloadState.set(this.runOwnerScope(companyId, runId), { version: 1, companyId, runId, issueId, agentId, startedAt: this.now() }).catch((error) => {
         this.logger.warn("boat: could not persist the local run's owner", { runId, error: errorText(error) });
       });
+      await this.trackRunOwner(companyId, runId);
+      // Remember the company so the sweep's age-out reaches run owners even
+      // when no whole-run lease ever registered it. Best effort, like the set.
+      await this.store.rememberCompany(companyId).catch(() => undefined);
       // The terminal event may have arrived while the write was in flight.
       if (this.endedLocalRuns.has(id)) {
         await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
+        await this.untrackRunOwner(companyId, runId);
         return false;
       }
     }
@@ -519,7 +559,7 @@ export class BoatVmManager {
     // Rehydrate after a restart, unless the terminal event arrived during the read.
     if (this.endedLocalRuns.has(id)) return false;
     if (live) live.agentId = saved.agentId;
-    else this.localRuns.set(id, { issueId: saved.issueId as string | null, agentId: saved.agentId });
+    else this.localRuns.set(id, { issueId: saved.issueId as string | null, agentId: saved.agentId, startedAt: this.now() });
     return saved.agentId === agentId;
   }
 
@@ -592,6 +632,58 @@ export class BoatVmManager {
     }
     // From the persisted index, so bindings are forgotten even when this worker never saw the run start.
     await this.forgetRunOffload(companyId, runId);
+    await this.untrackRunOwner(companyId, runId);
+  }
+
+  /** True once this worker has seen a whole-run config for the company (cached on acquire/realize). */
+  hasWholeRunConfig(companyId: string): boolean {
+    for (const cached of this.configs.values()) if (cached.companyId === companyId) return true;
+    return false;
+  }
+
+  /**
+   * Age out persisted run owners the terminal events never cleaned: records
+   * older than the run-state window, `{ended:true}` tombstones left by a
+   * failed forget, and index entries whose record is already gone. Each dropped
+   * run also forgets its workspace bindings. Runs without an index entry (or
+   * companies the caller does not name) are left for the next pass.
+   */
+  async collectRunOwnerGarbage(companyIds: Iterable<string>): Promise<void> {
+    this.pruneLocalRunState();
+    for (const companyId of new Set(companyIds)) {
+      let indexed: string[];
+      try {
+        const raw = await this.offloadState.get(this.runOwnerIndexScope(companyId));
+        if (!raw || typeof raw !== "object" || !Array.isArray((raw as { runs?: unknown }).runs)) continue;
+        indexed = (raw as { runs: unknown[] }).runs.filter((entry): entry is string => typeof entry === "string");
+      } catch {
+        continue;
+      }
+      if (indexed.length === 0) continue;
+      const live = new Set<string>();
+      for (const runId of indexed) {
+        let record: unknown;
+        try {
+          record = await this.offloadState.get(this.runOwnerScope(companyId, runId));
+        } catch {
+          live.add(runId);
+          continue;
+        }
+        const saved = (record ?? null) as { ended?: unknown; startedAt?: unknown } | null;
+        const stale = saved !== null && typeof saved === "object" && saved.ended !== true
+          && typeof saved.startedAt === "number" && this.now() - saved.startedAt > LOCAL_RUN_STATE_MAX_AGE_MS;
+        if (record === null || (saved !== null && typeof saved === "object" && saved.ended === true) || stale) {
+          await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
+          await this.forgetRunOffload(companyId, runId);
+          continue;
+        }
+        live.add(runId);
+      }
+      if (live.size !== indexed.length) {
+        if (live.size === 0) await this.offloadState.delete(this.runOwnerIndexScope(companyId)).catch(() => undefined);
+        else await this.offloadState.set(this.runOwnerIndexScope(companyId), { version: 1, runs: [...live] }).catch(() => undefined);
+      }
+    }
   }
 
   /** Drop a run's whole-run realizations, executor bindings and persisted workspace bindings. */
@@ -3003,6 +3095,27 @@ export class BoatVmManager {
             .catch(() => report.errors.push(tag(null, "offload broker retention unverified"))),
         ),
       ]);
+    }
+    // Persisted run owners age out on every sweep, not only on terminal
+    // events a restart can drop. Scoped sweeps cover their own company; the
+    // unscoped sweep also reaches local-run-only companies with no config.
+    {
+      const runOwnerCompanies = new Set<string>(scope !== null ? [scope]
+        : [...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId)]);
+      if (scope === null) {
+        const remembered = await this.store.companies().catch(() => [] as string[]);
+        for (const companyId of remembered) runOwnerCompanies.add(companyId);
+        for (const key of this.localRuns.keys()) {
+          try {
+            const [companyId] = JSON.parse(key) as [string];
+            if (typeof companyId === "string") runOwnerCompanies.add(companyId);
+          } catch {
+            // A corrupted in-memory key never blocks the age-out.
+          }
+        }
+      }
+      await withDeadline(this.collectRunOwnerGarbage(runOwnerCompanies), this.offloadUpkeepTimeoutMs, "run owner retention")
+        .catch(() => report.errors.push(tag(scope, "run owner retention unverified")));
     }
     if (this.configs.size === 0) {
       report.skipped = "no_config_seen";

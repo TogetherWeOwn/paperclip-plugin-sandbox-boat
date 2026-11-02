@@ -463,6 +463,7 @@ def rpc(action, data):
                     'receipt': 'completed' if value['result'] else 'running'}
         if action == 'read':
             events = []
+            total = 0
             filename = root / 'output'
             if filename.exists():
                 with filename.open() as output:
@@ -474,10 +475,13 @@ def rpc(action, data):
                             break
                         if index < data['after']:
                             continue
-                        if len(events) >= 4:
+                        if len(events) >= 64:
                             break
                         event = json.loads(line)
                         events.append(event)
+                        total += len(line)
+                        if total > 131072:
+                            break
             return {'events': events, 'result': value['result'] if not events else None,
                     'supervisorAlive': start_time(value['supervisorPid']) == value['supervisorStart'],
                     'outputLimitExceeded': value.get('outputLimitExceeded', False)}
