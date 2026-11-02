@@ -690,11 +690,23 @@ describe("journal partial-write recovery", () => {
         collectGarbage.mockRestore();
       }
 
-      // The pool accepts new work after recovery.
+      // The pool accepts new work after recovery. The claim runs before the
+      // guest preflight, so one (fake) VM is spent even where the guest then
+      // refuses: without a delegated cgroup v2 the preflight fails before
+      // spawn, the pre-start failure settles fallback-safe unavailable, and
+      // only hosts with PAPERCLIP_TEST_CGROUP_REQUIRED=1 run the guest.
       const result = await executor.execute(command());
+      expect(boat.callsOf("create")).toHaveLength(1);
       const detail = result.status === "completed" ? `exitCode=${result.exitCode}` : `${result.code}: ${result.reason}`;
-      expect(["completed", "not_started", "unknown"],
-        `post-recovery execute settled ${result.status} (${detail})`).toContain(result.status);
+      if (process.env.PAPERCLIP_TEST_CGROUP_REQUIRED === "1") {
+        expect(result.status, `post-recovery execute settled ${result.status} (${detail})`).toBe("completed");
+      } else {
+        expect(["completed", "not_started", "unknown", "unavailable"],
+          `post-recovery execute settled ${result.status} (${detail})`).toContain(result.status);
+        if (result.status === "unavailable") {
+          expect(result).toMatchObject({ remoteStarted: false, fallbackSafe: true });
+        }
+      }
     } finally {
       await rt.shutdown();
     }
