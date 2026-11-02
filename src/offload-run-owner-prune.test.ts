@@ -80,6 +80,56 @@ describe("run-owner state retention", () => {
     expect(await currentManager().localRunOwnedBy(COMPANY, "live-run", "agent-1")).toBe(true);
   });
 
+  it("a host lookup failure keeps the 25 h issue owner for the next sweep", async () => {
+    // The sweep must delete only positively-disproven runs: a transient host
+    // error is "unknown", not proof of death, so the owner row, the index
+    // entry, and the fail-closed gate must all survive it.
+    harness.issues.set("issue-flaky", { status: "open", executionRunId: "flaky-run", checkoutRunId: null });
+    harness.ctx.issues.get = async () => { throw new Error("host outage"); };
+    const recordKey = `company|${COMPANY}|boat-offload-runs|flaky-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "flaky-run",
+      issueId: "issue-flaky", agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["flaky-run"] });
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toMatchObject({ runId: "flaky-run" });
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["flaky-run"] });
+    expect(await currentManager().localRunOwnedBy(COMPANY, "flaky-run", "agent-1")).toBe(false);
+  });
+
+  it("a sweep without an issues provider keeps the 25 h issue owner", async () => {
+    // Same tri-state branch as a lookup failure: no provider means "unknown",
+    // so the sweep retains the run instead of stranding a possibly-live one.
+    setManagerOverridesForTests({ now: () => clock, sleep: async (ms: number) => { clock += ms; }, issues: null });
+    harness = createFakeContext();
+    await plugin.definition.setup(harness.ctx as never);
+    const recordKey = `company|${COMPANY}|boat-offload-runs|flaky-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "flaky-run",
+      issueId: "issue-flaky", agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["flaky-run"] });
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toMatchObject({ runId: "flaky-run" });
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["flaky-run"] });
+  });
+
+  it("a 25 h issue owner naming another run is still swept", async () => {
+    // The fix must not retain every issue run: an issue that exists but names
+    // a different run positively disproves liveness, so the sweep deletes it.
+    harness.issues.set("issue-moved", { status: "open", executionRunId: "other-run", checkoutRunId: null });
+    const recordKey = `company|${COMPANY}|boat-offload-runs|moved-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "moved-run",
+      issueId: "issue-moved", agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["moved-run"] });
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
   it("a failed owner-row delete stays indexed for the next sweep", async () => {
     // The per-company index is the only enumeration source: dropping a run
     // whose row delete failed would orphan the row where no sweep finds it.

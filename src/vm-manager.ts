@@ -576,9 +576,30 @@ export class BoatVmManager {
 
   /** A host or lookup failure counts as not live, so the request is refused and a later one retries. */
   private async savedRunLive(companyId: string, runId: string, issueId: string | null, startedAt: unknown): Promise<boolean> {
-    if (issueId === null) return typeof startedAt === "number" && this.now() - startedAt <= LOCAL_RUN_STATE_MAX_AGE_MS;
-    const issue = await this.issues?.get(issueId, companyId).catch(() => null);
-    return issue?.executionRunId === runId || issue?.checkoutRunId === runId;
+    return (await this.savedRunLiveness(companyId, runId, issueId, startedAt)) === "live";
+  }
+
+  /**
+   * Tri-state liveness for the owner sweep: only a positively-disproven run
+   * may be deleted — its issue exists and names another run, or a run without
+   * an issue is past the age bound. A lookup failure, a missing issues
+   * provider, or a missing issue keeps the run for the next sweep, the same
+   * retry posture as a failed row delete. The ownership gate stays fail-closed
+   * by treating anything but "live" as not owned (savedRunLive).
+   */
+  private async savedRunLiveness(companyId: string, runId: string, issueId: string | null, startedAt: unknown): Promise<"live" | "dead" | "unknown"> {
+    if (issueId === null) {
+      return typeof startedAt === "number" && this.now() - startedAt <= LOCAL_RUN_STATE_MAX_AGE_MS ? "live" : "dead";
+    }
+    if (!this.issues) return "unknown";
+    let issue: { executionRunId?: string | null; checkoutRunId?: string | null } | null;
+    try {
+      issue = await this.issues.get(issueId, companyId);
+    } catch {
+      return "unknown";
+    }
+    if (!issue) return "unknown";
+    return issue.executionRunId === runId || issue.checkoutRunId === runId ? "live" : "dead";
   }
 
   /** Issue of a live (started, not ended) local run, or null. */
@@ -693,7 +714,10 @@ export class BoatVmManager {
             // applies the same liveness bound instead of stranding active runs.
             if (!tombstone && saved !== null && typeof saved === "object") {
               const issueId = typeof saved.issueId === "string" ? saved.issueId : null;
-              if (await this.savedRunLive(companyId, runId, issueId, saved.startedAt)) {
+              // Delete only positively-disproven runs: a lookup failure or a
+              // missing provider/issue keeps the run for the next sweep, so a
+              // transient host error never strands a live issue run.
+              if ((await this.savedRunLiveness(companyId, runId, issueId, saved.startedAt)) !== "dead") {
                 live.add(runId);
                 continue;
               }
