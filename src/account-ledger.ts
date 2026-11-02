@@ -188,11 +188,15 @@ function monthUsageSeconds(doc: AccountDoc, companyId: string, nowMs: number): n
       // An open tail bills at most its funded tail plus grace: the provider
       // TTL stops the VM by then, so a tail still open days later is an
       // unreconciled receipt, not VM time. Rows without a known intent keep
-      // the full count (fail closed) rather than assuming a bound.
+      // the full count (fail closed) rather than assuming a bound. The bounded
+      // end is intersected with the month, so a tail that expired last month
+      // charges this month only for the part of its bound inside it (usually
+      // nothing).
       const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
       const fundedTailMs = intent == null || !Number.isFinite(intent.tailSeconds)
         ? Infinity : (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000;
-      totalMs += Math.min(Math.max(0, nowMs - Math.max(row.tailSince, monthStart)), fundedTailMs);
+      const boundedEnd = Math.min(nowMs, row.tailSince + fundedTailMs);
+      totalMs += Math.max(0, boundedEnd - Math.max(row.tailSince, monthStart));
     }
   }
   return totalMs / 1000;
@@ -377,15 +381,17 @@ export class AccountLedger {
   }
   /**
    * Latest billable instant for an open tail: terminal evidence observed at
-   * `at`, but never later than the requested stop deadline, nor later than
-   * the funded tail plus grace when the stop receipt itself lagged.
+   * `at`, but never later than the requested stop deadline plus grace, nor
+   * later than the funded tail plus grace when the stop receipt itself lagged.
+   * The grace bills a retried stop's actual minutes while still bounding a
+   * receipt that arrives days late.
    */
   private tailEnd(doc: AccountDoc, row: AccountUsageRow, at: number): number {
     if (row.tailSince == null) return at;
     const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
     const tailBudget = intent != null && Number.isFinite(intent.tailSeconds)
       ? row.tailSince + (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000 : null;
-    const cap = row.stopDueAt ?? tailBudget ?? at;
+    const cap = row.stopDueAt != null ? row.stopDueAt + STOP_OBSERVE_GRACE_S * 1000 : (tailBudget ?? at);
     return Math.min(at, cap);
   }
   private closeTail(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
@@ -417,7 +423,15 @@ export class AccountLedger {
       intent.active = false;
       intent.settledAt = now;
       intent.endedAt ??= Math.min(now, intent.at + ttlSeconds * 1000);
-      intent.compute = Math.min(intent.compute, Math.max(0, ttlSeconds) * WEIGHT[intent.size]);
+      // Release the unconsumed compute reservation: no live VM can consume it
+      // (boat auto-stopped it at the TTL) and the provider counter never will,
+      // so holding it would exhaust compute after repeated ambiguous starts.
+      // Already-reflected provider usage is kept so a later observation cannot
+      // double-refund it. The bounded bill lives on the row interval below.
+      intent.compute = Math.min(intent.compute, intent.computeReflected);
+      // Mark the hold terminal so a later archived listing cannot rewrite the
+      // TTL-clamped interval below into [at, now] via terminal().
+      intent.status = "stopped";
       const row = intent.usageId != null ? doc.usage.find((r) => r.usageRecordId === intent.usageId) : undefined;
       if (row != null && now > intent.at) {
         row.kind = "aborted_start";
@@ -433,20 +447,27 @@ export class AccountLedger {
       // A restart may have left ambiguous or never-reported starts behind;
       // retire them before they refuse this admission as phantom capacity.
       this.expireStaleHolds(doc, this.now());
-      if (req.monthlyCap && req.monthlyCap.capHours > 0 && req.monthlyCap.companyId) {
-        // Strict: the new request's own envelope counts too. The old
-        // used-only check admitted one full extra envelope past the cap.
-        const envelopeSeconds = req.jobSeconds + req.tailSeconds;
-        const used = monthUsageSeconds(doc, req.monthlyCap.companyId, req.monthlyCap.nowMs)
-          + pendingCapSeconds(doc, req.monthlyCap.companyId);
-        if ((used + envelopeSeconds) / 3600 > req.monthlyCap.capHours) {
+      // Strict: the new request's own envelope counts too. The old
+      // used-only check admitted one full extra envelope past the cap.
+      const monthly = req.monthlyCap && req.monthlyCap.capHours > 0 && req.monthlyCap.companyId
+        ? { ...req.monthlyCap,
+            used: monthUsageSeconds(doc, req.monthlyCap.companyId, req.monthlyCap.nowMs)
+              + pendingCapSeconds(doc, req.monthlyCap.companyId) }
+        : null;
+      const refuseOverCap = (envelopeSeconds: number): void => {
+        if (monthly && (monthly.used + envelopeSeconds) / 3600 > monthly.capHours) {
           throw new BoatBudgetError({ limit: "minComputeHoursLeft",
-            message: `monthly offload VM-hour cap reached (${req.monthlyCap.capHours}h); new commands run local until next month`,
+            message: `monthly offload VM-hour cap reached (${monthly.capHours}h); new commands run local until next month`,
             details: {} });
         }
-      }
+      };
+      refuseOverCap(req.jobSeconds + req.tailSeconds);
       let limits = await this.observe(api, doc, req.allowCachedLimits, req);
       const tailSeconds = this.tail(doc, limits, req);
+      // tail() can raise a short tail to 300 s under start pressure after the
+      // early check above: recheck the committed (larger) envelope, otherwise
+      // the strict comparison would not cover the admitted VM time.
+      if (tailSeconds > req.tailSeconds) refuseOverCap(req.jobSeconds + tailSeconds);
       // A warm handoff or a new resume reservation truncates the previous tail,
       // but only on a committed new reservation. A refusal must leave the
       // original tail and timer intact. A resume starts a new command on the
