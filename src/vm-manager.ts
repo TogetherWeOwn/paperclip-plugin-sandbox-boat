@@ -683,12 +683,26 @@ export class BoatVmManager {
             live.add(runId);
             continue;
           }
-          const saved = (record ?? null) as { ended?: unknown; startedAt?: unknown } | null;
-          const stale = saved !== null && typeof saved === "object" && saved.ended !== true
+          const saved = (record ?? null) as { ended?: unknown; startedAt?: unknown; issueId?: unknown } | null;
+          const tombstone = saved !== null && typeof saved === "object" && saved.ended === true;
+          const stale = !tombstone && saved !== null && typeof saved === "object"
             && typeof saved.startedAt === "number" && this.now() - saved.startedAt > LOCAL_RUN_STATE_MAX_AGE_MS;
-          if (record === null || (saved !== null && typeof saved === "object" && saved.ended === true) || stale) {
-            await this.offloadState.delete(this.runOwnerScope(companyId, runId)).catch(() => undefined);
+          if (record === null || tombstone || stale) {
+            // Age alone never ends an issue run: the ownership gate rehydrates
+            // live issue runs from the host (savedRunLive), so the sweep
+            // applies the same liveness bound instead of stranding active runs.
+            if (!tombstone && saved !== null && typeof saved === "object") {
+              const issueId = typeof saved.issueId === "string" ? saved.issueId : null;
+              if (await this.savedRunLive(companyId, runId, issueId, saved.startedAt)) {
+                live.add(runId);
+                continue;
+              }
+            }
+            const deleted = await this.offloadState.delete(this.runOwnerScope(companyId, runId)).then(() => true, () => false);
             await this.forgetRunOffload(companyId, runId);
+            // The index is the only enumeration source: a failed row delete
+            // stays indexed so the next sweep retries instead of orphaning it.
+            if (!deleted) live.add(runId);
             continue;
           }
           live.add(runId);

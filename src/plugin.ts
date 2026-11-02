@@ -135,6 +135,10 @@ const plugin = definePlugin({
       // Only a run on an issue binds locally.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
       const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
+      // Install the in-memory owner before any await: the ownership gate can
+      // run while company settings are still being fetched, and a 403 there
+      // would beat the bind the event is still setting up.
+      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId, false))) return;
       let companyConfig: unknown;
       try {
         companyConfig = await ctx.config.get(event.companyId);

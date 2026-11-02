@@ -46,6 +46,64 @@ describe("run-owner state retention", () => {
     }
   });
 
+  it("agent.run.started gates the run before company config resolves", async () => {
+    // The ownership gate can run while settings are still being fetched; the
+    // in-memory owner is installed first so the run's first offload request
+    // never 403s against an event that is still being handled.
+    let resolveConfig!: (value: Record<string, unknown>) => void;
+    const configPending = new Promise<Record<string, unknown>>((resolve) => { resolveConfig = resolve; });
+    harness.ctx.config.get = () => configPending;
+    const started = harness.emit("agent.run.started", { companyId: COMPANY,
+      payload: { runId: "run-early", issueId: null, agentId: "agent-1" } });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(await currentManager().localRunOwnedBy(COMPANY, "run-early", "agent-1")).toBe(true);
+    resolveConfig({});
+    await started;
+    expect(harness.state.size).toBe(0);
+    expect(await currentManager().localRunOwnedBy(COMPANY, "run-early", "agent-1")).toBe(true);
+  });
+
+  it("a 25 h old owner of a live issue run survives the sweep", async () => {
+    // Age alone never ends an issue run: the gate rehydrates live issue runs
+    // from the host, so the sweep applies the same liveness bound instead of
+    // deleting the owner and its workspace bindings mid-run.
+    harness.issues.set("issue-live", { status: "open", executionRunId: "live-run", checkoutRunId: null });
+    const recordKey = `company|${COMPANY}|boat-offload-runs|live-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "live-run",
+      issueId: "issue-live", agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["live-run"] });
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toMatchObject({ runId: "live-run" });
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["live-run"] });
+    expect(await currentManager().localRunOwnedBy(COMPANY, "live-run", "agent-1")).toBe(true);
+  });
+
+  it("a failed owner-row delete stays indexed for the next sweep", async () => {
+    // The per-company index is the only enumeration source: dropping a run
+    // whose row delete failed would orphan the row where no sweep finds it.
+    const recordKey = `company|${COMPANY}|boat-offload-runs|old-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "old-run",
+      issueId: null, agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["old-run"] });
+    const realDelete = harness.state.delete.bind(harness.state);
+    let failNext = true;
+    harness.state.delete = (key: string) => {
+      if (failNext && key === recordKey) { failNext = false; throw new Error("state outage"); }
+      return realDelete(key);
+    };
+    const report = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(report.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toMatchObject({ runId: "old-run" });
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["old-run"] });
+    const retry = await currentManager().sweep("test", { force: true, companyId: COMPANY });
+    expect(retry.errors).toEqual([]);
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
   it("a 25 h old owner record is gone after the sweep", async () => {
     const recordKey = `company|${COMPANY}|boat-offload-runs|old-run`;
     const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;

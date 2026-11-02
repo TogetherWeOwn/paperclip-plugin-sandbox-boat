@@ -341,6 +341,9 @@ export class OffloadExecutor {
     } else {
       vm.stopping = false;
       vm.stopped = true;
+      // A stopped VM resumes under a new boot id: its old watchdog paths are
+      // dead, exactly as in the direct stop response and retirement paths.
+      this.lifecycle?.releaseSandbox(vm.sandboxId);
     }
     return false;
   }
@@ -576,10 +579,11 @@ export class OffloadExecutor {
         // Duplicates replay from the durable journal from here on.
         this.journal.delete(key);
       } else {
-        while (this.journal.size > MAX_VOLATILE_JOURNAL) {
-          const oldest = this.journal.keys().next();
-          if (oldest.done) break;
-          this.journal.delete(oldest.value);
+        for (const [oldKey, entry] of this.journal) {
+          if (this.journal.size <= MAX_VOLATILE_JOURNAL) break;
+          // Live entries back in-flight work: finish() and duplicate joins
+          // need them, and they stay bounded by queue plus admission.
+          if (entry.result !== null) this.journal.delete(oldKey);
         }
       }
     }

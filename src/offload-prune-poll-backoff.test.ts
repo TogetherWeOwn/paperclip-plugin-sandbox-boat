@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { command, fixture, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { command, fixture, until, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { OffloadExecutor } from "./offload.js";
 import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { SshOffloadGuest } from "./offload-ssh.js";
 import type { ExecutionIdentity } from "./offload-lifecycle.js";
@@ -79,6 +80,62 @@ describe("offload in-memory pruning", () => {
       expect(maps.lifecycle?.watchdogPaths.size ?? -1).toBe(0);
     }
   }, 300_000);
+
+  it("a live command survives 512 completions without losing its journal entry", async () => {
+    // The non-durable journal retains settled receipts for idempotent replays
+    // and caps itself at 512 entries. The cap must evict settled receipts
+    // only: a live entry backs in-flight work, and finish() throws when it is
+    // gone, skipping the ledger close and the VM release while duplicates
+    // re-run. A legacy (guest-free) executor exercises the volatile path.
+    let releaseLong!: () => void;
+    const longGate = new Promise<void>((resolve) => { releaseLong = resolve; });
+    let longStarted = false;
+    const ex = new OffloadExecutor({
+      state: s.state,
+      accountId: "volatile-journal-test",
+      poolId: "volatile-journal-pool",
+      boat: s.boat as never,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      now: s.clock.now,
+      timers: { set: s.clock.set, clear: s.clock.clear },
+      config: { maxOffloadVms: 2, offloadIdleStopSeconds: 3600 },
+      runCommand: async (_sandboxId: string, cmd) => {
+        if (cmd.commandId === "long-lived") { longStarted = true; await longGate; }
+        return { exitCode: 0, seconds: 1 };
+      },
+    });
+    // Separate workspaces: same-workspace commands queue behind the busy VM
+    // instead of running beside it, which would never complete the shorts.
+    const longPending = ex.execute(command("long-lived", { executionWorkspaceId: "workspace-long" }));
+    await until(() => longStarted);
+    for (let n = 0; n < 512; n += 1) {
+      await ex.execute(command(`short-${n}`, { executionWorkspaceId: "workspace-shorts" }));
+    }
+    releaseLong();
+    await expect(longPending).resolves.toMatchObject({ status: "completed" });
+    const maps = executorMaps(ex);
+    const live = maps.journal.get("long-lived") as { result: unknown } | undefined;
+    expect(live?.result).toMatchObject({ status: "completed" });
+    expect(maps.journal.size).toBeLessThanOrEqual(512);
+    // The VM was released, not stuck busy behind a journal throw.
+    await expect(ex.execute(command("after", { executionWorkspaceId: "workspace-long" }))).resolves.toMatchObject({ status: "completed" });
+    await ex.shutdown();
+  }, 180_000);
+
+  it("an observed provider stop releases its watchdog paths for warm reuse", async () => {
+    // The direct stop response and retirement both release the sandbox's
+    // watchdog paths; an asynchronously observed stop must too, or every
+    // stop-observe-resume cycle pins another dead path until retirement.
+    s.boat.stopMode = "never";
+    await s.execute(command("observed-paths"));
+    const maps = executorMaps(s.executor);
+    expect(maps.lifecycle?.watchdogPaths.size ?? 0).toBeGreaterThan(0);
+    await s.clock.advance(15_000);
+    expect(s.boat.boxes.get(s.starts[0]!.sandboxId)?.state).toBe("archiving");
+    s.boat.boxes.get(s.starts[0]!.sandboxId)!.state = "archived";
+    await s.api().sweep?.();
+    expect(maps.lifecycle?.watchdogPaths.size ?? -1).toBe(0);
+  });
 });
 
 const PARENT = "/delegated-test-parent";

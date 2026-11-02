@@ -99,7 +99,11 @@ at all (local-run offload enabled or a seen whole-run config), so idle
 companies add no per-run state; the in-memory owner gate is always recorded.
 Every sweep (scoped or scheduled) ages out owner records older than 24 hours
 and ended tombstones via the persisted per-company owner index, so terminal
-events lost to a restart cannot accumulate rows. This adds five capabilities to the 0.2.2
+events lost to a restart cannot accumulate rows. Age alone never retires a
+live issue run: the sweep keeps an owner whose issue still names the run,
+matching the ownership gate. A run that started while the company did not use
+Boat has no persisted owner, so a worker restart before Boat is enabled leaves
+that run unable to offload; runs started afterwards are unaffected. This adds five capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
 `projects.read` and `project.workspaces.read`; the
 upgrade needs board approval of that capability change.
