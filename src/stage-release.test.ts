@@ -1,14 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-// stage-release.sh puts a downloaded release tarball on a host and points its
-// plugin-sdk link at that host's SDK; install-offload-shims.sh points a shim
-// dir's cargo at the staged package. The rbx1 runbook (docs/operations/rbx1.md)
-// relies on both refusing anything but a checked package and a stable SDK path.
+// stage-release.sh puts a downloaded release tarball on a host, read-only and
+// exactly as shipped: the package bundles a real copy of its pinned
+// plugin-sdk, so there is no host SDK link to re-point (that link, absolute to
+// the build host, made every tarball before 0.2.6 unloadable elsewhere).
+// check-tarball-links.sh is the release-time guard against any link coming
+// back. install-offload-shims.sh points a shim dir's cargo at the staged
+// package. The rbx1 runbook (docs/operations/rbx1.md) relies on all three.
 const stageRelease = path.resolve(__dirname, "../scripts/stage-release.sh");
+const checkTarballLinks = path.resolve(__dirname, "../scripts/check-tarball-links.sh");
 const installShims = path.resolve(__dirname, "../scripts/install-offload-shims.sh");
 const stagePackage = path.resolve(__dirname, "../scripts/stage-package.sh");
 const NAME = "sandbox-boat-1.2.3-abcdef1";
@@ -30,18 +34,11 @@ function sh(cwd: string, script: string, args: string[], env: Record<string, str
   return spawnSync("/bin/sh", [script, ...args], { cwd, encoding: "utf8", env: { ...process.env, ...env } });
 }
 
-function hostSdk(at: string, name = "@paperclipai/plugin-sdk") {
-  mkdirSync(at, { recursive: true });
-  writeFileSync(path.join(at, "package.json"), JSON.stringify({ name, version: "2026.1023.0" }));
-  return at;
-}
-
 /** A release tarball as release.yml builds it, with an optional twist. */
-function release(dir: string, opts: { extraLink?: boolean; version?: string; noBin?: boolean } = {}) {
+function release(dir: string, opts: { link?: "absolute-sdk" | "relative" | "hard"; noSdk?: boolean; version?: string; noBin?: boolean } = {}) {
   const src = path.join(dir, "src");
   const pkg = path.join(src, NAME);
   mkdirSync(path.join(pkg, "dist/offload"), { recursive: true });
-  mkdirSync(path.join(pkg, "node_modules/@paperclipai"), { recursive: true });
   writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "x", version: opts.version ?? "1.2.3" }));
   writeFileSync(path.join(pkg, ".source-commit"), "abcdef1234567890abcdef1234567890abcdef12\n");
   writeFileSync(path.join(pkg, "dist/worker.js"), "");
@@ -50,8 +47,17 @@ function release(dir: string, opts: { extraLink?: boolean; version?: string; noB
     mkdirSync(path.join(pkg, "bin"));
     writeFileSync(path.join(pkg, "bin/boat-offload-cargo"), "#!/usr/bin/env node\n");
   }
-  symlinkSync("/app/packages/plugins/sdk", path.join(pkg, "node_modules/@paperclipai/plugin-sdk"));
-  if (opts.extraLink) symlinkSync("/etc/passwd", path.join(pkg, "dist/evil.js"));
+  if (opts.link === "absolute-sdk") {
+    // The pre-0.2.6 shape: the SDK as an absolute symlink to the build host.
+    mkdirSync(path.join(pkg, "node_modules/@paperclipai"), { recursive: true });
+    symlinkSync("/app/packages/plugins/sdk", path.join(pkg, "node_modules/@paperclipai/plugin-sdk"));
+  } else if (!opts.noSdk) {
+    const sdk = path.join(pkg, "node_modules/@paperclipai/plugin-sdk");
+    mkdirSync(sdk, { recursive: true });
+    writeFileSync(path.join(sdk, "package.json"), JSON.stringify({ name: "@paperclipai/plugin-sdk", version: "2026.1023.0" }));
+  }
+  if (opts.link === "relative") symlinkSync("worker.js", path.join(pkg, "dist/alias.js"));
+  if (opts.link === "hard") linkSync(path.join(pkg, "dist/worker.js"), path.join(pkg, "dist/worker-hard.js"));
   spawnSync("chmod", ["-R", "a-w", pkg]);
   const out = path.join(dir, "dl");
   mkdirSync(out);
@@ -65,60 +71,81 @@ function release(dir: string, opts: { extraLink?: boolean; version?: string; noB
 const win = process.platform === "win32";
 
 describe("stage-release.sh", () => {
-  it.skipIf(win)("stages the package read-only with the SDK linked to the given host path", () => {
+  it.skipIf(win)("stages the package read-only with its bundled SDK copy untouched", () => {
     const dir = scratch();
     const tgz = release(dir);
     const root = path.join(dir, "root");
     mkdirSync(root);
-    const sdk = hostSdk(path.join(dir, "home/.paperclip/cli/current/node_modules/@paperclipai/plugin-sdk"));
-    const r = sh(dir, stageRelease, [tgz, root, sdk]);
+    const r = sh(dir, stageRelease, [tgz, root]);
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
     const dest = path.join(root, NAME);
     expect(r.stdout.trim()).toBe(dest);
-    expect(readlinkSync(path.join(dest, "node_modules/@paperclipai/plugin-sdk"))).toBe(sdk);
+    const sdk = path.join(dest, "node_modules/@paperclipai/plugin-sdk");
+    expect(lstatSync(sdk).isSymbolicLink()).toBe(false);
+    expect(existsSync(path.join(sdk, "package.json"))).toBe(true);
     expect(statSync(dest).mode & 0o222).toBe(0);
     expect(statSync(path.join(dest, "dist/worker.js")).mode & 0o222).toBe(0);
     expect(existsSync(path.join(dest, "bin/boat-offload-cargo"))).toBe(true);
   });
 
-  it.skipIf(win)("defaults to $PAPERCLIP_HOME/cli/current and keeps that path unresolved", () => {
+  it.skipIf(win)("refuses the pre-0.2.6 tarball shape: an absolute plugin-sdk symlink", () => {
     const dir = scratch();
-    const tgz = release(dir);
+    const tgz = release(dir, { link: "absolute-sdk" });
     const root = path.join(dir, "root");
     mkdirSync(root);
-    const home = path.join(dir, "ph");
-    hostSdk(path.join(home, "cli/installs/npm/2026.1023.0/node_modules/@paperclipai/plugin-sdk"));
-    mkdirSync(path.join(home, "cli"), { recursive: true });
-    symlinkSync("installs/npm/2026.1023.0", path.join(home, "cli/current"));
-    const r = sh(dir, stageRelease, [tgz, root], { PAPERCLIP_HOME: home });
-    expect(r.status).toBe(0);
-    expect(readlinkSync(path.join(root, NAME, "node_modules/@paperclipai/plugin-sdk")))
-      .toBe(path.join(home, "cli/current/node_modules/@paperclipai/plugin-sdk"));
+    const r = sh(dir, stageRelease, [tgz, root]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("holds a link;");
+    expect(existsSync(path.join(root, NAME))).toBe(false);
   });
 
-  it.skipIf(win)("refuses an SDK path inside a versioned Paperclip install", () => {
+  it.skipIf(win)("refuses a tarball with a relative link as well", () => {
     const dir = scratch();
-    const tgz = release(dir);
-    const sdk = hostSdk(path.join(dir, "ph/cli/installs/npm/2026.1023.0/node_modules/@paperclipai/plugin-sdk"));
-    const r = sh(dir, stageRelease, [tgz, dir, sdk]);
+    const tgz = release(dir, { link: "relative" });
+    const root = path.join(dir, "root");
+    mkdirSync(root);
+    const r = sh(dir, stageRelease, [tgz, root]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("link through cli/current");
+    expect(r.stderr).toContain("holds a link;");
+    expect(existsSync(path.join(root, NAME))).toBe(false);
   });
 
-  it.skipIf(win)("refuses a host path that is not the plugin SDK", () => {
+  it.skipIf(win)("refuses a tarball with a hardlink, which unpacks as a plain file", () => {
+    const dir = scratch();
+    const tgz = release(dir, { link: "hard" });
+    const root = path.join(dir, "root");
+    mkdirSync(root);
+    const r = sh(dir, stageRelease, [tgz, root]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("holds a link");
+    expect(existsSync(path.join(root, NAME))).toBe(false);
+  });
+
+  it.skipIf(win)("refuses a tarball with no bundled plugin-sdk", () => {
+    const dir = scratch();
+    const tgz = release(dir, { noSdk: true });
+    const root = path.join(dir, "root");
+    mkdirSync(root);
+    const r = sh(dir, stageRelease, [tgz, root]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("no bundled @paperclipai/plugin-sdk");
+    expect(existsSync(path.join(root, NAME))).toBe(false);
+  });
+
+  it.skipIf(win)("refuses a host SDK path argument; there is nothing to re-point", () => {
     const dir = scratch();
     const tgz = release(dir);
-    const r = sh(dir, stageRelease, [tgz, dir, hostSdk(path.join(dir, "other"), "left-pad")]);
+    const r = sh(dir, stageRelease, [tgz, dir, "/app/packages/plugins/sdk"]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("is not a @paperclipai/plugin-sdk package");
+    expect(r.stderr).toContain("unexpected argument");
   });
 
   it.skipIf(win)("refuses a tarball that does not match its .sha256", () => {
     const dir = scratch();
     const tgz = release(dir);
     writeFileSync(`${tgz}.sha256`, `${"0".repeat(64)}  ${NAME}.tgz\n`);
-    const r = sh(dir, stageRelease, [tgz, dir, hostSdk(path.join(dir, "sdk"))]);
+    const r = sh(dir, stageRelease, [tgz, dir]);
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("does not match");
     expect(existsSync(path.join(dir, NAME))).toBe(false);
@@ -131,26 +158,15 @@ describe("stage-release.sh", () => {
     writeFileSync(decoy, "decoy");
     const sum = spawnSync("sha256sum", ["decoy.tgz"], { cwd: path.dirname(tgz), encoding: "utf8" });
     writeFileSync(`${tgz}.sha256`, sum.stdout);
-    const r = sh(dir, stageRelease, [tgz, dir, hostSdk(path.join(dir, "sdk"))]);
+    const r = sh(dir, stageRelease, [tgz, dir]);
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("does not match");
-  });
-
-  it.skipIf(win)("refuses a tarball with any other link", () => {
-    const dir = scratch();
-    const tgz = release(dir, { extraLink: true });
-    const root = path.join(dir, "root");
-    mkdirSync(root);
-    const r = sh(dir, stageRelease, [tgz, root, hostSdk(path.join(dir, "sdk"))]);
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("other than node_modules/@paperclipai/plugin-sdk");
-    expect(existsSync(path.join(root, NAME))).toBe(false);
   });
 
   it.skipIf(win)("refuses a package whose version disagrees with its name", () => {
     const dir = scratch();
     const tgz = release(dir, { version: "9.9.9" });
-    const r = sh(dir, stageRelease, [tgz, dir, hostSdk(path.join(dir, "sdk"))]);
+    const r = sh(dir, stageRelease, [tgz, dir]);
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("does not match its package.json version 9.9.9");
   });
@@ -160,13 +176,41 @@ describe("stage-release.sh", () => {
     const tgz = release(dir, { noBin: true });
     const root = path.join(dir, "root");
     mkdirSync(root);
-    const sdk = hostSdk(path.join(dir, "sdk"));
-    const first = sh(dir, stageRelease, [tgz, root, sdk]);
+    const first = sh(dir, stageRelease, [tgz, root]);
     expect(first.status).toBe(0);
     expect(first.stderr).toContain("has no bin/");
-    const again = sh(dir, stageRelease, [tgz, root, sdk]);
+    const again = sh(dir, stageRelease, [tgz, root]);
     expect(again.status).not.toBe(0);
     expect(again.stderr).toContain("already exists");
+  });
+});
+
+describe("check-tarball-links.sh", () => {
+  it.skipIf(win)("passes a tarball of plain files and directories", () => {
+    const dir = scratch();
+    const r = sh(dir, checkTarballLinks, [release(dir)]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("holds no links");
+  });
+
+  it.skipIf(win)("fails a tarball with an absolute symlink", () => {
+    const dir = scratch();
+    const r = sh(dir, checkTarballLinks, [release(dir, { link: "absolute-sdk" })]);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("holds a link");
+    expect(r.stderr).toContain("/app/packages/plugins/sdk");
+  });
+
+  it.skipIf(win)("fails a tarball with a relative symlink or a hardlink", () => {
+    const rel = scratch();
+    expect(sh(rel, checkTarballLinks, [release(rel, { link: "relative" })]).status).not.toBe(0);
+    const hard = scratch();
+    expect(sh(hard, checkTarballLinks, [release(hard, { link: "hard" })]).status).not.toBe(0);
+  });
+
+  it.skipIf(win)("fails on a missing tarball", () => {
+    const dir = scratch();
+    expect(sh(dir, checkTarballLinks, [path.join(dir, "nope.tgz")]).status).not.toBe(0);
   });
 });
 
@@ -210,10 +254,10 @@ describe("install-offload-shims.sh", () => {
 });
 
 describe("stage-package.sh", () => {
-  it.skipIf(win)("refuses a host SDK path inside a versioned Paperclip install", () => {
+  it.skipIf(win)("refuses a host SDK path argument; the SDK is bundled, not linked", () => {
     const dir = scratch();
-    const r = sh(dir, stagePackage, ["HEAD", dir, "/home/u/.paperclip/cli/installs/npm/2026.1023.0/node_modules/@paperclipai/plugin-sdk"]);
+    const r = sh(dir, stagePackage, ["HEAD", dir, "/app/packages/plugins/sdk"]);
     expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("link through cli/current");
+    expect(r.stderr).toContain("unexpected argument");
   });
 });

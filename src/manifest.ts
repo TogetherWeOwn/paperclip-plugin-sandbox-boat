@@ -2,7 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { BOAT_SIZES } from "./size-policy.js";
 
 export const PLUGIN_ID = "togetherweown.sandbox-boat";
-export const PLUGIN_VERSION = "0.2.5";
+export const PLUGIN_VERSION = "0.2.6";
 export const DRIVER_KEY = "boat";
 export const SWEEP_JOB_KEY = "boat-idle-sweep";
 
@@ -247,6 +247,24 @@ const manifest: PaperclipPluginManifestV1 = {
             description: "Offload pool: stop a VM this many seconds after its last command ends (default 15).",
             ...advanced("Offload pool"),
           },
+          syncOutMaxBytes: {
+            type: "number",
+            default: 8589934592,
+            description: "Host safety: refuse a guest sync-out archive whose files total more than this many bytes (default 8 GiB, at most 32 GiB). The partially received tree is removed.",
+            ...advanced("Budget guard"),
+          },
+          syncOutMaxFiles: {
+            type: "number",
+            default: 200000,
+            description: "Host safety: refuse a guest sync-out archive with more than this many entries (files, directories and symlinks; default 200000, at most 1000000).",
+            ...advanced("Budget guard"),
+          },
+          syncOutDiskReserveBytes: {
+            type: "number",
+            default: 10737418240,
+            description: "Host safety: refuse a guest sync-out member that would leave less than this many bytes free on the target filesystem (default 10 GiB; the receiver also always keeps 5% of the filesystem free).",
+            ...advanced("Budget guard"),
+          },
           maxActive: {
             type: "number",
             default: 2,
@@ -313,6 +331,19 @@ const manifest: PaperclipPluginManifestV1 = {
             default: 8317,
             description: "Port of the model proxy, as seen from the plugin worker.",
             ...advanced("Model proxy tunnel"),
+          },
+          modelProxyKeyFingerprint: {
+            type: "string",
+            description:
+              "SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. ANTHROPIC_AUTH_TOKEN reaches the VM only when it is that key and ANTHROPIC_BASE_URL is the tunnel address; any other value (for example a managed AI-connection pool credential) is dropped. Unset: an on-tunnel token is delivered unverified and validation warns; an off-tunnel token is dropped either way.",
+            ...advanced("Model proxy tunnel"),
+          },
+          managedGithub: {
+            type: "boolean",
+            default: false,
+            description:
+              "Deliver Paperclip's managed-GitHub capability and its git/gh launcher shells to the VM, so the agent can push. Off by default: any process in the VM can exchange the capability for a GitHub credential with the run's grants while the run is live. Leave off for public repos and PR branches.",
+            ...advanced("VM"),
           },
           envAllowlist: {
             type: "array",

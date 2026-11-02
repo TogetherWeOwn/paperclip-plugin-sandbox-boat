@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -42,7 +43,7 @@ function backend(source: string): { runtime: SshOffloadRuntime; boat: FakeBoat; 
     ssh: sshStub as never, accountId: "test-only",
     boat: () => boat as unknown as BoatApiLike,
     session: async () => ({} as never),
-    guestOptions: { stateRoot: workRoot },
+    guestOptions: { stateRoot: workRoot }, trackedFiles: listAllFilesAsTracked,
   });
   runtime.remember({
     driverKey: "boat", companyId, environmentId: "env",

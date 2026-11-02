@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.6
+
+### Fixed
+
+* The release tarball no longer ships an absolute `plugin-sdk` symlink. Until now `node_modules/@paperclipai/plugin-sdk` in the tarball pointed at `/app/packages/plugins/sdk` (the build host's Paperclip container path), so on any other host the worker died with `ERR_MODULE_NOT_FOUND` until someone re-pointed the link by hand; 0.2.4 and 0.2.5 both needed that manual relink on install. `@paperclipai/plugin-sdk` is now a pinned runtime `dependencies` entry, and the staged package carries real copies of it and the rest of the runtime set (`@boatdev/sdk`, `@paperclipai/shared`, `zod`) under `node_modules` — the shape a local-path install can load, since the Paperclip loader registers the path in place and installs nothing for it. **0.2.6 installs with `POST /api/plugins/install` (`isLocalPath: true`) and no manual step**: stage the tarball (or just extract it), install the directory, done. `stage-package.sh` refuses a package holding any symlink or whose `dist/index.js` does not import from the staged `node_modules` alone, and the release workflow fails if the built tarball contains a symlink or hardlink (`scripts/check-tarball-links.sh`).
+
+### Changed
+
+* `scripts/stage-package.sh` and `scripts/stage-release.sh` no longer take a host plugin-sdk path; there is no SDK link to aim at a host. `stage-release.sh` now only verifies the tarball (`.sha256`, one package directory of plain files and directories with the bundled SDK inside, name against `package.json` and `.source-commit`) and lands it read-only as shipped. It refuses pre-0.2.6 tarballs for their absolute SDK symlink; stage those with the `stage-release.sh` of their own tag. A Paperclip upgrade no longer changes the SDK a staged package loads: the worker keeps the pinned SDK it was built and host-contract-tested against, and moving the pin is a new plugin release.
+
 ## 0.2.5
 
 ### Added

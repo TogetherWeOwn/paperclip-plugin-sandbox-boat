@@ -14,6 +14,20 @@ import tarfile
 CHUNK = 16 * 1024
 MAX_METADATA = 256 * 1024
 MAX_DIRECTORIES = 100000
+MAX_DEPTH = 256
+# Confined (host) receiver budgets. The host may tighten or loosen them through
+# the mapping (maxBytes / maxFiles / diskReserveBytes, validated there); these
+# defaults apply when a mapping carries none, so an older host still bounds a
+# guest-produced archive. 8 GiB / 200k entries covers a large workspace sync
+# (build output included) while the statvfs reserve keeps the host filesystem
+# itself from ever being filled by one archive.
+DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_MAX_FILES = 200000
+DEFAULT_DISK_RESERVE = 10 * 1024 * 1024 * 1024
+MIN_FREE_INODES = 8192
+# After the tar end marker only record padding is legitimate (one 10 KiB
+# record from our sender); 1 MiB is generous headroom, not a data channel.
+MAX_TRAILING = 1024 * 1024
 mapping = json.loads(sys.argv[2])
 
 
@@ -148,9 +162,23 @@ class BoundedTarInfo(tarfile.TarInfo):
         if self.type in extensions:
             if self.size > MAX_METADATA:
                 raise ValueError('tar extension exceeds metadata limit')
-        elif not (self.isfile() or self.isdir() or self.issym()):
-            raise ValueError('unsupported tar member (including hardlinks)')
+        elif self.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE):
+            # An explicit allowlist, checked before super(): isfile() also
+            # accepts GNUTYPE_SPARSE ('S'), whose extended headers tarfile
+            # buffers without limit in _proc_sparse. Rejecting the type here
+            # stops sparse/PAX/hardlink/device/FIFO members before tarfile
+            # reads a single extension block.
+            raise ValueError('unsupported tar member')
         return super()._proc_member(archive)
+
+
+def receive_limit(name, default):
+    value = mapping.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError('invalid sync receive limit')
+    return value
 
 
 def receive(confine):
@@ -160,9 +188,53 @@ def receive(confine):
     scratch = None
     directories = []
     refused_links = set()
+    seen_directories = set()
     files = 0
+    entries = 0
     byte_count = 0
+    created = False
+    failed = False
     single = mapping['kind'] == 'file'
+    # Only the confined (host) receiver treats its peer as hostile; the guest
+    # receiver's archive comes from the host itself.
+    max_bytes = receive_limit('maxBytes', DEFAULT_MAX_BYTES) if confine else None
+    max_files = receive_limit('maxFiles', DEFAULT_MAX_FILES) if confine else None
+    disk_reserve = receive_limit('diskReserveBytes', DEFAULT_DISK_RESERVE) if confine else None
+
+    def count_entry():
+        nonlocal entries
+        entries += 1
+        if max_files is not None and entries > max_files:
+            raise ValueError('tar entry budget exceeded')
+
+    def count_directory(prefix):
+        if prefix not in seen_directories:
+            seen_directories.add(prefix)
+            if len(seen_directories) > MAX_DIRECTORIES:
+                raise ValueError('too many tar directories')
+
+    def check_member_bytes(size):
+        if max_bytes is None:
+            return
+        if byte_count + size > max_bytes:
+            raise ValueError('tar byte budget exceeded')
+        fs = os.statvfs(parent)
+        total = fs.f_blocks * fs.f_frsize
+        # Keep the configured reserve free, and never less than 5% of the
+        # filesystem: either floor alone stops one archive filling the disk.
+        reserve = max(total // 20, disk_reserve)
+        if fs.f_bavail * fs.f_frsize - size < reserve:
+            raise ValueError('tar disk reserve would be breached')
+        # Gate on f_files (whether the filesystem reports inodes at all),
+        # not on f_favail: an f_favail of 0 is the exhausted case, not
+        # "unreported".
+        if fs.f_files and fs.f_favail <= MIN_FREE_INODES:
+            raise ValueError('tar inode reserve would be breached')
+
+    def directory_mode(member):
+        mode = member.mode & 0o777
+        # A guest-chosen mode must never leave a tree the host cannot delete.
+        return mode | 0o700 if confine else mode
     try:
         if not single:
             try:
@@ -176,6 +248,7 @@ def receive(confine):
                     raise ValueError('safe directory replacement is unavailable')
                 shutil.rmtree(target[-1], dir_fd=parent)
             os.mkdir(target[-1], 0o700, dir_fd=parent)
+            created = True
             root = directory_fd([target[-1]], base=parent)
         with tarfile.open(fileobj=sys.stdin.buffer, mode='r|', tarinfo=BoundedTarInfo) as archive:
             for member in archive:
@@ -184,9 +257,12 @@ def receive(confine):
                 if member.sparse is not None:
                     raise ValueError('sparse tar entries are unsupported')
                 parts = member_parts(member.name)
+                if len(parts) > MAX_DEPTH:
+                    raise ValueError('tar member path exceeds depth limit')
                 if single:
                     if parts != ['payload'] or not member.isfile() or files:
                         raise ValueError('invalid single-file archive')
+                    check_member_bytes(member.size)
                     fd_parent = os.dup(parent)
                     scratch = '.paperclip-upload.' + secrets.token_hex(16)
                     name = scratch
@@ -194,8 +270,15 @@ def receive(confine):
                     if not parts:
                         if not member.isdir():
                             raise ValueError('invalid tar root')
-                        directories.append(([], member.mode & 0o777))
+                        directories.append(([], directory_mode(member)))
                         continue
+                    # Every member costs one entry, created or dropped, so the
+                    # archive itself cannot keep the receiver busy without
+                    # bound. Parent directories a member implies count against
+                    # the directory budget whether or not they were sent.
+                    count_entry()
+                    for depth in range(1, len(parts)):
+                        count_directory(tuple(parts[:depth]))
                     # The sender never emits an excluded path or anything below
                     # one; a hostile sender must not land them in the target.
                     if any(excluded('/'.join(parts[:depth])) for depth in range(1, len(parts) + 1)):
@@ -212,10 +295,16 @@ def receive(confine):
                             raise ValueError('too many refused tar symlinks')
                         refused_links.add(tuple(parts))
                         continue
+                    # Every created member - directory, symlink or file -
+                    # must leave the byte/disk/inode budget intact. Check
+                    # before opening the parent walk, so not even the
+                    # directories this member implies are created first.
+                    check_member_bytes(member.size if member.isfile() else 0)
                     fd_parent = directory_fd(parts[:-1], create=True, base=root)
                     name = parts[-1]
                 try:
                     if member.isdir():
+                        count_directory(tuple(parts))
                         try:
                             os.mkdir(name, 0o700, dir_fd=fd_parent)
                         except FileExistsError:
@@ -223,13 +312,16 @@ def receive(confine):
                             os.close(check)
                         if len(directories) >= MAX_DIRECTORIES:
                             raise ValueError('too many tar directories')
-                        directories.append((parts, member.mode & 0o777))
+                        directories.append((parts, directory_mode(member)))
                     elif member.issym():
                         # Preserve links, never opening one as a parent: every
                         # parent walk uses NOFOLLOW. A confined (host) receiver
                         # has already dropped links that leave the target.
                         os.symlink(member.linkname, name, dir_fd=fd_parent)
                     elif member.isfile():
+                        # Refuse before opening the file, so an over-budget
+                        # member writes nothing at all.
+                        check_member_bytes(member.size)
                         mode = mapping.get('mode')
                         if mode is None:
                             mode = member.mode & 0o777
@@ -265,8 +357,16 @@ def receive(confine):
         # tarfile stops at its end marker, before the transport necessarily
         # reaches EOF. Drain record padding before committing/closing stdin so
         # the sender's last bounded write cannot race a closed receiver pipe.
-        while sys.stdin.buffer.read(CHUNK):
-            pass
+        # Bound the drain: endless trailing bytes must fail the receive (and
+        # drop the tree), not hold the sync open until the outer timeout.
+        trailing = 0
+        while True:
+            chunk = sys.stdin.buffer.read(CHUNK)
+            if not chunk:
+                break
+            trailing += len(chunk)
+            if trailing > MAX_TRAILING:
+                raise ValueError('trailing data after tar end marker exceeds limit')
         if single:
             if files != 1:
                 raise ValueError('single-file archive is empty')
@@ -282,11 +382,39 @@ def receive(confine):
                 finally:
                     os.close(fd)
         print(json.dumps({'filesTransferred': files, 'bytesTransferred': byte_count}))
+    except BaseException:
+        failed = True
+        raise
     finally:
         if scratch is not None:
             try:
                 os.unlink(scratch, dir_fd=parent)
             except FileNotFoundError:
+                pass
+        if failed and created:
+            # A hostile or truncated archive must not leave a partial tree (or
+            # its bytes) behind. Directories are 0700 while receiving, but a
+            # failure during the final mode restore may have locked some:
+            # reopen them owner-rwx shallow-first so the removal can descend.
+            if root is not None:
+                try:
+                    os.fchmod(root, 0o700)
+                    for prefix in sorted(seen_directories, key=len):
+                        try:
+                            fd = directory_fd(list(prefix), base=root)
+                            try:
+                                os.fchmod(fd, 0o700)
+                            finally:
+                                os.close(fd)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                os.close(root)
+                root = None
+            try:
+                shutil.rmtree(target[-1], dir_fd=parent)
+            except OSError:
                 pass
         if root is not None:
             os.close(root)

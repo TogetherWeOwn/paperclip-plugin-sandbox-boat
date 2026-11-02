@@ -22,6 +22,8 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `tunnelRemotePort` | 8317 | |
 | `tunnelTargetHost` | `127.0.0.1` | **Inside the Paperclip container, set this to `cliproxy`**: the container's 127.0.0.1 is not the CLIProxy. |
 | `tunnelTargetPort` | 8317 | |
+| `modelProxyKeyFingerprint` | none | SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. `ANTHROPIC_AUTH_TOKEN` reaches the VM only when it is that key, spent through the tunnel; any other value (a managed AI-connection pool credential included) is dropped. Unset: an on-tunnel token is delivered unverified (validation warns), an off-tunnel one dropped either way. See [Run env allowlist](security.md#run-env-allowlist) rule 4. |
+| `managedGithub` | false | Deliver Paperclip's managed-GitHub capability and its `git`/`gh` launcher shells, so the agent can push. Off by default: any VM process can exchange the capability for a GitHub credential with the run's grants while the run is live. Leave off for public repos and PR branches. |
 | `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](security.md#run-env-allowlist). A list you set replaces the built-in one; an empty list (`[]`) sends nothing. |
 | `noEnv` | true | |
 | `monitoring` | true | Explicit opt-out: `false` for **new** VMs. Existing VMs keep their creation policy. Never changes an account-wide switch; see [monitoring privacy](security.md#monitoring-retention-and-privacy). |
@@ -30,6 +32,9 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `namePrefix` | `paperclip` | |
 | `costApiKey` | main key | An optional read-only key for usage reads. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
+| `syncOutMaxBytes` | 8589934592 (8 GiB) | Host safety: refuse a guest sync-out archive whose files total more than this. Hard bound 32 GiB. See [Sync-out receiver budgets](security.md#sync-out-receiver-budgets). |
+| `syncOutMaxFiles` | 200000 | Host safety: refuse a guest sync-out archive with more entries (files, directories, symlinks) than this. Hard bound 1000000. |
+| `syncOutDiskReserveBytes` | 10737418240 (10 GiB) | Host safety: refuse a sync-out member that would leave less than this free on the target filesystem (the receiver also always keeps 5% of the filesystem and 8192 inodes free). |
 | `maxOffloadVms` | 4 | Offload pool: at most this many shared VMs for heavy commands. Beyond it, commands queue. |
 | `offloadIdleStopSeconds` | 15 | Offload pool: stop a VM this many seconds after its last command ends. |
 | `allowPaidNamedSnapshots` | false | Allow template capture beyond boat's 10 free named snapshots ($1.70 a month each). |

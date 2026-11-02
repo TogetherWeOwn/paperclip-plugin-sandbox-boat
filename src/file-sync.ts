@@ -13,8 +13,22 @@ interface SyncContext {
   session: SshSession;
   timeoutMs: number;
   remoteRoot: string;
+  /** Budgets for the host (confined) receiver of guest-produced archives. */
+  syncOutLimits?: { maxBytes: number; maxFiles: number; diskReserveBytes: number };
   onDirectoryReplaced?: (targetPath: string) => Promise<void>;
 }
+
+// The host helper parses guest-produced bytes, so it runs isolated: -I ignores
+// PYTHON* env, drops cwd/script dir from sys.path and disables user site; the
+// fixed cwd and minimal env keep the worker's own environment (which may hold
+// secrets) out of it.
+const HOST_HELPER = {
+  cwd: "/",
+  env: {
+    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    LANG: process.env.LANG ?? "C.UTF-8",
+  },
+} as const;
 
 type Counts = { filesTransferred: number; bytesTransferred: number };
 
@@ -36,17 +50,21 @@ function check(result: SshExecutionResult): SshExecutionResult {
 async function transfer(context: SyncContext, direction: "in" | "out", file: PluginSyncFileMapping): Promise<Counts> {
   absolute(file.sourcePath);
   absolute(file.targetPath);
-  const mapping = JSON.stringify(file);
+  // Only a sync-out's host receiver is confined, so only its mapping carries
+  // the receive budgets; the guest sender ignores the extra fields.
+  const withLimits = direction === "out" && context.syncOutLimits ? { ...file, ...context.syncOutLimits } : file;
+  const mapping = JSON.stringify(withLimits);
   if (Buffer.byteLength(mapping) > 64 * 1024) throw new Error("Native sync mapping exceeds metadata limit.");
   const localAction = direction === "in" ? "send" : "receive";
   const remoteAction = direction === "in" ? "receive" : "send";
   const pipe = new PassThrough({ highWaterMark: 64 * 1024 });
   // The host-side receiver handles guest-produced archives: confine their links.
-  const local = runStreamProcess("python3", ["-c", FILE_SYNC_SCRIPT, localAction, mapping, ...(direction === "out" ? ["confined"] : [])], {
+  const local = runStreamProcess("python3", ["-I", "-c", FILE_SYNC_SCRIPT, localAction, mapping, ...(direction === "out" ? ["confined"] : [])], {
     timeoutMs: context.timeoutMs,
+    ...HOST_HELPER,
     ...(direction === "in" ? { stdout: pipe } : { stdin: pipe }),
   });
-  const command = buildRemoteCommand(`exec python3 -c ${shellQuote(FILE_SYNC_SCRIPT)} ${remoteAction} ${shellQuote(mapping)}`);
+  const command = buildRemoteCommand(`exec python3 -I -c ${shellQuote(FILE_SYNC_SCRIPT)} ${remoteAction} ${shellQuote(mapping)}`);
   const remote = context.ssh.runStream(context.session, command, {
     timeoutMs: context.timeoutMs,
     ...(direction === "in" ? { stdin: pipe } : { stdout: pipe }),
@@ -114,8 +132,8 @@ async function preflightInbound(operation: PluginSyncOperation, timeoutMs: numbe
         done();
       } catch (error) { done(error as Error); }
     } });
-    check(await runStreamProcess("python3", ["-c", FILE_SYNC_SCRIPT, "preflight", mapping], {
-      timeoutMs: Math.max(1, deadline - Date.now()), stdout: paths,
+    check(await runStreamProcess("python3", ["-I", "-c", FILE_SYNC_SCRIPT, "preflight", mapping], {
+      timeoutMs: Math.max(1, deadline - Date.now()), stdout: paths, ...HOST_HELPER,
     }));
     if (pending || decoder.end()) throw new Error("Native sync preflight returned an incomplete path.");
   }
@@ -136,7 +154,7 @@ async function postUpload(context: SyncContext, operation: PluginSyncOperation):
     // An explicit command timeout replaces the provider default; the default
     // is only the fallback for commands without their own (manifest timeoutMs).
     check(await context.ssh.runStream(context.session,
-      buildRemoteCommand(`${TAR_SKIP_RUNTIME_DIR}; exec python3 -c ${shellQuote(POST_UPLOAD_SCRIPT)} ${shellQuote(cwd)} ${shellQuote(control.command)}`),
+      buildRemoteCommand(`${TAR_SKIP_RUNTIME_DIR}; exec python3 -I -c ${shellQuote(POST_UPLOAD_SCRIPT)} ${shellQuote(cwd)} ${shellQuote(control.command)}`),
       { timeoutMs }));
   }
 }

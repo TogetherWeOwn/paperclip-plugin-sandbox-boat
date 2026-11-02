@@ -197,6 +197,7 @@ const plugin = definePlugin({
     if (normalizedConfig.costApiKey == null) delete normalizedConfig.costApiKey;
     // Unset means the built-in allowlist; keep it unset so it follows the plugin.
     if (normalizedConfig.envAllowlist == null) delete normalizedConfig.envAllowlist;
+    if (normalizedConfig.modelProxyKeyFingerprint == null) delete normalizedConfig.modelProxyKeyFingerprint;
     return { ok: true, warnings, normalizedConfig };
   },
 

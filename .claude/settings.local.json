@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/ubuntu/.paperclip/instances/default/projects/09c1f96b-6f60-497d-8d3c-423f8b2989b6/aecea187-f013-4df3-8ef0-1e8ef8813cf3/paperclip-plugin-sandbox-boat/scripts/paperclip-issue-update.sh:*)",
+      "Bash(/home/ubuntu/.paperclip/instances/default/projects/09c1f96b-6f60-497d-8d3c-423f8b2989b6/aecea187-f013-4df3-8ef0-1e8ef8813cf3/paperclip-plugin-sandbox-boat/scripts/paperclip:*)",
+      "Bash(curl:*)",
+      "Bash(env)",
+      "Bash(env:*)"
+    ],
+    "additionalDirectories": [
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/2f4f938d-364c-40d4-b23e-c22422415014",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/341b6adf-77b3-46fa-bb13-7953b036a6d0",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/7b8f576c-ebce-447f-a904-dda322df4220",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/97b5f86e-4d79-4180-bf2a-bf1ac91c53a7",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/ad0e6eaa-51a3-41dd-97d8-af46a84fc5e9",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/c2f34a6f-1e2c-47e9-a1f1-fba4fa90a488",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/d6752db1-135e-4292-bded-fb4a7eef92e7",
+      "/home/ubuntu/.paperclip/instances/default/companies/09c1f96b-6f60-497d-8d3c-423f8b2989b6/acp-engine/agents/dd6fbe61-688e-44dc-8214-9199ef4296ab",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/2f4f938d-364c-40d4-b23e-c22422415014",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/341b6adf-77b3-46fa-bb13-7953b036a6d0",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/7b8f576c-ebce-447f-a904-dda322df4220",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/97b5f86e-4d79-4180-bf2a-bf1ac91c53a7",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/ad0e6eaa-51a3-41dd-97d8-af46a84fc5e9",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/c2f34a6f-1e2c-47e9-a1f1-fba4fa90a488",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/d6752db1-135e-4292-bded-fb4a7eef92e7",
+      "/home/ubuntu/.paperclip/instances/default/workspaces/dd6fbe61-688e-44dc-8214-9199ef4296ab"
+    ],
+    "defaultMode": "default"
+  }
+}

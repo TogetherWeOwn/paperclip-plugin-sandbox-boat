@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { planDependencies } from "./offload/deps-install.js";
 import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
+import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { captureSnapshot, collectAndStage, planPush, SyncError, type SourceManifest } from "./offload-sync.js";
 import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
 import type { OffloadSync } from "./offload-journal.js";
@@ -20,6 +21,8 @@ export interface SshOffloadSyncDeps {
   workRoot?: string;
   /** Test seam for the rsync delta spawn. */
   spawn?: SpawnFn;
+  /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  trackedFiles?: TrackedFilesFn;
   /** Clock for upload and artifact retention. */
   now?: () => number;
 }
@@ -34,6 +37,13 @@ export class SshOffloadSync implements OffloadSync {
   private readonly mirrors = new Map<string, SourceManifest>();
   /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
   private readonly mirrorLocks = new Map<string, Promise<void>>();
+  /**
+   * Mirrors a failed push left unfenced: its guest receiver may still be
+   * writing (cleanup failed or was skipped over a dead transport). Keyed
+   * like `mirrors` (VM + mirror). An unfenced mirror is never reused: the
+   * next push re-kills receivers, wipes it, and fully resyncs first.
+   */
+  private readonly unfencedMirrors = new Set<string>();
   /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
   private readonly installed = new Map<string, Set<string>>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
@@ -63,7 +73,14 @@ export class SshOffloadSync implements OffloadSync {
     try {
       const frozen = path.join(scratch, "source");
       await mkdir(frozen, { mode: 0o700 });
-      const { manifest } = await captureSnapshot(source, frozen);
+      // Tracked files only, re-checked at push time (resolve() already gated
+      // admission): a source that stopped being a git work tree, or gained a
+      // secret-shaped tracked file, since admission never reaches the guest.
+      const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(source).catch(() => null);
+      if (!tracked || tracked.size === 0) {
+        throw new SyncError("SYNC_NOT_GIT_WORKTREE", `refusing to sync ${source}: not a git work tree with tracked files; the command stays local.`);
+      }
+      const { manifest } = await captureSnapshot(source, frozen, { onlyPaths: tracked, scanForSecrets: true });
       const guestDir = this.directory(command);
       const mirrorKey = this.mirrorKey(command);
       await this.withMirrorLock(mirrorKey, async () => {
@@ -92,7 +109,7 @@ export class SshOffloadSync implements OffloadSync {
   /** Plan against the stored manifest, verify the guest agrees, then push only the delta. */
   private async pushLocked(sandboxId: string, guestDir: string, key: string, manifest: SourceManifest, frozen: string): Promise<void> {
     const baseKey = `${sandboxId}:${key}`;
-    const stored = this.mirrors.get(baseKey) ?? null;
+    let stored = this.mirrors.get(baseKey) ?? null;
     const planned = manifest.files.map((file) => file.path);
     const openStore = async (session: SshSession): Promise<SshGuestStore> =>
       new SshGuestStore({ ssh: this.deps.ssh, session, spawn: this.deps.spawn });
@@ -125,10 +142,28 @@ export class SshOffloadSync implements OffloadSync {
       verification = await store.verifyMirror(guestDir, planned, expectedHashes);
     }
     // A wipe removes the marker with the rest of the mirror: treat it as gone.
-    const marker = verification.suspect === null ? verification.marker : null;
+    let marker = verification.suspect === null ? verification.marker : null;
+    if (this.unfencedMirrors.has(baseKey)) {
+      // Fence before any reuse: prove no receiver from the failed push can
+      // still write, then wipe — a marker alone proves neither. If the kill
+      // cannot prove that, this throws, nothing is written, and the mirror
+      // stays unfenced for the next attempt.
+      await store.killStalledReceivers(guestDir);
+      await store.wipeMirror(guestDir);
+      this.unfencedMirrors.delete(baseKey);
+      marker = null;
+      stored = null;
+    } else if (verification.suspect !== null) {
+      await store.wipeMirror(guestDir);
+    } else if (stored === null && marker !== null) {
+      // A marker without a stored manifest predates this worker (restart or
+      // upgrade): the mirror may hold files no current admission would send,
+      // and no delta base exists to prune them. Wipe before the full resync.
+      await store.wipeMirror(guestDir);
+      marker = null;
+    }
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
-    if (verification.suspect !== null) await store.wipeMirror(guestDir);
     // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
     // snapshot), removed checkout-local installs too; the install must run again.
     if (marker === null) this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
@@ -148,7 +183,16 @@ export class SshOffloadSync implements OffloadSync {
         verification.mismatched.includes(file.path) && !plannedPaths.has(file.path));
       toSend = [...toSend, ...resend];
     }
-    if (toSend.length > 0) await store.push(frozen, toSend, guestDir);
+    if (toSend.length > 0) {
+      try {
+        await store.push(frozen, toSend, guestDir);
+      } catch (error) {
+        if ((error as { receiverMayBeLive?: unknown } | null)?.receiverMayBeLive === true) {
+          this.unfencedMirrors.add(baseKey);
+        }
+        throw error;
+      }
+    }
     if (stale.length > 0) await store.pruneMirror(guestDir, stale);
     const fresh = hashManifest(manifest);
     if (marker?.manifestHash !== fresh || marker?.mirrorKey !== key) {
