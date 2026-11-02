@@ -12,7 +12,7 @@ import { AccountLedger } from "./account-ledger.js";
 import { describeBoatError } from "./errors.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
-import { OffloadPoolStore } from "./offload-pool.js";
+import { OffloadPoolStore, type PoolVm } from "./offload-pool.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
@@ -595,18 +595,26 @@ export class SshOffloadRuntime {
     return true;
   }
 
-  /** Provider client for an unloaded pool: a binding config first, else the
-   * caller's company client. Null when neither resolves, and the pool waits. */
+  /** Provider client for an unloaded pool: the sweep caller's company client
+   * first, else a cached binding in sorted (environment, run, workspace) order.
+   * Caller-first keeps multi-account selection deterministic across restarts:
+   * binding-map order follows hook timing, while the caller's client is
+   * keyed-first sorted. Null when neither resolves, and the pool waits. */
   private poolBoatFor(companyId: string, boatFor?: (companyId: string) => BoatApiLike | null): BoatApiLike | null {
-    for (const binding of this.bindings.values()) {
-      if (binding.companyId !== companyId) continue;
+    try {
+      const caller = boatFor?.(companyId);
+      if (caller) return caller;
+    } catch { /* fall through to bindings */ }
+    const bindings = [...this.bindings.values()].filter((binding) => binding.companyId === companyId)
+      .sort((a, b) => a.environmentId < b.environmentId ? -1 : a.environmentId > b.environmentId ? 1
+        : a.runId < b.runId ? -1 : a.runId > b.runId ? 1
+        : a.workspaceId < b.workspaceId ? -1 : a.workspaceId > b.workspaceId ? 1 : 0);
+    for (const binding of bindings) {
       try {
         return this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config), apiBase: binding.config.apiBase });
       } catch { /* no usable key on this binding; try the next */ }
     }
-    try {
-      return boatFor?.(companyId) ?? null;
-    } catch { return null; }
+    return null;
   }
 
   /**
@@ -634,6 +642,15 @@ export class SshOffloadRuntime {
       sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
     const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     const now = Date.now();
+    // Fields a concurrent claim changes; compared against a reload before
+    // saving so the sweep never overwrites a reservation made from a snapshot
+    // taken before this upkeep's fence existed.
+    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.stopDueAt]);
+    // Placeholders without a provider ID key on their durable reservation,
+    // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
+    const vmKey = (vm: PoolVm) => vm.sandboxId || vm.accountReservation?.id || "";
+    const original = new Map(pool.map((vm) => [vmKey(vm), fingerprint(vm)]));
+    const deletedIds = new Set<string>();
     let changed = false;
     for (const vm of [...pool]) {
       if (!vm.sandboxId) continue; // a lost create reply: no provider handle until a command resolves this pool
@@ -646,10 +663,15 @@ export class SshOffloadRuntime {
         else continue; // unreadable: leave it, retry next sweep
       }
       if (state === null) continue;
+      // The provider call awaited above lets a resolve interleave (one that
+      // loaded the pool before this upkeep's fence existed): re-read this VM
+      // and leave it alone when it changed under us, before any stop or save.
+      const live = (await poolStore.loadDoc().catch(() => null))?.vms.find((entry) => vmKey(entry) === vmKey(vm));
+      if (!live || fingerprint(live) !== original.get(vmKey(vm))) continue;
       if (["archived", "cancelled", "deleted"].includes(state)) {
         vm.stopObservedAt ??= now;
         await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id).catch(() => undefined);
-        if (state === "deleted") pool.splice(pool.indexOf(vm), 1);
+        if (state === "deleted") { pool.splice(pool.indexOf(vm), 1); deletedIds.add(vm.sandboxId); }
         else {
           vm.busy = false;
           vm.stopping = false;
@@ -677,7 +699,34 @@ export class SshOffloadRuntime {
       vm.stopping = true;
       changed = true;
     }
-    if (changed) await poolStore.save(doc.config, pool);
+    if (changed) {
+      // Re-read before saving: a resolve that loaded the pool before this
+      // upkeep's fence existed may have reserved a VM meanwhile. Keep the
+      // fresh copy of anything that changed under us (and never resurrect our
+      // own delete over a fresh claim); only our untouched VMs save back. A
+      // vanished or unreadable doc throws so the sweep reports unverified.
+      const fresh = await poolStore.loadDoc();
+      const twinById = new Map(fresh.vms.map((twin) => [vmKey(twin), twin]));
+      const merged: PoolVm[] = [];
+      const seen = new Set<string>();
+      for (const vm of pool) {
+        const id = vmKey(vm);
+        const twin = twinById.get(id);
+        if (!twin || fingerprint(twin) !== original.get(id)) {
+          if (twin) { merged.push(twin); seen.add(id); }
+          continue;
+        }
+        merged.push(vm);
+        seen.add(id);
+      }
+      for (const twin of fresh.vms) {
+        const id = vmKey(twin);
+        if (seen.has(id)) continue;
+        if (deletedIds.has(twin.sandboxId) && fingerprint(twin) === original.get(id)) continue;
+        merged.push(twin);
+      }
+      await poolStore.save(fresh.config, merged);
+    }
     await ledger.reconcile(boat, undefined, false, false, poolId).catch(() => undefined);
   }
 
@@ -705,10 +754,20 @@ export class SshOffloadRuntime {
         // resolve this poolId. Without a client the pool waits, still covered
         // by retention below.
         if (unloadedBoat) {
+          // Fence resolutions before upkeep starts and hold the fence through
+          // provider calls and the save: resolve waits on retiredSweeps, so a
+          // command cannot claim a VM from a stale snapshot mid-upkeep while
+          // the sweep stops it, and the save cannot overwrite its reservation.
+          let releaseFence: () => void = () => undefined;
+          const fence = new Promise<void>((resolveFence) => { releaseFence = resolveFence; });
+          this.retiredSweeps.set(poolId, fence);
           try {
             await this.sweepUnloadedPool(companyId, poolId, entry.seenAt, unloadedBoat);
           } catch {
             failed = true;
+          } finally {
+            releaseFence();
+            this.retiredSweeps.delete(poolId);
           }
         }
         const task = this.collectRetiredPool(companyId, poolId, entry.seenAt);

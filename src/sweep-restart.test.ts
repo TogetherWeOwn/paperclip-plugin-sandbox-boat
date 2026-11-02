@@ -143,6 +143,81 @@ describe("sweep after a worker restart", () => {
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" })).toEqual(seeded);
   });
 
+  it("does not forget another account's records after a restart with a different host key", async () => {
+    const inlineKey = "boat_inline_key_other_account_not_real";
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({
+      companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey: inlineKey }, runId: "run-inline",
+      issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+    });
+    const sandboxId = lease.providerLeaseId!;
+    await untilSweepDescriptor();
+    // Drain the post-acquire background sweep while the VM still exists: it
+    // holds the live inline-key config and must see its own listing, so the
+    // forget below is decided only by the restarted worker without that key.
+    await currentManager().sweepInFlight()?.catch(() => undefined);
+    // The host key now belongs to a different account than the inline key, and
+    // the host-account listing does not contain this VM.
+    process.env.BOAT_API_KEY = "boat_host_key_different_account_not_real";
+    fake.boxes.delete(sandboxId);
+
+    await restart();
+    clock += 60_000;
+    const report = await currentManager().sweep("schedule", { force: true });
+    // The environment stays absent until a hook re-caches it: nothing forgotten.
+    expect(JSON.stringify(report.forgotten ?? [])).not.toContain(sandboxId);
+    const doc = await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" }) as {
+      vms?: Record<string, { sandboxId?: string; status?: string }>;
+    } | null;
+    expect(Object.values(doc?.vms ?? {}).some(
+      (record) => record.sandboxId === sandboxId && record.status !== "deleted")).toBe(true);
+  });
+
+  it("an unloaded-pool sweep leaves a reservation made mid-sweep alone", async () => {
+    const poolId = "pool-restart-race";
+    const box = fake.addSandbox({ id: "bx_poolrace000001", state: "ready" });
+    const accountId = "account-restart";
+    const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+    await store.save(
+      { maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+      [{ sandboxId: box.id, busy: false, stopped: false, stopping: false, quarantined: false,
+        lastActiveAt: clock - 60_000, generation: 1, idleHandle: null,
+        stopDueAt: clock - 1_000, stopRequestedAt: null, stopAttempts: 0, identity: null }],
+    );
+    await harness.ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-race", seenAt: clock - 60_000 } },
+    );
+    // A command resolves the pool after the sweep's snapshot: the first
+    // provider call persists a busy reservation, which the sweep must leave
+    // alone (no stop, no overwrite of the reservation).
+    const realGet = fake.get.bind(fake);
+    let injected = false;
+    fake.get = async (args: { sandboxId: string }) => {
+      if (!injected) {
+        injected = true;
+        const doc = await store.loadDoc();
+        const vm = doc.vms.find((entry) => entry.sandboxId === box.id)!;
+        vm.busy = true;
+        vm.generation += 1;
+        vm.stopDueAt = null;
+        await store.save(doc.config, doc.vms);
+      }
+      return realGet(args);
+    };
+    try {
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId });
+      await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+      await runtime.shutdown();
+    } finally {
+      fake.get = realGet;
+    }
+    expect((await store.load()).find((vm) => vm.sandboxId === box.id))
+      .toMatchObject({ busy: true, stopping: false });
+    expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).not.toContain(box.id);
+  });
+
   it("leaves name-matching VMs alone when the VM document is unreadable", async () => {
     await acquire();
     // Roll back to a document this version cannot read; the sweep must report

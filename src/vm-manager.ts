@@ -39,7 +39,7 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import type { AccountReservation } from "./account-ledger.js";
-import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
+import { DEFAULT_API_BASE, PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
@@ -753,8 +753,11 @@ export class BoatVmManager {
    * and persist its non-secret fields alongside it. After a worker restart the
    * in-memory map is empty, so the sweep rehydrates these descriptors
    * (ensureSweepConfigs) instead of reporting no_config_seen. Secrets are
-   * never persisted: a rehydrated entry authenticates through the host key,
-   * and an environment with an inline key needs a hook to re-cache it.
+   * never persisted: a rehydrated entry authenticates through the host key.
+   * An environment with an inline key is only rehydrated when the host key
+   * belongs to the same account (matching account digest); otherwise it stays
+   * absent until a hook re-caches it, so the sweep can never forget another
+   * account's live VMs from a host-account listing.
    */
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
     this.configs.set(environmentId, { companyId, environmentId, config, seenAt: this.now() });
@@ -768,9 +771,18 @@ export class BoatVmManager {
 
   private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
     const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
-    const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields };
-    const encoded = JSON.stringify(descriptor);
+    // Dedupe on the persisted content, not the write time: seenAt changes on
+    // every hook, so including it would defeat the cache with a write per call.
+    const encoded = JSON.stringify([companyId, publicFields]);
     if (this.persistedSweeps.get(environmentId) === encoded) return;
+    // A non-secret same-account marker: the ops listing runs under the inline
+    // key's account, so rehydration through the host key is only safe when the
+    // host key resolves to that same account. A digest, never the key itself.
+    const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
+      hadInlineKey: config.apiKey != null,
+      accountDigest: config.apiKey != null
+        ? createHash("sha256").update(`${config.apiBase}\u0000${config.apiKey}`).digest("hex")
+        : null };
     await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
     await this.store.rememberCompany(companyId);
     this.persistedSweeps.set(environmentId, encoded);
@@ -779,6 +791,9 @@ export class BoatVmManager {
   /**
    * Rehydrate persisted sweep descriptors into the in-memory map after a
    * restart. Live (keyed) entries always win; rehydrated ones carry no key.
+   * Descriptors from an inline-key environment are skipped unless the host key
+   * digests to the same account: rehydrating them under a different account's
+   * key would list the wrong account and forget their live records.
    */
   private async ensureSweepConfigs(scope: string | null): Promise<void> {
     const companies = new Set<string>();
@@ -796,6 +811,9 @@ export class BoatVmManager {
       }
       for (const [environmentId, descriptor] of Object.entries(saved)) {
         if (this.configs.has(environmentId)) continue;
+        // Legacy descriptors predate the marker: rehydrate as before; the next
+        // hook rewrites them with the marker.
+        if (descriptor.hadInlineKey === true && !this.sameAccountAsHost(descriptor)) continue;
         try {
           const config = parseDriverConfig({ ...descriptor.config, apiKey: null, costApiKey: null });
           this.configs.set(environmentId, { companyId, environmentId, config, seenAt: descriptor.seenAt });
@@ -804,6 +822,19 @@ export class BoatVmManager {
         }
       }
     }
+  }
+
+  /** True when the current host key digests to the descriptor's account. */
+  private sameAccountAsHost(descriptor: SweepDescriptor): boolean {
+    if (typeof descriptor.accountDigest !== "string" || !descriptor.accountDigest) return false;
+    const rawBase = (descriptor.config as Record<string, unknown>).apiBase;
+    const apiBase = typeof rawBase === "string" && rawBase ? rawBase : DEFAULT_API_BASE;
+    // Host keys are only sent to the default API; a foreign base with an
+    // inline key can never rehydrate until a hook re-caches it.
+    if (apiBase !== DEFAULT_API_BASE) return false;
+    const hostKey = process.env.BOAT_API_KEY?.trim() ?? "";
+    if (!hostKey) return false;
+    return createHash("sha256").update(`${apiBase}\u0000${hostKey}`).digest("hex") === descriptor.accountDigest;
   }
 
   /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */

@@ -263,6 +263,22 @@ export class OffloadJournal {
    * the result without re-holding and retention stays neutral (unknown is
    * never tombstoned). Returns the settled count.
    */
+  /** True when a non-terminal record bound to this sandbox still awaits its
+   * receipt (crash-pending unknown included; settled unknown excluded).
+   * Read-only: quarantine reconciliation asks this before rejoining a
+   * clean-observed VM, so an unverified disk never rejoins on a live receipt. */
+  async hasUnsettled(sandboxId: string): Promise<boolean> {
+    return this.serialize(async () => {
+      for (const key of await this.deps.journalStore.list("command/")) {
+        const record = parseRecord(await this.deps.journalStore.get(key), key);
+        if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state)) continue;
+        if (record.state === "unknown" && record.resultAt !== null) continue; // already settled
+        return true;
+      }
+      return false;
+    });
+  }
+
   async settleSandboxUnknown(sandboxId: string): Promise<number> {
     return this.serialize(async () => {
       let settled = 0;

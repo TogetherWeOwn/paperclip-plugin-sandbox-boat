@@ -123,9 +123,11 @@ function docVersion(value: unknown): string {
  * What the sweep needs after a worker restart, without the secrets: the
  * non-secret driver fields per environment. The apiKey/costApiKey are never
  * persisted; a rehydrated descriptor authenticates through the host key
- * (BOAT_API_KEY/BOAT_READONLY_KEY) when the environment left them unset, and
- * any environment with an inline key needs a hook to re-cache its config
- * before its VMs are stopped again.
+ * (BOAT_API_KEY/BOAT_READONLY_KEY) when the environment left them unset. An
+ * environment with an inline key carries a non-secret same-account marker
+ * (hadInlineKey + a digest of apiBase and key, never the key): the sweep only
+ * rehydrates it when the host key digests to the same account, and otherwise
+ * leaves it absent until a hook re-caches its config.
  */
 export interface SweepDescriptor {
   version: 1;
@@ -134,6 +136,10 @@ export interface SweepDescriptor {
   seenAt: number;
   /** Parsed driver config minus apiKey/costApiKey. */
   config: Record<string, unknown>;
+  /** True when the cached config carried its own apiKey. Absent on legacy descriptors. */
+  hadInlineKey?: boolean;
+  /** Opaque same-account digest (sha256 of apiBase + key), or null. Absent on legacy descriptors. */
+  accountDigest?: string | null;
 }
 
 export class VmStateStore {
@@ -214,7 +220,11 @@ export class VmStateStore {
         || descriptor.companyId !== companyId || descriptor.environmentId !== environmentId
         || typeof descriptor.seenAt !== "number" || !descriptor.config || typeof descriptor.config !== "object"
         || Array.isArray(descriptor.config)) continue;
-      envs[environmentId] = { version: 1, companyId, environmentId, seenAt: descriptor.seenAt, config: { ...(descriptor.config as Record<string, unknown>) } };
+      envs[environmentId] = { version: 1, companyId, environmentId, seenAt: descriptor.seenAt, config: { ...(descriptor.config as Record<string, unknown>) },
+        // Legacy descriptors predate the same-account marker: absent reads as
+        // keyless, and the sweep treats them as before until a hook rewrites them.
+        ...(descriptor.hadInlineKey === true ? { hadInlineKey: true as const } : {}),
+        ...(typeof descriptor.accountDigest === "string" ? { accountDigest: descriptor.accountDigest } : {}) };
     }
     return envs;
   }

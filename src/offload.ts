@@ -278,11 +278,13 @@ export class OffloadExecutor {
   /**
    * Provider-state reconciliation for a quarantined pool VM, provider first,
    * before any SSH observe. A gone guest (archived/cancelled/deleted) holds
-   * no command processes, so the slot is released (stop stamped, journal
-   * settled to terminal-read unknown, never replayed). A running VM stays
-   * fenced unless observe verifies it clean with known workspace ownership;
-   * a past-due running VM with no verifiable identity is still stopped, and
-   * the terminal observation releases it once Boat archives it.
+   * no command processes, so the slot is released once its journal receipt
+   * settles (stop stamped, settled to terminal-read unknown, never replayed);
+   * a failed settlement keeps the slot fenced for retry. A running VM stays
+   * fenced unless observe verifies it clean with known workspace ownership
+   * and no unresolved command receipt for its sandbox; a past-due running VM
+   * with no verifiable identity is still stopped (retrying while stopping),
+   * and the terminal observation releases it once Boat archives it.
    */
   private async reconcileQuarantined(vm: PoolVm): Promise<void> {
     if (!vm.sandboxId || vm.deletePending) return;
@@ -298,6 +300,15 @@ export class OffloadExecutor {
       await this.persistStopTelemetry(vm).catch(() => {
         this.logger.error("boat offload terminal receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
       });
+      // The slot stays fenced until the journal receipt settles: a transient
+      // journal failure must not free capacity that restart recovery re-holds
+      // and re-fences, and a freed slot must never outlive its unsettled bill.
+      if (this.durable && !await this.durable.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
+        vm.quarantined = true;
+        this.logger.error("boat offload terminal settlement failed; slot stays fenced for retry", { sandboxId: vm.sandboxId });
+        await this.persistPool().catch(() => undefined);
+        return;
+      }
       if (state === "deleted") {
         this.retireVm(vm);
       } else {
@@ -306,7 +317,6 @@ export class OffloadExecutor {
         vm.quarantined = false;
         vm.workspaceKey = null;
       }
-      if (this.durable) await this.durable.settleSandboxUnknown(vm.sandboxId).catch(() => undefined);
       await this.persistPool().catch(() => undefined);
       return;
     }
@@ -317,14 +327,24 @@ export class OffloadExecutor {
         // clean: reuse must not mix workspaces it cannot tell apart. Once
         // Boat archives the VM the terminal branch above still frees its slot.
         if (!(await this.lifecycle.observe(vm.identity)).populated && vm.workspaceKey !== undefined) {
+          // An unresolved command receipt keeps the VM fenced even when the
+          // guest looks clean: the disk is unverified, and the pending receipt
+          // is what restart recovery re-holds to re-fence it. Only a terminal
+          // provider observation (branch above) settles it, never a rejoin.
+          if (this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) return;
           vm.quarantined = false;
           await this.persistPool().catch(() => undefined);
         }
       } catch { /* observe failed: stay fenced */ }
       return;
     }
-    if (!vm.identity && vm.stopDueAt !== null && this.now() >= vm.stopDueAt && !vm.stopped && !vm.stopping) {
-      await this.stopVm(vm, false, true).catch(() => undefined);
+    if (!vm.identity && !vm.stopped && (vm.stopping
+      || (vm.stopDueAt !== null && this.now() >= vm.stopDueAt))) {
+      // A stop accepted without a terminal state leaves stopping=true while
+      // the VM still bills (provider still ready here): retry the stop until a
+      // terminal observation above releases the slot. Without the stopping
+      // retry the VM would bill until provider auto-stop.
+      await this.stopVm(vm, true, true).catch(() => undefined);
     }
   }
 
@@ -333,7 +353,11 @@ export class OffloadExecutor {
     if (!this.poolStartup) {
       const task = this.withAdmission(async () => {
         const loaded = await this.poolStore!.load();
-        for (const vm of loaded) {
+        // Install before any reconciliation that persists: persistPool writes
+        // this.pool, so reconciling first would save an empty pool and a crash
+        // before the next save would lose every recovered VM and its stop duty.
+        this.pool.splice(0, this.pool.length, ...loaded);
+        for (const vm of [...this.pool]) {
           // An in-flight allocation (including an unknown create ID) or guest
           // reservation cannot become idle just because its worker disappeared.
           if (vm.busy || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
@@ -347,7 +371,6 @@ export class OffloadExecutor {
           }
         }
         await this.ledger.load();
-        this.pool.splice(0, this.pool.length, ...loaded);
       });
       this.poolStartup = task;
       void task.catch(() => { if (this.poolStartup === task) this.poolStartup = null; });
