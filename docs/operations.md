@@ -266,7 +266,15 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 
 `offloadMonthlyVmHourCap` (default 0, disabled) caps the month's tracked
 offload VM-hours per company against the existing account-ledger usage rows;
-once reached, new commands run local until next month.
+once reached, new commands run local until next month. The check is strict:
+admission counts settled usage plus pending envelopes plus the new request's
+own command-plus-tail envelope, so a request that would cross the cap is
+refused instead of admitting one extra envelope past it. Stop lag does not
+inflate the month: a tail closed on late terminal evidence ends at the stop
+deadline plus a 5-minute grace (or the funded tail plus a 5-minute grace), and a still-open tail
+counts at most its funded tail plus grace. Ambiguous or never-reported starts
+hold capacity only until their provider TTL plus 10 minutes, then retire as
+`aborted_start` instead of locking the account forever.
 
 ### Usage accounting
 
