@@ -426,6 +426,16 @@ export class OffloadJournal {
       if (PRE_START.has(record.state) && result.status === "unknown") {
         result = this.unavailable(command, "command failed before durable starting intent");
       }
+      // Guest-controlled facts never commit unvalidated: exitCode and seconds
+      // must be a safe shape before they reach durable state (the same check
+      // matchingReceipt applies to guest receipts).
+      if (result.status !== "unavailable") {
+        const exit = (result as { exitCode?: unknown }).exitCode;
+        const secs = (result as { seconds?: unknown }).seconds;
+        if (!Number.isInteger(exit) || !Number.isFinite(secs) || (secs as number) < 0) {
+          throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+        }
+      }
       if (result.status === "unavailable") {
         if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });

@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   DURATION_HISTORY_LIMIT,
   DURATION_HISTORY_TTL_MS,
+  DURATION_INDEX_KEY,
+  DURATION_INDEX_LIMIT,
   durationKey,
   isLongEnough,
+  MAX_DURATION_SECONDS,
   medianSeconds,
   normalizeSignature,
+  pruneDurations,
   readHistory,
   recordDuration,
   type DurationSample,
@@ -21,6 +25,9 @@ class MapStore implements DurationStore {
   }
   async set(key: string, value: unknown): Promise<void> {
     this.data.set(key, structuredClone(value));
+  }
+  async delete(key: string): Promise<void> {
+    this.data.delete(key);
   }
 }
 
@@ -82,5 +89,58 @@ describe("recordDuration", () => {
   it("scopes keys per repo and profile", () => {
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:b", "node-public-1", "s"));
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:a", "python-public-1", "s"));
+  });
+
+  it("caps stored keys when a thousand unique signatures report", async () => {
+    const store = new MapStore();
+    for (let i = 0; i < 1000; i += 1) {
+      await recordDuration(store,
+        durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", `suite/${i}`])),
+        sample(120 + (i % 10), NOW + i));
+    }
+    const keys = [...store.data.keys()].filter((key) => key !== DURATION_INDEX_KEY);
+    expect(keys.length).toBeLessThanOrEqual(DURATION_INDEX_LIMIT);
+    expect(keys.length).toBeGreaterThan(0);
+    // Evicted keys are deleted, not just unindexed.
+    for (const key of keys) expect(await store.get(key)).not.toBe(null);
+    expect(store.data.size).toBe(keys.length + 1);
+  });
+
+  it("keeps all five samples under five concurrent writes to one key", async () => {
+    // A store that resolves reads after a tick: without a per-key mutex the
+    // five read-modify-write cycles interleave and samples are lost.
+    class RacyStore extends MapStore {
+      override async get(key: string): Promise<unknown> {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        return super.get(key);
+      }
+    }
+    const store = new RacyStore();
+    const key = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["test"]));
+    await Promise.all([0, 1, 2, 3, 4].map((i) => recordDuration(store, key, sample(100 + i, NOW + i))));
+    expect(await readHistory(store, key)).toHaveLength(5);
+  });
+
+  it("clamps untrusted durations to the one-day bound", async () => {
+    const store = new MapStore();
+    const key = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["test"]));
+    await recordDuration(store, key, sample(1e300, NOW));
+    await recordDuration(store, key, { seconds: Number.NaN, at: NOW } as DurationSample);
+    await recordDuration(store, key, { seconds: -5, at: NOW } as DurationSample);
+    const history = await readHistory(store, key);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.seconds).toBe(MAX_DURATION_SECONDS);
+  });
+
+  it("prunes expired keys in the sweep and repairs over-cap indexes", async () => {
+    const store = new MapStore();
+    const fresh = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["test"]));
+    const stale = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", "old"]));
+    await recordDuration(store, fresh, sample(10, NOW));
+    await recordDuration(store, stale, sample(10, NOW - DURATION_HISTORY_TTL_MS - 1));
+    expect(await store.get(stale)).not.toBe(null);
+    await pruneDurations(store, NOW);
+    expect(await store.get(stale)).toBe(null);
+    expect(await readHistory(store, fresh)).toHaveLength(1);
   });
 });

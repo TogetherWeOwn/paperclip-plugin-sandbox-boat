@@ -74,6 +74,26 @@ describe("guest lifecycle boundary regressions", () => {
     expect(s.starts.map((v) => v.commandId)).toEqual(["first"]);
   });
 
+  it("a guest-fabricated exit fact ends unknown without touching the ledger or cancel state", async () => {
+    // A compromised guest answers with a megabyte exitCode, an infinite
+    // duration and a cancel nobody requested. None of it may reach durable
+    // state: the command ends unknown, the shared account document stays
+    // small, and no cancelled state is recorded without a host cancel.
+    const fabricated = { exitCode: "x".repeat(100_000), seconds: 1e300, cancelled: true, timedOut: true };
+    const hostile = s.make({}, s.state, (async () => fabricated) as never);
+    const result = await hostile.execute(command("fabricated"));
+    expect(result).toMatchObject({ status: "unknown", fallbackSafe: false, exitCode: 75 });
+    expect("cancelled" in result).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("xxxx");
+    const receipt = await hostile.readCommand("company-a", "run-a", "fabricated");
+    expect(JSON.stringify(receipt)).not.toContain("xxxx");
+    expect(JSON.stringify(receipt)).not.toContain("cancelled");
+    const doc = await s.state.all();
+    const account = Object.entries(doc).find(([key]) => key.includes("boat-account"));
+    expect(account).toBeDefined();
+    expect(JSON.stringify(account![1]).length).toBeLessThan(8_192);
+  });
+
   it("matches guest receipts across renewed interest but not changed subtree ownership", async () => {
     await s.execute(command("receipt"));
     const identity = s.starts[0]!.context!.identity;

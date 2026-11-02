@@ -10,6 +10,13 @@ export interface GuestIdentity {
   journalGeneration: number;
   heartbeatDeadline: number;
   guestDeadline: number;
+  /**
+   * Guest clock (epoch ms) when the prepare response was produced. The host
+   * maps guest-clock absolutes onto its own clock with this offset and never
+   * compares the two clocks' absolutes directly. Absent (older fixtures):
+   * the clocks are assumed aligned.
+   */
+  guestNow?: number;
 }
 export type ExecutionIdentity = OffloadIdentity & GuestIdentity;
 export interface OffloadRunContext {
@@ -63,10 +70,18 @@ export class OffloadLifecycle {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
     }
     const identity = await this.guest.prepare(sandboxId, command);
+    // The guest reports absolutes on its own clock. Map them onto the host
+    // clock with the reported guest-now before any comparison: a guest clock
+    // seconds behind or ahead must neither fail heartbeats nor refuse
+    // prepare. The stored identity below is host-clock throughout.
+    const guestNow = Number.isSafeInteger(identity.guestNow) ? (identity.guestNow as number) : this.now();
+    const skew = guestNow - this.now();
+    const heartbeatDeadline = identity.heartbeatDeadline - skew;
+    const guestDeadline = identity.guestDeadline - skew;
     if (!validGuestIdentity(identity) || identity.guestBootId.startsWith("unverified:")
       || identity.guestBootId !== base.guestBootId || identity.journalGeneration !== base.journalGeneration
-      || identity.heartbeatDeadline <= this.now() || identity.heartbeatDeadline > this.now() + 30_000
-      || identity.guestDeadline <= this.now() || identity.guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
+      || !(heartbeatDeadline > this.now()) || heartbeatDeadline > this.now() + 30_000
+      || !(guestDeadline > this.now()) || guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
       throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
     }
     const path = JSON.stringify([sandboxId, identity.guestBootId, identity.cgroupPath]);
@@ -76,8 +91,7 @@ export class OffloadLifecycle {
     // fields can cross this boundary; host command and VM bindings cannot.
     const full: ExecutionIdentity = { ...base, guestBootId: identity.guestBootId,
       processGroupId: identity.processGroupId, cgroupPath: identity.cgroupPath,
-      journalGeneration: identity.journalGeneration, heartbeatDeadline: identity.heartbeatDeadline,
-      guestDeadline: identity.guestDeadline };
+      journalGeneration: identity.journalGeneration, heartbeatDeadline, guestDeadline };
     // Register before the journal awaits its starting commit, so a cancellation
     // winning that commit/run gap cannot disappear before run() registers it.
     this.active.set(commandKey(full), { identity: structuredClone(full), interestTimer: null,
@@ -145,8 +159,18 @@ export class OffloadLifecycle {
       } else {
         await this.clean(entry);
       }
+      // The transport result is guest-controlled bytes: validate before use,
+      // and take cancelled/timedOut only from host state, never from the
+      // guest. A defensive return from named fields (no ...raw spread) keeps
+      // even a compromised transport out of the journal and ledger.
+      const guestExit = (raw as { exitCode?: unknown } | null)?.exitCode;
+      const guestSeconds = (raw as { seconds?: unknown } | null)?.seconds;
+      if (!Number.isInteger(guestExit) || (guestExit as number) < 0 || (guestExit as number) > 255
+        || typeof guestSeconds !== "number" || !Number.isFinite(guestSeconds) || guestSeconds < 0) {
+        throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      }
       const timedOut = entry.reason === "execution_timeout" || this.now() >= identity.guestDeadline;
-      return { ...raw, exitCode: timedOut ? 124 : entry.reason !== null ? 130 : raw.exitCode,
+      return { exitCode: timedOut ? 124 : entry.reason !== null ? 130 : (guestExit as number), seconds: guestSeconds,
         ...(entry.reason !== null ? { cancelled: !timedOut } : {}), ...(timedOut ? { timedOut: true } : {}) };
     } finally {
       this.discard(identity);
@@ -157,10 +181,13 @@ export class OffloadLifecycle {
     const entry = this.active.get(commandKey(identity));
     if (!entry || entry.reason || entry.cleanup || this.now() >= entry.identity.heartbeatDeadline
       || !this.matches(entry, identity as GuestIdentity)) return;
+    // Host-side deadline from the host clock taken just before the send; the
+    // guest renews its own clock-side deadline from the renewMs duration.
+    const sentAt = this.now();
     if (this.guest.heartbeat) await this.guest.heartbeat(identity.sandboxId, identity as GuestIdentity);
     // A cancellation/timeout can win while the renewal crosses SSH.
     if (entry.reason || entry.cleanup || this.now() >= entry.identity.heartbeatDeadline) return;
-    entry.identity.heartbeatDeadline = (identity as GuestIdentity).heartbeatDeadline;
+    entry.identity.heartbeatDeadline = sentAt + 30_000;
     this.scheduleInterest(entry);
   }
 

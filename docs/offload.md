@@ -62,10 +62,26 @@ profile + normalized-command-signature duration history (last 20 runs,
 30-day TTL) in its existing company-scoped state. A Node/Python command is a
 remote candidate only when its recorded median meets
 `offloadMinExpectedSeconds` (default 120); unknown signatures run local first
-and record, so the second identical long run can go remote. Recordings come
-from completed remote runs (server-side) and from shim-reported local runs
-(`POST /offload/report`, agent-authed, bounded samples). Rust keeps its
-existing behaviour and is never gated by this setting.
+and record, so the second identical long run can go remote. The gate learns
+host-measured wall time only: a completed remote run records the host-side
+elapsed interval (the guest-reported value can only shorten it, never
+lengthen it), and every sample is clamped to one day. Recordings come from
+completed remote runs (server-side) and from shim-reported local runs
+(`POST /offload/report`, agent-authed, bounded samples). Reports for
+local-mode signatures (watch mode, single-file filters, inline code,
+unrecognized scripts) are refused before any state write, and each run is
+rate-limited (a short burst, then one report per second, 200 per run); excess
+samples are dropped. History keeps the last 20 runs per signature with a
+30-day TTL, and at most 500 signature keys per company+repo scope: evicted
+and expired keys are deleted during the pool sweep, so unique-argv report
+loops cannot grow plugin state without bound. Guest-reported exit facts are
+untrusted input: only an integer exit code 0..255 with finite non-negative
+seconds is accepted, `cancelled`/`timedOut` come from host state only, and
+anything else ends the command `unknown` instead of entering the journal or
+the account ledger. Heartbeats renew interest with a duration, never an
+absolute timestamp, so a skewed guest clock can neither fail renewals nor
+refuse prepare. Rust keeps its existing behaviour and is never gated by this
+setting.
 
 Short commands must stay local: sync plus VM overhead (~30 s) makes anything
 shorter slower remotely. Watch modes, single-file filters, lint/typecheck/

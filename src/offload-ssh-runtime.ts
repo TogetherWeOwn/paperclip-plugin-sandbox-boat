@@ -11,7 +11,7 @@ import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./confi
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
 import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
-import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
+import { durationKey, normalizeSignature, pruneDurations, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
 import { cargoToolchain, classifyNode, classifyPython, isCargoOffline } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
@@ -508,7 +508,8 @@ export class SshOffloadRuntime {
         const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
-            set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value) }, key, { seconds, at: Date.now() });
+            set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value),
+            delete: (id) => this.deps.state.delete({ ...scope, stateKey: id }) }, key, { seconds, at: Date.now() });
         } catch {
           // Telemetry only; the command already completed.
         }
@@ -600,6 +601,18 @@ export class SshOffloadRuntime {
       await sync.collectGarbage();
     }));
     const companies = new Set([...companyIds, ...[...this.pools.values()].map((pool) => pool.companyId)]);
+    // Duration-learning hygiene rides the same sweep: drop expired signature
+    // keys and repair over-cap indexes. Telemetry-only; a failing prune must
+    // not fail pool retention.
+    for (const companyId of companies) {
+      const scope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "" };
+      const durations = {
+        get: (key: string) => this.deps.state.get({ ...scope, stateKey: key }),
+        set: (key: string, value: unknown) => this.deps.state.set({ ...scope, stateKey: key }, value),
+        delete: (key: string) => this.deps.state.delete({ ...scope, stateKey: key }),
+      };
+      await pruneDurations(durations, Date.now()).catch(() => undefined);
+    }
     let failed = false;
     const retired = await Promise.allSettled([...companies].map((companyId) => this.updateRegistry(companyId, async (registry) => {
       // (Re-)register loaded pools first: this retries a lost write from resolve.
