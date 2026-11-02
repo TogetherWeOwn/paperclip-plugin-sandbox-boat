@@ -704,6 +704,11 @@ describe("env policy", () => {
       ["TWO_SSH_ID_ED25519", pem, ["secret_value"]],
       ["TWO_PG_CONN", "host=db.prod.example password=s3cret", ["secret_value"]],
       ["TWO_REDIS", "default:Ab/Cd+ef==@redis.prod:6379", ["remote_database_or_credential_url"]],
+      // A password starting with `/` must not hide behind the separator rule:
+      // the `:` is in the token's first segment and is no `://` separator.
+      ["TWO_CONFIG", "user:/password@db.prod.example:5432", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user:/pa/ss@db.prod.example", ["remote_database_or_credential_url"]],
+      ["TWO_CONFIG", "user://password@db.prod.example", ["remote_database_or_credential_url"]],
       ["TWO_API_URL", "https://api.example/x?pw=hunter2", ["remote_database_or_credential_url"]],
       ["TWO_CALLBACK", "https://a.example/cb#access_token=ghp_abc", ["remote_database_or_credential_url"]],
       ["TWO_SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T000/B000/xyz", ["secret_name_needs_exact_entry"]],
