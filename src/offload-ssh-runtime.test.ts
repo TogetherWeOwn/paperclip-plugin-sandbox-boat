@@ -171,6 +171,30 @@ describe("stock concrete executor factory", () => {
     }, { timeout: 15_000 }).toBe("not_started");
     expect(view.events).toHaveLength(0);
   }, 20_000);
+  it("scopes queued-upload roots per company: another company's config neither cancels nor resurrects a queued push", async () => {
+    await mkdir(path.join(source, ".git"));
+    await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
+    runtime.forgetRun(companyId, runId);
+    const localRunNative = native();
+    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    runtime.remember(localRunNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    const executor = (await runtime.resolve(command(), rooted))!;
+    expect(executor).not.toBe(null);
+    const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
+    const sync = [...pools.values()][0]!.sync;
+    const otherCompanyId = "cccccccc-cccc-4ccc-cccc-cccccccccccc";
+    // Config is per-company: company B resolving with empty roots (it has no
+    // binding, so resolve returns null) must not cancel company A's queued push.
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).resolves.toBeUndefined();
+    // Symmetrically, once A drops its own roots, B resolving with roots that
+    // cover the source must not resurrect A's queued push.
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, rooted)).toBe(null);
+    await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
+    expect(boat.calls).toHaveLength(0);
+  }, 20_000);
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
       expect(await runtime.resolve(command(), { ...config, [setting]: value })).toBe(null);

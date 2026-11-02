@@ -279,9 +279,11 @@ export class SshOffloadRuntime {
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
   private registryTail: Promise<unknown> = Promise.resolve();
-  /** Latest operator-configured local-run roots seen by resolve. Upload-time
-   * revalidation reads them, so dropping a root also refuses pushes already queued. */
-  private localRunRoots: string[] = [];
+  /** Latest operator-configured local-run roots seen by resolve, per company.
+   * Upload-time revalidation reads the pushing command's own company entry, so
+   * dropping a root also refuses that company's pushes already queued — and
+   * another company's config can neither cancel nor resurrect them. */
+  private readonly localRunRootsByCompany = new Map<string, string[]>();
   private closing = false;
   private closed = false;
   constructor(private readonly deps: SshOffloadRuntimeDeps) {}
@@ -336,7 +338,7 @@ export class SshOffloadRuntime {
   }
 
   async resolve(command: BackendCommand, settings: Record<string, unknown>) {
-    this.localRunRoots = localSourceRoots(settings);
+    this.localRunRootsByCompany.set(command.companyId, localSourceRoots(settings));
     if (this.closing || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
       || !plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")
       || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
@@ -345,7 +347,7 @@ export class SshOffloadRuntime {
     if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
     // The workspace row behind a local-run binding is agent-mutable, so the
     // operator-owned facts are re-proven on every resolve, not only at bind.
-    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRoots)) return null;
+    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) return null;
     const profile = profileForId(command.profileId);
     if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
     const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
@@ -415,9 +417,10 @@ export class SshOffloadRuntime {
       if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) throw new Error("Native offload binding unavailable");
       // A queued command can snapshot long after resolve approved it, so a
       // local-run binding is re-proven again at upload time against the latest
-      // configured roots. Throwing fails the push before transport, which the
-      // journal records as not_started (fallback-safe, runs locally).
-      if (native.localRun && !await this.revalidateLocalRun(native, this.localRunRoots)) {
+      // roots configured for its own company. Throwing fails the push before
+      // transport, which the journal records as not_started (fallback-safe,
+      // runs locally).
+      if (native.localRun && !await this.revalidateLocalRun(native, this.localRunRootsByCompany.get(cmd.companyId) ?? [])) {
         throw new Error("Local-run offload source no longer passes roots/origin validation");
       }
       return native.source;
