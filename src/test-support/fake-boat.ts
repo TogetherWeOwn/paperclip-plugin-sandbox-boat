@@ -175,9 +175,8 @@ export class FakeBoat {
     });
   }
 
-  /** Provider-side effect of a create whose reply is then lost: the box exists
-   * and the idempotency key maps to it, so a same-key retry replays it instead
-   * of billing a second VM. Use as a failNext handler for lost-reply tests. */
+  /** A create whose effect lands but whose reply is lost: the box exists and
+   * the key maps to it, so a same-key retry replays it. A failNext handler. */
   loseCreateReply(args: Record<string, unknown>): Error {
     const sandbox = this.makeBox(args);
     const key = this.idempotencyKeyOf(args);

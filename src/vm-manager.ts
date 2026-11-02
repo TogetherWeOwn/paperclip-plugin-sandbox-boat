@@ -153,9 +153,8 @@ function runHoldsVm(record: VmRecord | null | undefined): boolean {
 }
 
 /**
- * The provider-side effect of a start whose receipt write then failed
- * (startCall's ledger `started()` after a successful create or resume). The
- * id is attached to the thrown error so the caller can stop the VM instead of
+ * The provider-side effect of a start whose receipt write then failed. The id
+ * is attached to the thrown error so the caller can stop the VM instead of
  * orphaning a billing sandbox it has no record of.
  */
 function withCreatedSandboxId(error: unknown, sandboxId: string): unknown {
@@ -1332,9 +1331,8 @@ export class BoatVmManager {
   }
 
   /**
-   * The lease's hard deadline for a VM, restored from its persisted record
-   * when this worker has not seen the lease (a restart, or a lease that
-   * started in another worker). The map is the fast path; the record is the
+   * The lease's hard deadline, restored from the persisted record when this
+   * worker never saw the lease. The map is the fast path; the record is the
    * durable one acquire maintains on every start.
    */
   private async hardDeadlineMsFor(companyId: string, sandboxId: string): Promise<number | null> {
@@ -1626,9 +1624,8 @@ export class BoatVmManager {
           if (sandbox) {
             const target = sandbox;
             const sizeChange = target.state === "archived" && target.type !== config.size ? { type: config.size } : {};
-            // The resume's provider effect may land before its receipt write
-            // fails; remember the target so the catch keeps that disk (it is
-            // the card's) instead of deleting it as a fresh VM.
+            // Remember the resume target: if the receipt write fails, the catch
+            // keeps this disk (the card's) instead of deleting it as a fresh VM.
             resumeTargetId = target.id;
             try {
               const response = await this.startCall(
@@ -1751,8 +1748,7 @@ export class BoatVmManager {
         return lease;
       } catch (error) {
         // A receipt write can fail after the provider effect landed (startCall
-        // attaches the created id then). Without that id the new VM would bill
-        // untracked: no record was persisted and the rename never ran.
+        // attaches the created id). Without it the new VM would bill untracked.
         const receiptOrphanId = createdSandboxIdOf(error);
         const doomedId = sandboxId || receiptOrphanId;
         // A resume whose receipt failed still owns the card's disk, even though
@@ -1953,8 +1949,7 @@ export class BoatVmManager {
     }
     const sandboxId = sandbox.id;
     this.sandboxCompany.set(sandboxId, params.companyId);
-    // Repopulate the in-memory hard deadline from the persisted record: a
-    // worker that never saw the lease must still cap the resume's ttl.
+    // Repopulate the hard deadline: this worker may never have seen the lease.
     await this.hardDeadlineMsFor(params.companyId, sandboxId);
     const wasUp = UP_STATES.has(sandbox.state);
     const taskClass = parseTaskClass(params.leaseMetadata?.taskClass, config.taskClass);
@@ -2084,8 +2079,7 @@ export class BoatVmManager {
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.
         const size = resize && sandbox.state === "archived" ? config.size : requireBoatSize(sandbox.type);
         const startConfig = { ...config, size };
-        // After a restart the map is empty until a lease path repopulates it;
-        // fall back to the persisted record so the resume honors the hard deadline.
+        // After a restart the map is empty: fall back to the persisted record.
         const hardDeadline = await this.hardDeadlineMsFor(companyId, sandboxId);
         const response = await this.startCall(
           "resume",
@@ -2305,9 +2299,8 @@ export class BoatVmManager {
     const runId = str(params.leaseMetadata?.runId);
     const api = this.opsApi(config);
 
-    // The sweep must run even when the release throws (a failed delete still
-    // stopped the VM; the sweep retries the delete). This covers every caller,
-    // including StopLease, which has no plugin-level sweep of its own.
+    // The sweep must run even when the release throws. This covers every
+    // caller, including StopLease, which has no plugin-level sweep of its own.
     const done: Promise<PluginEnvironmentTerminationReceipt | undefined> = this.withCardLock(params.companyId, sandboxId, params.leaseMetadata, () => this.withLock(`sandbox:${sandboxId}`, async () => {
       // The run's lease ends: its offload workspace bindings must not outlive it.
       if (runId) await this.forgetRunOffload(params.companyId, runId);
@@ -2486,12 +2479,9 @@ export class BoatVmManager {
   }
 
   /**
-   * A delete that failed must not leave the VM running untracked: stop it so
-   * billing stops, record the stop, and rethrow the delete error so the
-   * caller reports it. No tombstone is written (the VM still exists), the
-   * other runs are cleared only once the stop is confirmed (they may still
-   * hold the lease while the save is pending), and the sweep retries the
-   * delete from the record left behind.
+   * A failed delete must not leave the VM running untracked: stop it, record
+   * the stop, and rethrow. No tombstone (the VM still exists); other runs
+   * clear only on a confirmed stop, and the sweep retries the delete.
    */
   private async stopAfterFailedDelete(input: {
     config: BoatDriverConfig;
@@ -2918,10 +2908,8 @@ export class BoatVmManager {
   ): Promise<PluginEnvironmentCaptureTemplateResult> {
     const api = this.opsApi(config);
     const name = sanitizeSnapshotName(params.templateLabel, `${config.namePrefix}-tpl-${params.environmentId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase()}-${this.now().toString(36)}`);
-    // A VM this capture resumed must be stopped again afterwards (its disk is
-    // kept: it is the card's). A VM that was already up is left running. The
-    // stop runs on every path below, including the scrub refusal and the
-    // snapshot failure, so a capture never leaves a resumed VM billing.
+    // A VM this capture resumed is stopped again on every path below (its
+    // disk is kept: it is the card's). A VM that was already up is left alone.
     const before = await this.getSandbox(api, sandboxId).catch(() => null);
     const resumedForCapture = !!before && !UP_STATES.has(before.state);
     try {
@@ -2955,9 +2943,9 @@ export class BoatVmManager {
           `could not verify that Paperclip's run MCP config (run JWT) is gone from boat VM ${sandboxId}, so no template was captured (${scrub.status}${scrub.detail ? `: ${scrub.detail}` : ""}).`,
         );
       }
-      // The allowance check and the save run under one lock: concurrent captures
-      // of different cards share no card lock, so without this both could see a
-      // free slot and both save. The poll below runs unlocked.
+      // Check and save hold one lock: concurrent captures of different cards
+      // share no card lock, so without this both could see a free slot. The
+      // poll below runs unlocked.
       await this.withLock("boat:named-snapshots", async () => {
         const list = (await api.listNamedSnapshots()) as {
           snapshots?: Array<{ name?: string }>;
@@ -2980,9 +2968,8 @@ export class BoatVmManager {
         const info = (await api.getNamedSnapshot({ name })) as { snapshot?: { status?: string; error?: string; sizeBytes?: number; snapshotId?: string } };
         const status = info.snapshot?.status;
         if (status === "ready") {
-          // Our check and save were atomic, but another client may have filled
-          // the allowance between them: never keep a paid snapshot without
-          // permission. On overage the just-saved snapshot is deleted again.
+          // Another client may have filled the allowance since: never keep a
+          // paid snapshot without permission, so delete the just-saved one.
           if (!config.allowPaidNamedSnapshots) {
             const verify = (await api.listNamedSnapshots()) as {
               snapshots?: Array<{ name?: string }>;

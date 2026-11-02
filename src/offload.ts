@@ -693,9 +693,8 @@ export class OffloadExecutor {
     if (this.lifecycle && this.pool.some((vm) => vm.quarantined && vm.workspaceKey === undefined)) {
       return { kind: "unavailable", reason: "recovered workspace ownership unknown; reconciliation required" };
     }
-    // Resolve lost create replies before selecting: each iteration retires at
-    // least one uncertain placeholder (adopted runs return at once), so the
-    // loop ends when none remain or a replay stays uncertain.
+    // Adopt (or free) lost-create placeholders before selecting; the loop ends
+    // when none remain or a replay stays uncertain.
     for (;;) {
       const uncertain = this.pool.find((vm) => vm.quarantined && vm.sandboxId === "" && vm.accountReservation);
       if (!uncertain) break;
@@ -839,14 +838,10 @@ export class OffloadExecutor {
   }
 
   /**
-   * Adopt (or stop) a create whose reply was lost. The placeholder stays
-   * quarantined with no provider id but a retained reservation; re-issuing the
-   * create under the same idempotency key replays the original effect instead
-   * of billing a second VM. A compatible retry adopts the replayed VM and runs
-   * on it; an incompatible one stops the replayed VM and retires the slot so a
-   * fresh create can proceed. Returns the run claim, "freed" when the slot was
-   * retired, or null when the replay itself is still uncertain (the placeholder
-   * stays quarantined for a later claim to retry).
+   * Adopt (or stop) a create whose reply was lost, replayed under the same
+   * idempotency key. A compatible retry adopts the VM and runs on it; an
+   * incompatible one stops it and frees the slot. Null keeps the placeholder
+   * quarantined when the replay itself stays uncertain.
    */
   private async resolveUncertainCreate(vm: PoolVm, command: OffloadCommand): Promise<Reservation | { kind: "freed" } | null> {
     const ledger = this.ledger!;
@@ -898,12 +893,9 @@ export class OffloadExecutor {
       await this.persistPool().catch(() => undefined);
       return { kind: "run", vm, warm: "cold" };
     }
-    // Another trust domain's retry must not adopt the replayed VM; stop it so
-    // it never bills untracked, close the retained reservation, and free the slot.
-    // Settle the reservation against the replayed VM first: without a started()
-    // receipt the intent has no sandbox id, so a later stopped() could never
-    // match it and the hold would leak. A failing receipt write keeps the
-    // placeholder quarantined for a later claim to retry.
+    // Another trust domain must not adopt the replayed VM: settle the
+    // reservation against it first (so stopped() can match it), then stop it
+    // and free the slot. A failing receipt write keeps the placeholder.
     try {
       await ledger.started(this.boat, reservation, id);
     } catch {

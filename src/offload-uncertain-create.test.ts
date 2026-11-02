@@ -48,10 +48,8 @@ function setup(runCommand: OffloadDeps["runCommand"] = async () => ({ exitCode: 
 describe("offload uncertain create", () => {
   it("a compatible retry replays the same key and adopts the VM", async () => {
     const s = setup();
-    // The provider effect lands; only the reply is lost.
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
-    const first = await s.executor.execute(command("cmd-1"));
-    expect(first).toMatchObject({ status: "unavailable" });
+    expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
     expect(s.fake.callsOf("create")).toHaveLength(1);
     expect(s.fake.boxes.size).toBe(1);
 
@@ -72,21 +70,19 @@ describe("offload uncertain create", () => {
 
   it("an incompatible retry stops the replayed VM and frees the slot", async () => {
     // One VM of account capacity: the retained hold must be released before a
-    // fresh create can be admitted, or the slot leaks quarantined forever.
+    // fresh create is admitted, or the slot leaks quarantined forever.
     const s = setup(undefined, { maxActive: 1 });
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
-    const first = await s.executor.execute(command("cmd-1"));
-    expect(first).toMatchObject({ status: "unavailable" });
+    expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
 
-    // Another trust domain must not adopt the replayed VM.
     const second = await s.executor.execute(command("cmd-2", "other-profile"));
     expect(second).toMatchObject({ status: "completed" });
 
+    // The retry replays the lost create under the same key, then the freed
+    // slot creates fresh under a new key.
     const creates = s.fake.callsOf("create");
     expect(creates).toHaveLength(3);
-    // The retry replays the lost create under the same key...
     expect(creates[1]!.args.idempotencyKey).toBe(creates[0]!.args.idempotencyKey);
-    // ...then the freed slot creates fresh under a new key.
     expect(creates[2]!.args.idempotencyKey).not.toBe(creates[0]!.args.idempotencyKey);
 
     // The replayed VM was stopped exactly once and never adopted: two boxes,
