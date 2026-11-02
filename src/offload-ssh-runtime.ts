@@ -44,16 +44,40 @@ type Binding = { companyId: string; runId: string; workspaceId: string; repoId: 
    * credential never changes mid-run, so the digest is computed once. */
   credentialDigest?: Promise<string> };
 
-const scryptAsync = promisify(scrypt) as (password: string, salt: string, keylen: number) => Promise<Buffer>;
+const scryptAsync = promisify(scrypt) as (
+  password: string,
+  salt: string,
+  keylen: number,
+  options: { N: number; r: number; p: number },
+) => Promise<Buffer>;
+
+/**
+ * Pool-identity version 1 scrypt parameters. The digest is baked into
+ * persisted poolIds, so these values are part of pool identity forever:
+ * changing any of them silently re-keys every pool and orphans its journals
+ * and VMs into retirement. Do not change without a pool migration. They are
+ * pinned explicitly rather than relying on Node's defaults, which could
+ * change in a future Node release (they currently equal those defaults).
+ */
+const POOL_CREDENTIAL_SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 } as const;
 
 /**
  * The credential part of pool identity. The digest is persisted (inside the
  * poolId) but the key never is, so derive it with a password KDF rather than
  * a fast hash: a leaked pool journal then gives no cheap offline test for
- * guessed API keys. The salt binds the digest to this purpose and endpoint.
+ * guessed API keys. That protection covers the pool journal only — the
+ * whole-run path still derives a persisted scope from the same key with a
+ * fast hash (see `VmManager.account`), so this is not a system-wide
+ * guarantee for every persisted derivation of the key. The salt binds the
+ * digest to this purpose and endpoint.
  */
 async function poolCredentialDigest(config: BoatDriverConfig): Promise<string> {
-  const derived = await scryptAsync(resolveApiKey(config), `boat-offload-pool\u0000${config.apiBase}`, 32);
+  const derived = await scryptAsync(
+    resolveApiKey(config),
+    `boat-offload-pool\u0000${config.apiBase}`,
+    32,
+    POOL_CREDENTIAL_SCRYPT_PARAMS,
+  );
   return derived.toString("hex");
 }
 export interface SshOffloadRuntimeDeps {
