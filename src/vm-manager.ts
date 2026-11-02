@@ -250,17 +250,19 @@ function envPolicyConflict(config: BoatDriverConfig, sandbox: SandboxView): stri
 }
 
 /**
- * Why a stopped VM cannot be resumed under the configured env policy. Boat's
- * noEnv resume is one-way: the restored snapshot is scrubbed of the owner
- * secrets and later resumes stay noEnv, so a stripped disk (no creator
- * logins) resumed when the policy needs credentials again would run without
- * them. Only positive evidence (holdsCreatorLogins === false) refuses the
- * resume; an unreported field still resumes, or no VM would ever be reused.
+ * Why a VM cannot serve the configured env policy. Boat's noEnv resume is
+ * one-way: the restored snapshot is scrubbed of the owner secrets and later
+ * resumes stay noEnv, so a stripped VM (no creator logins) handed out when
+ * the policy needs credentials again would run without them — whether it is
+ * resumed stopped or run against while up. Only positive evidence
+ * (holdsCreatorLogins === false) refuses; an unreported field still serves,
+ * or no VM would ever be reused. Under noEnv nothing is needed: boat strips
+ * the logins and ignores the configured environment, so a stripped disk
+ * resumes fine no matter which environment is configured alongside it.
  */
-function resumeCannotRestorePolicy(config: BoatDriverConfig, sandbox: SandboxView): string | null {
-  const needsCreds = !config.noEnv || config.boatEnvironment != null;
-  if (needsCreds && sandbox.holdsCreatorLogins === false) {
-    return "it was stripped by an earlier noEnv resume and boat does not restore creator logins, so resuming it cannot provide the configured credentials";
+function cannotServePolicy(config: BoatDriverConfig, sandbox: SandboxView): string | null {
+  if (!config.noEnv && sandbox.holdsCreatorLogins === false) {
+    return "it was stripped by an earlier noEnv resume and boat does not restore creator logins, so it cannot provide the configured credentials";
   }
   return null;
 }
@@ -744,16 +746,18 @@ export class BoatVmManager {
   private async findSandboxByName(api: BoatApiLike, name: string, config: BoatDriverConfig, recordedIds: ReadonlySet<string>): Promise<SandboxView | null> {
     const all = await this.listSandboxes(api);
     // A same-named VM this plugin has no record of is adopted only when it
-    // already conforms to the env policy: its provenance is unknown (a lost
-    // state document, a hand-made VM), so a conflicting one is never resumed
-    // or reused just because the name collides. Recorded VMs are handled by
-    // acquire's own conflict path (resume re-asserts the policy).
+    // can serve the env policy: its provenance is unknown (a lost state
+    // document, a hand-made VM), so a conflicting one — or a stripped one
+    // that can never provide the configured credentials again — is never
+    // resumed or reused just because the name collides. Recorded VMs are
+    // handled by acquire's own conflict path (resume re-asserts the policy).
     const matches = all.filter(
       (sandbox) =>
         sandbox.name === name &&
         !sandbox.dataExpiredAt &&
         sandbox.state !== "cancelled" &&
-        (recordedIds.has(sandbox.id) || envPolicyConflict(config, sandbox) == null),
+        (recordedIds.has(sandbox.id) ||
+          (envPolicyConflict(config, sandbox) == null && cannotServePolicy(config, sandbox) == null)),
     );
     if (matches.length === 0) return null;
     // Prefer one that is already up (no start needed), then the newest.
@@ -1460,6 +1464,20 @@ export class BoatVmManager {
             sandbox = null;
           }
         }
+        // A stripped running VM can never serve a policy that needs
+        // credentials again: stopping and resuming it would come back
+        // stripped too, so the run creates a fresh VM instead of reusing
+        // it (no stop: nothing a resume could restore is at stake).
+        const unservable = sandbox && UP_STATES.has(sandbox.state) ? cannotServePolicy(config, sandbox) : null;
+        if (sandbox && unservable) {
+          this.logger.warn("boat: the card's running VM cannot satisfy the env policy; creating a fresh VM instead of reusing it", {
+            vmKey: key,
+            runId: params.runId,
+            sandboxId: sandbox.id,
+            unservable,
+          });
+          sandbox = null;
+        }
       }
 
       const runningSize = sandbox && sandbox.state !== "archived" ? requireBoatSize(sandbox.type) : undefined;
@@ -1487,12 +1505,12 @@ export class BoatVmManager {
           // A disk boat stripped under noEnv can never serve a policy that
           // needs credentials again: resuming it would run without them, so
           // a fresh VM is created instead and this disk is left stopped.
-          const unrestorable = sandbox ? resumeCannotRestorePolicy(config, sandbox) : null;
-          if (sandbox && unrestorable) {
+          const unservable = sandbox ? cannotServePolicy(config, sandbox) : null;
+          if (sandbox && unservable) {
             this.logger.warn("boat: the card's stopped VM cannot satisfy the env policy by resume; creating a fresh VM instead", {
               ...context,
               sandboxId: sandbox.id,
-              unrestorable,
+              unservable,
             });
             sandbox = null;
           }
@@ -1791,17 +1809,20 @@ export class BoatVmManager {
     if (!sandbox || sandbox.dataExpiredAt || sandbox.state === "cancelled") {
       return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
     }
-    // A running VM that conflicts with the env policy is not handed back for
-    // a new run window. Reporting the lease expired makes the host acquire
-    // instead, where the recorded, idle VM is stopped and resumed with the
-    // policy asserted. A stopped one needs no special case: liveSession's
-    // resume re-asserts the policy.
+    // A running VM that cannot serve the env policy is not handed back for a
+    // new run window: it either holds credentials the policy withholds (or
+    // the wrong environment) or it was stripped by an earlier noEnv resume
+    // and can never provide the configured credentials again. Reporting the
+    // lease expired makes the host acquire instead, where the recorded, idle
+    // VM is stopped and resumed with the policy asserted (or a fresh VM is
+    // created when no resume could satisfy it). A stopped one needs no
+    // special case: liveSession's resume re-asserts the policy.
     if (UP_STATES.has(sandbox.state)) {
-      const conflict = envPolicyConflict(config, sandbox);
-      if (conflict) {
-        this.logger.warn("boat: the lease's running VM conflicts with the env policy; reporting the lease expired instead of resuming it", {
+      const refusal = envPolicyConflict(config, sandbox) ?? cannotServePolicy(config, sandbox);
+      if (refusal) {
+        this.logger.warn("boat: the lease's running VM cannot serve the env policy; reporting the lease expired instead of resuming it", {
           sandboxId: sandbox.id,
-          conflict,
+          conflict: refusal,
         });
         return { providerLeaseId: null, metadata: { provider: "boat", expired: true } };
       }
@@ -1878,17 +1899,22 @@ export class BoatVmManager {
       const current = BoatVmManager.validatedPolicyOf(config);
       if (!stamped || stamped.noEnv !== current.noEnv || stamped.environment !== current.environment) {
         const api = this.opsApi(config);
-        const sandbox = await this.getSandbox(api, sandboxId).catch(() => null);
+        // Fail closed when the lookup itself fails: stamping an unverified
+        // policy would let later commands skip validation entirely.
+        const sandbox = await this.getSandbox(api, sandboxId);
         if (sandbox && UP_STATES.has(sandbox.state)) {
-          const conflict = envPolicyConflict(config, sandbox);
-          if (conflict) {
+          const refusal = envPolicyConflict(config, sandbox) ?? cannotServePolicy(config, sandbox);
+          if (refusal) {
             throw new BoatProviderError(
               "BOAT_ENV_POLICY_CONFLICT",
-              `boat VM ${sandboxId} conflicts with the env policy (${conflict}); refusing to run against it. The run must acquire a new lease.`,
+              `boat VM ${sandboxId} cannot serve the env policy (${refusal}); refusing to run against it. The run must acquire a new lease.`,
             );
           }
+          this.sessionPolicy.set(sandboxId, current);
         }
-        this.sessionPolicy.set(sandboxId, current);
+        // A stopped, gone, or expired VM is deliberately not stamped: the
+        // reconnect path below re-reads and validates before running
+        // anything, and the next command retries this check.
       }
       return existing;
     }
@@ -1906,13 +1932,14 @@ export class BoatVmManager {
       if (!resumed) {
         // A reconnect must not quietly serve a running VM the current env
         // policy would never hand out (the operator turned noEnv on after
-        // the lease started). Fail closed; the next acquire stops and
-        // resumes it under the policy, or creates a fresh VM.
-        const conflict = envPolicyConflict(config, sandbox);
-        if (conflict) {
+        // the lease started, or turned it off over a stripped VM that can
+        // never provide credentials again). Fail closed; the next acquire
+        // stops and resumes it under the policy, or creates a fresh VM.
+        const refusal = envPolicyConflict(config, sandbox) ?? cannotServePolicy(config, sandbox);
+        if (refusal) {
           throw new BoatProviderError(
             "BOAT_ENV_POLICY_CONFLICT",
-            `boat VM ${sandboxId} conflicts with the env policy (${conflict}); refusing to run against it. The run must acquire a new lease.`,
+            `boat VM ${sandboxId} cannot serve the env policy (${refusal}); refusing to run against it. The run must acquire a new lease.`,
           );
         }
       }
@@ -1920,11 +1947,11 @@ export class BoatVmManager {
       // that needs credentials again: fail closed so the run acquires a new
       // (fresh) lease instead of running without them.
       if (resumed) {
-        const unrestorable = resumeCannotRestorePolicy(config, sandbox);
-        if (unrestorable) {
+        const unservable = cannotServePolicy(config, sandbox);
+        if (unservable) {
           throw new BoatProviderError(
             "BOAT_VM_GONE",
-            `boat VM ${sandboxId} cannot satisfy the env policy by resume (${unrestorable}); the run must acquire a new lease.`,
+            `boat VM ${sandboxId} cannot satisfy the env policy by resume (${unservable}); the run must acquire a new lease.`,
           );
         }
         // Mid-lease reconnects keep their actual size; only a new lease may resize an archived VM.

@@ -15,7 +15,7 @@ import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { DRIVER_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
-import { FakeBoat } from "./test-support/fake-boat.js";
+import { FakeBoat, responseError } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext } from "./test-support/harness.js";
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
@@ -258,6 +258,86 @@ describe("review round: fail-safe reuse", () => {
     const lease = await acquire("run-1", "agent-a", { noEnv: false });
     expect((await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never)).exitCode).toBe(0);
     // execute() reports a refused reconnect as a result, not a throw.
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_POLICY_CONFLICT" } });
+  });
+});
+
+describe("review round 2: unservable VMs and fail-closed validation", () => {
+  it("resumes a stripped disk when noEnv stays on even with a boat environment configured", async () => {
+    const config = { noEnv: true, boatEnvironment: "proj-env" };
+    const first = await acquire("run-1", "agent-a", config);
+    expect(fake.boxes.get(first.providerLeaseId!)).toMatchObject({ holdsCreatorLogins: false, environment: null });
+    await release(first, config);
+    const second = await acquire("run-2", "agent-a", config);
+    expect(second.providerLeaseId).toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "resume" });
+    expect(fake.callsOf("create")).toHaveLength(1);
+    expect(fake.callsOf("resume")).toHaveLength(1);
+    expect(fake.callsOf("resume")[0].args).toMatchObject({ noEnv: true });
+  });
+
+  it("reconnects to a stopped stripped disk when noEnv stays on with a boat environment configured", async () => {
+    const config = { noEnv: true, boatEnvironment: "proj-env" };
+    const lease = await acquire("run-1", "agent-a", config);
+    await currentManager().shutdown();
+    fake.boxes.get(lease.providerLeaseId!)!.state = "archived"; // boat's auto-stop
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base(config), lease, command: "true" } as never);
+    expect(result.exitCode).toBe(0);
+    expect(fake.callsOf("resume")).toHaveLength(1);
+  });
+
+  it("refuses a cached session when noEnv flips off over a stripped running VM", async () => {
+    const lease = await acquire("run-1", "agent-a", { noEnv: true });
+    expect(fake.boxes.get(lease.providerLeaseId!)).toMatchObject({ holdsCreatorLogins: false });
+    expect((await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never)).exitCode).toBe(0);
+    // execute() reports a refused command as a result, not a throw.
+    const result = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never);
+    expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_POLICY_CONFLICT" } });
+    expect(fake.boxes.get(lease.providerLeaseId!)!.state).toBe("ready");
+  });
+
+  it("creates a fresh VM when the next acquire needs credentials the running VM was stripped of", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    // run-1 still holds the VM: stopping under it is not an option, and no
+    // resume could restore the stripped logins, so run-2 gets a fresh disk.
+    const second = await acquire("run-2", "agent-a", { noEnv: false });
+    expect(second.providerLeaseId).not.toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "create" });
+    expect(fake.boxes.get(first.providerLeaseId!)!.state).toBe("ready");
+  });
+
+  it("does not adopt a running stripped VM by name when the policy needs credentials", async () => {
+    const first = await acquire("run-1", "agent-a", { noEnv: true });
+    harness.state.clear(); // the plugin state is lost; only the name can match
+    const second = await acquire("run-2", "agent-a", { noEnv: false });
+    expect(second.providerLeaseId).not.toBe(first.providerLeaseId);
+    expect(second.metadata).toMatchObject({ startKind: "create" });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+  });
+
+  it("fails a command closed when the policy-change lookup fails, and revalidates on the next command", async () => {
+    const lease = await acquire("run-1", "agent-a", { noEnv: false });
+    expect((await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never)).exitCode).toBe(0);
+    fake.failNext("get", responseError(500, { code: "boat_down", message: "boat is down" }));
+    // execute() reports a refused command as a result, not a throw.
+    const refused = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
+    expect(refused).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_API_ERROR" } });
+    // The failed lookup must not stamp the new policy: the VM still holds its
+    // creator's logins, so the next command refuses it under noEnv instead of
+    // running unchecked.
+    const again = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
+    expect(again).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_POLICY_CONFLICT" } });
+  });
+
+  it("does not stamp a policy change seen while the VM is stopped", async () => {
+    const lease = await acquire("run-1", "agent-a", { noEnv: false });
+    expect((await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: false }), lease, command: "true" } as never)).exitCode).toBe(0);
+    fake.boxes.get(lease.providerLeaseId!)!.state = "archived"; // boat's auto-stop; the session stays cached
+    await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
+    // The VM is back up still holding its creator's logins: the earlier
+    // stopped sighting must not have validated the new policy away.
+    fake.boxes.get(lease.providerLeaseId!)!.state = "ready";
     const result = await plugin.definition.onEnvironmentExecute!({ ...base({ noEnv: true }), lease, command: "true" } as never);
     expect(result).toMatchObject({ exitCode: 1, metadata: { error: "BOAT_ENV_POLICY_CONFLICT" } });
   });
