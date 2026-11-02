@@ -143,4 +143,60 @@ describe("recordDuration", () => {
     expect(await store.get(stale)).toBe(null);
     expect(await readHistory(store, fresh)).toHaveLength(1);
   });
+
+  it("retains an evicted key when its state delete fails so a later sweep retries", async () => {
+    // A transient state deletion must not orphan the history: the key stays
+    // indexed until the delete succeeds.
+    class FlakyStore extends MapStore {
+      failNext = new Set<string>();
+      override async delete(key: string): Promise<void> {
+        if (this.failNext.delete(key)) throw new Error("INJECTED_DELETE_FAILURE");
+        return super.delete(key);
+      }
+    }
+    const store = new FlakyStore();
+    const keys: string[] = [];
+    for (let i = 0; i < DURATION_INDEX_LIMIT; i += 1) {
+      const key = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", `suite/${i}`]));
+      keys.push(key);
+      await recordDuration(store, key, sample(120, NOW + i));
+    }
+    const oldest = keys[0]!;
+    store.failNext.add(oldest);
+    const newcomer = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", "suite/new"]));
+    await recordDuration(store, newcomer, sample(120, NOW + DURATION_INDEX_LIMIT));
+    // The failed eviction stays indexed with its history intact: no orphan.
+    const index = (await store.get(DURATION_INDEX_KEY)) as Array<{ key: string; at: number }>;
+    expect(index.map((entry) => entry.key)).toContain(oldest);
+    expect(await readHistory(store, oldest)).toHaveLength(1);
+    expect(await readHistory(store, newcomer)).toHaveLength(1);
+    // The next sweep retries the delete and the index converges back to the cap.
+    await pruneDurations(store, NOW + DURATION_INDEX_LIMIT);
+    expect(await store.get(oldest)).toBe(null);
+    const converged = (await store.get(DURATION_INDEX_KEY)) as Array<{ key: string; at: number }>;
+    expect(converged.length).toBeLessThanOrEqual(DURATION_INDEX_LIMIT);
+  });
+
+  it("loses no completed-run history under concurrent writes at a full index", async () => {
+    const store = new MapStore();
+    const keys: string[] = [];
+    for (let i = 0; i < DURATION_INDEX_LIMIT; i += 1) {
+      const key = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", `suite/${i}`]));
+      keys.push(key);
+      await recordDuration(store, key, sample(120, NOW + i));
+    }
+    // The re-recorded oldest signature finishes its history write while the
+    // newcomer evicts: the eviction must not delete the new sample. (A
+    // legitimate eviction of the oldest sample may still drop it first; the
+    // new sample itself must survive under either interleave order.)
+    const oldest = keys[0]!;
+    const newcomer = durationKey("repo:a", "node-public-1", normalizeSignature("node", "npm", ["run", "test", "--", "suite/new"]));
+    await Promise.all([
+      recordDuration(store, newcomer, sample(140, NOW + DURATION_INDEX_LIMIT)),
+      recordDuration(store, oldest, sample(150, NOW + DURATION_INDEX_LIMIT + 1)),
+    ]);
+    const survived = await readHistory(store, oldest);
+    expect(survived.map((entry) => entry.seconds)).toContain(150);
+    expect(await readHistory(store, newcomer)).toHaveLength(1);
+  });
 });

@@ -69,13 +69,16 @@ export class OffloadLifecycle {
     if (capabilities.cgroupV2Delegated !== true || capabilities.outsideWatchdogVerified !== true) {
       throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
     }
+    const sentAt = this.now();
     const identity = await this.guest.prepare(sandboxId, command);
     // The guest reports absolutes on its own clock. Map them onto the host
-    // clock with the reported guest-now before any comparison: a guest clock
-    // seconds behind or ahead must neither fail heartbeats nor refuse
-    // prepare. The stored identity below is host-clock throughout.
-    const guestNow = Number.isSafeInteger(identity.guestNow) ? (identity.guestNow as number) : this.now();
-    const skew = guestNow - this.now();
+    // clock with the pre-send host time: the supervisor stamps guestNow when
+    // it creates the child, which can be no earlier than the send, so
+    // send-based mapping is conservative where receive-based mapping would
+    // shift an already-expired guest deadline into the host future. The
+    // stored identity below is host-clock throughout.
+    const guestNow = Number.isSafeInteger(identity.guestNow) ? (identity.guestNow as number) : sentAt;
+    const skew = guestNow - sentAt;
     const heartbeatDeadline = identity.heartbeatDeadline - skew;
     const guestDeadline = identity.guestDeadline - skew;
     if (!validGuestIdentity(identity) || identity.guestBootId.startsWith("unverified:")

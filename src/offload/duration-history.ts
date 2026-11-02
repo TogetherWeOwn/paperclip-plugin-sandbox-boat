@@ -78,22 +78,16 @@ export async function readHistory(store: DurationStore, key: string): Promise<Du
 }
 
 // Both writers (the report route and the remote-completion hook) run in this
-// worker, so one in-process keyed mutex covers them: a store that resolves
-// reads after a tick still yields one serialized read-modify-write per key.
-const keyTails = new Map<string, Promise<unknown>>();
-async function withKeyLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const previous = keyTails.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const mine = new Promise<void>((resolve) => { release = resolve; });
-  const tail = previous.then(() => mine);
-  keyTails.set(key, tail);
-  await previous;
-  try {
-    return await fn();
-  } finally {
-    release();
-    if (keyTails.get(key) === tail) keyTails.delete(key);
-  }
+// worker, so one in-process mutex serializes every duration mutation: history
+// writes, index updates and sweeps. A per-key lock would still let a newcomer's
+// eviction delete a history another signature just stored (the eviction runs
+// under a different lock), so the whole read-modify-write-index cycle is one
+// critical section instead.
+let tail: Promise<unknown> = Promise.resolve();
+async function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const pending = tail.then(fn);
+  tail = pending.catch(() => undefined);
+  return pending;
 }
 
 interface IndexEntry {
@@ -119,51 +113,50 @@ export async function recordDuration(store: DurationStore, key: string, sample: 
   // Guest-measured and self-reported durations are untrusted input: clamp to
   // the one-day learning bound instead of storing them raw.
   const bounded: DurationSample = { seconds: Math.min(sample.seconds, MAX_DURATION_SECONDS), at: sample.at };
-  await withKeyLock(key, async () => {
+  await serialized(async () => {
     const history = await readHistory(store, key);
     history.push(bounded);
     await store.set(key, history.slice(-DURATION_HISTORY_LIMIT));
-    await trackKey(store, key, bounded.at);
-  });
-}
-
-/**
- * Record the key in the LRU signature index, evicting the oldest entries past
- * the cap (deleting their state keys). Runs under the caller's key lock; the
- * index itself is serialized separately so concurrent keys cannot interleave.
- */
-let indexTail: Promise<unknown> = Promise.resolve();
-async function trackKey(store: DurationStore, key: string, at: number): Promise<void> {
-  const pending = indexTail.then(async () => {
     const index = (await readIndex(store)).filter((entry) => entry.key !== key);
-    index.push({ key, at });
+    index.push({ key, at: bounded.at });
     while (index.length > DURATION_INDEX_LIMIT) {
-      const evicted = index.shift()!;
-      await store.delete(evicted.key).catch(() => undefined);
+      const evicted = index[0]!;
+      try {
+        await store.delete(evicted.key);
+      } catch {
+        // A transient delete failure must not orphan the history: the evicted
+        // entry stays indexed at the head (retried first) until the delete
+        // succeeds. The index drains back to the cap on the next success.
+        break;
+      }
+      index.shift();
     }
     await store.set(DURATION_INDEX_KEY, index);
   });
-  indexTail = pending.catch(() => undefined);
-  await pending;
 }
 
 /**
  * Drop index entries whose newest sample is older than the TTL and delete
  * their keys; also repair over-cap indexes left by older writers. Runs in the
- * pool sweep, so a key whose writer crashed still expires.
+ * pool sweep, so a key whose writer crashed still expires. Entries whose
+ * delete fails stay indexed so the next sweep retries them.
  */
 export async function pruneDurations(store: DurationStore, now: number): Promise<void> {
-  const pending = indexTail.then(async () => {
+  await serialized(async () => {
     const index = await readIndex(store);
-    const kept = index.filter((entry) => now - entry.at <= DURATION_HISTORY_TTL_MS);
-    const dropped = index.filter((entry) => now - entry.at > DURATION_HISTORY_TTL_MS);
-    while (kept.length > DURATION_INDEX_LIMIT) {
-      const evicted = kept.shift()!;
-      dropped.push(evicted);
+    const fresh = index.filter((entry) => now - entry.at <= DURATION_HISTORY_TTL_MS);
+    const victims = [...index.filter((entry) => now - entry.at > DURATION_HISTORY_TTL_MS),
+      ...fresh.slice(0, Math.max(0, fresh.length - DURATION_INDEX_LIMIT))];
+    const victimKeys = new Set(victims.map((entry) => entry.key));
+    const failed = new Set<string>();
+    for (const entry of victims) {
+      try {
+        await store.delete(entry.key);
+      } catch {
+        failed.add(entry.key);
+      }
     }
-    for (const entry of dropped) await store.delete(entry.key).catch(() => undefined);
-    if (dropped.length > 0 || kept.length !== index.length) await store.set(DURATION_INDEX_KEY, kept);
+    const next = index.filter((entry) => !victimKeys.has(entry.key) || failed.has(entry.key));
+    if (next.length !== index.length) await store.set(DURATION_INDEX_KEY, next);
   });
-  indexTail = pending.catch(() => undefined);
-  await pending;
 }
