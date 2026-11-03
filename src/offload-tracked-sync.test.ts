@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -168,9 +169,19 @@ describe("certificate-only .pem exception", () => {
     // OpenSSL parses a cert with garbage appended to the DER; only the
     // cert.raw byte-equality in isCertificateOnlyPem catches this.
     const b64 = PUBLIC_CA_PEM.replace(/-----BEGIN CERTIFICATE-----/, "").replace(/-----END CERTIFICATE-----/, "").replace(/\s+/g, "");
-    const smuggled = Buffer.concat([Buffer.from(b64, "base64"), Buffer.from("smuggled-secret")]).toString("base64");
+    const der = Buffer.concat([Buffer.from(b64, "base64"), Buffer.from("smuggled-secret")]);
+    // Precondition, pinned so this test cannot silently regress to being
+    // rejected by an earlier shape check: the smuggled DER parses as a
+    // certificate, and the parsed certificate is shorter than the DER.
+    const parsed = new X509Certificate(der);
+    expect(parsed.raw.equals(der)).toBe(false);
+    const smuggled = der.toString("base64");
     const wrapped = smuggled.replace(/(.{64})/g, "$1\n");
-    expect(isCertificateOnlyPem(`-----BEGIN CERTIFICATE-----\n${wrapped}-----END CERTIFICATE-----\n`)).toBe(false);
+    // The END marker must start on its own line: glued onto the last base64
+    // line it would fail the strict base64-line check before ever reaching
+    // the DER parse this test guards (smuggled length ≡ 20 mod 64).
+    const pem = `-----BEGIN CERTIFICATE-----\n${wrapped.endsWith("\n") ? wrapped : `${wrapped}\n`}-----END CERTIFICATE-----\n`;
+    expect(isCertificateOnlyPem(pem)).toBe(false);
   });
 
   it("refuses an oversized pem fail-closed", () => {
@@ -220,6 +231,21 @@ describe("certificate-only .pem exception", () => {
     symlinkSync(path.join(root, "src/lib.rs"), path.join(root, "ca.pem"));
     git(root, "add", "ca.pem");
     const tracked = await listTrackedFiles(root);
+    await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
+      .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
+  });
+
+  it("aborts the capture when a parent dir of a verified cert is swapped for a symlink after admission", async () => {
+    const root = gitRepo({ "fixtures/ca.pem": PUBLIC_CA_PEM });
+    const tracked = await listTrackedFiles(root);
+    // Admission verifies the certificate through the real directory.
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/ca.pem"])).toBe(true);
+    // Then the parent is swapped for a symlink to an identical tree outside
+    // the root: capture must refuse, never silently manifest without the cert.
+    const elsewhere = makeTemp();
+    writeTree(elsewhere, { "ca.pem": PUBLIC_CA_PEM });
+    renameSync(path.join(root, "fixtures"), path.join(root, "fixtures-real"));
+    symlinkSync(elsewhere, path.join(root, "fixtures"));
     await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
       .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
   });

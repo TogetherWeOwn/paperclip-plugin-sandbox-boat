@@ -969,6 +969,38 @@ describe("captureManifest open race", () => {
     expect(swapped).toBe(true);
     expect(manifest.files.find((f) => f.path === "a.txt")!.sha256).toBe(createHash("sha256").update(original).digest("hex"));
   });
+
+  it("retries instead of blocking when a file is swapped for a FIFO between lstat and open", async () => {
+    const root = makeTemp();
+    const original = "fifo-victim-bytes";
+    writeTree(root, { "a.txt": original });
+    const aAbs = path.join(root, "a.txt");
+    let swapped = false;
+    const realOpen = fsp.open;
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        if (p === aAbs && !swapped) {
+          swapped = true;
+          // Transient file->FIFO swap inside open: without O_NONBLOCK this
+          // open parks forever waiting for a writer; with it, the handle's
+          // stat must refuse the FIFO and the capture retries.
+          rmSync(aAbs);
+          execFileSync("mkfifo", [aAbs]);
+          try {
+            return await realOpen(p, flags);
+          } finally {
+            rmSync(aAbs);
+            writeFileSync(aAbs, original);
+          }
+        }
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+    };
+    const { manifest } = await captureManifest(root, { fs });
+    expect(swapped).toBe(true);
+    expect(manifest.files.find((f) => f.path === "a.txt")!.sha256).toBe(createHash("sha256").update(original).digest("hex"));
+  });
 });
 
 describe("captureSnapshot freeze races", () => {

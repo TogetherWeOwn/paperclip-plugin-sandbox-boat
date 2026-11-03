@@ -12,7 +12,7 @@
 // V1 never writes a returned change into the live workspace: there is no apply
 // step and no apply API in this module, even when the local baseline is
 // unchanged or a mutation lease token is supplied.
-import { O_NOFOLLOW, O_RDONLY } from "node:constants";
+import { O_NONBLOCK, O_NOFOLLOW, O_RDONLY } from "node:constants";
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
@@ -319,6 +319,10 @@ export async function resolveContained(root: string, rel: string): Promise<strin
 
 async function hashOpenFile(handle: fsp.FileHandle, preSize: number, preMtimeMs: number): Promise<{ bytes: Buffer; size: number; mtimeMs: number }> {
   const before = await handle.stat();
+  // A file swapped for a FIFO/device/dir between the lstat and the open is a
+  // structural race, not content to hash: size/mtime alone cannot see it (a
+  // FIFO reports size 0), and reading it could block or drain a device.
+  if (!before.isFile()) throw new ConcurrentEdit();
   if (before.size !== preSize || before.mtimeMs !== preMtimeMs) throw new ConcurrentEdit();
   const bytes = await handle.readFile();
   const after = await handle.stat();
@@ -446,7 +450,10 @@ async function walkAndHash(
         }
         // Deleted, swapped for a link, or file<->dir exchanged anywhere between
         // readdir and read: retry the capture instead of throwing a raw errno.
-        const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW));
+        // O_NONBLOCK so a file-to-FIFO swap after the lstat cannot park the
+        // open waiting for a writer; hashOpenFile then refuses the handle
+        // for not being a regular file (O_NONBLOCK is a no-op for those).
+        const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
         try {
           const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs));
           // Any .pem bound for a manifest — via the tracked exception or a
@@ -468,6 +475,21 @@ async function walkAndHash(
         }
       } else {
         throw new SyncError("SYNC_SPECIAL_FILE", `refusing special file ${entryRel}: only regular files, directories and in-root symlinks sync.`);
+      }
+    }
+  }
+  // No verified certificate may silently vanish from the manifest: a parent
+  // directory swapped for a symlink (skipped above before the leaf guard can
+  // see its subtree), a parent replaced by a file, or the .pem deleted after
+  // admission would all leave the guest quietly missing a file the host
+  // verified. Every tracked .pem whose only barrier is *.pem must have
+  // landed above; anything else aborts the capture instead.
+  if (onlyPaths) {
+    const captured = new Set(files.map((f) => f.path));
+    for (const allowed of onlyPaths) {
+      if (!allowed.endsWith(".pem") || isExcluded(allowed, false, excludesWithoutPem)) continue;
+      if (!captured.has(allowed)) {
+        throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync: tracked .pem ${allowed} did not reach the manifest (missing, or a parent path changed type after admission); the command stays local.`);
       }
     }
   }
