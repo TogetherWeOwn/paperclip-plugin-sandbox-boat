@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.9
+
+Follow-up to 0.2.8: local-run restore fencing and the `rust-public-1`
+toolchain pin. Offload and whole-run behaviour stay off by default;
+nothing is enabled by upgrading.
+
+### Fixed
+
+* Local-run restore no longer resurrects finished runs or serves a stale
+  whole-run realization: after the awaited persisted restore,
+  `rememberLocalRun` rechecks the terminal fence and the current marker
+  in the same synchronous stretch as the runtime write, forgetting the
+  restored records when the run ended and restoring the current marker
+  when a newer realization landed during the await (#85).
+
+* `rust-public-1` now pins toolchain `1.99.1` (replacing `1.98.1`) with
+  clippy, matching two-bot-next's current pin. Workspaces pinning
+  `1.99.1` classify as remote candidates again, while the replaced
+  `1.98.1` pin stays local (#87).
+
 ## 0.2.8
 
 Hardening follow-up to 0.2.7: offload binding and result handling, SSH
