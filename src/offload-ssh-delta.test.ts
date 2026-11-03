@@ -882,6 +882,26 @@ describe("mirror scripts executed locally", () => {
         return false;
       }
     };
+    const cmdlineOf = (pid: number): string | null => {
+      try {
+        return readFileSync(`/proc/${pid}/cmdline`, "utf8");
+      } catch {
+        return null;
+      }
+    };
+    // Synchronous sleep: unlike a timer it never yields to the event loop,
+    // so a child checked below cannot be reaped (and its pid reused)
+    // between a poll and the assertion that follows it.
+    const sleepSync = (ms: number) => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    };
+    const waitFor = (timeoutMs: number, cond: () => boolean, describe: () => string) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!cond()) {
+        if (Date.now() >= deadline) throw new Error(`timed out waiting: ${describe()}`);
+        sleepSync(10);
+      }
+    };
     const children: ChildProcess[] = [];
     const own = (child: ChildProcess): number => {
       if (!child.pid) throw new Error("child did not start");
@@ -901,14 +921,40 @@ describe("mirror scripts executed locally", () => {
       // Wrapper shape: a shell script named rsync that has not exec'd the
       // real binary yet runs as 'sh /path/rsync --server ... <mirror>'.
       const wrapper = path.join(temp("boat-delta-wrapper-"), "rsync");
-      writeFileSync(wrapper, "sleep 10\n");
+      writeFileSync(wrapper, "while :; do sleep 1; done\n");
       const wrappedReceiver = own(spawn("sh", [wrapper, "--server", "-vlogDtpre.iLsfxCIvu", ".", mirror], { stdio: "ignore" }));
       expect(running(wrappedReceiver)).toBe(true);
+
+      // Settle the spawn race: under a loaded runner a fresh fork may not
+      // have exec'd yet when the kill scans below run, so the scan finds no
+      // matching receiver, reports a vacuous all-clear, and the process is
+      // still alive at the assertion. Wait for the exec'd identities first,
+      // so the kill is proven against the genuine rsync receiver (argv[0]
+      // is rsync only after sh execs it) and the wrapper shell shape.
+      waitFor(
+        5_000,
+        () => (cmdlineOf(receiver) ?? "").split("\0")[0] === "rsync",
+        () => `receiver to exec rsync (cmdline=${JSON.stringify(cmdlineOf(receiver))})`,
+      );
+      waitFor(
+        5_000,
+        () => (cmdlineOf(wrappedReceiver) ?? "").includes(wrapper),
+        () => `wrapper to reach its shell shape (cmdline=${JSON.stringify(cmdlineOf(wrappedReceiver))})`,
+      );
 
       const { stdout, exitCode } = runScript(MIRROR_KILL_STALLED_RSYNC_SCRIPT, [mirror]);
 
       expect(exitCode).toBe(0);
       expect(JSON.parse(stdout)).toMatchObject({ ok: true, remaining: 0 });
+      // The kill signals SIGTERM then SIGKILL, but an rsync receiver takes
+      // on the order of half a second to shut down even on an idle box, so
+      // an instant assertion races process exit. Wait boundedly instead;
+      // the receiver must still be shown dead, not merely unobserved.
+      waitFor(
+        5_000,
+        () => !running(receiver) && !running(wrappedReceiver),
+        () => `receiver and wrapper to exit (receiver running=${running(receiver)}, wrapper running=${running(wrappedReceiver)})`,
+      );
       expect(running(receiver), "genuine receiver must be dead").toBe(false);
       expect(running(wrappedReceiver), "rsync wrapper script must be dead").toBe(false);
       expect(running(bystander), "argv lookalike must survive").toBe(true);
