@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { BoatApiLike } from "./boat-client.js";
 import { OffloadExecutor } from "./offload.js";
 import type { OffloadCommand, OffloadDeps } from "./offload.js";
-import { FakeBoat, responseError } from "./test-support/fake-boat.js";
+import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.js";
 import { JsonState } from "./test-support/account-admission.fixture.js";
 
 const EPOCH = Date.parse("2026-10-23T10:00:00Z");
@@ -161,6 +161,10 @@ describe("offload uncertain create", () => {
     expect(await s.executor.execute(command("cmd-2"))).toMatchObject({ status: "unavailable" });
     s.account.state.set = innerSet;
 
+    // The failed receipt failed the new hold instead of stranding it.
+    expect(s.executor.getUsage().filter((row) => row.commandId === "cmd-2").map((row) => row.kind))
+      .toEqual(["failed_start"]);
+
     // Nothing was recorded: one box, and the next claim replays the same key
     // (a create) instead of warm-updating a half-adopted VM.
     expect(s.fake.boxes.size).toBe(1);
@@ -183,6 +187,88 @@ describe("offload uncertain create", () => {
     const dispatched = rows.filter((row) => row.kind === "command");
     expect(dispatched.map((row) => row.commandId)).toEqual(["cmd-2"]);
     expect(rows.filter((row) => row.kind === "failed_start").map((row) => row.commandId)).toEqual(["cmd-1"]);
+  });
+
+  it("adopts a compatible replay without charging a second active slot at maxActive=1", async () => {
+    // The lost VM already occupies the single provider slot. Adoption reuses
+    // it warm, so no second create slot is admitted.
+    const s = setup(undefined, { maxActive: 1 });
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
+
+    s.fake.limitsResponse = trialLimits({ activeSandboxes: 1 });
+    const second = await s.executor.execute(command("cmd-2"));
+    const [id] = [...s.fake.boxes.keys()];
+    expect(second).toMatchObject({ status: "completed", warm: "cold", sandboxId: id });
+    expect(s.fake.boxes.size).toBe(1);
+    expect(s.fake.callsOf("create")).toHaveLength(2);
+    expect(s.fake.callsOf("stop")).toHaveLength(0);
+  });
+
+  it("extends the provider TTL when the adopter funds a longer envelope", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 60_000 })).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(75);
+
+    const second = await s.executor.execute({ ...command("cmd-2"), timeoutMs: 600_000 });
+    expect(second).toMatchObject({ status: "completed" });
+
+    // Same key, same original body on replay; the TTL extension is an update.
+    const creates = s.fake.callsOf("create");
+    expect(creates[1]!.args).toEqual(creates[0]!.args);
+    const [id] = [...s.fake.boxes.keys()];
+    expect(s.fake.callsOf("update")).toHaveLength(1);
+    expect(s.fake.callsOf("update")[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 615 });
+    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(615);
+    expect(second).toMatchObject({ sandboxId: id });
+  });
+
+  it("fails the adopter hold when the adoption pool write fails", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
+
+    // Fail the pool write that must durably record the adoption (the adopter
+    // receipt itself succeeds first). The harness wires no pool store, so the
+    // failure is injected at the persist seam.
+    const persist = s.executor as unknown as { persistPool: () => Promise<void> };
+    const innerPersist = persist.persistPool.bind(s.executor);
+    persist.persistPool = async () => { throw new Error("synthetic pool failure"); };
+    expect(await s.executor.execute(command("cmd-2"))).toMatchObject({ status: "unavailable" });
+    persist.persistPool = innerPersist;
+
+    // The adopter hold was failed, not stranded: cmd-2 never ran, and the
+    // next claim replays the same key onto the same VM.
+    expect(s.executor.getUsage().filter((row) => row.commandId === "cmd-2").map((row) => row.kind))
+      .toEqual(["failed_start"]);
+    const third = await s.executor.execute(command("cmd-3"));
+    expect(third).toMatchObject({ status: "completed" });
+    expect(s.fake.boxes.size).toBe(1);
+    const creates = s.fake.callsOf("create");
+    expect(creates[2]!.args.idempotencyKey).toBe(creates[0]!.args.idempotencyKey);
+    expect(third).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
+  });
+
+  it("keeps the original hold and adds no stray holds when adoption is refused", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
+
+    // Refuse the adopter (machine type unavailable): the live VM keeps its
+    // original hold, and no adopter hold is left behind.
+    s.fake.limitsResponse = trialLimits({ machineTypes: [{ type: "default", available: false, reason: "test" }] });
+    expect(await s.executor.execute(command("cmd-2"))).toMatchObject({ status: "unavailable" });
+    const rows = s.executor.getUsage();
+    expect(rows.filter((row) => row.commandId === "cmd-1").map((row) => row.kind)).toEqual(["aborted_start"]);
+    expect(rows.filter((row) => row.commandId === "cmd-2")).toHaveLength(0);
+
+    // Capacity restored: the next claim adopts the same VM.
+    s.fake.limitsResponse = trialLimits();
+    const third = await s.executor.execute(command("cmd-3"));
+    expect(third).toMatchObject({ status: "completed" });
+    expect(s.fake.boxes.size).toBe(1);
+    expect(third).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
   });
 
   it("keeps an incompatible replay tracked when its stop is unconfirmed", async () => {

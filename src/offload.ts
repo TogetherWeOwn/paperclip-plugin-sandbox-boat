@@ -911,21 +911,36 @@ export class OffloadExecutor {
       return { kind: "freed" };
     }
     if (vm.compatibilityKey === this.compatibilityKey(command)) {
-      // The replayed VM now exists. The original command never dispatched, so
-      // settle its held intent and fund the adopting command under current
-      // admission: usage attributes to the command that actually runs, and a
-      // replay never bypasses caps with a stale envelope.
-      await ledger.failed(reservation, true).catch(() => undefined);
-      const funded = await this.admitCommand(command, "create", id);
+      // The replayed VM now exists and keeps billing under its original TTL.
+      // Fund the adopting command first, without releasing the original hold:
+      // the replayed VM already occupies its provider active slot, so the
+      // adopter reuses it warm (no second active/start charge) while its own
+      // compute envelope is still fully admitted. The original hold is
+      // released only after the adopter is receipted and the pool ownership
+      // change is durable. Any failure before that point fails the new hold
+      // and leaves the placeholder (with its original hold) untouched for the
+      // next claim under the same key.
+      const funded = await this.admitCommand(command, "warm", id);
       if ("kind" in funded) return null;
-      let tailSeconds: number;
+      const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+      // The replay resent the persisted (original) body, so a longer adopter
+      // would otherwise lose its VM mid-run. Extend the provider TTL to the
+      // funded envelope before dispatch; a refused extension keeps the VM
+      // (and the placeholder) tracked instead of running past its deadline.
+      const originalTtl = vm.pendingCreate?.ttlSeconds ?? legacyTtlSeconds;
+      let tailSeconds = funded.tailSeconds;
       try {
+        const neededTtl = Math.max(60, Math.ceil(jobSeconds + funded.tailSeconds));
+        if (neededTtl > originalTtl) await this.boat.update({ sandboxId: id, ttlSeconds: neededTtl });
         tailSeconds = await ledger.started(this.boat, funded, id);
       } catch {
-        // The receipt write failed; the placeholder is untouched, so a later
-        // claim replays the same key and funds the adopter again.
+        // The receipt write or the TTL extension failed: fail the new hold so
+        // it cannot strand adopter capacity. The original hold still covers
+        // the (unextended) VM, and the next claim replays the same key.
+        await ledger.failed(funded, true).catch(() => undefined);
         return null;
       }
+      const snapshot = { ...vm };
       vm.pendingCreate = undefined;
       vm.accountReservation = funded;
       vm.sandboxId = id;
@@ -934,7 +949,24 @@ export class OffloadExecutor {
       vm.lastActiveAt = this.now();
       vm.tailSeconds = tailSeconds;
       this.reserveVm(vm, command);
-      await this.persistPool().catch(() => undefined);
+      try {
+        await this.persistPool();
+      } catch {
+        // The pool write failed after the adopter receipt: fail the new hold
+        // so recovery (which reloads the old placeholder) does not pile up
+        // adopter reservations, and restore the in-memory placeholder to
+        // match. The original hold still covers the VM.
+        const idleHandle = vm.idleHandle;
+        Object.assign(vm, snapshot);
+        vm.idleHandle = idleHandle;
+        await ledger.failed(funded, true).catch(() => undefined);
+        await this.persistPool().catch(() => undefined);
+        return null;
+      }
+      // Only now is the adopter durably running on the VM: release the
+      // original hold. A failing settlement write is logged, not fatal; the
+      // double hold is conservative and converges on reconcile.
+      await ledger.failed(reservation, true).catch(() => undefined);
       return { kind: "run", vm, warm: "cold" };
     }
     // Another trust domain must not adopt the replayed VM: settle the
@@ -965,7 +997,9 @@ export class OffloadExecutor {
 
   // One admission path for first creates and for adopters of a replayed VM:
   // the reservation funds the command that will actually run, under current
-  // limits and caps, never under a stale command's envelope.
+  // limits and caps, never under a stale command's envelope. Adopters reuse
+  // the already-live VM warm: no second active/start slot is charged, while
+  // the adopter's own compute envelope is still fully admitted.
   private async admitCommand(command: OffloadCommand, operation: "create" | "resume" | "warm", sandboxId?: string): Promise<AccountReservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
     // Monthly VM-hour cap, when configured, is enforced atomically with
