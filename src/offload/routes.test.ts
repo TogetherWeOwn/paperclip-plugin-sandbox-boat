@@ -284,11 +284,14 @@ describe("rust-public-1 profile parity", () => {
     expect(response.status).toBe(200);
     return response.body as { mode: string; reason: string };
   }
-  const TWO_BOT_NEXT_TOOLCHAIN = '# Pinned toolchain\n[toolchain]\nchannel = "1.98.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n';
+  const TWO_BOT_NEXT_TOOLCHAIN = '# Pinned toolchain\n[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n';
 
-  it("pins 1.98.1 with clippy and owns the lean build env", () => {
-    expect(V1_PROFILE.toolchains).toContain("1.98.1");
-    expect(V1_PROFILE.components).toContain("clippy");
+  it("pins 1.99.1 with clippy and owns the lean build env", () => {
+    // Exact, not additive: the guest template serves one pinned toolchain,
+    // so the profile mirrors it. rustfmt is deliberately absent from
+    // components even though two-bot-next's file lists it: fmt stays local.
+    expect(V1_PROFILE.toolchains).toEqual(["stable", "1.99.1"]);
+    expect(V1_PROFILE.components).toEqual(["clippy"]);
     expect(V1_PROFILE.env).toEqual({ CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0" });
     // Host paths from the local wrapper never become guest env.
     expect(Object.keys(V1_PROFILE.env!).some((key) => /TARGET_DIR|BUILD_DIR|TMP|SCRATCH/.test(key))).toBe(false);
@@ -306,16 +309,19 @@ describe("rust-public-1 profile parity", () => {
   it("keeps a workspace pinned to an uninstalled or unparseable toolchain local", async () => {
     const pinned = await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"]);
     expect(pinned).toMatchObject({ mode: "local", reason: "rust-toolchain.toml pins 1.99.0, not installed on the profile" });
+    // The replaced 1.98.1 pin (two-bot-next before its 1.99.1 move) now refuses.
+    expect(await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n' }), ["check"]))
+      .toMatchObject({ mode: "local", reason: "rust-toolchain.toml pins 1.98.1, not installed on the profile" });
     expect((await dryRun(workspaceWith({ "rust-toolchain": "nightly-2026-01-01\n" }), ["check"])).mode).toBe("local");
     expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\npath = "/opt/rust"\n' }), ["check"])).mode).toBe("local");
-    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1" }), ["check"])).mode).toBe("remote_candidate");
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.99.1" }), ["check"])).mode).toBe("remote_candidate");
     // rustup reads the legacy file when both exist.
     expect(await dryRun(workspaceWith({ "rust-toolchain": "1.99.0", "rust-toolchain.toml": TWO_BOT_NEXT_TOOLCHAIN }), ["check"]))
       .toMatchObject({ mode: "local", reason: "rust-toolchain pins 1.99.0, not installed on the profile" });
-    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.98.1", "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"])).mode)
+    expect((await dryRun(workspaceWith({ "rust-toolchain": "1.99.1", "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["check"])).mode)
       .toBe("remote_candidate");
     // An explicit installed +toolchain overrides the file, as rustup does.
-    expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["+1.98.1", "check"])).mode).toBe("remote_candidate");
+    expect((await dryRun(workspaceWith({ "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.0"\n' }), ["+1.99.1", "check"])).mode).toBe("remote_candidate");
   });
 
   it("uses the toolchain file nearest the run directory", async () => {
