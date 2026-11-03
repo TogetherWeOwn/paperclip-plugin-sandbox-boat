@@ -106,6 +106,63 @@ describe("journal names the failed pre-start step", () => {
     expect(discard).toHaveBeenCalledWith("vm", cmd);
   });
 
+  it("lifecycle prepare detail token reaches the failure record but never the client reason", async () => {
+    const { journal } = makeJournal({ prepare: async () => {
+      throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "probe_mkdir_failed:EACCES");
+    } });
+    const cmd = lifecycleCommand("prestart-prepare-detail");
+    let captured: ReturnType<OffloadJournal["preStartFailure"]> = null;
+    const result = await journal.execute(cmd, async () => {
+      try {
+        await journal.run("vm", cmd, async () => ({ exitCode: 0, seconds: 1 }));
+        throw new Error("run must throw");
+      } catch {
+        captured = journal.preStartFailure(cmd);
+        return await journal.finish(cmd, { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: cmd.commandId,
+          sandboxId: "vm", warm: "cold", queueWaitMs: 0, remoteStarted: true, fallbackSafe: false,
+          exitCode: 75, seconds: 0, dollars: 0, reason: captured?.reason ?? "test" });
+      }
+    });
+    expect(captured).toMatchObject({ step: "guest lifecycle prepare", code: "OFFLOAD_GUEST_INELIGIBLE",
+      detail: "probe_mkdir_failed:EACCES" });
+    // The detail is server-log diagnosis only: the journaled reason the shim
+    // announces is byte-identical to the pre-detail wording, with no token.
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
+      reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    expect(JSON.stringify(result)).not.toContain("probe_mkdir_failed");
+    expect(JSON.stringify(result)).not.toContain("EACCES");
+    expect(await journal.readCommand(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({
+      state: "not_started",
+      fallbackReason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+  });
+
+  it("a forged or hostile detail token never reaches the failure record", async () => {
+    const forged = Object.assign(new Error("x"), { code: "OFFLOAD_GUEST_INELIGIBLE",
+      detail: "leaked /home/agent/.ssh/id_ed25519; EACCES" });
+    const accessor = Object.assign(new Error("y"), { code: "OFFLOAD_GUEST_INELIGIBLE" });
+    Object.defineProperty(accessor, "detail", { get() { throw new Error("getter boom"); } });
+    for (const [name, error] of [["forged", forged], ["accessor", accessor]] as const) {
+      const { journal } = makeJournal({ prepare: async () => { throw error; } });
+      const cmd = lifecycleCommand(`prestart-detail-${name}`);
+      let captured: ReturnType<OffloadJournal["preStartFailure"]> = null;
+      const result = await journal.execute(cmd, async () => {
+        try {
+          await journal.run("vm", cmd, async () => ({ exitCode: 0, seconds: 1 }));
+          throw new Error("run must throw");
+        } catch {
+          captured = journal.preStartFailure(cmd);
+          return await journal.finish(cmd, { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: cmd.commandId,
+            sandboxId: "vm", warm: "cold", queueWaitMs: 0, remoteStarted: true, fallbackSafe: false,
+            exitCode: 75, seconds: 0, dollars: 0, reason: captured?.reason ?? "test" });
+        }
+      });
+      expect(captured).toMatchObject({ step: "guest lifecycle prepare", code: "OFFLOAD_GUEST_INELIGIBLE", detail: null });
+      expect(JSON.stringify(result)).not.toContain("leaked");
+      expect(result).toMatchObject({ status: "unavailable",
+        reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    }
+  });
+
   it("starting-intent commit failure names its step and errno code", async () => {
     const { journal, transport, lifecycleDiscard } = makeJournal({ failCommitState: "starting", lifecycle: true });
     const cmd = lifecycleCommand("prestart-commit");
@@ -214,8 +271,38 @@ describe("executor logs and releases on a pre-start failure", () => {
     expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
       reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
     const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
+    // No sub-cause reported: the log still says which capability flag refused.
     expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
-      code: "OFFLOAD_GUEST_INELIGIBLE" });
+      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "cgroup_not_delegated" });
+    expect(s.starts).toEqual([]);
+  });
+
+  it("guest-reported probe sub-cause reaches the warn detail, never the result reason", async () => {
+    s.guest.delegated = false;
+    s.guest.watchdog = false;
+    s.guest.preflightReason = "probe_mkdir_failed:EACCES";
+    const cmd = lifecycleCommand("exec-prepare-probe-fail");
+    const result = await s.execute(cmd);
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
+      reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    expect(JSON.stringify(result)).not.toContain("probe_mkdir_failed");
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
+    expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
+      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "probe_mkdir_failed:EACCES" });
+    expect(s.starts).toEqual([]);
+  });
+
+  it("preflight RPC failure is a distinct warn detail from a guest-reported refusal", async () => {
+    s.guest.delegated = false;
+    s.guest.watchdog = false;
+    s.guest.preflightReason = "preflight_rpc_failed:OFFLOAD_GUEST_TRANSPORT_UNKNOWN";
+    const cmd = lifecycleCommand("exec-prepare-rpc-fail");
+    const result = await s.execute(cmd);
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
+      reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
+    expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
+      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "preflight_rpc_failed:OFFLOAD_GUEST_TRANSPORT_UNKNOWN" });
     expect(s.starts).toEqual([]);
   });
 });

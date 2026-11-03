@@ -62,8 +62,60 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
   it("refuses without real cgroup delegation instead of claiming a process-group fallback", async () => {
     const unavailable = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session,
       cgroupParent: path.join(ssh.root, "not-a-cgroup"), stateRoot: ssh.root, workspace: async () => ssh.root });
-    expect(await unavailable.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false, outsideWatchdogVerified: false });
+    expect(await unavailable.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
+      outsideWatchdogVerified: false, ineligibleReason: "parent_not_delegated" });
     await unavailable.shutdown();
+  });
+
+  it("preflight names each ineligible sub-cause without reflecting guest bytes", async () => {
+    const withScript = (script: string, cgroupParent = parent) => new SshOffloadGuest({ ssh: ssh.manager,
+      session: async () => ssh.session, cgroupParent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
+    const cases: Array<[string, string, string]> = [
+      // A guest-reported probe refusal carries its allowlisted step token.
+      ["probe token", `import json; print(json.dumps("probe_mkdir_failed:EACCES"))`, "probe_mkdir_failed:EACCES"],
+      ["probe token without errno", `import json; print(json.dumps("probe_kill_failed"))`, "probe_kill_failed"],
+      // A legacy guest's bare false and any unrecognized guest string both
+      // collapse to the generic token; guest bytes are never echoed.
+      ["legacy false", `import json; print(json.dumps(False))`, "guest_reported_ineligible"],
+      ["guest garbage", `import json; print(json.dumps("evil /home/agent/.ssh/id_ed25519 EACCES"))`, "guest_reported_ineligible"],
+      ["guest object", `import json; print(json.dumps({"eligible": False, "why": "secret"}))`, "guest_reported_ineligible"],
+      // A guest process that dies mid-RPC is a transport failure, distinct
+      // from any guest-reported verdict.
+      ["rpc exit", `import sys; sys.exit(3)`, "preflight_rpc_failed:OFFLOAD_GUEST_TRANSPORT_UNKNOWN"],
+      ["rpc bad json", `print("not json")`, "preflight_rpc_failed:OFFLOAD_GUEST_TRANSPORT_UNKNOWN"],
+    ];
+    for (const [name, script, ineligibleReason] of cases) {
+      const candidate = withScript(script);
+      try {
+        const capabilities = await candidate.preflight(ssh.session.sandboxId, cmd());
+        expect(capabilities, name).toEqual({ cgroupV2Delegated: false, outsideWatchdogVerified: false, ineligibleReason });
+        expect(JSON.stringify(capabilities), name).not.toContain("secret");
+        expect(JSON.stringify(capabilities), name).not.toContain("/home/agent");
+      } finally {
+        await candidate.shutdown();
+      }
+    }
+    // The real probe on a symlinked configured parent: canonical() refuses
+    // before any cgroup access, and the token says so instead of reading as
+    // a transport failure.
+    const { symlink } = await import("node:fs/promises");
+    const link = path.join(ssh.root, "parent-link");
+    await symlink("/sys/fs/cgroup", link);
+    const symlinked = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session,
+      cgroupParent: link, stateRoot: ssh.root, workspace: async () => ssh.root });
+    try {
+      expect(await symlinked.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
+        outsideWatchdogVerified: false, ineligibleReason: "parent_invalid" });
+    } finally {
+      await symlinked.shutdown();
+    }
+  });
+
+  it("host env gate refuses prepare with its own detail, distinct from guest sub-causes", async () => {
+    const command = cmd();
+    command.env = { CARGO_TERM_COLOR: "always", SOME_SECRET: "nope" };
+    await expect(guest.prepare(ssh.session.sandboxId, command))
+      .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE", detail: "host_env_gate" });
   });
 
   it("prepares, arms, streams both channels and verifies an empty real subtree", async () => {

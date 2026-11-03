@@ -36,6 +36,10 @@ export interface SshOffloadGuestDeps {
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
  * No process-group-only execution is advertised as equivalent containment. */
 const FETCH_TIMEOUT_MS = 600_000;
+/** The guest probe's failure vocabulary (offload-ssh-script `preflight`):
+ * the sub-step that refused, plus the errno name where an OSError caused it.
+ * Anything else from the guest is not a token and never reaches a log. */
+const GUEST_PROBE_TOKEN = /^(?:parent_invalid|parent_not_delegated|probe_mkdir_failed|probe_admit_failed|probe_outside_failed|probe_kill_failed)(?::E[A-Z]{2,11})?$/;
 export class SshOffloadGuest implements GuestController {
   private readonly prepared = new Map<string, { sandboxId: string; identity: GuestIdentity }>();
   private readonly sessions = new Map<string, SshSession>();
@@ -68,9 +72,29 @@ export class SshOffloadGuest implements GuestController {
 
   async bootId(sandboxId: string): Promise<string> { return this.rpc(sandboxId, "boot"); }
   async preflight(sandboxId: string, _command: OffloadCommand) {
-    let eligible = false;
-    try { eligible = await this.rpc<boolean>(sandboxId, "preflight", { cgroupParent: this.deps.cgroupParent }); } catch { /* Refuse before spawn. */ }
-    return { cgroupV2Delegated: eligible === true, outsideWatchdogVerified: eligible === true };
+    // Eligibility is still one guest probe exercising real admission, kill
+    // and outside placement; both flags stand or fall together. What changed
+    // is only the diagnosis: a guest-reported refusal names its probe step
+    // as an allowlisted token (re-validated here, so guest bytes never reach
+    // a log verbatim), and an RPC transport failure is named separately
+    // instead of collapsing into the same false. Refusal semantics are
+    // identical — anything but a literal `true` refuses before spawn.
+    let raw: unknown;
+    try {
+      raw = await this.rpc<unknown>(sandboxId, "preflight", { cgroupParent: this.deps.cgroupParent });
+    } catch (error) {
+      let suffix = "";
+      try {
+        const code = (error as { code?: unknown } | null)?.code;
+        if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,56}$/.test(code)) suffix = `:${code}`;
+      } catch { /* A throwing accessor contributes no suffix. */ }
+      return { cgroupV2Delegated: false, outsideWatchdogVerified: false,
+        ineligibleReason: `preflight_rpc_failed${suffix}` };
+    }
+    if (raw === true) return { cgroupV2Delegated: true, outsideWatchdogVerified: true };
+    const probeToken = typeof raw === "string" && GUEST_PROBE_TOKEN.test(raw) ? raw : null;
+    return { cgroupV2Delegated: false, outsideWatchdogVerified: false,
+      ineligibleReason: probeToken ?? "guest_reported_ineligible" };
   }
   async prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity> {
     // Explicit nonsecret command env only; no inherited host/Boat credentials.
@@ -78,7 +102,7 @@ export class SshOffloadGuest implements GuestController {
     // it); cargo keeps its two validated keys.
     const allowedEnv = this.deps.allowedEnv?.(command) ?? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"];
     if (Object.keys(command.env ?? {}).some((key) => !allowedEnv.includes(key))) {
-      throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+      throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "host_env_gate");
     }
     const cwd = await this.deps.workspace(sandboxId, command);
     let executable = command.runner ?? command.executable ?? this.deps.executable ?? "cargo";
@@ -99,9 +123,9 @@ export class SshOffloadGuest implements GuestController {
       if (venvRoot !== null && venvRoot !== undefined) {
         const base = command.runner ?? command.executable ?? this.deps.executable ?? "python";
         if (!base || base.includes("/") || base.includes("\\") || base.includes("\0")
-          || base === "." || base === ".." || base.includes("..")) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+          || base === "." || base === ".." || base.includes("..")) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_venv_gate");
         if (!venvRoot.startsWith("/") || venvRoot.includes("\0") || venvRoot.split("/").includes("..")) {
-          throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+          throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_venv_gate");
         }
         const venvDir = path.posix.join(venvRoot, ".venv");
         const venvBin = path.posix.join(venvDir, "bin");
@@ -147,7 +171,7 @@ export class SshOffloadGuest implements GuestController {
   private async fetchLocked(sandboxId: string, cwd: string, guestPath: string, toolchain: string | null, cargoHome: string): Promise<void> {
     const result = await this.rpc<{ exitCode: number }>(sandboxId, "fetch",
       { executable: "cargo", toolchain, cwd, path: guestPath, cargoHome }, FETCH_TIMEOUT_MS);
-    if (result.exitCode !== 0) throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+    if (result.exitCode !== 0) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "cargo_fetch_failed");
   }
   async armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }> {
     return this.call(sandboxId, "arm", identity);
