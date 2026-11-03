@@ -1,7 +1,7 @@
 // Guest enforcement is an opt-in transport port, not a claim that a profile
 // name or a host timer proves cgroup delegation / an independent watchdog.
 import type { OffloadCommand, OffloadTimers } from "./offload.js";
-import { commandKey, offloadError, validGuestIdentity, type OffloadIdentity } from "./offload-journal.js";
+import { commandKey, offloadError, validGuestIdentity, validPreStartDetail, type OffloadIdentity } from "./offload-journal.js";
 
 export interface GuestIdentity {
   guestBootId: string;
@@ -32,6 +32,10 @@ export interface CommandExit {
 export interface GuestController {
   preflight(sandboxId: string, command: OffloadCommand): Promise<{
     cgroupV2Delegated: boolean | null; outsideWatchdogVerified: boolean | null;
+    /** Allowlisted sub-cause token when not eligible (guest-probe step,
+     * RPC transport failure, …). Server-log diagnosis only; the
+     * client-facing code stays OFFLOAD_GUEST_INELIGIBLE. */
+    ineligibleReason?: string;
   }>;
   prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity>;
   armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }>;
@@ -67,7 +71,15 @@ export class OffloadLifecycle {
   async prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<ExecutionIdentity> {
     const capabilities = await this.guest.preflight(sandboxId, command);
     if (capabilities.cgroupV2Delegated !== true || capabilities.outsideWatchdogVerified !== true) {
-      throw offloadError("OFFLOAD_GUEST_INELIGIBLE");
+      // The client-facing code is unchanged; the detail token only lets the
+      // server log separate a guest-reported refusal (and which probe step)
+      // from a preflight RPC transport failure. A controller that names no
+      // sub-cause still says which capability flag was not true.
+      const detail = validPreStartDetail(capabilities.ineligibleReason)
+        ?? (capabilities.cgroupV2Delegated !== true && capabilities.outsideWatchdogVerified !== true
+          ? "cgroup_and_watchdog_false"
+          : capabilities.cgroupV2Delegated !== true ? "cgroup_not_delegated" : "watchdog_not_verified");
+      throw offloadError("OFFLOAD_GUEST_INELIGIBLE", detail);
     }
     const sentAt = this.now();
     const identity = await this.guest.prepare(sandboxId, command);

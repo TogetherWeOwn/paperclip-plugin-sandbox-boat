@@ -176,7 +176,10 @@ export class Guest {
   actions: Array<{ kind: string; at: number; commandId?: string; identity?: GuestIdentity }> = [];
   onEmpty: (identity: GuestIdentity) => void = () => {};
   constructor(readonly clock: Clock) {}
-  preflight = async () => ({ cgroupV2Delegated: this.delegated, outsideWatchdogVerified: this.watchdog });
+  /** Sub-cause token a concrete guest would report alongside false flags. */
+  preflightReason: string | null = null;
+  preflight = async () => ({ cgroupV2Delegated: this.delegated, outsideWatchdogVerified: this.watchdog,
+    ...(this.preflightReason !== null ? { ineligibleReason: this.preflightReason } : {}) });
   prepare = async (_sandboxId: string, cmd: LifecycleCommand): Promise<GuestIdentity> => {
     const identity = {
       guestBootId: "boot-a", processGroupId: 4100 + this.prepared.size,

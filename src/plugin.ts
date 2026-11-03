@@ -129,7 +129,13 @@ const plugin = definePlugin({
       if (bound && params) {
         const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
         const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : null;
-        ctx.logger.info("boat: bound local run for offload", { runId, workspaceId });
+        // The shim submits under the project workspace id even for execution
+        // workspaces, and later executor logs carry that id; log the alias
+        // here too so the bind and refusal lines correlate.
+        const source = request?.source as Record<string, unknown> | undefined;
+        const projectWorkspaceId = typeof source?.projectWorkspaceId === "string" ? source.projectWorkspaceId : null;
+        ctx.logger.info("boat: bound local run for offload", { runId, workspaceId,
+          ...(projectWorkspaceId !== null && projectWorkspaceId !== workspaceId ? { projectWorkspaceId } : {}) });
       }
       return bound;
     };

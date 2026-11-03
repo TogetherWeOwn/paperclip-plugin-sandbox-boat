@@ -115,7 +115,12 @@ const OUTPUT_LIMIT_EVENTS = 16_384;
 const TERMINAL = new Set<OffloadState>(["completed", "not_started", "cancelled", "failed"]);
 const PRE_START = new Set<OffloadState>(["accepted", "queued", "syncing_in"]);
 const STATES = new Set<OffloadState>([...TERMINAL, ...PRE_START, "starting", "running", "syncing_out", "unknown"]);
-export const offloadError = (code: string) => Object.assign(new Error(code), { code });
+/** First-party failure with an allowlisted code, plus — only where a site
+ * knows which sub-cause refused — a server-log detail token. The detail is
+ * validated again before anyone logs it and never joins a client-visible
+ * reason; see describePreStartFailure. */
+export const offloadError = (code: string, detail?: string) =>
+  Object.assign(new Error(code), { code, ...(detail !== undefined ? { detail } : {}) });
 
 /** The pre-start steps of `OffloadJournal.run()`, in dispatch order. A failure
  * in any of them happens before transport, so it is a known non-start — but
@@ -129,6 +134,9 @@ export interface PreStartFailure {
   step: PreStartStep;
   /** Sanitized first-party/errno error code, or null. */
   code: string | null;
+  /** Sanitized sub-cause token for the server log only, or null. Never
+   * joins `reason`: the reason crosses to the client, the detail must not. */
+  detail: string | null;
   /** Server-authored reason safe for the journal result and shim announcement. */
   reason: string;
 }
@@ -138,20 +146,35 @@ export interface PreStartFailure {
 // only when it is a known first-party prefix or an errno token. Raw error
 // messages never cross (they can carry guest diagnostics, source paths or
 // environment bytes; see the guest RPC boundary), and metadata is never
-// read from or written to an adapter-owned error object, whose accessors,
-// frozen state or reuse across commands must not affect attribution. The
-// single property read is guarded: describing a failure never throws.
+// written to an adapter-owned error object, whose accessors, frozen state
+// or reuse across commands must not affect attribution. The property reads
+// are guarded: describing a failure never throws.
+//
+// One more token may cross for the server log only: a first-party site that
+// knows which sub-cause refused (a guest-probe step, an RPC transport
+// failure, the host env gate) attaches it as `detail`. It is read under the
+// same guard and kept only when it matches the fixed token shape below, so
+// guest- or adapter-influenced bytes still cannot reach the log — and it is
+// never appended to `reason`, which crosses to the client unchanged.
 const SAFE_ERROR_CODE = /^(?:(?:OFFLOAD|SYNC|BOAT)_[A-Z0-9_]{1,56}|E[A-Z]{2,11})$/;
+const SAFE_PRESTART_DETAIL = /^[a-z][a-z0-9_]{0,40}(?::(?:E[A-Z]{2,11}|[A-Z][A-Z0-9_]{1,56}))?$/;
+export function validPreStartDetail(value: unknown): string | null {
+  return typeof value === "string" && SAFE_PRESTART_DETAIL.test(value) ? value : null;
+}
 function describePreStartFailure(step: PreStartStep, error: unknown): PreStartFailure {
   let code: string | null = null;
   try {
     const raw = (error as { code?: unknown } | null)?.code;
     if (typeof raw === "string" && SAFE_ERROR_CODE.test(raw)) code = raw;
   } catch { /* A throwing accessor contributes no code. */ }
+  let detail: string | null = null;
+  try {
+    detail = validPreStartDetail((error as { detail?: unknown } | null)?.detail);
+  } catch { /* A throwing accessor contributes no detail. */ }
   const reason = code === "OFFLOAD_COMMAND_NOT_STARTED"
     ? "cancelled before durable starting intent"
     : `${step} failed before the command could start${code ? ` (${code})` : ""}`;
-  return { step, code, reason };
+  return { step, code, detail, reason };
 }
 
 export function commandDigest(command: OffloadCommand): string {

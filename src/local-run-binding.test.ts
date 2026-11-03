@@ -220,7 +220,9 @@ describe("plugin wiring", () => {
       projectWorkspaceId, path: dir, cwd: dir });
     await harness.emit("agent.run.started", started);
     const bound = harness.logs.find((entry) => entry.message === "boat: bound local run for offload");
-    expect(bound?.meta).toMatchObject({ runId, workspaceId });
+    // Both ids are logged: binds key on the execution workspace id, but the
+    // shim (and later executor refusal logs) report the project workspace id.
+    expect(bound?.meta).toMatchObject({ runId, workspaceId, projectWorkspaceId });
     const response = await exec(runId, projectWorkspaceId);
     expect(response.status).toBe(200);
     // Remote classification under the alias, then the executor gate answers:

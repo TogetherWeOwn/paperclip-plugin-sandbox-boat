@@ -2,7 +2,7 @@
 // The detached supervisor/watchdog stays OUTSIDE the command cgroup. State and
 // output are private, bounded and ephemeral (/tmp, never a Boat snapshot).
 export const OFFLOAD_SSH_SCRIPT = String.raw`
-import base64, contextlib, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
+import base64, contextlib, errno, fcntl, json, os, pathlib, secrets, selectors, signal, stat, subprocess, sys, time
 
 MAX_OUTPUT = 1048576
 BOOT = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -295,28 +295,57 @@ def rpc(action, data):
     if action == 'boot':
         return BOOT
     if action == 'preflight':
-        parent = pathlib.Path(canonical(data['cgroupParent']))
-        if not str(parent).startswith('/sys/fs/cgroup/') or not (parent / 'cgroup.controllers').is_file():
-            return False
-        probe = parent / ('paperclip-boat-probe-' + secrets.token_hex(8))
+        # Eligibility crosses as True and only True. A refusal crosses as an
+        # allowlisted token naming the sub-step that failed (plus the errno
+        # name where an OSError caused it), so the host log can separate a
+        # missing delegation from a failed admission or kill. No path or
+        # guest text crosses; the host re-validates the token against this
+        # same fixed vocabulary before logging it. The probe itself is
+        # unchanged: same admission, kill and outside-placement exercise.
+        def probe_failed(step, error=None):
+            name = errno.errorcode.get(getattr(error, 'errno', None) or 0)
+            return step + (':' + name if name else '')
         try:
-            probe.mkdir()
+            parent = pathlib.Path(canonical(data['cgroupParent']))
+        except (KeyError, TypeError, ValueError):
+            return 'parent_invalid'
+        except OSError as error:
+            return probe_failed('parent_invalid', error)
+        if not str(parent).startswith('/sys/fs/cgroup/') or not (parent / 'cgroup.controllers').is_file():
+            return 'parent_not_delegated'
+        probe = parent / ('paperclip-boat-probe-' + secrets.token_hex(8))
+        child = None
+        try:
+            try:
+                probe.mkdir()
+            except OSError as error:
+                return probe_failed('probe_mkdir_failed', error)
             # Actually exercise admission, recursive kill and outside placement,
             # not merely access(W_OK). No ambient process is moved or signalled.
-            child = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(5)'], start_new_session=True)
             try:
+                child = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(5)'], start_new_session=True)
                 (probe / 'cgroup.procs').write_text(str(child.pid))
-                outside = str(os.getpid()) not in (probe / 'cgroup.procs').read_text().split()
+                membership = (probe / 'cgroup.procs').read_text().split()
+            except OSError as error:
+                return probe_failed('probe_admit_failed', error)
+            if str(os.getpid()) in membership:
+                return 'probe_outside_failed'
+            try:
                 (probe / 'cgroup.kill').write_text('1')
                 child.wait(timeout=2)
-                return outside and 'populated 0' in (probe / 'cgroup.events').read_text()
-            finally:
+                events = (probe / 'cgroup.events').read_text()
+            except subprocess.TimeoutExpired:
+                return 'probe_kill_failed'
+            except OSError as error:
+                return probe_failed('probe_kill_failed', error)
+            if 'populated 0' not in events:
+                return 'probe_kill_failed'
+            return True
+        finally:
+            if child is not None:
                 if child.poll() is None:
                     child.kill()
                 child.wait()
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        finally:
             if probe.exists():
                 probe.rmdir()
     if action == 'fetch':
