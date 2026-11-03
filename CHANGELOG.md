@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.10
+
+Follow-up to 0.2.9: sweep liveness after a worker restart and reasoned
+pre-start refusals with announced local fallbacks. Offload and
+whole-run behaviour stay off by default; nothing is enabled by
+upgrading.
+
+### Fixed
+
+* The idle/stale sweep keeps working after a worker restart: non-secret
+  environment configs are rehydrated from durable state (live keyed
+  configs always win), unloaded offload pools are swept through a
+  registry-driven path that checks each VM against the provider first,
+  and quarantine is reconciled provider-first — terminal VMs settle and
+  free their slot even when fenced, running VMs rejoin only with
+  identity, a clean observe and a known workspace (#71).
+
+* Pre-start refusals are now reasoned end to end and local fallbacks are
+  announced: every read-only gate returns a site-specific refusal reason
+  (runtime → backend → broker journal → read view → shim stderr, plus a
+  server log line), and dry-run runs the same read-only gates so it
+  agrees with real submit by construction. A command that falls back
+  locally says why instead of compiling silently with no VM and no
+  notice (#89).
+
 ## 0.2.9
 
 Follow-up to 0.2.8: local-run restore fencing and the `rust-public-1`
