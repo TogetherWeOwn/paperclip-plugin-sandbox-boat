@@ -12,16 +12,19 @@
 // V1 never writes a returned change into the live workspace: there is no apply
 // step and no apply API in this module, even when the local baseline is
 // unchanged or a mutation lease token is supplied.
-import { O_NOFOLLOW, O_RDONLY } from "node:constants";
+import { O_NONBLOCK, O_NOFOLLOW, O_RDONLY } from "node:constants";
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
-import { containsSecretContent } from "./offload-secret-scan.js";
+import { containsSecretContent, isCertificateOnlyPem, MAX_CERTIFICATE_PEM_BYTES } from "./offload-secret-scan.js";
 import { assertValidSshEndpoint } from "./ssh.js";
 
 export const SYNC_MANIFEST_VERSION = 1;
 
-/** Default push/collect exclusions: caches, runtime state, secrets, private registry config. */
+/** Default push/collect exclusions: caches, runtime state, secrets, private registry config.
+ * `*.pem` excludes by name; the one exception is a tracked .pem verified
+ * certificate-only at capture (see isCertificateOnlyPem), which capture
+ * admits into the manifest and the rsync push re-includes by exact path. */
 export const DEFAULT_SYNC_EXCLUDES: readonly string[] = [
   ".git/",
   "target/",
@@ -222,6 +225,25 @@ export function isDefaultSyncExcluded(relPosix: string): boolean {
   return isExcluded(relPosix, false, DEFAULT_PARSED_EXCLUDES);
 }
 
+const PARSED_EXCLUDES_WITHOUT_PEM = parseExcludes(DEFAULT_SYNC_EXCLUDES.filter((pattern) => pattern !== "*.pem"));
+
+/**
+ * True when `*.pem` is the only default exclude between this path and the
+ * guest: the basename ends in `.pem`, no other default pattern (env files,
+ * tfstate, credentials, ...) claims it, and no parent directory is
+ * excluded. Such a path may sync once its contents verify as
+ * certificate-only; every other excluded path stays excluded by name.
+ */
+export function isCertificatePemSyncCandidate(relPosix: string): boolean {
+  const segments = relPosix.split("/");
+  if (!segments.at(-1)!.endsWith(".pem")) return false;
+  if (isExcluded(relPosix, false, PARSED_EXCLUDES_WITHOUT_PEM)) return false;
+  for (let depth = 1; depth < segments.length; depth += 1) {
+    if (isExcluded(segments.slice(0, depth).join("/"), true, DEFAULT_PARSED_EXCLUDES)) return false;
+  }
+  return true;
+}
+
 const MAX_CWD_PROBE_ENTRIES = 5_000;
 
 /**
@@ -250,7 +272,10 @@ export async function snapshotHasDirectory(root: string, cwdRelative: string): P
       const entryRel = `${dir}/${entry.name}`;
       if (entry.isDirectory()) {
         if (!isExcluded(entryRel, true, DEFAULT_PARSED_EXCLUDES)) stack.push(entryRel);
-      } else if ((entry.isFile() || entry.isSymbolicLink()) && !isExcluded(entryRel, false, DEFAULT_PARSED_EXCLUDES)) {
+      } else if ((entry.isFile() || entry.isSymbolicLink()) && !isExcluded(entryRel, false, PARSED_EXCLUDES_WITHOUT_PEM)) {
+        // A .pem counts as synced presence: a verified certificate-only one
+        // reaches the guest, and an unverified one is refused by the
+        // admission gates regardless of what this probe returns.
         return true;
       }
     }
@@ -294,6 +319,10 @@ export async function resolveContained(root: string, rel: string): Promise<strin
 
 async function hashOpenFile(handle: fsp.FileHandle, preSize: number, preMtimeMs: number): Promise<{ bytes: Buffer; size: number; mtimeMs: number }> {
   const before = await handle.stat();
+  // A file swapped for a FIFO/device/dir between the lstat and the open is a
+  // structural race, not content to hash: size/mtime alone cannot see it (a
+  // FIFO reports size 0), and reading it could block or drain a device.
+  if (!before.isFile()) throw new ConcurrentEdit();
   if (before.size !== preSize || before.mtimeMs !== preMtimeMs) throw new ConcurrentEdit();
   const bytes = await handle.readFile();
   const after = await handle.stat();
@@ -312,12 +341,13 @@ export async function captureManifest(root: string, opts: CaptureOptions = {}): 
   const io: ManifestFs = opts.fs ?? (fsp as unknown as ManifestFs);
   const clock = opts.now ?? Date.now;
   const excludes = parseExcludes(opts.excludes ?? DEFAULT_SYNC_EXCLUDES);
+  const excludesWithoutPem = parseExcludes((opts.excludes ?? DEFAULT_SYNC_EXCLUDES).filter((pattern) => pattern !== "*.pem"));
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxFiles = opts.maxFiles ?? DEFAULT_MAX_FILES;
   const started = clock();
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const files = await walkAndHash(root, io, excludes, maxBytes, maxFiles, opts.onlyPaths, opts.scanForSecrets === true);
+      const files = await walkAndHash(root, io, excludes, excludesWithoutPem, maxBytes, maxFiles, opts.onlyPaths, opts.scanForSecrets === true);
       files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
       const bytes = files.reduce((sum, f) => sum + f.size, 0);
       return {
@@ -335,6 +365,7 @@ async function walkAndHash(
   root: string,
   io: ManifestFs,
   excludes: ParsedExcludes,
+  excludesWithoutPem: ParsedExcludes,
   maxBytes: number,
   maxFiles: number,
   onlyPaths?: ReadonlySet<string>,
@@ -377,6 +408,15 @@ async function walkAndHash(
       // must not block (or be probed by) the capture.
       if (onlyPaths && !entry.isDirectory() && !onlyPaths.has(entryRel)) continue;
       if (entry.isSymbolicLink()) {
+        // A tracked .pem link can never prove certificate-only content
+        // (its bytes are its target's): refuse it outright instead of
+        // silently dropping it via the *.pem exclude, so a file-to-link
+        // swap after admission cannot leave the guest quietly missing a
+        // file the host verified. Under caller-supplied excludes without
+        // *.pem the same refusal applies to any .pem link.
+        if (entry.name.endsWith(".pem") && (onlyPaths?.has(entryRel) === true || !isExcluded(entryRel, false, excludes))) {
+          throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: a .pem symlink is not a verified certificate; the command stays local.`);
+        }
         // Excluded names skip before any link validation: target/ as a link
         // is still target/, whether its target escapes or stays in-root.
         if (isExcluded(entryRel, false, excludes) || isExcluded(entryRel, true, excludes)) continue;
@@ -391,13 +431,38 @@ async function walkAndHash(
         if (onlyPaths && !onlyDirs.has(entryRel)) continue;
         stack.push(entryRel);
       } else if (entry.isFile()) {
-        if (isExcluded(entryRel, false, excludes)) continue;
+        if (isExcluded(entryRel, false, excludes)) {
+          // The one name-exclude exception: a tracked .pem whose only
+          // barrier is *.pem is read below and must prove certificate-only
+          // to enter the manifest. Untracked pems already skipped via
+          // onlyPaths above, and captures without a tracked set never
+          // reach this exception.
+          const certCandidate = entry.name.endsWith(".pem") && onlyPaths?.has(entryRel) === true
+            && !isExcluded(entryRel, false, excludesWithoutPem);
+          if (!certCandidate) continue;
+        }
         const pre = await raceToRetry(() => io.lstat(entryAbs));
+        // Bound the .pem verdict before any read: an admitted certificate
+        // replaced by a huge file refuses on its lstat size instead of
+        // being buffered whole for isCertificateOnlyPem to reject.
+        if (entry.name.endsWith(".pem") && pre.size > MAX_CERTIFICATE_PEM_BYTES) {
+          throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: it exceeds the certificate-only .pem size bound; the command stays local.`);
+        }
         // Deleted, swapped for a link, or file<->dir exchanged anywhere between
         // readdir and read: retry the capture instead of throwing a raw errno.
-        const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW));
+        // O_NONBLOCK so a file-to-FIFO swap after the lstat cannot park the
+        // open waiting for a writer; hashOpenFile then refuses the handle
+        // for not being a regular file (O_NONBLOCK is a no-op for those).
+        const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
         try {
           const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs));
+          // Any .pem bound for a manifest — via the tracked exception or a
+          // caller's own excludes — must prove certificate-only on the
+          // exact frozen bytes, so a swap between admission and capture
+          // cannot smuggle a key past the resolve-time check.
+          if (entry.name.endsWith(".pem") && !isCertificateOnlyPem(content)) {
+            throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: it is not a verified certificate-only .pem; the command stays local.`);
+          }
           if (scanForSecrets && containsSecretContent(content)) {
             throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: it carries a known credential shape; the command stays local.`);
           }
@@ -410,6 +475,21 @@ async function walkAndHash(
         }
       } else {
         throw new SyncError("SYNC_SPECIAL_FILE", `refusing special file ${entryRel}: only regular files, directories and in-root symlinks sync.`);
+      }
+    }
+  }
+  // No verified certificate may silently vanish from the manifest: a parent
+  // directory swapped for a symlink (skipped above before the leaf guard can
+  // see its subtree), a parent replaced by a file, or the .pem deleted after
+  // admission would all leave the guest quietly missing a file the host
+  // verified. Every tracked .pem whose only barrier is *.pem must have
+  // landed above; anything else aborts the capture instead.
+  if (onlyPaths) {
+    const captured = new Set(files.map((f) => f.path));
+    for (const allowed of onlyPaths) {
+      if (!allowed.endsWith(".pem") || isExcluded(allowed, false, excludesWithoutPem)) continue;
+      if (!captured.has(allowed)) {
+        throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync: tracked .pem ${allowed} did not reach the manifest (missing, or a parent path changed type after admission); the command stays local.`);
       }
     }
   }
@@ -890,6 +970,22 @@ function assertRsyncComponent(name: string, value: string): void {
   }
 }
 
+/**
+ * An rsync filter pattern matching exactly this literal path. Rsync only
+ * interprets wildcards and backslash escapes when the pattern contains a
+ * wildcard, so a path without `*`, `?` or `[` is already literal (a `]`
+ * or `\` in it needs — and tolerates — no escaping; escaping it anyway
+ * would make the pattern not match). With a wildcard present, each
+ * wildcard char hides in a one-char class and backslashes double.
+ * Verified against rsync 3.2.7 for names containing `]`, `[`, `*`, `?`
+ * and `\`, singly and combined.
+ */
+function rsyncLiteralPattern(rel: string): string {
+  if (!/[*?[]/.test(rel)) return rel;
+  // One pass: sequential replaces would re-escape the `[` each class opens.
+  return rel.replace(/[\\*?[]/g, (ch) => (ch === "\\" ? "\\\\" : ch === "*" ? "[*]" : ch === "?" ? "[?]" : "[[]"));
+}
+
 function assertRsyncLocalPath(name: string, value: string): void {
   if (!value || RSYNC_UNSAFE_LOCAL_PATH.test(value)) {
     throw new Error(`rsync push refused: ${name} contains whitespace, quotes, backslashes or expansion characters: ${JSON.stringify(value)}`);
@@ -947,6 +1043,13 @@ export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, gue
     "-p",
     String(spec.port),
   ].join(" ");
+  // A .pem in the explicit delta list reached the snapshot only by proving
+  // certificate-only at capture, so re-include exactly those paths ahead
+  // of the *.pem exclude (rsync filters apply to --files-from entries, and
+  // the first matching filter wins). Every unlisted .pem stays excluded.
+  const pemIncludes = files
+    .filter((rel) => rel.split("/").at(-1)!.endsWith(".pem"))
+    .map((rel) => `--include=/${rsyncLiteralPattern(rel)}`);
   return [
     "rsync",
     "-a",
@@ -956,6 +1059,7 @@ export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, gue
     "--timeout=30",
     "--files-from=-",
     "--from0",
+    ...pemIncludes,
     ...DEFAULT_SYNC_EXCLUDES.map((pattern) => `--exclude=${pattern}`),
     "-e",
     ssh,
@@ -1091,7 +1195,12 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
     // scan may simply not have reached this path. Uploaded files are
     // restored on every push, so a repeated absence is this command's own
     // delete and is proposed again (no previous-scan suppression here).
-    if (!guest.has(rel) && !scan.truncated) {
+    // Default-excluded names are scan-blind by design (a verified
+    // certificate .pem is the one such path a manifest can hold): the
+    // guest scan never reports them, so their absence proves nothing and
+    // must not invent a delete. They are never return-eligible either;
+    // mirror verify restores their bytes from the manifest hash.
+    if (!guest.has(rel) && !scan.truncated && !isDefaultSyncExcluded(rel)) {
       changes.push({ path: rel, op: "proposed-delete", supported: isReturnEligible(rel, policy), baselineSha256: baseline.sha256, returnedSha256: null, liveSha256: await liveHash(live, rel), stagedRelPath: null });
     }
   }

@@ -1,11 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { containsSecretContent, hasSecretInFiles, listTrackedFiles } from "./offload-secret-scan.js";
+import { containsSecretContent, hasSecretInFiles, isCertificateOnlyPem, listTrackedFiles, pemFilesAreCertificateOnly } from "./offload-secret-scan.js";
 import { hasRegistryCredentials } from "./offload-ssh-runtime.js";
-import { captureManifest, captureSnapshot, isDefaultSyncExcluded } from "./offload-sync.js";
+import { captureManifest, captureSnapshot, collectAndStage, isCertificatePemSyncCandidate, isDefaultSyncExcluded, LocalGuestStore } from "./offload-sync.js";
+
+/** The public ISRG Root X1 CA certificate: the exact shape that kept
+ * two-bot-next local before the certificate-only .pem exception. */
+const PUBLIC_CA_PEM = readFileSync(new URL("./test-support/isrg-root-x1.pem", import.meta.url), "utf8");
+const FAKE_PRIVATE_KEY_PEM = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBBQ==\n-----END PRIVATE KEY-----\n";
 
 const temps: string[] = [];
 afterEach(() => {
@@ -137,6 +143,139 @@ describe("secret content scan", () => {
     expect(isDefaultSyncExcluded("config/prod.tfvars")).toBe(true);
     expect(isDefaultSyncExcluded(".aws/credentials")).toBe(true);
     expect(isDefaultSyncExcluded("src/lib.rs")).toBe(false);
+  });
+});
+
+describe("certificate-only .pem exception", () => {
+  it("accepts a real public CA certificate and a certificate bundle", () => {
+    expect(isCertificateOnlyPem(PUBLIC_CA_PEM)).toBe(true);
+    expect(isCertificateOnlyPem(PUBLIC_CA_PEM + PUBLIC_CA_PEM)).toBe(true);
+    expect(isCertificateOnlyPem(PUBLIC_CA_PEM.replaceAll("\n", "\r\n"))).toBe(true);
+  });
+
+  it.each([
+    ["a private key", FAKE_PRIVATE_KEY_PEM],
+    ["a mixed cert+key bundle", PUBLIC_CA_PEM + FAKE_PRIVATE_KEY_PEM],
+    ["a malformed certificate block", "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"],
+    ["text outside the blocks", `Bag Attributes\n${PUBLIC_CA_PEM}`],
+    ["trailing text after the block", `${PUBLIC_CA_PEM}secret-suffix\n`],
+    ["an empty file", ""],
+    ["whitespace only", "\n  \n"],
+  ])("refuses %s", (_label, content) => {
+    expect(isCertificateOnlyPem(content)).toBe(false);
+  });
+
+  it("refuses bytes smuggled after the certificate inside its own block", () => {
+    // OpenSSL parses a cert with garbage appended to the DER; only the
+    // cert.raw byte-equality in isCertificateOnlyPem catches this.
+    const b64 = PUBLIC_CA_PEM.replace(/-----BEGIN CERTIFICATE-----/, "").replace(/-----END CERTIFICATE-----/, "").replace(/\s+/g, "");
+    const der = Buffer.concat([Buffer.from(b64, "base64"), Buffer.from("smuggled-secret")]);
+    // Precondition, pinned so this test cannot silently regress to being
+    // rejected by an earlier shape check: the smuggled DER parses as a
+    // certificate, and the parsed certificate is shorter than the DER.
+    const parsed = new X509Certificate(der);
+    expect(parsed.raw.equals(der)).toBe(false);
+    const smuggled = der.toString("base64");
+    const wrapped = smuggled.replace(/(.{64})/g, "$1\n");
+    // The END marker must start on its own line: glued onto the last base64
+    // line it would fail the strict base64-line check before ever reaching
+    // the DER parse this test guards (smuggled length ≡ 20 mod 64).
+    const pem = `-----BEGIN CERTIFICATE-----\n${wrapped.endsWith("\n") ? wrapped : `${wrapped}\n`}-----END CERTIFICATE-----\n`;
+    expect(isCertificateOnlyPem(pem)).toBe(false);
+  });
+
+  it("refuses an oversized pem fail-closed", () => {
+    expect(isCertificateOnlyPem(PUBLIC_CA_PEM.repeat(200))).toBe(false);
+  });
+
+  it("verifies files on disk but never follows a symlink or excuses a missing file", async () => {
+    const root = makeTemp();
+    writeTree(root, { "fixtures/ca.pem": PUBLIC_CA_PEM, "fixtures/key.pem": FAKE_PRIVATE_KEY_PEM });
+    symlinkSync(path.join(root, "fixtures/ca.pem"), path.join(root, "fixtures/link.pem"));
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/ca.pem"])).toBe(true);
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/key.pem"])).toBe(false);
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/link.pem"])).toBe(false);
+    // A symlinked parent directory is refused too: the leaf check alone
+    // would read a certificate outside the root that capture could never
+    // sync (it does not descend through links).
+    const outside = makeTemp();
+    writeTree(outside, { "ca.pem": PUBLIC_CA_PEM });
+    symlinkSync(outside, path.join(root, "linked"));
+    expect(await pemFilesAreCertificateOnly(root, ["linked/ca.pem"])).toBe(false);
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/missing.pem"])).toBe(false);
+    expect(await pemFilesAreCertificateOnly(root, ["../outside.pem"])).toBe(false);
+  });
+
+  it("manifests a tracked public CA certificate so the guest tree is complete", async () => {
+    const root = gitRepo({ "scripts/ci/fixtures/isrg-x1.pem": PUBLIC_CA_PEM });
+    const tracked = await listTrackedFiles(root);
+    const { manifest } = await captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true });
+    expect(manifest.files.map((f) => f.path).sort()).toEqual([".gitignore", "scripts/ci/fixtures/isrg-x1.pem", "src/lib.rs"]);
+    expect(isCertificatePemSyncCandidate("scripts/ci/fixtures/isrg-x1.pem")).toBe(true);
+  });
+
+  it.each([
+    ["a private-key pem", FAKE_PRIVATE_KEY_PEM],
+    ["a mixed cert+key bundle", PUBLIC_CA_PEM + FAKE_PRIVATE_KEY_PEM],
+    ["a malformed pem", "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"],
+    ["an oversized pem", PUBLIC_CA_PEM.repeat(200)],
+  ])("aborts the capture when a tracked file is %s", async (_label, content) => {
+    const root = gitRepo({ "fixtures/ca.pem": content });
+    const tracked = await listTrackedFiles(root);
+    await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
+      .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
+  });
+
+  it("aborts the capture when a tracked .pem is a symlink", async () => {
+    const root = gitRepo();
+    symlinkSync(path.join(root, "src/lib.rs"), path.join(root, "ca.pem"));
+    git(root, "add", "ca.pem");
+    const tracked = await listTrackedFiles(root);
+    await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
+      .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
+  });
+
+  it("aborts the capture when a parent dir of a verified cert is swapped for a symlink after admission", async () => {
+    const root = gitRepo({ "fixtures/ca.pem": PUBLIC_CA_PEM });
+    const tracked = await listTrackedFiles(root);
+    // Admission verifies the certificate through the real directory.
+    expect(await pemFilesAreCertificateOnly(root, ["fixtures/ca.pem"])).toBe(true);
+    // Then the parent is swapped for a symlink to an identical tree outside
+    // the root: capture must refuse, never silently manifest without the cert.
+    const elsewhere = makeTemp();
+    writeTree(elsewhere, { "ca.pem": PUBLIC_CA_PEM });
+    renameSync(path.join(root, "fixtures"), path.join(root, "fixtures-real"));
+    symlinkSync(elsewhere, path.join(root, "fixtures"));
+    await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
+      .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
+  });
+
+  it("only *.pem by name may be a sync candidate; every other barrier still applies", () => {
+    expect(isCertificatePemSyncCandidate("ca.pem")).toBe(true);
+    expect(isCertificatePemSyncCandidate("fixtures/ca.key")).toBe(false);
+    expect(isCertificatePemSyncCandidate(".aws/ca.pem")).toBe(false);
+    expect(isCertificatePemSyncCandidate("target/ca.pem")).toBe(false);
+    expect(isCertificatePemSyncCandidate("state.tfstate.pem")).toBe(false);
+    expect(isCertificatePemSyncCandidate(".env.pem")).toBe(false);
+  });
+
+  it("collect invents no delete for a scan-blind uploaded certificate", async () => {
+    const root = gitRepo({ "fixtures/isrg-x1.pem": PUBLIC_CA_PEM });
+    const tracked = await listTrackedFiles(root);
+    const uploaded = (await captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true })).manifest;
+    const guest = makeTemp();
+    writeTree(guest, { "src/lib.rs": "pub fn f() {}\n", ".gitignore": "secrets.pem\n", "fixtures/isrg-x1.pem": PUBLIC_CA_PEM });
+    const result = await collectAndStage({ liveRoot: root, uploaded, guest: new LocalGuestStore(), guestDir: guest, stagingDir: path.join(makeTemp(), "stage") });
+    expect(result.changes).toEqual([]);
+    expect(result.state).toBe("clean");
+  });
+
+  it("registry-credential walk ignores only the verified certificate set", async () => {
+    const root = makeTemp();
+    writeTree(root, { "fixtures/ca.pem": PUBLIC_CA_PEM, "package.json": "{}\n" });
+    expect(await hasRegistryCredentials(root)).toBe(true);
+    expect(await hasRegistryCredentials(root, new Set(["fixtures/ca.pem"]))).toBe(false);
+    expect(await hasRegistryCredentials(root, new Set(["fixtures/other.pem"]))).toBe(true);
   });
 });
 

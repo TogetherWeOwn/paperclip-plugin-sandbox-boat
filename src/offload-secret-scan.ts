@@ -13,7 +13,8 @@
 // proof that a workspace is secret-free; the tracked-only rule and the sync
 // excludes are the primary boundary.
 import { execFile } from "node:child_process";
-import { O_NOFOLLOW, O_RDONLY } from "node:constants";
+import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { X509Certificate } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -88,6 +89,131 @@ export function containsSecretContent(content: Buffer | string): boolean {
 
 const MAX_SCAN_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SCAN_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/** Bounds for the certificate-only .pem exception: a public CA bundle fits
+ * far inside them, and anything past them refuses instead of being judged. */
+export const MAX_CERTIFICATE_PEM_BYTES = 256 * 1024;
+const MAX_CERTIFICATE_PEM_BLOCKS = 64;
+
+/**
+ * True only when the content is provably nothing but X.509 certificates:
+ * one or more `CERTIFICATE` PEM blocks (no other label — a `TRUSTED
+ * CERTIFICATE` or any key block refuses), nothing but whitespace outside
+ * the blocks, strict base64 inside them, and each block's DER both parses
+ * as a certificate and byte-equals the parser's canonical re-encoding
+ * (`cert.raw`). The byte-equality is load-bearing: OpenSSL parses a
+ * certificate with garbage appended to its DER, so parse-alone would let
+ * extra bytes ride along inside an otherwise-valid block. Certificates
+ * are public material by construction (the ASN.1 type carries a public
+ * key and a signature, never private key material), so bytes proven to
+ * be exactly certificates may sync where an unverified `.pem` may not.
+ * Anything malformed, mixed, oversized or carrying a known credential
+ * shape returns false: the caller keeps the command local.
+ */
+export function isCertificateOnlyPem(content: Buffer | string): boolean {
+  const buf = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+  if (buf.length === 0 || buf.length > MAX_CERTIFICATE_PEM_BYTES) return false;
+  if (containsSecretContent(buf)) return false;
+  // PEM is printable ASCII plus line breaks and tabs; a NUL or high byte
+  // anywhere means this is not the text format it claims to be.
+  for (const byte of buf) {
+    if (byte === 9 || byte === 10 || byte === 13) continue;
+    if (byte < 0x20 || byte > 0x7e) return false;
+  }
+  const lines = buf.toString("latin1").split(/\r\n|\n/);
+  let blocks = 0;
+  let base64 = "";
+  let padded = false;
+  let inBlock = false;
+  for (const line of lines) {
+    if (!inBlock) {
+      if (line.trim() === "") continue;
+      if (line !== "-----BEGIN CERTIFICATE-----") return false;
+      blocks += 1;
+      if (blocks > MAX_CERTIFICATE_PEM_BLOCKS) return false;
+      base64 = "";
+      padded = false;
+      inBlock = true;
+      continue;
+    }
+    if (line === "-----END CERTIFICATE-----") {
+      if (base64 === "" || base64.length % 4 !== 0) return false;
+      const der = Buffer.from(base64, "base64");
+      let cert: X509Certificate;
+      try {
+        cert = new X509Certificate(der);
+      } catch {
+        return false;
+      }
+      if (!cert.raw.equals(der)) return false;
+      inBlock = false;
+      continue;
+    }
+    // Base64 data lines only: no PEM headers (Proc-Type:, DEK-Info:), no
+    // blank separator lines, and padding may appear only on the last line.
+    if (padded || !/^[A-Za-z0-9+/]+={0,2}$/.test(line)) return false;
+    if (line.includes("=")) padded = true;
+    base64 += line;
+  }
+  return !inBlock && blocks > 0;
+}
+
+/**
+ * True only when every listed root-relative file is a regular file (never
+ * a symlink, opened O_NOFOLLOW) whose bounded contents pass
+ * isCertificateOnlyPem. A file that is missing, unreadable or oversized
+ * fails: a tracked .pem must be present and verifiable on the host before
+ * its bytes may be treated as public certificates.
+ */
+export async function pemFilesAreCertificateOnly(root: string, relPaths: readonly string[]): Promise<boolean> {
+  const base = path.resolve(root);
+  for (const rel of relPaths) {
+    const abs = path.resolve(base, rel);
+    if (abs === base || !abs.startsWith(base + path.sep)) return false;
+    // O_NOFOLLOW protects only the leaf: a symlinked parent would let the
+    // read escape the root, and capture (which never descends through a
+    // link) would then silently omit a file admission verified. Every
+    // ancestor below the root must be a real directory.
+    const segments = rel.split("/");
+    let ancestorOk = true;
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      const st = await lstat(path.join(base, ...segments.slice(0, depth))).catch(() => null);
+      if (!st || !st.isDirectory() || st.isSymbolicLink()) { ancestorOk = false; break; }
+    }
+    if (!ancestorOk) return false;
+    const st = await lstat(abs).catch(() => null);
+    if (!st || !st.isFile() || st.size > MAX_CERTIFICATE_PEM_BYTES) return false;
+    let handle;
+    try {
+      // O_NONBLOCK so a regular-file-to-FIFO swap after the lstat cannot
+      // park admission waiting for a writer; the handle stat then refuses
+      // anything that is not a regular file.
+      handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    } catch {
+      return false;
+    }
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.size > MAX_CERTIFICATE_PEM_BYTES) return false;
+      // Capped read: a file grown past the bound after the stat is refused
+      // on length, never buffered whole.
+      const buf = Buffer.alloc(MAX_CERTIFICATE_PEM_BYTES + 1);
+      let off = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buf, off, buf.length - off);
+        if (bytesRead === 0) break;
+        off += bytesRead;
+        if (off > MAX_CERTIFICATE_PEM_BYTES) return false;
+      }
+      if (!isCertificateOnlyPem(buf.subarray(0, off))) return false;
+    } catch {
+      return false;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+  return true;
+}
 
 /**
  * Bounded scan of the given root-relative files. Returns true on the first
