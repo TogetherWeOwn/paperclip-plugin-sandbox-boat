@@ -11,7 +11,7 @@ vi.mock("node:child_process", async () => {
 import type { BoatApiLike } from "./boat-client.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import { commandDigest } from "./offload-journal.js";
-import { createHash } from "node:crypto";
+import { scryptSync } from "node:crypto";
 import { DEFAULT_API_BASE } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
@@ -179,7 +179,7 @@ describe("sweep after a worker restart", () => {
   it("re-persists the sweep descriptor when only the inline key changes", async () => {
     const keyA = "boat_inline_key_account_a_not_real";
     const keyB = "boat_inline_key_account_b_not_real";
-    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;
@@ -304,7 +304,7 @@ describe("sweep after a worker restart", () => {
   it("an A→B→A hook burst leaves the latest descriptor digest on disk", async () => {
     const keyA = "boat_burst_key_a_not_real";
     const keyB = "boat_burst_key_b_not_real";
-    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;
@@ -363,7 +363,7 @@ describe("sweep after a worker restart", () => {
 
   it("retries the descriptor when a duplicate hook arrives during a failed first write", async () => {
     const keyA = "boat_retry_key_a_not_real";
-    const digestOf = (key: string) => createHash("sha256").update(`${DEFAULT_API_BASE}\u0000${key}`).digest("hex");
+    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;

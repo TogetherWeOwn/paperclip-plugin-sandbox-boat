@@ -138,7 +138,7 @@ export interface SweepDescriptor {
   config: Record<string, unknown>;
   /** True when the cached config carried its own apiKey. Absent on legacy descriptors. */
   hadInlineKey?: boolean;
-  /** Opaque same-account digest (sha256 of apiBase + key), or null. Absent on legacy descriptors. */
+  /** Opaque same-account digest (scrypt of the key, salted by apiBase), or null. Absent on legacy descriptors. */
   accountDigest?: string | null;
 }
 

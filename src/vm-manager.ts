@@ -10,7 +10,7 @@
 //     is actually running (docs.boat.dev/long-running-tasks/auto-stop);
 //   - every start (create, resume) passes the budget guard first and uses
 //     fail-fast, so nothing waits for a machine or a rate window.
-import { createHash } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import { createConnection } from "node:net";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -327,15 +327,24 @@ export function sandboxNameFor(prefix: string, companyId: string, environmentId:
 /**
  * Non-secret account-equality fingerprint: lets a restarted sweep check that
  * the host key belongs to the same account as an inline-key descriptor without
- * ever persisting key bytes. The input is a high-entropy API key, not a
- * password, so a password-strength KDF would add cost without meaning.
+ * ever persisting key bytes. The digest itself is persisted, so it uses a
+ * password-hash-grade KDF (scrypt, the remediation `js/insufficient-password-hash`
+ * recommends) rather than a fast hash: fast hashes of key material are exactly
+ * what that query flags, and a KDF keeps the stored value resistant even if a
+ * key ever carries less entropy than assumed. Deterministic (salted by the
+ * apiBase) so equality checks work across restarts. Memoized: rememberConfig
+ * runs on every driver op and scrypt is deliberately slow; live keys already
+ * live in memory, so caching digests adds no new secret exposure, and entries
+ * are bounded by the distinct keys the process has seen.
  */
+const sweepDigestCache = new Map<string, string>();
 function sweepAccountDigest(apiBase: string, apiKey: string): string {
-  // lgtm[js/insufficient-password-hash] suppression: account-equality digest of
-  // a high-entropy API key, not password storage (same primitive as
-  // `account()` scope and alert #2); the check only honors the legacy inline
-  // comment on a sink-adjacent line, so it covers the statement below.
-  return createHash("sha256").update(`${apiBase}\u0000${apiKey}`).digest("hex"); // codeql[js/insufficient-password-hash]
+  const preimage = `${apiBase}\u0000${apiKey}`;
+  const hit = sweepDigestCache.get(preimage);
+  if (hit !== undefined) return hit;
+  const digest = scryptSync(apiKey, apiBase, 32).toString("hex");
+  sweepDigestCache.set(preimage, digest);
+  return digest;
 }
 
 function iso(value: unknown): string | null {
