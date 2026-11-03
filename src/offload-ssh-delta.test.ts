@@ -921,7 +921,7 @@ describe("mirror scripts executed locally", () => {
       // Wrapper shape: a shell script named rsync that has not exec'd the
       // real binary yet runs as 'sh /path/rsync --server ... <mirror>'.
       const wrapper = path.join(temp("boat-delta-wrapper-"), "rsync");
-      writeFileSync(wrapper, "sleep 10\n");
+      writeFileSync(wrapper, "while :; do sleep 1; done\n");
       const wrappedReceiver = own(spawn("sh", [wrapper, "--server", "-vlogDtpre.iLsfxCIvu", ".", mirror], { stdio: "ignore" }));
       expect(running(wrappedReceiver)).toBe(true);
 
