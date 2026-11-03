@@ -311,9 +311,8 @@ export function sandboxNameFor(prefix: string, companyId: string, environmentId:
  * ever persisting key bytes. The input is a high-entropy API key, not a
  * password, so a password-strength KDF would add cost without meaning.
  */
-// codeql[js/insufficient-password-hash]: account-equality digest of a high-entropy API key, not password storage.
 function sweepAccountDigest(apiBase: string, apiKey: string): string {
-  return createHash("sha256").update(`${apiBase}\u0000${apiKey}`).digest("hex");
+  return createHash("sha256").update(`${apiBase}\u0000${apiKey}`).digest("hex"); // codeql-suppress js/insufficient-password-hash: account-equality digest of a high-entropy API key, not password storage.
 }
 
 function iso(value: unknown): string | null {
