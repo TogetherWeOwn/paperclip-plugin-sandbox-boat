@@ -146,8 +146,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * v1 built-in server profile: public-source, secret-free Rust builds/tests.
- * Toolchain 1.98.1 with clippy is two-bot-next's pin (rust-toolchain.toml);
- * the guest template must install exactly these. The env mirrors the lean
+ * Toolchain 1.99.1 with clippy is two-bot-next's pin (rust-toolchain.toml);
+ * the guest template must install exactly these. Its file also lists
+ * rustfmt, deliberately not declared here: `fmt` always stays local, so no
+ * remote command ever needs it. The env mirrors the lean
  * build settings two-bot-next's scripts/cargo_cache.py sets for local Cargo.
  * Its host target/scratch paths are deliberately absent: the guest owns those.
  * two-bot-next's `db` feature and `#[ignore]`d tests need agent-testdb.
@@ -155,7 +157,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const V1_PROFILE: ServerProfile = {
   id: "rust-public-1",
   tool: "cargo",
-  toolchains: ["stable", "1.98.1"],
+  toolchains: ["stable", "1.99.1"],
   allowRustflags: false,
   runners: ["cargo"],
   components: ["clippy"],
