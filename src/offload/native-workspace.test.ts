@@ -74,6 +74,30 @@ describe("native workspace binding", () => {
     expect(response).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
   });
 
+  it("refuses a project alias two execution workspaces of one run claim with different sources", async () => {
+    // The shim can only send the shared project id, so an alias naming two
+    // checkouts must fail closed instead of serving the later one.
+    const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
+    const otherWorkspaceId = "22222222-2222-4222-8222-222222222222";
+    await setup();
+    await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace({
+      source: { localPath: "/work/public-rust", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" },
+    }));
+    const second = nativeWorkspace({ executionWorkspaceId: otherWorkspaceId,
+      source: { localPath: "/work/other-checkout", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" } });
+    second.workspace.localPath = "/work/other-checkout";
+    await plugin.definition.onEnvironmentRealizeWorkspace!(second);
+    const byAlias = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
+    expect(byAlias).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    const byOther = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: otherWorkspaceId }, params: {}, query: {} } as never);
+    expect(byOther).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+  });
+
   it("logs the run, workspace and reason when the exec route refuses with 503", async () => {
     const harness = await setup();
     expect((await submit()).status).toBe(503);

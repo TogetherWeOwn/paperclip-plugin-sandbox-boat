@@ -71,6 +71,7 @@ export class NativeOffloadWorkspaces {
     // payload, so register the binding under the project workspace id too.
     const aliasId = workspace.projectWorkspaceId;
     const ids = aliasId && aliasId !== workspaceId ? [workspaceId, aliasId] : [workspaceId];
+    const localRun = request.localRun === true;
     // Index first, and write the binding under the same lock: a binding must
     // never exist that forgetRun cannot find, even when forgetRun runs meanwhile.
     await this.withIndex(params.companyId, runId, async () => {
@@ -80,8 +81,29 @@ export class NativeOffloadWorkspaces {
         await this.state.set(runIndexScope(params.companyId, runId), { version: 1, workspaces: [...workspaces, ...missing] });
       }
       for (const id of ids) {
+        const existing = record(await this.state.get(scope(params.companyId, id, runId)));
+        // A withdrawn alias stays withdrawn for the run; a workspace may
+        // still reclaim its own primary id.
+        if (existing.ambiguous === true && id !== workspaceId) continue;
+        const existingPath = text(record(existing.workspace).path);
+        if (existingPath) {
+          // A local-run binding never replaces a whole-run one; the reverse wins.
+          if (existing.localRun !== true && localRun) continue;
+          if (existingPath !== localPath && !(existing.localRun === true && !localRun)
+            && id !== workspaceId && text(existing.executionWorkspaceId) !== workspaceId) {
+            // Two execution workspaces of this run claim the shared project
+            // id with different checkouts, and the shim can only send that
+            // id: withdraw the alias (503, local fallback) instead of
+            // silently serving the later checkout.
+            await this.state.set(scope(params.companyId, id, runId), {
+              version: 1, companyId: params.companyId, runId, workspaceId: id, ambiguous: true,
+            });
+            continue;
+          }
+        }
         await this.state.set(scope(params.companyId, id, runId), {
-          version: 1, companyId: params.companyId, runId, workspaceId: id, workspace,
+          version: 1, companyId: params.companyId, runId, workspaceId: id,
+          executionWorkspaceId: workspaceId, localRun, workspace,
         });
       }
     });
@@ -101,7 +123,8 @@ export class NativeOffloadWorkspaces {
 
   async get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null> {
     const saved = record(await this.state.get(scope(companyId, workspaceId, runId)));
-    if (saved.version !== 1 || saved.companyId !== companyId || saved.runId !== runId || saved.workspaceId !== workspaceId) return null;
+    if (saved.version !== 1 || saved.companyId !== companyId || saved.runId !== runId || saved.workspaceId !== workspaceId
+      || saved.ambiguous === true) return null;
     const workspace = record(saved.workspace);
     const root = text(workspace.path);
     if (!root || !isAbsolute(root) || root.includes("\0") || workspace.cwd !== root || !text(workspace.projectId)) return null;

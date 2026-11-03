@@ -2465,7 +2465,15 @@ export class BoatVmManager {
     this.nativeOffload.remember(params);
     const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
     if (typeof request?.heartbeatRunId === "string" && typeof request.executionWorkspaceId === "string") {
-      this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, request.executionWorkspaceId]), { params, at: this.now() });
+      // Both stores register this realization under the project workspace id
+      // too, so the precedence marker must cover every registered id: a later
+      // project-branch local bind keys on that alias alone.
+      const aliasId = (request.source as { projectWorkspaceId?: unknown } | undefined)?.projectWorkspaceId;
+      const ids = typeof aliasId === "string" && aliasId && aliasId !== request.executionWorkspaceId
+        ? [request.executionWorkspaceId, aliasId] : [request.executionWorkspaceId];
+      for (const id of ids) {
+        this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, id]), { params, at: this.now() });
+      }
     }
     const config = parseDriverConfig(params.config);
     const remoteCwd =

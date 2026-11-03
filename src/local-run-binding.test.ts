@@ -422,6 +422,32 @@ describe("plugin wiring", () => {
     }
   });
 
+  it("never replaces a whole-run realization under its project workspace alias", async () => {
+    const harness = await setup(enabled);
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-alias-"));
+    const nativeEnv = randomUUID();
+    try {
+      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId } } } } } as never);
+      // The issue now presents without an execution workspace, so the started
+      // local bind takes the project branch and keys on the alias alone.
+      harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+      harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",
+        path: harness.workspaces.get(workspaceId)!.path, repoUrl: "https://github.com/example/public" });
+      await harness.emit("agent.run.started", started);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(nativeSource);
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(nativeSource);
+    } finally {
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
   const workspaceBindings = (harness: Awaited<ReturnType<typeof setup>>) =>
     [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
   const restart = async (harness: Awaited<ReturnType<typeof setup>>) => {

@@ -57,6 +57,33 @@ afterEach(async () => {
   await runtime?.shutdown(); await ssh?.cleanup();
 }, 20_000);
 
+describe("project workspace alias", () => {
+  it("withdraws an alias two execution workspaces claim with different sources", async () => {
+    const projectWorkspaceId = randomUUID();
+    const first = native();
+    const firstRequest = first.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown>>;
+    firstRequest.source!.projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(true);
+    const otherWorkspaceId = randomUUID();
+    const otherSource = path.join(ssh.root, "other-checkout");
+    const second = native();
+    second.workspace.localPath = otherSource;
+    const secondRequest = second.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown> | string>;
+    secondRequest.executionWorkspaceId = otherWorkspaceId;
+    (secondRequest.source as Record<string, unknown>).localPath = otherSource;
+    (secondRequest.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(second);
+    // The shared id resolves to neither checkout; each workspace keeps its own.
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+    expect(runtime.has(companyId, runId, executionWorkspaceId)).toBe(true);
+    expect(runtime.has(companyId, runId, otherWorkspaceId)).toBe(true);
+    // Re-realizing the first workspace does not resurrect the ambiguous alias.
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+  });
+});
+
 describe("stock concrete executor factory", () => {
   it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
     const executor = (await runtime.resolve(command(), config))!;
