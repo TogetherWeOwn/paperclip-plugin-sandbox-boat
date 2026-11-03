@@ -406,6 +406,105 @@ describe("plugin wiring", () => {
     }
   });
 
+  // State writes in the two restoration-race tests below, in order: the local
+  // record under both ids (1-2), the whole-run realization's own persisted
+  // record and alias claim (3-4), then the restoration write inside
+  // rememberLocalRun (5). Gating write 5 holds the restoration in flight.
+  const gateRestorationWrites = (harness: Awaited<ReturnType<typeof setup>>) => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstReached!: () => void;
+    const firstWriting = new Promise<void>((resolve) => { firstReached = resolve; });
+    let releaseRestore!: () => void;
+    const restoreGate = new Promise<void>((resolve) => { releaseRestore = resolve; });
+    let restoreReached!: () => void;
+    const restoreWriting = new Promise<void>((resolve) => { restoreReached = resolve; });
+    const originalSet = harness.ctx.state.set;
+    let writes = 0;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces") {
+        writes += 1;
+        if (writes === 1) { firstReached(); await firstGate; }
+        if (writes === 5) { restoreReached(); await restoreGate; }
+      }
+      return originalSet(input, value);
+    };
+    return { firstWriting, restoreWriting, releaseFirst, releaseRestore,
+      restore: () => { harness.ctx.state.set = originalSet; } };
+  };
+  const realizeWholeRun = (source: string, projectId: string) => {
+    const nativeEnv = randomUUID();
+    return plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+      config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+      workspace: { localPath: source, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+        environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+        source: { localPath: source, repoUrl: null, projectId, projectWorkspaceId: null } } } } } as never);
+  };
+
+  it("a terminal event while the whole-run restoration is written leaves no binding under either id", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-restore-terminal-"));
+    const gates = gateRestorationWrites(harness);
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await gates.firstWriting;
+      const realizing = realizeWholeRun(nativeSource, "native-project");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseFirst();
+      await gates.restoreWriting;
+      const ending = harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseRestore();
+      await Promise.all([pending, realizing, ending]);
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+      expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(false);
+      expect((await exec(runId)).status).toBe(403);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(403);
+    } finally {
+      gates.restore();
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  it("a newer whole-run realization landing during the restoration is the one both stores serve", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    const sourceA = await mkdtemp(path.join(tmpdir(), "boat-native-restore-a-"));
+    const sourceB = await mkdtemp(path.join(tmpdir(), "boat-native-restore-b-"));
+    const gates = gateRestorationWrites(harness);
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await gates.firstWriting;
+      const realizingA = realizeWholeRun(sourceA, "native-project-a");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseFirst();
+      await gates.restoreWriting;
+      const realizingB = realizeWholeRun(sourceB, "native-project-b");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseRestore();
+      await Promise.all([pending, realizingA, realizingB]);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(sourceB);
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(sourceB);
+      // hasOffloadBinding is boolean, so read the runtime binding's source
+      // directly: it must be B under both ids, not the stale captured A.
+      const manager = (await import("./plugin.js")).currentManager();
+      const runtime = manager as unknown as { nativeOffload: { bindings: Map<string, { source: string }> } };
+      expect(runtime.nativeOffload.bindings.get(JSON.stringify([companyId, runId, workspaceId]))?.source).toBe(sourceB);
+      expect(runtime.nativeOffload.bindings.get(JSON.stringify([companyId, runId, projectWorkspaceId]))?.source).toBe(sourceB);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    } finally {
+      gates.restore();
+      await rm(sourceA, { recursive: true, force: true });
+      await rm(sourceB, { recursive: true, force: true });
+    }
+  });
+
   it("a whole-run realization without the project alias supersedes a completed local bind under the alias in both stores", async () => {
     const harness = await setup(enabled);
     harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",

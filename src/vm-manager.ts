@@ -586,8 +586,8 @@ export class BoatVmManager {
       return false;
     }
     // A whole-run realization may have landed while the write was in flight: it keeps both stores.
-    const whole = wholeRun();
-    if (whole) {
+    let whole = wholeRun();
+    while (whole) {
       // The whole-run payload may omit the project alias this local request
       // just registered (host workspace metadata carries it; the realization
       // payload need not). Fill it in from this request — the same
@@ -604,6 +604,26 @@ export class BoatVmManager {
         } as PluginEnvironmentRealizeWorkspaceParams;
       }
       await this.offloadWorkspaces.remember(restored);
+      // The terminal event may have arrived while the restoration was in
+      // flight (or a lease release may have cleared the marker): writing the
+      // runtime binding now would re-insert it after forgetRunOffload
+      // cleared both stores. Forget the restored records instead, like the
+      // terminal-after-first-write cleanup above. The recheck and the
+      // runtime write below stay in one synchronous stretch, so nothing can
+      // land between them.
+      const current = wholeRun();
+      if (!current || !this.localRuns.has(this.localRunKey(params.companyId, runId))
+        || this.endedLocalRuns.has(this.localRunKey(params.companyId, runId))) {
+        await this.offloadWorkspaces.forgetRun(params.companyId, runId);
+        return false;
+      }
+      // A newer whole-run realization may have landed during that same
+      // await: restore the current marker instead of re-registering the
+      // captured stale payload over it in the runtime store.
+      if (current !== whole) {
+        whole = current;
+        continue;
+      }
       this.nativeOffload.remember(restored);
       return false;
     }
