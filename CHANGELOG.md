@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.13
+
+Follow-up to 0.2.12: a guest-ineligible refusal at lifecycle prepare now
+names its sub-cause in the server log instead of only the shared error
+code. Offload and whole-run behaviour stay off by default; nothing is
+enabled by upgrading.
+
+### Fixed
+
+* The guest preflight probe keeps the identical eligibility exercise —
+  canonical delegated parent, probe mkdir, sleeper admission, outside
+  placement, `cgroup.kill`, `populated 0`, only a literal `true`
+  eligible — but a refusal now crosses as an allowlisted token naming
+  the failing sub-step (plus the errno name where an `OSError` caused
+  it), and the host separates it from a preflight RPC transport failure
+  and its own prepare gates (`host_env_gate`, `python_venv_gate`,
+  `cargo_fetch_failed`). The token is re-validated host-side and
+  journal-side, appears only as `detail=` on the existing server-side
+  warn line, and never joins the client-visible reason: the
+  `OFFLOAD_GUEST_INELIGIBLE` code, journal result, fallback semantics
+  and eligibility bar are unchanged, and no guest output, RPC error,
+  cgroup path or raw errno text is recorded. The bound-local-run log
+  also carries the project workspace id alias so bind and refusal lines
+  for one run correlate, and `docs/operations.md` documents the tokens
+  (#95).
+
 ## 0.2.12
 
 Follow-up to 0.2.11: pre-start offload failures now name the step that
