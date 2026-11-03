@@ -432,6 +432,9 @@ export class BoatVmManager {
     this.offloadWorkspaces = new NativeOffloadWorkspaces(deps.state);
     this.offloadState = deps.state;
     this.offloadBackend = new ExecutorBackend({
+      logRefusal: ({ runId, workspaceId, reason }) => {
+        this.logger.info("boat: offload executor refused", { runId, workspaceId, reason });
+      },
       resolveExecutor: async (command) => {
         const config = await deps.offloadConfig?.(command.companyId);
         // Strict boolean opt-in, checked for each new command. Toggling the
@@ -691,9 +694,12 @@ export class BoatVmManager {
       // submit runs, answered against the raw company config this host was
       // built with. A custom executor has no native gates to preflight.
       preflight: async (command: BackendCommand) => {
-        if (this.hasCustomOffloadExecutor) return null;
+        // The enabled opt-in gates resolveExecutor for custom executors too,
+        // so it is checked before the custom-executor shortcut: dry-run must
+        // not promise remote past a gate the real submit refuses on.
         const config = settings ?? {};
         if (config.offloadExecutorEnabled !== true) return "offload executor is not enabled";
+        if (this.hasCustomOffloadExecutor) return null;
         return this.nativeOffload.preflight(command, config);
       },
     };

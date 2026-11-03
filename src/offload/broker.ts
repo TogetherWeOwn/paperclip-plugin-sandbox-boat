@@ -314,7 +314,10 @@ export class OffloadBroker {
         state: "not_started",
         remoteStarted: false,
         fallbackSafe: true,
-        fallbackReason: reason,
+        // Same 256-char bound failToStart applies: a classification reason can
+        // embed argv-derived names, and the journal must not persist or serve
+        // an unbounded caller-influenced string on every read.
+        fallbackReason: reason.slice(0, 256),
         events: [],
         outputBytes: 0,
         result: null,

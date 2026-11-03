@@ -366,7 +366,13 @@ export async function handleExec(
   if (!validated.ok) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
-  const request = validated.value;
+  // Normalise tool/runner once, before every broker call: a Node/Python
+  // request may omit `runner`, and the broker defaults an omitted runner to
+  // cargo. Without this, dry-run/preflight would judge npm/pytest while the
+  // real submit (and its idempotency digest) judged cargo.
+  const tool = validated.value.tool ?? profileTool(profile);
+  const runner = validated.value.runner ?? defaultRunnerFor(tool);
+  const request = { ...validated.value, tool, runner };
   if (!request.dryRun) {
     // A lost workspace binding is not proof that this ID never started. Consult
     // the journal before any unjournaled 503 below; an unknown ID still returns
@@ -374,8 +380,6 @@ export async function handleExec(
     const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
     if (known) return known;
   }
-  const tool = request.tool ?? profileTool(profile);
-  const runner = request.runner ?? defaultRunnerFor(tool);
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
   if (!settings.offloadProfiles.includes(profile.id)) {
     // Not journaled as a refusal: enabling the profile later must accept the

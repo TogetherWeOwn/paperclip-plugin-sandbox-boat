@@ -364,18 +364,21 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // any dry-run failure degrades to the default local path: a dry run never
   // journals, so running local is always safe here. The prefilter already
   // called this argv a remote candidate, so either local path is announced:
-  // an unannounced fallback is indistinguishable from a remote run.
+  // an unannounced fallback is indistinguishable from a remote run. Only the
+  // dry-run call is inside the catch: a rejecting local spawn must surface
+  // once, never be mistaken for a dry-run failure and run a second time.
+  let classification: Awaited<ReturnType<typeof runDryRun>>;
   try {
-    const classification = await runDryRun(request, clientDeps);
-    if (classification.mode === "local") {
-      writeStderr(`offload: running local (${oneLine(classification.reason)})\n`);
-      const exit = await runLocalMeasured(toolArgv);
-      if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "local", reason: classification.reason, exitCode: exit })}\n`, "utf8"));
-      return exit;
-    }
+    classification = await runDryRun(request, clientDeps);
   } catch (error) {
     writeStderr(`offload: running local (dry-run failed: ${oneLine(error instanceof Error ? error.message : String(error))})\n`);
     return runLocalMeasured(toolArgv);
+  }
+  if (classification.mode === "local") {
+    writeStderr(`offload: running local (${oneLine(classification.reason)})\n`);
+    const exit = await runLocalMeasured(toolArgv);
+    if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "local", reason: classification.reason, exitCode: exit })}\n`, "utf8"));
+    return exit;
   }
   const exit = await runOffload(request, clientDeps);
   if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "remote", exitCode: exit })}\n`, "utf8"));

@@ -19,6 +19,10 @@ export interface ExecutorBackendDeps {
    * reason, so older bindings keep working. */
   resolveExecutor(command: BackendCommand): Promise<ExecutorPort | ExecutorRefusal | null>;
   pollIntervalMs?: number;
+  /** Server-side refusal log for the never-started branches no other layer
+   * logs (executor admission, binding failure). Resolve-path refusals are
+   * logged by their source and are not repeated here. */
+  logRefusal?: (info: { runId: string; workspaceId: string; reason: string }) => void;
 }
 
 const uncertain = () => Object.assign(new Error("OFFLOAD_EXECUTION_UNKNOWN"), { code: "OFFLOAD_EXECUTION_UNKNOWN" });
@@ -84,7 +88,9 @@ export class ExecutorBackend implements OffloadBackend {
         // trying to read a nonexistent row would turn safe fallback into unknown.
         if (active.initial.state === "not_started") {
           outcome = terminal(active.initial);
-          sink.failToStart("executor admission refused the command before start");
+          const reason = active.initial.fallbackReason ?? "executor admission refused the command before start";
+          this.deps.logRefusal?.({ runId: command.runId, workspaceId: command.executionWorkspaceId, reason });
+          sink.failToStart(reason);
           return;
         }
         sawStart = active.initial.remoteStarted === true || active.initial.state === "starting"
@@ -113,8 +119,11 @@ export class ExecutorBackend implements OffloadBackend {
           if (result?.state === "not_started" && sawStart) throw uncertain();
           if (result) {
             outcome = result;
-            if (result.state === "not_started") sink.failToStart("executor reported the command never started");
-            else sink.complete(result.result);
+            if (result.state === "not_started") {
+              const reason = view.fallbackReason ?? "executor reported the command never started";
+              this.deps.logRefusal?.({ runId: command.runId, workspaceId: command.executionWorkspaceId, reason });
+              sink.failToStart(reason);
+            } else sink.complete(result.result);
             return;
           }
           await new Promise<void>((resolve) => setTimeout(resolve, this.pollIntervalMs));
@@ -123,6 +132,7 @@ export class ExecutorBackend implements OffloadBackend {
         if (!dispatched) {
           // Config/binding failed before calling start: no execution effect.
           outcome = { state: "not_started", remoteStarted: false, fallbackSafe: true, result: null };
+          this.deps.logRefusal?.({ runId: command.runId, workspaceId: command.executionWorkspaceId, reason: "offload executor binding unavailable" });
           sink.failToStart("offload executor binding unavailable");
         } else {
           await cancelGuest().catch(() => undefined);

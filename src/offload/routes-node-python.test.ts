@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { NeverDispatchBackend, OffloadBroker, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
+import { NeverDispatchBackend, OffloadBroker, type BackendCommand, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
 import { DURATION_INDEX_KEY, DURATION_INDEX_LIMIT, durationKey, normalizeSignature } from "./duration-history.js";
 import {
   NODE_PROFILE,
@@ -122,6 +122,28 @@ describe("handleExec node/python gating", () => {
       [{ seconds: 200, at: Date.parse("2026-10-26T09:00:00Z") }, { seconds: 400, at: Date.parse("2026-10-26T09:30:00Z") }]);
     const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host);
     expect(response.body).toMatchObject({ mode: "remote_candidate", profileId: "node-public-1" });
+  });
+
+  it("normalises an omitted runner before submission, so real exec matches the dry-run", async () => {
+    const started: BackendCommand[] = [];
+    const backend: OffloadBackend = {
+      start: (command) => {
+        started.push(command);
+        return { done: Promise.resolve(), cancel: async () => {} };
+      },
+    };
+    const t = setup(backend);
+    const repoId = canonicalRepoId({ repoUrl: "https://github.com/example/app", projectId: "proj-1" });
+    await t.store.set(durationKey(repoId, "node-public-1", normalizeSignature("node", "npm", ["run", "test"])),
+      [{ seconds: 300, at: Date.parse("2026-10-26T09:00:00Z") }]);
+    const dry = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ runner: undefined }) }, t.host);
+    expect(dry.body).toMatchObject({ mode: "remote_candidate", profileId: "node-public-1" });
+    const real = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody({ runner: undefined, dryRun: false }) }, t.host);
+    expect(real.status).toBe(202);
+    // The broker would default an omitted runner to cargo; the route must
+    // hand it the same npm runner the dry-run judged.
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ tool: "node", runner: "npm" });
   });
 
   it("routes python remote with history, and classifies narrow selections local", async () => {

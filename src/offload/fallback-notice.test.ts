@@ -6,6 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import { SshOffloadRuntime } from "../offload-ssh-runtime.js";
 import type { SshManager } from "../ssh.js";
 import type { StateClientLike } from "../state.js";
+import { createFakeContext } from "../test-support/harness.js";
+import { BoatVmManager } from "../vm-manager.js";
 import {
   OffloadBroker,
   type BackendCommand,
@@ -125,6 +127,19 @@ describe("shim fallback notices", () => {
     expect(t.deps.spawn).toHaveBeenCalledTimes(1);
     expect(t.stderrText()).toContain("offload: running local (no offload binding for this run and workspace)\n");
   });
+
+  it("a rejecting local spawn after a local dry-run verdict surfaces once, never re-runs as a dry-run failure", async () => {
+    const t = shimSetup();
+    (t.deps.http.post as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
+      ok: true, status: 200,
+      json: { version: 1, commandId: CMD, mode: "local", reason: "pinned toolchain is not supported", profileId: "rust-public-1" },
+    }));
+    (t.deps.spawn as ReturnType<typeof vi.fn>).mockImplementation(async () => { throw new Error("spawn EINVAL"); });
+    await expect(shimMain(AS_CARGO, ["check", "--locked"], t.deps)).rejects.toThrow("spawn EINVAL");
+    expect(t.deps.spawn).toHaveBeenCalledTimes(1);
+    expect(t.stderrText()).toContain("offload: running local (pinned toolchain is not supported)\n");
+    expect(t.stderrText()).not.toContain("dry-run failed");
+  });
 });
 
 // ------------------------------------------------------------- broker level
@@ -170,6 +185,24 @@ describe("broker fallback reason", () => {
     } satisfies Partial<OffloadReadResponse>);
   });
 
+  it("recordRefusal bounds the journaled reason to 256 characters", async () => {
+    const broker = new OffloadBroker({
+      store: new MapStore(),
+      backend: { start: () => { throw new Error("recordRefusal must not dispatch"); } },
+      now: () => 1_000_000,
+    });
+    const request: OffloadSubmitRequest = {
+      version: 1, commandId: CMD, executionWorkspaceId: WS, cwdRelative: ".",
+      argv: ["check", "--locked"], env: {}, queueTimeoutMs: 30_000, timeoutMs: 1_200_000, dryRun: false,
+    };
+    const principal = { companyId: COMPANY, runId: RUN, cardId: "card-1", repoId: "repo-1", profileId: "rust-public-1" };
+    const long = `incompatible workload: ${"x".repeat(400)}`;
+    await broker.recordRefusal(request, principal, long);
+    const read = await broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0);
+    expect(read.body).toMatchObject({ state: "not_started", fallbackReason: long.slice(0, 256) });
+    expect((read.body as OffloadReadResponse).fallbackReason).toHaveLength(256);
+  });
+
   it("executor backend forwards a reasoned refusal to failToStart verbatim", async () => {
     const output = { started: vi.fn(), write: vi.fn(), complete: vi.fn(), failToStart: vi.fn(), fail: vi.fn() } satisfies OffloadOutputSink;
     const backend = new ExecutorBackend({
@@ -185,6 +218,52 @@ describe("broker fallback reason", () => {
     await handle.done;
     expect(output.failToStart).toHaveBeenCalledWith("no offload binding for this run and workspace");
     expect(output.started).not.toHaveBeenCalled();
+  });
+
+  it("executor admission refusals keep their specific reason (immediate and polled views)", async () => {
+    const command: BackendCommand = {
+      commandId: CMD, companyId: COMPANY, runId: RUN, cardId: "card-1", repoId: "repo-1",
+      profileId: "rust-public-1", executionWorkspaceId: WS, cwdRelative: ".",
+      argv: ["check", "--locked"], env: {}, queueTimeoutMs: 30_000, timeoutMs: 1_200_000,
+    };
+    const notStarted = (fallbackReason: string) => ({
+      version: 1 as const, commandId: CMD, state: "not_started" as const,
+      remoteStarted: false, fallbackSafe: true, fallbackReason, result: null, events: [], nextCursor: 0,
+    });
+    // Immediate: start() itself acknowledges never-started (capacity admission).
+    const immediateOutput = { started: vi.fn(), write: vi.fn(), complete: vi.fn(), failToStart: vi.fn(), fail: vi.fn() } satisfies OffloadOutputSink;
+    const immediateLog = vi.fn();
+    const immediate = new ExecutorBackend({
+      resolveExecutor: async () => ({
+        start: async () => notStarted("queue full (32 pending)"),
+        readOutput: async () => { throw new Error("no journal row to read"); },
+        heartbeatCommand: async () => { throw new Error("unused"); },
+        cancelCommand: async () => { throw new Error("unused"); },
+      }),
+      pollIntervalMs: 1,
+      logRefusal: immediateLog,
+    });
+    await immediate.start(command, immediateOutput).done;
+    expect(immediateOutput.failToStart).toHaveBeenCalledWith("queue full (32 pending)");
+    expect(immediateLog).toHaveBeenCalledWith({ runId: RUN, workspaceId: WS, reason: "queue full (32 pending)" });
+
+    // Polled: start() accepts, the first read turns terminal never-started.
+    const polledOutput = { started: vi.fn(), write: vi.fn(), complete: vi.fn(), failToStart: vi.fn(), fail: vi.fn() } satisfies OffloadOutputSink;
+    const polled = new ExecutorBackend({
+      resolveExecutor: async () => ({
+        start: async () => ({
+          version: 1 as const, commandId: CMD, state: "queued" as const,
+          remoteStarted: false, fallbackSafe: false, result: null, events: [], nextCursor: 0,
+        }),
+        readOutput: async () => notStarted("monthly offload VM-hour cap reached (10h); new commands run local until next month"),
+        heartbeatCommand: async () => { throw new Error("unused"); },
+        cancelCommand: async () => { throw new Error("unused"); },
+      }),
+      pollIntervalMs: 1,
+    });
+    await polled.start(command, polledOutput).done;
+    expect(polledOutput.failToStart).toHaveBeenCalledWith("monthly offload VM-hour cap reached (10h); new commands run local until next month");
+    expect(polledOutput.started).not.toHaveBeenCalled();
   });
 });
 
@@ -311,5 +390,35 @@ describe("runtime gate reasons", () => {
     expect(logger.info).toHaveBeenCalledWith("boat: offload executor refused", {
       runId: RUN, workspaceId: WS, reason: "offload executor is not enabled",
     });
+  });
+});
+
+// ------------------------------------------------------------ manager level
+
+describe("manager preflight ordering", () => {
+  it("a custom executor does not bypass the enabled opt-in on dry-run", async () => {
+    const harness = createFakeContext();
+    const manager = new BoatVmManager({
+      state: harness.ctx.state, logger: harness.ctx.logger,
+      offloadExecutor: async () => null,
+    });
+    try {
+      const hostOf = (settings: Record<string, unknown>) => (manager as unknown as {
+        offloadRouteHost(companyId: string, s?: Record<string, unknown>): {
+          preflight(command: BackendCommand): Promise<string | null>;
+        };
+      }).offloadRouteHost(COMPANY, settings);
+      const command: BackendCommand = {
+        commandId: CMD, companyId: COMPANY, runId: RUN, cardId: "card-1", repoId: "repo-1",
+        profileId: "rust-public-1", executionWorkspaceId: WS, cwdRelative: ".",
+        argv: ["check", "--locked"], env: {}, queueTimeoutMs: 30_000, timeoutMs: 1_200_000,
+      };
+      // resolveExecutor refuses here even with a custom executor installed,
+      // so preflight must refuse too instead of promising remote.
+      await expect(hostOf({}).preflight(command)).resolves.toBe("offload executor is not enabled");
+      await expect(hostOf({ offloadExecutorEnabled: true }).preflight(command)).resolves.toBeNull();
+    } finally {
+      await manager.shutdown().catch(() => undefined);
+    }
   });
 });
