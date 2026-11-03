@@ -5,7 +5,12 @@ The agent and model stay on the Paperclip host; only an eligible heavy command a
 **What leaves the host.** Only files git tracks (the index, `git ls-files
 --cached`), minus the sync excludes (caches, build outputs and secret-bearing
 names such as `.env*`, `.dev.vars`, `*.pem`, `*.key`, `id_rsa*`, `.aws/`,
-`*.tfvars`). Untracked or ignored workspace files never sync, so stage new
+`*.tfvars`). One exception: a tracked `*.pem` whose contents verify as
+certificate-only — one or more X.509 `CERTIFICATE` blocks and nothing else,
+re-verified on the frozen bytes at capture — syncs like any other tracked
+file, because public CA certificates are fixtures a build may read; any
+`.pem` that is a key, mixed, malformed, oversized or a symlink keeps the
+command local. Untracked or ignored workspace files never sync, so stage new
 files (`git add`) before offloading a command that needs them; submodule
 contents are not in the parent index and do not sync. A source that is not a
 git work tree (or whose tracked files cannot be listed) stays local. Before
@@ -123,7 +128,8 @@ Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
 are never synced and keep commands local; the same holds for secret-bearing
 names and credential directories (`.dev.vars`, `.envrc`, `*.pem`, `*.key`,
 `id_rsa*`, `.git-credentials`, `.aws/`, `.docker/`, `.kube/`, `*.tfvars`,
-`*credentials*.json`). Symlinked config is never followed:
+`*credentials*.json`) — except a tracked `*.pem` verified certificate-only,
+as described under "What leaves the host". Symlinked config is never followed:
 a symlinked `pyproject.toml` stays local without reading its target, and
 regular `pyproject.toml` files are read bounded at 256 KiB. The same rule
 covers every host-side workspace probe: toolchain pins (`rust-toolchain*`,

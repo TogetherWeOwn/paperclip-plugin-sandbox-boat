@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { createHash, randomUUID, scryptSync } from "node:crypto";
@@ -324,11 +325,36 @@ describe("stock concrete executor factory", () => {
       mustResolve(await rt.resolve(command(), config));
     } finally { await rt.shutdown(); }
   });
-  it("keeps cargo local when a tracked secret-bearing file would be withheld from sync", async () => {
+  it("keeps cargo local when a tracked .pem is not a verifiable public certificate", async () => {
     gitIn(source, "init", "-q", ".");
     await mkdir(path.join(source, "tests/fixtures"), { recursive: true });
     await writeFile(path.join(source, "tests/fixtures/ca.pem"), "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
     gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/ca.pem");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.stringContaining("not a verified public certificate") }));
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("admits cargo when the only tracked .pem is a public CA certificate fixture", async () => {
+    gitIn(source, "init", "-q", ".");
+    await mkdir(path.join(source, "scripts/ci/fixtures"), { recursive: true });
+    await writeFile(path.join(source, "scripts/ci/fixtures/isrg-x1.pem"),
+      readFileSync(new URL("./test-support/isrg-root-x1.pem", import.meta.url), "utf8"));
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "scripts/ci/fixtures/isrg-x1.pem");
+    const rt = realGitRuntime();
+    try {
+      mustResolve(await rt.resolve(command(), config));
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps cargo local when a tracked .pem carries a private key alongside a public certificate", async () => {
+    gitIn(source, "init", "-q", ".");
+    await mkdir(path.join(source, "tests/fixtures"), { recursive: true });
+    const bundle = readFileSync(new URL("./test-support/isrg-root-x1.pem", import.meta.url), "utf8")
+      + "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBBQ==\n-----END PRIVATE KEY-----\n";
+    await writeFile(path.join(source, "tests/fixtures/bundle.pem"), bundle);
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/bundle.pem");
     const rt = realGitRuntime();
     try {
       expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));

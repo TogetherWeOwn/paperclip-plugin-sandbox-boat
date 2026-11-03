@@ -744,6 +744,36 @@ describe("rsync transport spec", () => {
     }
   });
 
+  it("re-includes only the listed .pem paths ahead of the *.pem exclude", () => {
+    const spec = {
+      controlPath: "/tmp/pcboat/abc.ctl",
+      user: "user",
+      host: "10.0.0.9",
+      port: 2222,
+      privateKeyPath: "/tmp/pcboat/id_ed25519",
+      knownHostsPath: "/tmp/pcboat/known_hosts_abc",
+      hostKeyAlias: "sandbox-abc",
+      connectTimeoutSec: 10,
+    };
+    const args = buildRsyncPushArgs(spec, "/tmp/snap", "/home/user/card-1",
+      ["src/b.rs", "scripts/ci/fixtures/isrg-x1.pem"]);
+    const include = args.indexOf("--include=/scripts/ci/fixtures/isrg-x1.pem");
+    expect(include).toBeGreaterThan(-1);
+    expect(include).toBeLessThan(args.indexOf("--exclude=*.pem"));
+    const noPem = buildRsyncPushArgs(spec, "/tmp/snap", "/home/user/card-1", ["src/b.rs"]);
+    expect(noPem.some((arg) => arg.startsWith("--include="))).toBe(false);
+    expect(noPem).toContain("--exclude=*.pem");
+    // Pattern-literal names: no wildcard char means the path is verbatim
+    // (escaping `]` or `\` would make rsync not match); with one, chars
+    // hide in classes. Verified end-to-end against rsync 3.2.7.
+    const odd = buildRsyncPushArgs(spec, "/tmp/snap", "/home/user/card-1",
+      ["f/ca].pem", "f/ca[1].pem", "f/a*b.pem", "f/a\\b.pem"]);
+    expect(odd).toContain("--include=/f/ca].pem");
+    expect(odd).toContain("--include=/f/ca[[]1].pem");
+    expect(odd).toContain("--include=/f/a[*]b.pem");
+    expect(odd).toContain("--include=/f/a\\b.pem");
+  });
+
   it("renders the delta file list null-separated so odd names cannot smuggle flags", () => {
     const out = renderFilesFromList([{ path: "src/b.rs" } as never, { path: "--delete" } as never]);
     expect(out).toBe("src/b.rs\0--delete\0");

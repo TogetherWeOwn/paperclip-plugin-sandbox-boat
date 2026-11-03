@@ -24,8 +24,8 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
-import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
-import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
+import { hasSecretInFiles, listTrackedFiles, pemFilesAreCertificateOnly, type TrackedFilesFn } from "./offload-secret-scan.js";
+import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
 
@@ -138,12 +138,15 @@ function isUvAuthPyproject(text: string): boolean {
  * pyproject.toml with uv auth, or any secret-bearing name or credential
  * directory (.aws/, .docker/, .kube/, *.pem, id_rsa*, ...). Bounded and skips
  * excluded dirs such as node_modules; unreadable or over-limit sources fail
- * closed to local. */
-export async function hasRegistryCredentials(sourceRoot: string): Promise<boolean> {
+ * closed to local. `verifiedCertPems` names tracked .pem paths already
+ * proven certificate-only by the admission gate: those sync to the guest,
+ * so their presence alone is not stay-local config. Any other .pem —
+ * untracked included, since it would never reach the guest — still is. */
+export async function hasRegistryCredentials(sourceRoot: string, verifiedCertPems: ReadonlySet<string> = new Set()): Promise<boolean> {
   let entriesSeen = 0;
-  const stack: Array<{ dir: string; depth: number }> = [{ dir: sourceRoot, depth: 0 }];
+  const stack: Array<{ dir: string; rel: string; depth: number }> = [{ dir: sourceRoot, rel: "", depth: 0 }];
   while (stack.length > 0) {
-    const { dir, depth } = stack.pop()!;
+    const { dir, rel, depth } = stack.pop()!;
     if (depth > MAX_CREDENTIAL_DEPTH) return true;
     let entries;
     try {
@@ -155,8 +158,9 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
       entriesSeen += 1;
       if (entriesSeen > MAX_CREDENTIAL_ENTRIES) return true;
       const name = entry.name;
+      const entryRel = rel === "" ? name : `${rel}/${name}`;
       if (REGISTRY_CREDENTIAL_FILES.includes(name) || name === "uv.toml") return true;
-      if (isSecretBearingName(name)) return true;
+      if (isSecretBearingName(name) && !verifiedCertPems.has(entryRel)) return true;
       if (entry.isDirectory() && STAY_LOCAL_DIRS.has(name)) return true;
       if (name === "pyproject.toml") {
         try {
@@ -195,7 +199,7 @@ export async function hasRegistryCredentials(sourceRoot: string): Promise<boolea
       }
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(name)) continue;
-        stack.push({ dir: path.join(dir, name), depth: depth + 1 });
+        stack.push({ dir: path.join(dir, name), rel: entryRel, depth: depth + 1 });
       }
       // Symlinks are never followed: a matching basename above already stays
       // local, and anything else is left for the sync lstat guard.
@@ -523,15 +527,32 @@ export class SshOffloadRuntime {
     // workspace from ever spending a VM.
     const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(binding.source).catch(() => null);
     if (!tracked || tracked.size === 0) return refuse("workspace has no tracked files to sync");
-    const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel));
-    if (syncable.length === 0) return refuse("no tracked files are syncable");
-    // A tracked secret-bearing name (a public test cert, a .docker/ context)
-    // is withheld from sync, so the guest tree would silently lack a file the
-    // build may read: stay local for every tool, cargo included.
-    if ([...tracked].some((rel) => { const parts = rel.split("/");
-      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) {
+    // A tracked secret-bearing name (a .docker/ context, a key file) is
+    // withheld from sync, so the guest tree would silently lack a file the
+    // build may read: stay local for every tool, cargo included. The one
+    // exception is a tracked .pem whose only barrier is its name: proven
+    // certificate-only below, its bytes are public certificates, so it
+    // syncs like any other tracked file instead of going missing.
+    const certPemCandidates: string[] = [];
+    for (const rel of tracked) {
+      const parts = rel.split("/");
+      if (parts.some((part) => STAY_LOCAL_DIRS.has(part))) {
+        return refuse("tracked secret-bearing file keeps the command local");
+      }
+      if (!isSecretBearingName(parts.at(-1)!)) continue;
+      if (isCertificatePemSyncCandidate(rel)) {
+        certPemCandidates.push(rel);
+        continue;
+      }
       return refuse("tracked secret-bearing file keeps the command local");
     }
+    if (certPemCandidates.length > 0
+      && !await pemFilesAreCertificateOnly(binding.source, certPemCandidates).catch(() => false)) {
+      return refuse("tracked .pem file is not a verified public certificate; keeps the command local");
+    }
+    const certPems = new Set(certPemCandidates);
+    const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel) || certPems.has(rel));
+    if (syncable.length === 0) return refuse("no tracked files are syncable");
     // Git lists normalized paths: "./src" or "src/." name the same directory.
     const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
     if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) {
@@ -558,7 +579,7 @@ export class SshOffloadRuntime {
       if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) {
         return refuse("nested lockfile below the workspace root; stays local");
       }
-      if (await hasRegistryCredentials(binding.source).catch(() => true)) {
+      if (await hasRegistryCredentials(binding.source, certPems).catch(() => true)) {
         return refuse("registry credential config present; stays local");
       }
     }
