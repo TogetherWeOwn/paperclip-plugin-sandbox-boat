@@ -57,6 +57,56 @@ afterEach(async () => {
   await runtime?.shutdown(); await ssh?.cleanup();
 }, 20_000);
 
+describe("project workspace alias", () => {
+  it("withdraws an alias two execution workspaces claim with different sources", async () => {
+    const projectWorkspaceId = randomUUID();
+    const first = native();
+    const firstRequest = first.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown>>;
+    firstRequest.source!.projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(true);
+    const otherWorkspaceId = randomUUID();
+    const otherSource = path.join(ssh.root, "other-checkout");
+    const second = native();
+    second.workspace.localPath = otherSource;
+    const secondRequest = second.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown> | string>;
+    secondRequest.executionWorkspaceId = otherWorkspaceId;
+    (secondRequest.source as Record<string, unknown>).localPath = otherSource;
+    (secondRequest.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(second);
+    // The shared id resolves to neither checkout; each workspace keeps its own.
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+    expect(runtime.has(companyId, runId, executionWorkspaceId)).toBe(true);
+    expect(runtime.has(companyId, runId, otherWorkspaceId)).toBe(true);
+    // Re-realizing the first workspace does not resurrect the ambiguous alias.
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+  });
+
+  it("a whole-run realization without the alias supersedes the local-run alias binding", async () => {
+    const localRunId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const mutate = (params: PluginEnvironmentRealizeWorkspaceParams, fn: (request: Record<string, unknown>) => void) => {
+      const request = params.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, unknown>;
+      request.heartbeatRunId = localRunId;
+      fn(request);
+      return params;
+    };
+    runtime.remember(mutate(native(), (request) => {
+      request.localRun = true;
+      (request.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    }));
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    // The whole-run payload for the same run and workspace omits the alias.
+    runtime.remember(mutate(native(), () => undefined));
+    // With no local source roots configured, a local-run binding under the
+    // alias could not resolve; the whole-run binding the alias now answers
+    // with can.
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    expect(await runtime.resolve({ ...command(), runId: localRunId, executionWorkspaceId: projectWorkspaceId }, config)).not.toBe(null);
+  });
+});
+
 describe("stock concrete executor factory", () => {
   it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
     const executor = (await runtime.resolve(command(), config))!;

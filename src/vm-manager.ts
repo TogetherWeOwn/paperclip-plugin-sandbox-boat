@@ -563,11 +563,6 @@ export class BoatVmManager {
     return this.nativeOffload.has(companyId, runId, workspaceId);
   }
 
-  /** True when the run holds any offload binding, so request-triggered binds (and secret resolutions) stop. */
-  hasAnyOffloadBinding(companyId: string, runId: string): boolean {
-    return this.nativeOffload.hasRun(companyId, runId);
-  }
-
   /** Local-run binding built from host-owned event and workspace data (local-run-binding.ts).
    * Only for a live local run; a native whole-run realization for the same run and workspace is never replaced.
    * The workspace record is persisted first, so a failed write leaves nothing half-installed and a later bind can retry. */
@@ -575,8 +570,15 @@ export class BoatVmManager {
     const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
     const runId = typeof request?.heartbeatRunId === "string" ? request.heartbeatRunId : "";
     const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : "";
+    // The binding answers under both host-owned ids of the workspace, so a
+    // whole-run realization recorded under either one blocks a local-run
+    // overwrite. An earlier local-run binding of this same run does not: a
+    // request-triggered re-bind may register ids the started bind could not.
+    const aliasId = (request?.source as { projectWorkspaceId?: unknown } | undefined)?.projectWorkspaceId;
+    const ids = typeof aliasId === "string" && aliasId && aliasId !== workspaceId ? [workspaceId, aliasId] : [workspaceId];
+    const wholeRun = () => ids.map((id) => this.wholeRunRealizations.get(JSON.stringify([params.companyId, runId, id]))).find(Boolean);
     const live = this.localRuns.get(this.localRunKey(params.companyId, runId));
-    if (!runId || !workspaceId || !live || this.nativeOffload.has(params.companyId, runId, workspaceId)) return false;
+    if (!runId || !workspaceId || !live || wholeRun()) return false;
     await this.offloadWorkspaces.remember(params);
     // The terminal event may have arrived while the write was in flight.
     if (!this.localRuns.has(this.localRunKey(params.companyId, runId))) {
@@ -584,10 +586,25 @@ export class BoatVmManager {
       return false;
     }
     // A whole-run realization may have landed while the write was in flight: it keeps both stores.
-    if (this.nativeOffload.has(params.companyId, runId, workspaceId)) {
-      const whole = this.wholeRunRealizations.get(JSON.stringify([params.companyId, runId, workspaceId]));
-      if (whole) await this.offloadWorkspaces.remember(whole.params);
-      else await this.offloadWorkspaces.forget(params.companyId, workspaceId, runId);
+    const whole = wholeRun();
+    if (whole) {
+      // The whole-run payload may omit the project alias this local request
+      // just registered (host workspace metadata carries it; the realization
+      // payload need not). Fill it in from this request — the same
+      // host-owned id pair for the same execution workspace — or the alias
+      // record written above would keep serving the local source.
+      let restored = whole.params;
+      const wholeRequest = whole.params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+      const wholeSource = wholeRequest?.source as { projectWorkspaceId?: unknown } | undefined;
+      if (typeof aliasId === "string" && aliasId && aliasId !== workspaceId && wholeRequest
+        && typeof wholeSource?.projectWorkspaceId !== "string") {
+        restored = { ...whole.params, workspace: { ...whole.params.workspace,
+          metadata: { ...whole.params.workspace.metadata,
+            workspaceRealizationRequest: { ...wholeRequest, source: { ...(wholeSource ?? {}), projectWorkspaceId: aliasId } } } },
+        } as PluginEnvironmentRealizeWorkspaceParams;
+      }
+      await this.offloadWorkspaces.remember(restored);
+      this.nativeOffload.remember(restored);
       return false;
     }
     this.nativeOffload.remember(params);
@@ -638,6 +655,9 @@ export class BoatVmManager {
       extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],
       settings: normalizeOffloadSettings(settings ?? {}),
       durations: this.offloadDurations(companyId),
+      logRefusal: ({ runId, workspaceId, reason }: { runId: string; workspaceId: string; reason: string }) => {
+        this.logger.warn("boat: offload exec refused", { runId, workspaceId, reason });
+      },
     };
   }
 
@@ -2571,7 +2591,15 @@ export class BoatVmManager {
     this.nativeOffload.remember(params);
     const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
     if (typeof request?.heartbeatRunId === "string" && typeof request.executionWorkspaceId === "string") {
-      this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, request.executionWorkspaceId]), { params, at: this.now() });
+      // Both stores register this realization under the project workspace id
+      // too, so the precedence marker must cover every registered id: a later
+      // project-branch local bind keys on that alias alone.
+      const aliasId = (request.source as { projectWorkspaceId?: unknown } | undefined)?.projectWorkspaceId;
+      const ids = typeof aliasId === "string" && aliasId && aliasId !== request.executionWorkspaceId
+        ? [request.executionWorkspaceId, aliasId] : [request.executionWorkspaceId];
+      for (const id of ids) {
+        this.wholeRunRealizations.set(JSON.stringify([params.companyId, request.heartbeatRunId, id]), { params, at: this.now() });
+      }
     }
     const config = parseDriverConfig(params.config);
     const remoteCwd =

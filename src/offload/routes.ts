@@ -90,6 +90,8 @@ export interface OffloadRouteHost {
   extraProfiles?: ServerProfile[];
   settings?: Partial<OffloadSettings>;
   durations?: DurationStore;
+  /** Observability hook for fallback-safe refusals; the shim only prints the code to the agent. */
+  logRefusal?: (entry: { runId: string; workspaceId: string; reason: string }) => void;
 }
 
 export interface RouteResponse {
@@ -369,6 +371,7 @@ export async function handleExec(
   if (!settings.offloadProfiles.includes(profile.id)) {
     // Not journaled as a refusal: enabling the profile later must accept the
     // same command ID. The shim falls back locally.
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: `profile ${profile.id} is not enabled for offload` });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -388,6 +391,7 @@ export async function handleExec(
     // shim must fall back locally, never fail the build. Not journaled, so the
     // same command ID submits cleanly once the workspace resolves. Other-agent
     // runs keep the 403 in plugin.ts; this path carries no agent identity claim.
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: "unknown execution workspace; running local" });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", "unknown execution workspace; running local", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -406,6 +410,7 @@ export async function handleExec(
   if (workspace.path == null && workspace.cwd == null) {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, "execution workspace is not locally realized; cannot snapshot source");
     if (conflict) return conflict;
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: "execution workspace confinement is unsupported" });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -415,6 +420,7 @@ export async function handleExec(
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: `incompatible workload: ${classification.reason}` });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", `incompatible workload: ${classification.reason}`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),

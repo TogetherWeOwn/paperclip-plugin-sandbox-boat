@@ -2160,7 +2160,9 @@ describe("offload API routes", () => {
   it.each(["release", "destroy"])("a %s of the run's lease forgets its whole-run workspace bindings", async (end) => {
     const lease = await acquire(RUN_ID);
     await seedWorkspace();
-    expect(workspaceBindings()).toHaveLength(1);
+    // The binding is persisted under both host-owned ids of the workspace
+    // (execution workspace id and project workspace id).
+    expect(workspaceBindings()).toHaveLength(2);
     if (end === "release") await release(lease);
     else await plugin.definition.onEnvironmentDestroyLease!({ ...base(), providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never);
     expect(workspaceBindings()).toEqual([]);

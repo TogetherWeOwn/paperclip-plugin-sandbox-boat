@@ -348,6 +348,10 @@ const poolRegistryScope = (companyId: string) =>
 
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
+  /** Project-id aliases withdrawn because two execution workspaces of one run
+   * claimed them with different sources; kept until the run is forgotten so a
+   * re-realization cannot resurrect an ambiguous alias. */
+  private readonly ambiguousAliases = new Set<string>();
   private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync; sessions: Map<string, SshSession> }>();
   /** Credential-free pool identity (the poolId fields minus the credential
    * digest) to the live poolId, so a rotated or re-pointed API key presented
@@ -371,19 +375,17 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
-  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
-  hasRun(companyId: string, runId: string): boolean {
-    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
-    return false;
-  }
-
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
   forgetRun(companyId: string, runId: string): string[] {
-    const dropped: string[] = [];
+    const dropped = new Set<string>();
     for (const [id, entry] of this.bindings) {
-      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.push(entry.workspaceId); }
+      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.add(entry.workspaceId); }
     }
-    return dropped;
+    for (const id of this.ambiguousAliases) {
+      const [company, run] = JSON.parse(id) as [string, string, string];
+      if (company === companyId && run === runId) this.ambiguousAliases.delete(id);
+    }
+    return [...dropped];
   }
 
   remember(params: PluginEnvironmentRealizeWorkspaceParams): void {
@@ -393,12 +395,54 @@ export class SshOffloadRuntime {
       || request.environmentId !== params.environmentId || !plain(request.heartbeatRunId) || !plain(request.executionWorkspaceId)
       || !plain(source.localPath) || !path.isAbsolute(source.localPath) || source.localPath !== params.workspace.localPath) return;
     const config = parseDriverConfig(params.config);
-    this.bindings.set(key(params.companyId, request.heartbeatRunId, request.executionWorkspaceId), {
+    const binding: Binding = {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
       config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
-    });
+    };
+    const primaryKey = key(params.companyId, binding.runId, binding.workspaceId);
+    const existingPrimary = this.bindings.get(primaryKey);
+    // A local-run binding never replaces a whole-run one under the same key
+    // (mirrors NativeOffloadWorkspaces).
+    if (!(existingPrimary && !existingPrimary.localRun && binding.localRun)) {
+      this.bindings.set(primaryKey, binding);
+      this.ambiguousAliases.delete(primaryKey);
+    }
+    // The shim reports PAPERCLIP_WORKSPACE_ID, which carries the project
+    // workspace id even for execution workspaces, so the same binding must
+    // answer under that host-owned id too (mirrors NativeOffloadWorkspaces).
+    if (plain(source.projectWorkspaceId) && source.projectWorkspaceId !== binding.workspaceId) {
+      const aliasKey = key(params.companyId, binding.runId, source.projectWorkspaceId);
+      const existing = this.bindings.get(aliasKey);
+      if (this.ambiguousAliases.has(aliasKey) || (existing && !existing.localRun && binding.localRun)) {
+        // Withdrawn ambiguity stays withdrawn; a whole-run alias is kept.
+      } else if (!existing || (existing.localRun && !binding.localRun)
+        || existing.source === binding.source || existing.workspaceId === binding.workspaceId) {
+        this.bindings.set(aliasKey, binding);
+      } else {
+        // Two execution workspaces of this run claim the shared project id
+        // with different checkouts, and the shim can only send that id:
+        // withdraw the alias so resolution fails closed instead of silently
+        // serving the later checkout.
+        this.bindings.delete(aliasKey);
+        this.ambiguousAliases.add(aliasKey);
+      }
+    }
+    if (!binding.localRun) {
+      // A local-run bind may have registered this same execution workspace
+      // under a project alias this whole-run payload omits; whole-run
+      // precedence covers that alias too, so claim it for the whole-run
+      // binding instead of leaving the local checkout served under it
+      // (mirrors NativeOffloadWorkspaces). Bindings of another execution
+      // workspace are identified by their workspaceId and left alone.
+      for (const [id, existing] of this.bindings) {
+        if (id !== primaryKey && existing.companyId === binding.companyId && existing.runId === binding.runId
+          && existing.workspaceId === binding.workspaceId && !this.ambiguousAliases.has(id)) {
+          this.bindings.set(id, binding);
+        }
+      }
+    }
   }
 
   /** Re-prove a local-run binding's operator-owned facts: the source still sits

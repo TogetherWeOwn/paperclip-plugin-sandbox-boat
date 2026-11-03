@@ -181,7 +181,11 @@ export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise
   if (!response.ok) throw new Error(`offload dry-run failed: ${response.error}`);
   if (response.status !== 200) {
     const envelope = asError(response.json);
-    throw new Error(`offload dry-run rejected: ${envelope?.code ?? `HTTP ${response.status}`}`);
+    // The code alone (e.g. OFFLOAD_UNAVAILABLE) hides why the broker refused;
+    // the detail is the only diagnosable part from the shim side.
+    throw new Error(envelope
+      ? `offload dry-run rejected: ${envelope.code} (${envelope.detail})`
+      : `offload dry-run rejected: HTTP ${response.status}`);
   }
   const body = response.json as { mode: DryRunResult["mode"]; reason: string; profileId: string };
   return { mode: body.mode, reason: body.reason, profileId: body.profileId };
