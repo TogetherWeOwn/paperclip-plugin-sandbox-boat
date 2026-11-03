@@ -157,7 +157,7 @@ export interface PreStartFailure {
 // guest- or adapter-influenced bytes still cannot reach the log — and it is
 // never appended to `reason`, which crosses to the client unchanged.
 const SAFE_ERROR_CODE = /^(?:(?:OFFLOAD|SYNC|BOAT)_[A-Z0-9_]{1,56}|E[A-Z]{2,11})$/;
-const SAFE_PRESTART_DETAIL = /^[a-z][a-z0-9_]{0,40}(?::(?:E[A-Z]{2,11}|[A-Z][A-Z0-9_]{1,56}))?$/;
+const SAFE_PRESTART_DETAIL = /^[a-z][a-z0-9_]{0,40}(?::(?:E[A-Z]{2,11}|[A-Z][A-Z0-9_]{1,56}))?(?::(?:session_delegated|session_not_delegated|session_placement_unknown))?$/;
 export function validPreStartDetail(value: unknown): string | null {
   return typeof value === "string" && SAFE_PRESTART_DETAIL.test(value) ? value : null;
 }

@@ -302,24 +302,47 @@ def rpc(action, data):
         # guest text crosses; the host re-validates the token against this
         # same fixed vocabulary before logging it. The probe itself is
         # unchanged: same admission, kill and outside-placement exercise.
-        def probe_failed(step, error=None):
+        def session_placement(parent=None):
+            # Name only whether THIS RPC process sits inside the configured
+            # parent, never the membership path itself. An SSH session that
+            # missed the template's ForceCommand scope (for example a control
+            # master accepted by a pre-restart sshd listener) still runs as
+            # the same user and can mkdir below the user-owned delegated
+            # parent, but the kernel also requires write access to the
+            # nearest common ancestor of the source and destination cgroups
+            # to migrate a process in — from outside the parent that ancestor
+            # is outside the delegated subtree, so admission fails EACCES on
+            # an eligible template. This token separates that stale-session
+            # refusal from a template fault.
+            if parent is None:
+                return 'session_placement_unknown'
+            try:
+                membership = pathlib.Path('/proc/self/cgroup').read_text().split('0::', 1)[1].strip()
+            except (OSError, IndexError):
+                return 'session_placement_unknown'
+            if not membership.startswith('/'):
+                return 'session_placement_unknown'
+            own = '/sys/fs/cgroup' + membership
+            parent = str(parent)
+            return 'session_delegated' if own == parent or own.startswith(parent + '/') else 'session_not_delegated'
+        def probe_failed(step, error=None, parent=None):
             name = errno.errorcode.get(getattr(error, 'errno', None) or 0)
-            return step + (':' + name if name else '')
+            return step + (':' + name if name else '') + ':' + session_placement(parent)
         try:
             parent = pathlib.Path(canonical(data['cgroupParent']))
         except (KeyError, TypeError, ValueError):
-            return 'parent_invalid'
+            return probe_failed('parent_invalid')
         except OSError as error:
             return probe_failed('parent_invalid', error)
         if not str(parent).startswith('/sys/fs/cgroup/') or not (parent / 'cgroup.controllers').is_file():
-            return 'parent_not_delegated'
+            return probe_failed('parent_not_delegated', parent=parent)
         probe = parent / ('paperclip-boat-probe-' + secrets.token_hex(8))
         child = None
         try:
             try:
                 probe.mkdir()
             except OSError as error:
-                return probe_failed('probe_mkdir_failed', error)
+                return probe_failed('probe_mkdir_failed', error, parent)
             # Actually exercise admission, recursive kill and outside placement,
             # not merely access(W_OK). No ambient process is moved or signalled.
             try:
@@ -327,19 +350,19 @@ def rpc(action, data):
                 (probe / 'cgroup.procs').write_text(str(child.pid))
                 membership = (probe / 'cgroup.procs').read_text().split()
             except OSError as error:
-                return probe_failed('probe_admit_failed', error)
+                return probe_failed('probe_admit_failed', error, parent)
             if str(os.getpid()) in membership:
-                return 'probe_outside_failed'
+                return probe_failed('probe_outside_failed', parent=parent)
             try:
                 (probe / 'cgroup.kill').write_text('1')
                 child.wait(timeout=2)
                 events = (probe / 'cgroup.events').read_text()
             except subprocess.TimeoutExpired:
-                return 'probe_kill_failed'
+                return probe_failed('probe_kill_failed', parent=parent)
             except OSError as error:
-                return probe_failed('probe_kill_failed', error)
+                return probe_failed('probe_kill_failed', error, parent)
             if 'populated 0' not in events:
-                return 'probe_kill_failed'
+                return probe_failed('probe_kill_failed', parent=parent)
             return True
         finally:
             if child is not None:

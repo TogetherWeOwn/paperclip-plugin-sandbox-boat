@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 
@@ -256,5 +258,38 @@ describe("guest cargo cache priming", () => {
       expect(fetched.error).toMatch(/^ValueError: invalid toolchain selector$/);
       expect(fetched).not.toHaveProperty("result");
     }
+  });
+});
+
+// The shipped preflight names its own placement on refusal: whether the RPC
+// process sits inside the configured delegated parent at all. A session
+// outside it (for example one that missed the template's delegated scope)
+// fails admission at the common-ancestor check even on an eligible guest,
+// so the token must say which world refused. These parents are chosen so
+// the placement verdict is deterministic on any Linux host.
+describe("guest preflight session placement", () => {
+  function guestPreflight(cgroupParent: string): unknown {
+    return JSON.parse(execFileSync("python3", ["-I", "-c", OFFLOAD_SSH_SCRIPT, "preflight"], {
+      input: JSON.stringify({ cgroupParent }), encoding: "utf8", timeout: 5_000,
+    }).trim());
+  }
+
+  it.skipIf(process.platform !== "linux")("names a session outside the configured parent", () => {
+    const parent = mkdtempSync(path.join(tmpdir(), "boat-not-a-cgroup-"));
+    try {
+      expect(guestPreflight(parent)).toBe("parent_not_delegated:session_not_delegated");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("names a delegated session when the process is under the parent", () => {
+    // Every Linux process is under /sys/fs/cgroup; the exact failing step is
+    // host-dependent, the placement suffix is not.
+    expect(guestPreflight("/sys/fs/cgroup")).toMatch(/:session_delegated$/);
+  });
+
+  it("names placement unknown when the parent never parsed", () => {
+    expect(guestPreflight("relative/path")).toBe("parent_invalid:session_placement_unknown");
   });
 });

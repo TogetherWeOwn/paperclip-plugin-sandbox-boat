@@ -13,6 +13,12 @@ export interface SshOffloadGuestDeps {
   ssh: SshManager;
   /** Authorize the key and pin the API-provided host key after every resume. */
   session(sandboxId: string): Promise<SshSession>;
+  /** Drop the cached session (and its control master) and open a fresh one.
+   * Used once when a preflight probe proves the current session runs outside
+   * the delegated cgroup parent: a connection accepted by a pre-restart sshd
+   * listener keeps that listener's config — no template ForceCommand scope —
+   * for every multiplexed command, however long the master lives. */
+  refreshSession?(sandboxId: string): Promise<SshSession>;
   /** Trusted operator delegation, never an agent-supplied path. */
   cgroupParent: string;
   workspace(sandboxId: string, command: OffloadCommand): Promise<string>;
@@ -37,9 +43,12 @@ export interface SshOffloadGuestDeps {
  * No process-group-only execution is advertised as equivalent containment. */
 const FETCH_TIMEOUT_MS = 600_000;
 /** The guest probe's failure vocabulary (offload-ssh-script `preflight`):
- * the sub-step that refused, plus the errno name where an OSError caused it.
- * Anything else from the guest is not a token and never reaches a log. */
-const GUEST_PROBE_TOKEN = /^(?:parent_invalid|parent_not_delegated|probe_mkdir_failed|probe_admit_failed|probe_outside_failed|probe_kill_failed)(?::E[A-Z]{2,11})?$/;
+ * the sub-step that refused, the errno name where an OSError caused it, and
+ * whether the RPC process itself sits inside the configured delegated
+ * parent. Anything else from the guest is not a token and never reaches a
+ * log. The placement suffix is optional so a pre-placement guest's bare
+ * step/errno tokens still map. */
+const GUEST_PROBE_TOKEN = /^(?:parent_invalid|parent_not_delegated|probe_mkdir_failed|probe_admit_failed|probe_outside_failed|probe_kill_failed)(?::E[A-Z]{2,11})?(?::(?:session_delegated|session_not_delegated|session_placement_unknown))?$/;
 export class SshOffloadGuest implements GuestController {
   private readonly prepared = new Map<string, { sandboxId: string; identity: GuestIdentity }>();
   private readonly sessions = new Map<string, SshSession>();
@@ -54,8 +63,8 @@ export class SshOffloadGuest implements GuestController {
 
   private script(): string { return this.deps.script ?? OFFLOAD_SSH_SCRIPT; }
 
-  private async rpc<T>(sandboxId: string, action: string, input: Record<string, unknown> = {}, timeoutMs = 15_000): Promise<T> {
-    const session = await this.deps.session(sandboxId);
+  private async rpc<T>(sandboxId: string, action: string, input: Record<string, unknown> = {}, timeoutMs = 15_000, sessionOverride?: SshSession): Promise<T> {
+    const session = sessionOverride ?? await this.deps.session(sandboxId);
     this.sessions.set(sandboxId, session);
     const result = await this.deps.ssh.runStream(session,
       buildRemoteCommand(`exec python3 -I -c ${shellQuote(this.script())} ${shellQuote(action)}`),
@@ -72,6 +81,31 @@ export class SshOffloadGuest implements GuestController {
 
   async bootId(sandboxId: string): Promise<string> { return this.rpc(sandboxId, "boot"); }
   async preflight(sandboxId: string, _command: OffloadCommand) {
+    const first = await this.probe(sandboxId);
+    // A probe that ran OUTSIDE the delegated parent indicts this SSH
+    // session, not the template: a control master accepted by a pre-restart
+    // sshd listener keeps that listener's parsed config (no template
+    // ForceCommand scope) for every multiplexed command, and the guest's
+    // config-watch unit restarts the listener exactly while a resumed VM's
+    // first session opens. Drop the cached session once and re-run the
+    // identical probe over a fresh connection, which the current listener
+    // serves. Every other refusal (a delegated session whose admission or
+    // kill still failed, an unplaced or transport failure) refreshes
+    // nothing: a new connection would land in the same place. Eligibility
+    // still requires the probe's literal `true`. The placement suffix is
+    // guest-reported like the rest of the token, so it only ever steers
+    // this one reconnect — a forged suffix can waste or skip a refresh,
+    // never admit a command the identical re-probe would refuse.
+    if (first.cgroupV2Delegated === true
+      || !first.ineligibleReason?.endsWith(":session_not_delegated")
+      || !this.deps.refreshSession) return first;
+    let fresh: SshSession;
+    try { fresh = await this.deps.refreshSession(sandboxId); } catch { return first; }
+    // Pin the re-probe to the refreshed session itself, so a concurrent
+    // session change cannot silently substitute a different connection.
+    return this.probe(sandboxId, fresh);
+  }
+  private async probe(sandboxId: string, sessionOverride?: SshSession): Promise<Awaited<ReturnType<GuestController["preflight"]>>> {
     // Eligibility is still one guest probe exercising real admission, kill
     // and outside placement; both flags stand or fall together. What changed
     // is only the diagnosis: a guest-reported refusal names its probe step
@@ -81,7 +115,7 @@ export class SshOffloadGuest implements GuestController {
     // identical — anything but a literal `true` refuses before spawn.
     let raw: unknown;
     try {
-      raw = await this.rpc<unknown>(sandboxId, "preflight", { cgroupParent: this.deps.cgroupParent });
+      raw = await this.rpc<unknown>(sandboxId, "preflight", { cgroupParent: this.deps.cgroupParent }, 15_000, sessionOverride);
     } catch (error) {
       let suffix = "";
       try {
