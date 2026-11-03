@@ -38,11 +38,14 @@ import {
   buildLoginShellScript,
   buildRemoteCommand,
   buildRemoteEnvFileContents,
+  cancelRemoteCommand,
+  finalizeRemoteCommand,
   newRemoteEnvStage,
   runtimeDirScript,
   scrubRuntimeSecretsScript,
   shellQuote,
   stageRemoteEnvCommand,
+  wrapRemoteCommand,
 } from "./shell.js";
 import type { RemoteEnvStage } from "./shell.js";
 import { endpointFromSshKeyResponse } from "./ssh.js";
@@ -1145,8 +1148,8 @@ describe("ssh endpoint", () => {
       user: "user",
       hostKey: "ssh-ed25519 A",
     });
-    expect(endpointFromSshKeyResponse({ sshEndpoint: "[2001:db8::1]:2222", hostKey: "k" })).toMatchObject({ host: "2001:db8::1", port: 2222 });
-    expect(endpointFromSshKeyResponse({ machineIp: "203.0.113.5", hostKey: "k" })).toEqual({ host: "203.0.113.5", port: 22, user: "user", hostKey: "k" });
+    expect(endpointFromSshKeyResponse({ sshEndpoint: "[2001:db8::1]:2222", hostKey: "ssh-ed25519 AAAA" })).toMatchObject({ host: "2001:db8::1", port: 2222 });
+    expect(endpointFromSshKeyResponse({ machineIp: "203.0.113.5", hostKey: "ssh-ed25519 AAAA" })).toEqual({ host: "203.0.113.5", port: 22, user: "user", hostKey: "ssh-ed25519 AAAA" });
     expect(() => endpointFromSshKeyResponse({ machineIp: "203.0.113.5" })).toThrow(/host key/);
   });
 });
@@ -1186,6 +1189,16 @@ describe("keys and names", () => {
 });
 
 describe("shell", () => {
+  it("pins run-cancellation records in the given directory, defaulting to /tmp", () => {
+    const runId = "0123456789abcdef0123456789abcdef";
+    expect(cancelRemoteCommand(runId)).toContain(`/tmp/paperclip-boat-run-${runId}`);
+    expect(finalizeRemoteCommand(runId, "/home/user/test-root")).toContain(`/home/user/test-root/paperclip-boat-run-${runId}`);
+    expect(wrapRemoteCommand("true", runId, true, "/home/user/test-root/")).toContain(`/home/user/test-root/paperclip-boat-run-${runId}`);
+    for (const bad of ["relative/dir", "/tmp/../etc", "/tmp/$(touch_x)", "/tmp/a b", ""]) {
+      expect(() => cancelRemoteCommand(runId, bad), bad).toThrow(/record directory/);
+    }
+  });
+
   it("quotes env values for the staged file", () => {
     expect(buildRemoteEnvFileContents([["A", "it's"]])).toBe("export A='it'\"'\"'s';\n");
   });

@@ -1,8 +1,9 @@
 // Stock-worker integration. Authorization originates in native realization
 // params, never an API body or execution.workspaces.read. Credentials remain in
 // memory only; persisted executor state is credential-free and company scoped.
-import { createHash } from "node:crypto";
+import { createHash, scrypt } from "node:crypto";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { promisify } from "node:util";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
@@ -14,7 +15,7 @@ import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offl
 import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
 import { OffloadPoolStore, type PoolVm } from "./offload-pool.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
-import { durationKey, normalizeSignature, recordDuration } from "./offload/duration-history.js";
+import { durationKey, normalizeSignature, pruneDurations, recordDuration } from "./offload/duration-history.js";
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
 import { cargoToolchain, classifyNode, classifyPython, isCargoOffline } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
@@ -26,11 +27,62 @@ import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offl
 import { hasSecretInFiles, listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
+import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
+
+/**
+ * Removes boat's `export ASCII_TOKEN=...` line from the guest's ~/.bashrc once
+ * per offload session, matching whole-run setup/resume. Best-effort: this
+ * only stops casual use (the guest is root and can restore the line), so a
+ * failure never fails the session.
+ */
+export async function scrubOffloadGuestBashrc(ssh: SshManager, session: SshSession): Promise<void> {
+  await ssh.run(session, `sh -c ${shellQuote(SCRUB_BASHRC_ASCII_TOKEN)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+}
 
 type Binding = { companyId: string; runId: string; workspaceId: string; repoId: string; source: string;
   config: BoatDriverConfig; environmentId: string; seenAt: number;
   /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
-  localRun: boolean };
+  localRun: boolean;
+  /** Memoized KDF digest of the bind-time credential (memory only). A binding's
+   * credential never changes mid-run, so the digest is computed once. */
+  credentialDigest?: Promise<string> };
+
+const scryptAsync = promisify(scrypt) as (
+  password: string,
+  salt: string,
+  keylen: number,
+  options: { N: number; r: number; p: number },
+) => Promise<Buffer>;
+
+/**
+ * Pool-identity version 1 scrypt parameters. The digest is baked into
+ * persisted poolIds, so these values are part of pool identity forever:
+ * changing any of them silently re-keys every pool and orphans its journals
+ * and VMs into retirement. Do not change without a pool migration. They are
+ * pinned explicitly rather than relying on Node's defaults, which could
+ * change in a future Node release (they currently equal those defaults).
+ */
+const POOL_CREDENTIAL_SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 } as const;
+
+/**
+ * The credential part of pool identity. The digest is persisted (inside the
+ * poolId) but the key never is, so derive it with a password KDF rather than
+ * a fast hash: a leaked pool journal then gives no cheap offline test for
+ * guessed API keys. That protection covers the pool journal only — the
+ * whole-run path still derives a persisted scope from the same key with a
+ * fast hash (see `VmManager.account`), so this is not a system-wide
+ * guarantee for every persisted derivation of the key. The salt binds the
+ * digest to this purpose and endpoint.
+ */
+async function poolCredentialDigest(config: BoatDriverConfig): Promise<string> {
+  const derived = await scryptAsync(
+    resolveApiKey(config),
+    `boat-offload-pool\u0000${config.apiBase}`,
+    32,
+    POOL_CREDENTIAL_SCRYPT_PARAMS,
+  );
+  return derived.toString("hex");
+}
 export interface SshOffloadRuntimeDeps {
   state: StateClientLike;
   logger: OffloadLogger;
@@ -299,7 +351,16 @@ const poolRegistryScope = (companyId: string) =>
 
 export class SshOffloadRuntime {
   private readonly bindings = new Map<string, Binding>();
-  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync }>();
+  /** Project-id aliases withdrawn because two execution workspaces of one run
+   * claimed them with different sources; kept until the run is forgotten so a
+   * re-realization cannot resurrect an ambiguous alias. */
+  private readonly ambiguousAliases = new Set<string>();
+  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync; sessions: Map<string, SshSession> }>();
+  /** Credential-free pool identity (the poolId fields minus the credential
+   * digest) to the live poolId, so a rotated or re-pointed API key presented
+   * by a new binding retires the pool bound to the old credential instead of
+   * silently reusing it. */
+  private readonly poolByBaseIdentity = new Map<string, string>();
   /** Retention of an unloaded pool in progress: resolve waits before loading that pool's journal. */
   private readonly retiredSweeps = new Map<string, Promise<void>>();
   private registryTail: Promise<unknown> = Promise.resolve();
@@ -317,19 +378,17 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
-  /** True when the run holds a binding for any workspace (so a request never triggers a re-bind). */
-  hasRun(companyId: string, runId: string): boolean {
-    for (const entry of this.bindings.values()) if (entry.companyId === companyId && entry.runId === runId) return true;
-    return false;
-  }
-
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
   forgetRun(companyId: string, runId: string): string[] {
-    const dropped: string[] = [];
+    const dropped = new Set<string>();
     for (const [id, entry] of this.bindings) {
-      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.push(entry.workspaceId); }
+      if (entry.companyId === companyId && entry.runId === runId) { this.bindings.delete(id); dropped.add(entry.workspaceId); }
     }
-    return dropped;
+    for (const id of this.ambiguousAliases) {
+      const [company, run] = JSON.parse(id) as [string, string, string];
+      if (company === companyId && run === runId) this.ambiguousAliases.delete(id);
+    }
+    return [...dropped];
   }
 
   remember(params: PluginEnvironmentRealizeWorkspaceParams): void {
@@ -339,12 +398,54 @@ export class SshOffloadRuntime {
       || request.environmentId !== params.environmentId || !plain(request.heartbeatRunId) || !plain(request.executionWorkspaceId)
       || !plain(source.localPath) || !path.isAbsolute(source.localPath) || source.localPath !== params.workspace.localPath) return;
     const config = parseDriverConfig(params.config);
-    this.bindings.set(key(params.companyId, request.heartbeatRunId, request.executionWorkspaceId), {
+    const binding: Binding = {
       companyId: params.companyId, runId: request.heartbeatRunId, workspaceId: request.executionWorkspaceId,
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
       config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
-    });
+    };
+    const primaryKey = key(params.companyId, binding.runId, binding.workspaceId);
+    const existingPrimary = this.bindings.get(primaryKey);
+    // A local-run binding never replaces a whole-run one under the same key
+    // (mirrors NativeOffloadWorkspaces).
+    if (!(existingPrimary && !existingPrimary.localRun && binding.localRun)) {
+      this.bindings.set(primaryKey, binding);
+      this.ambiguousAliases.delete(primaryKey);
+    }
+    // The shim reports PAPERCLIP_WORKSPACE_ID, which carries the project
+    // workspace id even for execution workspaces, so the same binding must
+    // answer under that host-owned id too (mirrors NativeOffloadWorkspaces).
+    if (plain(source.projectWorkspaceId) && source.projectWorkspaceId !== binding.workspaceId) {
+      const aliasKey = key(params.companyId, binding.runId, source.projectWorkspaceId);
+      const existing = this.bindings.get(aliasKey);
+      if (this.ambiguousAliases.has(aliasKey) || (existing && !existing.localRun && binding.localRun)) {
+        // Withdrawn ambiguity stays withdrawn; a whole-run alias is kept.
+      } else if (!existing || (existing.localRun && !binding.localRun)
+        || existing.source === binding.source || existing.workspaceId === binding.workspaceId) {
+        this.bindings.set(aliasKey, binding);
+      } else {
+        // Two execution workspaces of this run claim the shared project id
+        // with different checkouts, and the shim can only send that id:
+        // withdraw the alias so resolution fails closed instead of silently
+        // serving the later checkout.
+        this.bindings.delete(aliasKey);
+        this.ambiguousAliases.add(aliasKey);
+      }
+    }
+    if (!binding.localRun) {
+      // A local-run bind may have registered this same execution workspace
+      // under a project alias this whole-run payload omits; whole-run
+      // precedence covers that alias too, so claim it for the whole-run
+      // binding instead of leaving the local checkout served under it
+      // (mirrors NativeOffloadWorkspaces). Bindings of another execution
+      // workspace are identified by their workspaceId and left alone.
+      for (const [id, existing] of this.bindings) {
+        if (id !== primaryKey && existing.companyId === binding.companyId && existing.runId === binding.runId
+          && existing.workspaceId === binding.workspaceId && !this.ambiguousAliases.has(id)) {
+          this.bindings.set(id, binding);
+        }
+      }
+    }
   }
 
   /** Re-prove a local-run binding's operator-owned facts: the source still sits
@@ -424,9 +525,40 @@ export class SshOffloadRuntime {
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
     if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
-    const poolId = createHash("sha256").update(JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
-      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]))
+    // The credential digest is part of pool identity: persisted executor state
+    // stays credential-free (a KDF digest is not the key), and a rotated or
+    // re-pointed key must not keep operating pools, journals or VMs under the
+    // old account. A binding's config — credential included — is captured at
+    // bind time, so rotation takes effect when a new binding presents the new
+    // key (the next run or realization, or the first bind after a worker
+    // restart), never by switching a live binding's credential mid-run. That
+    // resolve retires the old credential's pool below instead of reusing it.
+    binding.credentialDigest ??= poolCredentialDigest(binding.config)
+      .catch((error: unknown) => { binding.credentialDigest = undefined; throw error; });
+    const credentialDigest = await binding.credentialDigest;
+    // The KDF await reopens the window the closing check above closed:
+    // shutdown may have taken its pool snapshot while the digest was pending.
+    // Re-fence here (and after every later await) so no executor can be
+    // registered after that snapshot; from the last check to pools.set the
+    // path is synchronous, so shutdown cannot interleave.
+    if (this.closing) return null;
+    const baseIdentity = JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
+      command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]);
+    const poolId = createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest]))
       .digest("hex").slice(0, 24);
+    const supersededPoolId = this.poolByBaseIdentity.get(baseIdentity);
+    if (supersededPoolId && supersededPoolId !== poolId) {
+      this.poolByBaseIdentity.delete(baseIdentity);
+      const superseded = this.pools.get(supersededPoolId);
+      if (superseded) {
+        // Retire under the old credential while it may still work: sweep
+        // stops its idle VMs. The pool stays loaded and registered, so its
+        // journal is retained and ages out through collectRetiredPool; no
+        // new resolve can reach it because its poolId embeds the old digest.
+        await superseded.executor.sweep().catch(() => undefined);
+        if (this.closing) return null;
+      }
+    }
     // Neither template selection is deliberately part of the pool identity:
     // changing it must keep ownership of VMs already recorded under this pool
     // so they are retired through the normal stop path. The executor keys VM
@@ -434,26 +566,44 @@ export class SshOffloadRuntime {
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
+      if (this.closing) return null;
       existing = this.pools.get(poolId);
     }
     if (existing) {
       existing.executor.setTemplateSnapshot(binding.config.templateSnapshot ?? null);
       existing.executor.setTemplateSourceSandboxId(binding.config.templateSourceSandboxId ?? null);
       existing.executor.setEphemeralRepos(normalizeOffloadSettings(settings).offloadEphemeralRepos);
+      existing.executor.setMonitoring(binding.config.monitoring);
       return existing.executor;
     }
     const api = this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config)!, apiBase: binding.config.apiBase });
     const sessions = new Map<string, SshSession>();
+    // First-touch races share one opener per VM: concurrent guests warming
+    // the same pool never authorize the key or open the session twice.
+    const pending = new Map<string, Promise<SshSession>>();
     const session = this.deps.session ?? (async (sandboxId: string) => {
       const cached = sessions.get(sandboxId);
       if (cached) return cached;
-      await waitReady(api, sandboxId, { timeoutMs: binding.config.timeoutMs });
-      const sshKey = await this.deps.ssh.ensureKey();
-      const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
-      const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
-        connectTimeoutSec: binding.config.sshConnectTimeoutSec });
-      sessions.set(sandboxId, opened);
-      return opened;
+      const ongoing = pending.get(sandboxId);
+      if (ongoing) return ongoing;
+      const opening = (async (): Promise<SshSession> => {
+        await waitReady(api, sandboxId, { timeoutMs: binding.config.timeoutMs });
+        const sshKey = await this.deps.ssh.ensureKey();
+        const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
+        const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
+          connectTimeoutSec: binding.config.sshConnectTimeoutSec });
+        // Once per opened session (sessions are cached; a refresh after resume
+        // re-opens and re-scrubs), before any dependency install runs guest code.
+        await scrubOffloadGuestBashrc(this.deps.ssh, opened);
+        sessions.set(sandboxId, opened);
+        return opened;
+      })();
+      pending.set(sandboxId, opening);
+      try {
+        return await opening;
+      } finally {
+        if (pending.get(sandboxId) === opening) pending.delete(sandboxId);
+      }
     });
     const sourceRoot = async (cmd: OffloadCommand) => {
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
@@ -495,12 +645,20 @@ export class SshOffloadRuntime {
     const executor = new OffloadExecutor({ boat: api, state: this.deps.state, accountId: this.deps.accountId, poolId,
       logger: this.deps.logger, now: Date.now,
       config: { maxOffloadVms: binding.config.maxOffloadVms, offloadIdleStopSeconds: binding.config.offloadIdleStopSeconds,
-        size: binding.config.size, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
+        size: binding.config.size, monitoring: binding.config.monitoring, maxActive: binding.config.maxActive, maxStartsPerDay: binding.config.maxStartsPerDay,
         minComputeHoursLeft: binding.config.minComputeHoursLeft,
         offloadMonthlyVmHourCap: normalizeOffloadSettings(settings).offloadMonthlyVmHourCap,
         ephemeralRepos: normalizeOffloadSettings(settings).offloadEphemeralRepos,
         templateSnapshot: binding.config.templateSnapshot ?? null,
         templateSourceSandboxId: binding.config.templateSourceSandboxId ?? null },
+      // A released VM's session is closed and forgotten; the next command
+      // needing it re-opens on demand through the cached-session path.
+      // A plain dep, not persisted config, so pool snapshots stay
+      // structured-cloneable. Never throws: cleanup must not lose a receipt.
+      onVmReleased: async (sandboxId: string) => {
+        sessions.delete(sandboxId);
+        await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
+      },
       guest, runCommand: (vm, cmd, context) => guest.runCommand(vm, cmd, context),
       recordDuration: async (cmd, seconds) => {
         // Completed remote Node/Python runs teach the duration gate. Rust is
@@ -511,7 +669,8 @@ export class SshOffloadRuntime {
         const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
-            set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value) }, key, { seconds, at: Date.now() });
+            set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value),
+            delete: (id) => this.deps.state.delete({ ...scope, stateKey: id }) }, key, { seconds, at: Date.now() });
         } catch {
           // Telemetry only; the command already completed.
         }
@@ -523,9 +682,10 @@ export class SshOffloadRuntime {
       }),
       sync: { push: (vm, cmd) => sync.push(vm, cmd),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
-        discard: (vm, cmd) => sync.discard(vm, cmd) },
+        discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
-    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync });
+    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync, sessions });
+    this.poolByBaseIdentity.set(baseIdentity, poolId);
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
     // lost write is retried by every sweep while the pool is loaded.
     void this.updateRegistry(command.companyId, (registry) => {
@@ -561,7 +721,7 @@ export class SshOffloadRuntime {
     const journal = new OffloadJournal({ journalStore: store, guestReceipts: { read: inert },
       resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
         tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
-      sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
+      sync: { push: inert, collect: inert, stage: inert, markSuspect: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
     await journal.collectGarbage();
     return (await store.list("")).length === 0;
   }
@@ -743,6 +903,18 @@ export class SshOffloadRuntime {
       await sync.collectGarbage();
     }));
     const companies = new Set([...companyIds, ...[...this.pools.values()].map((pool) => pool.companyId)]);
+    // Duration-learning hygiene rides the same sweep: drop expired signature
+    // keys and repair over-cap indexes. Telemetry-only; a failing prune must
+    // not fail pool retention.
+    for (const companyId of companies) {
+      const scope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "" };
+      const durations = {
+        get: (key: string) => this.deps.state.get({ ...scope, stateKey: key }),
+        set: (key: string, value: unknown) => this.deps.state.set({ ...scope, stateKey: key }, value),
+        delete: (key: string) => this.deps.state.delete({ ...scope, stateKey: key }),
+      };
+      await pruneDurations(durations, Date.now()).catch(() => undefined);
+    }
     let failed = false;
     const retired = await Promise.allSettled([...companies].map((companyId) => this.updateRegistry(companyId, async (registry) => {
       // (Re-)register loaded pools first: this retries a lost write from resolve.
@@ -808,6 +980,16 @@ export class SshOffloadRuntime {
       await guest.shutdown();
     }));
     await this.registryTail;
+    // Sessions outlive executors only when their release hook never fired
+    // (a pool created before the hook existed, or a VM deleted out-of-band):
+    // runtime shutdown still closes what it cached. The worker-level
+    // closeAll in BoatVmManager.shutdown remains the backstop for the rest.
+    for (const { sessions } of this.pools.values()) {
+      for (const sandboxId of [...sessions.keys()]) {
+        sessions.delete(sandboxId);
+        await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
+      }
+    }
     this.closed = true;
   }
 }

@@ -90,11 +90,56 @@ export interface OffloadRouteHost {
   extraProfiles?: ServerProfile[];
   settings?: Partial<OffloadSettings>;
   durations?: DurationStore;
+  /** Observability hook for fallback-safe refusals; the shim only prints the code to the agent. */
+  logRefusal?: (entry: { runId: string; workspaceId: string; reason: string }) => void;
 }
 
 export interface RouteResponse {
   status: number;
   body: unknown;
+}
+
+// In-memory per-run report budget: an agent-reachable route must not let one
+// run mint samples faster than a local command can finish them. A burst of 5
+// covers legitimate back-to-back completions, then 1 report per second
+// sustained and 200 per run lifetime; excess samples are dropped with 429
+// (the shim treats reporting as telemetry-only and ignores the loss). The
+// table itself is bounded to REPORT_RUN_LIMIT runs with stalest-first
+// eviction, so run churn cannot grow worker memory without bound either.
+const REPORT_MIN_INTERVAL_MS = 1_000;
+const REPORT_BURST = 5;
+const REPORT_MAX_PER_RUN = 200;
+const REPORT_RUN_LIMIT = 1_000;
+const reportBudgets = new Map<string, { count: number; tokens: number; updatedMs: number }>();
+
+/** Test-only reset for the in-memory report budgets. */
+export function resetReportBudgets(): void {
+  reportBudgets.clear();
+}
+
+function reportAllowed(runId: string, now: number): boolean {
+  let budget = reportBudgets.get(runId);
+  if (!budget) {
+    budget = { count: 0, tokens: REPORT_BURST, updatedMs: now };
+    reportBudgets.set(runId, budget);
+  }
+  const elapsed = Math.max(0, now - budget.updatedMs);
+  if (elapsed >= REPORT_MIN_INTERVAL_MS) {
+    const refill = Math.floor(elapsed / REPORT_MIN_INTERVAL_MS);
+    budget.tokens = Math.min(REPORT_BURST, budget.tokens + refill);
+    budget.updatedMs += refill * REPORT_MIN_INTERVAL_MS;
+  }
+  if (budget.count >= REPORT_MAX_PER_RUN || budget.tokens < 1) return false;
+  budget.tokens -= 1;
+  budget.count += 1;
+  if (reportBudgets.size > REPORT_RUN_LIMIT) {
+    let stalest: string | null = null;
+    for (const [id, other] of reportBudgets) {
+      if (id !== runId && (stalest === null || other.updatedMs < reportBudgets.get(stalest)!.updatedMs)) stalest = id;
+    }
+    if (stalest !== null) reportBudgets.delete(stalest);
+  }
+  return true;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -326,6 +371,7 @@ export async function handleExec(
   if (!settings.offloadProfiles.includes(profile.id)) {
     // Not journaled as a refusal: enabling the profile later must accept the
     // same command ID. The shim falls back locally.
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: `profile ${profile.id} is not enabled for offload` });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -345,6 +391,7 @@ export async function handleExec(
     // shim must fall back locally, never fail the build. Not journaled, so the
     // same command ID submits cleanly once the workspace resolves. Other-agent
     // runs keep the 403 in plugin.ts; this path carries no agent identity claim.
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: "unknown execution workspace; running local" });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", "unknown execution workspace; running local", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -363,6 +410,7 @@ export async function handleExec(
   if (workspace.path == null && workspace.cwd == null) {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, "execution workspace is not locally realized; cannot snapshot source");
     if (conflict) return conflict;
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: "execution workspace confinement is unsupported" });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -372,6 +420,7 @@ export async function handleExec(
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
+    host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: `incompatible workload: ${classification.reason}` });
     return {
       status: 503,
       body: offloadError("OFFLOAD_UNAVAILABLE", `incompatible workload: ${classification.reason}`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
@@ -464,9 +513,21 @@ export async function handleReport(
   if (argv.some((arg) => /[\u0000-\u001f\u007f]/.test(arg) || LONE_SURROGATE.test(arg))) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "argv holds invalid control characters", {}) };
   }
+  // Only remote-candidate signatures create duration keys: a report for a
+  // local-mode invocation (watch mode, single-file filter, inline code, an
+  // unrecognized script) is never a learning sample, so it is refused before
+  // any state lookup or write.
+  const classification = classifyRequest(profile, tool, record.runner, argv as string[]);
+  if (classification.mode === "local") {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST",
+      `only remote-candidate signatures are recorded; ${classification.reason}`, {}) };
+  }
   if (typeof record.durationSeconds !== "number" || !Number.isFinite(record.durationSeconds)
     || record.durationSeconds < 0 || record.durationSeconds > 86_400) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "durationSeconds must be 0..86400", {}) };
+  }
+  if (!reportAllowed(runId, Date.now())) {
+    return { status: 429, body: offloadError("OFFLOAD_UNAVAILABLE", "duration report rate limited for this run; sample dropped", {}) };
   }
   // Optional for older shims, which only ever ran at the workspace root.
   const cwdRelative = record.cwdRelative ?? ".";

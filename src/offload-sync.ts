@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import path from "node:path";
 import { containsSecretContent } from "./offload-secret-scan.js";
+import { assertValidSshEndpoint } from "./ssh.js";
 
 export const SYNC_MANIFEST_VERSION = 1;
 
@@ -29,6 +30,15 @@ export const DEFAULT_SYNC_EXCLUDES: readonly string[] = [
   "venv/",
   "__pycache__/",
   ".pytest_cache/",
+  ".hypothesis/",
+  ".mypy_cache/",
+  ".ruff_cache/",
+  ".tox/",
+  ".nox/",
+  "test-results/",
+  "playwright-report/",
+  "*.egg-info/",
+  "*.profraw",
   ".coverage/",
   "htmlcov/",
   "coverage/",
@@ -161,24 +171,32 @@ function symlinkHash(target: string): string {
 
 interface ParsedExcludes {
   dirs: Set<string>;
+  dirGlobs: RegExp[];
   exactFiles: Set<string>;
   fileGlobs: RegExp[];
 }
 
+function globRegExp(pattern: string): RegExp {
+  return new RegExp(`^${pattern.split("*").map(escapeRegExp).join(".*")}$`);
+}
+
 function parseExcludes(patterns: readonly string[]): ParsedExcludes {
   const dirs = new Set<string>();
+  const dirGlobs: RegExp[] = [];
   const exactFiles = new Set<string>();
   const fileGlobs: RegExp[] = [];
   for (const pattern of patterns) {
     if (pattern.endsWith("/")) {
-      dirs.add(pattern.slice(0, -1));
+      const dir = pattern.slice(0, -1);
+      if (dir.includes("*")) dirGlobs.push(globRegExp(dir));
+      else dirs.add(dir);
     } else if (pattern.includes("*")) {
-      fileGlobs.push(new RegExp(`^${pattern.split("*").map(escapeRegExp).join(".*")}$`));
+      fileGlobs.push(globRegExp(pattern));
     } else {
       exactFiles.add(pattern);
     }
   }
-  return { dirs, exactFiles, fileGlobs };
+  return { dirs, dirGlobs, exactFiles, fileGlobs };
 }
 
 function escapeRegExp(text: string): string {
@@ -189,9 +207,9 @@ function escapeRegExp(text: string): string {
 function isExcluded(relPosix: string, isDir: boolean, parsed: ParsedExcludes): boolean {
   const segments = relPosix.split("/");
   for (let i = 0; i < segments.length - (isDir ? 0 : 1); i += 1) {
-    if (parsed.dirs.has(segments[i]!)) return true;
+    if (parsed.dirs.has(segments[i]!) || parsed.dirGlobs.some((re) => re.test(segments[i]!))) return true;
   }
-  if (isDir && parsed.dirs.has(segments[segments.length - 1]!)) return true;
+  if (isDir && (parsed.dirs.has(segments[segments.length - 1]!) || parsed.dirGlobs.some((re) => re.test(segments[segments.length - 1]!)))) return true;
   const base = segments[segments.length - 1]!;
   if (parsed.exactFiles.has(base)) return true;
   return parsed.fileGlobs.some((re) => re.test(base));
@@ -545,6 +563,16 @@ export interface GuestFileState {
   symlink?: string;
   /** A link the guest planted that escapes its root: never followed, never staged. */
   escaping?: boolean;
+  /** A FIFO, socket or device: metadata only (sha256 ""), never read, never staged. */
+  special?: boolean;
+  /** A regular file past the scan hash budget: metadata only (sha256 ""), never staged. */
+  unhashed?: boolean;
+}
+
+export interface GuestScanResult {
+  files: Map<string, GuestFileState>;
+  /** True when enumeration stopped early (entry/directory limits): the file set is partial. */
+  truncated: boolean;
 }
 
 /**
@@ -556,7 +584,7 @@ export interface GuestFileState {
 export interface GuestStore {
   push(snapshotDir: string, entries: SyncFileEntry[], guestDir: string): Promise<TransferResult>;
   pruneMirror(guestDir: string, relPaths: string[]): Promise<{ removed: number }>;
-  scan(guestDir: string): Promise<Map<string, GuestFileState>>;
+  scan(guestDir: string): Promise<GuestScanResult>;
   /**
    * Stream one guest file, capped: at most maxBytes are ever buffered. Returns
    * null when the bytes are unavailable (missing, not a regular file, or over
@@ -572,6 +600,10 @@ export interface LocalGuestStoreOptions {
   beforeCopy?: (entry: SyncFileEntry) => void;
   /** Test hook: opens guest files for bounded reads; defaults to fsp.open. Lets tests stream more bytes than stat reported. */
   open?: typeof fsp.open;
+  /** Scan hash budget in bytes (test seam); files past it are recorded unhashed. */
+  maxScanBytes?: number;
+  /** Scan entry cap (test seam); enumeration past it truncates the scan. */
+  maxScanEntries?: number;
 }
 
 export class LocalGuestStore implements GuestStore {
@@ -627,10 +659,14 @@ export class LocalGuestStore implements GuestStore {
     return { removed };
   }
 
-  async scan(guestDir: string): Promise<Map<string, GuestFileState>> {
+  async scan(guestDir: string): Promise<GuestScanResult> {
     const guest = path.resolve(guestDir);
     const excludes = parseExcludes(DEFAULT_SYNC_EXCLUDES);
+    const maxScanBytes = this.opts.maxScanBytes ?? DEFAULT_MAX_BYTES;
+    const maxScanEntries = this.opts.maxScanEntries ?? DEFAULT_MAX_FILES;
     const out = new Map<string, GuestFileState>();
+    let truncated = false;
+    let hashedBytes = 0;
     const stack: string[] = [""];
     while (stack.length > 0) {
       const rel = stack.pop()!;
@@ -648,6 +684,7 @@ export class LocalGuestStore implements GuestStore {
       });
       if (!entries) continue;
       for (const entry of entries) {
+        if (out.size >= maxScanEntries) { truncated = true; break; }
         const entryRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
         const entryAbs = path.join(guest, entryRel);
         if (entry.isSymbolicLink()) {
@@ -669,17 +706,35 @@ export class LocalGuestStore implements GuestStore {
           stack.push(entryRel);
         } else if (entry.isFile()) {
           if (isExcluded(entryRel, false, excludes)) continue;
+          const st = await fsp.lstat(entryAbs).catch(() => null);
+          if (!st) continue; // Vanished mid-scan.
+          // Past the hash budget the file is metadata only: enumerating the
+          // rest of the mirror must not fail because one output is huge.
+          if (st.size > maxScanBytes || hashedBytes + st.size > maxScanBytes) {
+            out.set(entryRel, { size: st.size, mtimeMs: st.mtimeMs, sha256: "", unhashed: true });
+            continue;
+          }
           const hashed = await hashGuestFile(entryAbs);
           if (!hashed) continue; // Vanished mid-scan.
           if ("escaping" in hashed) {
             out.set(entryRel, { size: 0, mtimeMs: 0, sha256: "", escaping: true });
           } else {
+            hashedBytes += hashed.size;
             out.set(entryRel, { size: hashed.size, mtimeMs: hashed.mtimeMs, sha256: hashed.sha256 });
           }
+        } else {
+          // FIFO/socket/device: record it, never open it. Opening a FIFO
+          // would block the scan; failing the scan would fail every later
+          // command in this mirror.
+          if (isExcluded(entryRel, false, excludes)) continue;
+          const st = await fsp.lstat(entryAbs).catch(() => null);
+          if (!st) continue;
+          out.set(entryRel, { size: st.size, mtimeMs: st.mtimeMs, sha256: "", special: true });
         }
       }
+      if (truncated) break;
     }
-    return out;
+    return { files: out, truncated };
   }
 
   async readBounded(guestDir: string, relPath: string, maxBytes: number): Promise<Buffer | null> {
@@ -812,9 +867,53 @@ export function renderFilesFromList(entries: ReadonlyArray<Pick<SyncFileEntry, "
  * delta list comes on stdin (--files-from=- --from0); there is deliberately
  * no --delete flag: obsolete inputs are pruned by explicit bounded paths only.
  */
+// rsync word-splits the -e string itself, so provider-derived components
+// (hostKeyAlias is the sandbox id; user/host go through the endpoint
+// validator above) may contain nothing the splitter or a shell could act
+// on. guestDir is held to the same rule: it travels inside the
+// user@host:path word the remote side parses. Throwing here means push()
+// never spawns rsync on hostile data.
+// Host-generated paths (the key, known_hosts and control socket under the
+// host's tmpdir()) are refused only for the characters either parser acts
+// on — whitespace and quotes split/group in both rsync's -e splitter and
+// ssh's -o values, backslash escapes in rsync's, and ssh expands ${VAR}
+// and %-tokens inside these path options — so every tmpdir spelling that
+// worked before this validation still works, and one that never could
+// (ssh itself rejects a spaced -o ControlPath) fails here with a clear
+// message instead of a mangled transport word.
+const RSYNC_UNSAFE_COMPONENT = /[\s"'`\\$;|&<>(){}[\]*?~#!\x00-\x1f\x7f]/;
+const RSYNC_UNSAFE_LOCAL_PATH = /[\s"'\\$%\x00-\x1f\x7f]/;
+
+function assertRsyncComponent(name: string, value: string): void {
+  if (!value || RSYNC_UNSAFE_COMPONENT.test(value)) {
+    throw new Error(`rsync push refused: ${name} contains whitespace, quotes or shell characters: ${JSON.stringify(value)}`);
+  }
+}
+
+function assertRsyncLocalPath(name: string, value: string): void {
+  if (!value || RSYNC_UNSAFE_LOCAL_PATH.test(value)) {
+    throw new Error(`rsync push refused: ${name} contains whitespace, quotes, backslashes or expansion characters: ${JSON.stringify(value)}`);
+  }
+}
+
 export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, guestDir: string, files: readonly string[]): string[] {
+  // hostKey is unused by rsync (the pinned known_hosts file is); the dummy
+  // valid value lets the endpoint validator check user, host and port.
+  assertValidSshEndpoint({ host: spec.host, port: spec.port, user: spec.user, hostKey: "ssh-ed25519 AAAA" });
+  assertRsyncComponent("hostKeyAlias", spec.hostKeyAlias);
+  assertRsyncLocalPath("controlPath", spec.controlPath);
+  assertRsyncLocalPath("knownHostsPath", spec.knownHostsPath);
+  assertRsyncLocalPath("privateKeyPath", spec.privateKeyPath);
+  assertRsyncComponent("guestDir", guestDir);
+  const connectTimeoutSec = spec.connectTimeoutSec ?? 10;
+  if (!Number.isInteger(connectTimeoutSec) || connectTimeoutSec < 1 || connectTimeoutSec > 3600) {
+    throw new Error(`rsync push refused: connectTimeoutSec outside 1-3600: ${connectTimeoutSec}`);
+  }
   const ssh = [
     "ssh",
+    // Same rule as ssh.ts: the operator's ssh config never applies here.
+    "-F",
+    "/dev/null",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -834,7 +933,7 @@ export function buildRsyncPushArgs(spec: RsyncPushSpec, snapshotDir: string, gue
     "-o",
     "PreferredAuthentications=publickey",
     "-o",
-    `ConnectTimeout=${spec.connectTimeoutSec ?? 10}`,
+    `ConnectTimeout=${connectTimeoutSec}`,
     "-o",
     `ControlPath=${spec.controlPath}`,
     "-o",
@@ -918,6 +1017,8 @@ export interface StageResult {
   artifactDir: string | null;
   changes: StagedChange[];
   truncated: boolean;
+  /** The guest scan this result was computed from; callers keep it as the next command's previousGuest. */
+  scan: GuestScanResult;
 }
 
 export interface CollectOptions {
@@ -928,6 +1029,15 @@ export interface CollectOptions {
   stagingDir: string;
   policy?: ReturnPolicy;
   maxStagedBytes?: number;
+  /**
+   * The previous command's post-collect guest scan for this mirror (host-kept,
+   * complete scans only). Guest-only content identical to it was already
+   * reported by that command: it is not this command's change and must not
+   * re-stage. Uploaded paths are never suppressed by it: push restores them
+   * to the baseline before every command, so their modifies and deletes are
+   * always compared against the baseline.
+   */
+  previousGuest?: ReadonlyMap<string, GuestFileState>;
   /**
    * Accepted and ignored: V1 is stage-first and has no apply path, so a
    * mutation lease cannot authorize a live write. Kept so callers that hold
@@ -951,33 +1061,66 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
   const maxStagedBytes = opts.maxStagedBytes ?? DEFAULT_MAX_STAGED_BYTES;
   const live = path.resolve(opts.liveRoot);
   const uploaded = new Map(opts.uploaded.files.map((f) => [f.path, f]));
-  const guest = await opts.guest.scan(opts.guestDir);
+  const scan = await opts.guest.scan(opts.guestDir);
+  const guest = scan.files;
+  const previous = opts.previousGuest;
 
   const changes: StagedChange[] = [];
   for (const [rel, state] of guest) {
+    // Identical to the previous command's post-collect scan: stale mirror
+    // output that command already reported, not a change by this one. Only
+    // guest-only paths qualify: uploaded files are restored to the host
+    // baseline on every push, so a modify that repeats the previous scan is
+    // still this command's own change against that baseline.
+    const prev = previous?.get(rel);
+    if (prev && sameGuestState(prev, state) && !uploaded.has(rel)) continue;
     const baseline = uploaded.get(rel);
     if (!baseline) {
       changes.push(await newGuestChange(live, opts.guest, opts.guestDir, rel, state, policy));
-    } else if (state.escaping || state.sha256 !== baseline.sha256 || state.symlink !== baseline.symlink) {
+    } else if (state.escaping || state.special || state.unhashed
+      || state.sha256 !== baseline.sha256 || state.symlink !== baseline.symlink) {
+      // An unhashed file cannot prove it still equals the baseline; when its
+      // size also matches, treat it as unchanged-but-unverified (the result
+      // is truncated) rather than staging a phantom modify every command.
+      if (state.unhashed && state.size === baseline.size && baseline.symlink === undefined) continue;
       changes.push(await modifiedGuestChange(live, opts.guest, opts.guestDir, rel, state, baseline, policy));
     }
   }
   for (const [rel, baseline] of uploaded) {
-    if (!guest.has(rel)) {
+    // Absence only proves deletion in a complete enumeration: a truncated
+    // scan may simply not have reached this path. Uploaded files are
+    // restored on every push, so a repeated absence is this command's own
+    // delete and is proposed again (no previous-scan suppression here).
+    if (!guest.has(rel) && !scan.truncated) {
       changes.push({ path: rel, op: "proposed-delete", supported: isReturnEligible(rel, policy), baselineSha256: baseline.sha256, returnedSha256: null, liveSha256: await liveHash(live, rel), stagedRelPath: null });
     }
   }
   changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const conflictPaths = changes.filter((c) => isConflict(c)).map((c) => c.path);
-  const state: StageResult["state"] = changes.length === 0 ? "clean" : conflictPaths.length > 0 ? "conflict" : "staged";
-  if (changes.length === 0) {
-    return { state, changedPaths: [], conflictPaths: [], unsupportedPaths: [], artifactDir: null, changes, truncated: false };
+  // A guest-only unsupported create is tool output, not a returned write: it
+  // is reported in unsupportedPaths but never stages (exit 74) on its own.
+  // Modifies/deletes of files the host sent, supported creates and every
+  // conflict still stage.
+  const driving = changes.filter((c) => c.supported || c.op !== "create" || isConflict(c));
+  const state: StageResult["state"] = driving.length === 0 ? "clean" : conflictPaths.length > 0 ? "conflict" : "staged";
+  const scanTruncated = scan.truncated || [...guest.values()].some((entry) => entry.unhashed === true);
+  if (driving.length === 0) {
+    return {
+      state,
+      changedPaths: changes.map((c) => c.path),
+      conflictPaths: [],
+      unsupportedPaths: changes.filter((c) => !c.supported).map((c) => c.path),
+      artifactDir: null,
+      changes,
+      truncated: scanTruncated,
+      scan,
+    };
   }
 
   await fsp.mkdir(opts.stagingDir, { recursive: true });
   let remaining = maxStagedBytes;
-  let truncated = false;
+  let truncated = scanTruncated;
   let fileIndex = 0;
   for (const change of changes) {
     if (change.op === "proposed-delete" || change.returnedSha256 === null) continue;
@@ -1007,6 +1150,7 @@ export async function collectAndStage(opts: CollectOptions): Promise<StageResult
     artifactDir: opts.stagingDir,
     changes,
     truncated,
+    scan,
   };
   await fsp.writeFile(
     path.join(opts.stagingDir, "manifest.json"),
@@ -1025,13 +1169,13 @@ async function newGuestChange(
 ): Promise<StagedChange> {
   void guest;
   void guestDir;
-  const supported = !state.escaping && isReturnEligible(rel, policy);
+  const supported = returnable(state) && isReturnEligible(rel, policy);
   return {
     path: rel,
     op: "create",
     supported,
     baselineSha256: null,
-    returnedSha256: state.escaping ? null : state.sha256,
+    returnedSha256: returnable(state) ? state.sha256 : null,
     liveSha256: await liveHash(live, rel),
     stagedRelPath: null,
   };
@@ -1048,16 +1192,34 @@ async function modifiedGuestChange(
 ): Promise<StagedChange> {
   void guest;
   void guestDir;
-  const supported = !state.escaping && isReturnEligible(rel, policy);
+  const supported = returnable(state) && isReturnEligible(rel, policy);
   return {
     path: rel,
     op: "modify",
     supported,
     baselineSha256: baseline.sha256,
-    returnedSha256: state.escaping ? null : state.sha256,
+    returnedSha256: returnable(state) ? state.sha256 : null,
     liveSha256: await liveHash(live, rel),
     stagedRelPath: null,
   };
+}
+
+/** Only a hashed regular file or in-root link can ever be staged back. */
+function returnable(state: GuestFileState): boolean {
+  return !state.escaping && !state.special && !state.unhashed;
+}
+
+/**
+ * Identity across two guest scans: hashed content/link target, or — for
+ * metadata-only entries (special/unhashed) — kind, size and mtime.
+ */
+function sameGuestState(a: GuestFileState, b: GuestFileState): boolean {
+  if ((a.escaping ?? false) !== (b.escaping ?? false)) return false;
+  if ((a.special ?? false) !== (b.special ?? false)) return false;
+  if ((a.unhashed ?? false) !== (b.unhashed ?? false)) return false;
+  if (a.symlink !== b.symlink) return false;
+  if (!a.special && !a.unhashed && !a.escaping) return a.sha256 === b.sha256;
+  return a.size === b.size && a.mtimeMs === b.mtimeMs;
 }
 
 /** Conflict: the live content/existence differs from the uploaded baseline on a path the guest also changed. */

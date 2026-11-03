@@ -14,7 +14,8 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -45,6 +46,10 @@ export interface SshSession {
   tunnelError: string | null;
   connectTimeoutSec: number;
   lastMasterStartAt: number;
+  /** In-flight startMaster shared by concurrent ensureMaster callers. */
+  masterStarting: Promise<void> | null;
+  /** Control-master child still connecting (not yet stored in master). */
+  startingChild: ChildProcess | null;
 }
 
 export interface SshExecutionResult {
@@ -64,6 +69,48 @@ const SIGKILL_GRACE_MS = 250;
 const MASTER_RESTART_MIN_INTERVAL_MS = 10_000;
 const REMOTE_CANCEL_TIMEOUT_MS = 10_000;
 
+// Provider data is untrusted input to host processes: the sandbox id becomes
+// the HostKeyAlias (a space-joined rsync -e word and a known_hosts pattern),
+// the host key is written verbatim into known_hosts, and user@host is ssh's
+// destination word, where a leading '-' is parsed as an option. These checks
+// run where provider data becomes an SSH target — the sshkey answer parse and
+// every openSession — so a malformed or hostile value throws before any ssh
+// or rsync process spawns, whatever state it was read back from.
+const SANDBOX_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const SSH_USER_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
+const HOST_KEY_PATTERN = /^(?:ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|rsa-sha2-(?:256|512)|ssh-rsa) [A-Za-z0-9+/]+={0,2}$/;
+const HOSTNAME_PATTERN = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+/** Throw unless a provider-supplied sandbox id is safe in every SSH context. */
+export function assertValidSandboxId(sandboxId: string): string {
+  if (!SANDBOX_ID_PATTERN.test(sandboxId)) {
+    throw new Error(`boat returned a sandbox id that is not [A-Za-z0-9_-]{1,64}: ${JSON.stringify(sandboxId)}`);
+  }
+  return sandboxId;
+}
+
+/** An IP literal or an RFC 1123 hostname; never an option-looking word. */
+export function isValidSshHost(host: string): boolean {
+  return isIP(host) !== 0 || HOSTNAME_PATTERN.test(host);
+}
+
+/** Throw unless every field of a connect target is safe to hand to ssh. */
+export function assertValidSshEndpoint(endpoint: SshEndpoint): SshEndpoint {
+  if (!HOST_KEY_PATTERN.test(endpoint.hostKey)) {
+    throw new Error("boat returned an SSH host key that is not a single `<type> <base64>` line; cannot pin it.");
+  }
+  if (!SSH_USER_PATTERN.test(endpoint.user)) {
+    throw new Error(`boat returned an sshUser that is not a plain login name: ${JSON.stringify(endpoint.user)}`);
+  }
+  if (!isValidSshHost(endpoint.host)) {
+    throw new Error(`boat returned an SSH host that is not an IP address or hostname: ${JSON.stringify(endpoint.host)}`);
+  }
+  if (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+    throw new Error(`boat returned an SSH port outside 1-65535: ${endpoint.port}`);
+  }
+  return endpoint;
+}
+
 /** Parse the POST /sandboxes/{id}/sshkey answer into a connect target. */
 export function endpointFromSshKeyResponse(response: {
   machineIp?: string | null;
@@ -77,17 +124,17 @@ export function endpointFromSshKeyResponse(response: {
   const endpoint = response.sshEndpoint?.trim();
   if (endpoint) {
     const bracketed = endpoint.match(/^\[([^\]]+)\]:(\d+)$/);
-    if (bracketed) return { host: bracketed[1], port: Number(bracketed[2]), user, hostKey };
+    if (bracketed) return assertValidSshEndpoint({ host: bracketed[1], port: Number(bracketed[2]), user, hostKey });
     const index = endpoint.lastIndexOf(":");
     if (index > 0) {
       const port = Number(endpoint.slice(index + 1));
-      if (Number.isInteger(port) && port > 0) return { host: endpoint.slice(0, index), port, user, hostKey };
+      if (Number.isInteger(port) && port > 0) return assertValidSshEndpoint({ host: endpoint.slice(0, index), port, user, hostKey });
     }
     throw new Error(`boat returned an sshEndpoint that is not host:port: ${endpoint}`);
   }
   const ip = response.machineIp?.trim();
   if (!ip) throw new Error("boat returned neither sshEndpoint nor machineIp for the sandbox.");
-  return { host: ip, port: 22, user, hostKey };
+  return assertValidSshEndpoint({ host: ip, port: 22, user, hostKey });
 }
 
 export class SshManager {
@@ -97,11 +144,19 @@ export class SshManager {
 
   private readonly pause: (ms: number) => Promise<void>;
 
+  // Guest-side directory for the run-cancellation records. Production keeps
+  // the default (guest /tmp); test harnesses that execute the "remote"
+  // scripts on this host pin it inside their own temp root so tombstones
+  // from cancelled-before-admission runs cannot leak into host /tmp.
+  private readonly runRecordDir?: string;
+
   constructor(
     private readonly logger: SshLogger,
     pause?: (ms: number) => Promise<void>,
+    opts?: { runRecordDir?: string },
   ) {
     this.pause = pause ?? sleep;
+    this.runRecordDir = opts?.runRecordDir;
   }
 
   /**
@@ -132,8 +187,20 @@ export class SshManager {
 
   private async ensureDir(): Promise<string> {
     if (!this.keyDir) {
+      // Reap key dirs of dead workers before creating ours, so a crash loop
+      // cannot accumulate key material and control sockets in /tmp. Best
+      // effort: our own startup never fails because the sweep did.
+      await cleanupStaleKeyDirs(tmpdir()).catch(() => undefined);
       this.keyDir = await mkdtemp(path.join(tmpdir(), "pcboat-"));
+      // Owner marker for the startup sweep: same-uid processes may share the
+      // key dir (uid is the boundary), so liveness is tracked by pid, and a
+      // dir is only reaped once its creator is gone.
+      await writeFile(path.join(this.keyDir, "owner.pid"), `${process.pid}\n`, { mode: 0o600 });
     }
+    return this.keyDir;
+  }
+
+  get keyDirPath(): string | null {
     return this.keyDir;
   }
 
@@ -151,6 +218,10 @@ export class SshManager {
     tunnel: TunnelSpec | null;
     connectTimeoutSec: number;
   }): Promise<SshSession> {
+    // Validate before touching any existing session or writing known_hosts:
+    // endpoints can also arrive from persisted state, not only the parse above.
+    assertValidSandboxId(input.sandboxId);
+    assertValidSshEndpoint(input.endpoint);
     await this.closeSession(input.sandboxId);
     const dir = await this.ensureDir();
     const safeId = input.sandboxId.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 40);
@@ -168,6 +239,8 @@ export class SshManager {
       tunnelError: null,
       connectTimeoutSec: input.connectTimeoutSec,
       lastMasterStartAt: 0,
+      masterStarting: null,
+      startingChild: null,
     };
     this.sessions.set(input.sandboxId, session);
     await this.startMaster(session);
@@ -178,11 +251,24 @@ export class SshManager {
     return !!session.master && session.master.exitCode === null && session.master.signalCode === null && !session.master.killed;
   }
 
-  /** Restart a dead control master (and its tunnel) at most every 10 s. */
+  /** Restart a dead control master (and its tunnel) at most every 10 s.
+   * Concurrent callers share one starter: exactly one `ssh -N` runs per
+   * restart, and a loser never overwrites the winner's master. */
   async ensureMaster(session: SshSession): Promise<void> {
     if (this.masterAlive(session)) return;
+    const ongoing = session.masterStarting;
+    if (ongoing) {
+      await ongoing;
+      return;
+    }
     if (Date.now() - session.lastMasterStartAt < MASTER_RESTART_MIN_INTERVAL_MS) return;
-    await this.startMaster(session);
+    const starting = this.startMaster(session);
+    session.masterStarting = starting;
+    try {
+      await starting;
+    } finally {
+      if (session.masterStarting === starting) session.masterStarting = null;
+    }
   }
 
   private async startMaster(session: SshSession): Promise<void> {
@@ -190,6 +276,9 @@ export class SshManager {
     session.lastMasterStartAt = Date.now();
     const attempts: Array<TunnelSpec | null> = session.tunnelSpec ? [session.tunnelSpec, session.tunnelSpec, null] : [null];
     for (const tunnel of attempts) {
+      // A concurrent closeSession/closeAll must win: never start (or retry)
+      // a master for a session that is no longer registered.
+      if (this.sessions.get(session.sandboxId) !== session) return;
       const args = [
         "-N",
         "-o",
@@ -209,12 +298,29 @@ export class SshManager {
         `${session.endpoint.user}@${session.endpoint.host}`,
       ];
       const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"] });
+      session.startingChild = child;
+      // closeSession may have run between the loop-top check and spawn: a
+      // removed session never gains a new master child.
+      if (this.sessions.get(session.sandboxId) !== session) {
+        session.startingChild = null;
+        killQuietly(child);
+        return;
+      }
       let stderr = "";
       child.stderr?.on("data", (chunk) => {
         stderr += String(chunk);
       });
       const ready = await waitForControlSocket(child, session.controlPath, (session.connectTimeoutSec + 5) * 1000);
+      if (session.startingChild === child) session.startingChild = null;
       if (ready) {
+        // The session may have been closed or replaced while we waited for
+        // the socket (or a concurrent starter won first): never resurrect a
+        // dead session's master or overwrite the winner's.
+        if (this.sessions.get(session.sandboxId) !== session
+          || (session.master && session.master !== child && this.masterAlive(session))) {
+          killQuietly(child);
+          return;
+        }
         session.master = child;
         session.tunnel = tunnel ? "up" : session.tunnelSpec ? "down" : "disabled";
         if (!tunnel && session.tunnelSpec) {
@@ -233,9 +339,14 @@ export class SshManager {
       }
       killQuietly(child);
       session.tunnelError = stderr.trim().slice(0, 500) || "control master did not start";
-      if (tunnel) await this.pause(2_000);
+      if (tunnel) {
+        if (this.sessions.get(session.sandboxId) !== session) return;
+        await this.pause(2_000);
+      }
     }
-    // No master: commands fall back to one direct connection each.
+    // No master: commands fall back to one direct connection each. A removed
+    // session stays untouched (no resurrecting log noise for a closed one).
+    if (this.sessions.get(session.sandboxId) !== session) return;
     session.master = null;
     if (session.tunnelSpec) session.tunnel = "down";
     this.logger.warn("boat: SSH control master did not start; falling back to direct connections", {
@@ -300,7 +411,7 @@ export class SshManager {
     const runId = randomUUID().replace(/-/g, "");
     let result: SshExecutionResult | undefined;
     try {
-      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true)), options);
+      result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true, this.runRecordDir)), options);
       return { ...result, stderr: stripRunMarker(result.stderr, runId) };
     } finally {
       // Local pipe/cap errors throw, while timeouts return a result. Both must
@@ -315,8 +426,8 @@ export class SshManager {
       // itself exits 255 therefore also loses its background helpers.)
       const cleanExit = result !== undefined && !result.timedOut && result.signal === null && result.exitCode !== 255;
       const cleanupCommand = cleanExit && !cancelGroupOnCleanExit
-        ? finalizeRemoteCommand(runId)
-        : cancelRemoteCommand(runId);
+        ? finalizeRemoteCommand(runId, this.runRecordDir)
+        : cancelRemoteCommand(runId, this.runRecordDir);
       try {
         const cleanup = await runStreamProcess("ssh", slave(cleanupCommand), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
         if (cleanup.timedOut || cleanup.exitCode !== 0) {
@@ -335,6 +446,12 @@ export class SshManager {
     const session = this.sessions.get(sandboxId);
     if (!session) return;
     this.sessions.delete(sandboxId);
+    // Also signal a still-connecting master: it is not in session.master
+    // yet, and without this it would outlive shutdown until it connects or
+    // times out. waitForControlSocket notices the exit within one poll, and
+    // the liveness guards above stop the starter from retrying.
+    if (session.startingChild) killQuietly(session.startingChild);
+    session.startingChild = null;
     if (session.master) killQuietly(session.master);
     session.master = null;
     await rm(session.knownHostsPath, { force: true }).catch(() => undefined);
@@ -349,8 +466,126 @@ export class SshManager {
   }
 }
 
+/** Prefix for worker SSH key dirs under os.tmpdir(). */
+export const STALE_KEY_DIR_PREFIX = "pcboat-";
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // Only ESRCH proves the owner is gone. EPERM and any other error mean the
+    // process exists or the result is uncertain: keep the dir.
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+  }
+}
+
+/** Pids of live ssh clients with dir on their command line (Linux /proc
+ * scan). Null when the platform cannot answer (non-Linux, unreadable /proc):
+ * keep-decisions treat unknown as "in use" (never reap what may be live),
+ * best-effort kills treat it as "nothing to kill". */
+async function sshPidsForDir(dir: string): Promise<number[] | null> {
+  if (process.platform !== "linux") return null;
+  let pids;
+  try {
+    pids = await readdir("/proc");
+  } catch {
+    return null;
+  }
+  const found: number[] = [];
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      if ((await readFile(`/proc/${pid}/comm`, "utf8")).trim() !== "ssh") continue;
+      const cmdline = await readFile(`/proc/${pid}/cmdline`, "utf8");
+      if (!cmdline.split("\0").some((part) => part.includes(dir))) continue;
+      found.push(Number(pid));
+    } catch {
+      // /proc race: the process exited mid-scan.
+    }
+  }
+  return found;
+}
+
+/** SIGTERM every ssh client multiplexing on sockets inside a dead worker's key
+ * dir (Linux /proc scan). Best effort: a missed client only leaks until the
+ * next sweep, and /proc races are ignored. Never touches live dirs. */
+async function killStaleSshForDir(dir: string): Promise<void> {
+  for (const pid of (await sshPidsForDir(dir)) ?? []) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/** Remove worker key dirs whose owner pid is verifiably dead (kill(pid, 0)
+ * reports ESRCH). Dirs predating the owner.pid marker are never reaped: going
+ * idle is not dying — a still-running pre-upgrade worker whose master died and
+ * whose last direct command finished has no live ssh client referencing its
+ * dir, so age plus no referencing client cannot prove the owner dead. Legacy
+ * unmarked dirs therefore leak until manual/ops cleanup. Only same-uid dirs
+ * are considered: the uid is the boundary, and another user's key material is
+ * never touched. Returns the removed dirs. Failures for one dir never block
+ * the others. */
+export async function cleanupStaleKeyDirs(baseDir: string = tmpdir()): Promise<string[]> {
+  const removed: string[] = [];
+  let entries;
+  try {
+    entries = await readdir(baseDir);
+  } catch {
+    return removed;
+  }
+  const uid = process.getuid?.();
+  for (const name of entries) {
+    if (!name.startsWith(STALE_KEY_DIR_PREFIX)) continue;
+    const dir = path.join(baseDir, name);
+    let stat;
+    try {
+      stat = await lstat(dir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    if (uid !== undefined && stat.uid !== uid) continue;
+    let owner: string | null = null;
+    try {
+      owner = (await readFile(path.join(dir, "owner.pid"), "utf8")).trim();
+    } catch {
+      owner = null;
+    }
+    const pid = owner !== null && /^\d+$/.test(owner) ? Number(owner) : NaN;
+    if (Number.isSafeInteger(pid)) {
+      // Marked dir: liveness is verifiable by pid. (A recycled pid reads as
+      // alive, which keeps the dir — the safe direction.)
+      if (pidAlive(pid)) continue;
+    } else {
+      // Unmarked legacy dir (predates the owner.pid marker): never reaped.
+      // Idle is not dead — a live pre-upgrade worker between commands has no
+      // referencing ssh client — so no age/reference check can prove the
+      // owner gone. These leak until manual/ops cleanup.
+      continue;
+    }
+    await killStaleSshForDir(dir);
+    try {
+      await rm(dir, { recursive: true, force: true });
+      removed.push(dir);
+    } catch {
+      // Race: someone else reaped it.
+    }
+  }
+  return removed;
+}
+
 function commonSshOptions(session: SshSession, privateKeyPath: string): string[] {
   return [
+    // Never read the operator's ~/.ssh/config or /etc/ssh/ssh_config(.d):
+    // a Host-* IdentityFile, RemoteForward or LocalCommand written for other
+    // work must not ride connections to an untrusted guest. -F /dev/null
+    // replaces both files; every setting the plugin needs is given below.
+    "-F",
+    "/dev/null",
     "-o",
     "BatchMode=yes",
     "-o",

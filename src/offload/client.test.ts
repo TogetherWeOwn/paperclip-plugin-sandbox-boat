@@ -446,6 +446,14 @@ describe("dry run", () => {
     t.http.post.mockImplementation(async () => ({ ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST") }));
     await expect(runDryRun(t.request, t.deps)).rejects.toThrow("OFFLOAD_INVALID_REQUEST");
   });
+
+  it("prints the broker's refusal reason, not just the code", async () => {
+    const t = setup();
+    t.http.post.mockImplementation(async () => ({ ok: true, status: 503,
+      json: errorBody("OFFLOAD_UNAVAILABLE", { detail: "unknown execution workspace; running local" }) }));
+    await expect(runDryRun(t.request, t.deps)).rejects.toThrow(
+      "offload dry-run rejected: OFFLOAD_UNAVAILABLE (unknown execution workspace; running local)");
+  });
 });
 
 describe("auth and gone answers after the submit", () => {

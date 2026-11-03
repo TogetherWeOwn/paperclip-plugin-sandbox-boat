@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { OffloadCommand, OffloadResult, OffloadWarm, OffloadSyncBack } from "./offload.js";
 import type { CommandExit, GuestIdentity } from "./offload-lifecycle.js";
+import { MAX_DURATION_SECONDS } from "./offload/duration-history.js";
 
 export interface OffloadStore {
   get(key: string): Promise<unknown>;
@@ -69,6 +70,10 @@ export interface OffloadSync {
   stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;
   // Drop the host-side upload after a command failed before transport; never throws.
   discard?(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Collect failed after a completed transport: the guest mirror cannot be
+  // trusted as a delta base, so the next push wipes and fully resyncs it.
+  // Required (not optional) so an adapter cannot silently drop the marking.
+  markSuspect(sandboxId: string, command: OffloadCommand): Promise<void>;
 }
 
 export interface OffloadDurableDeps {
@@ -151,8 +156,17 @@ export function matchingReceipt(value: unknown, identity: OffloadIdentity): valu
   if (!(Object.keys(identity) as Array<keyof OffloadIdentity>)
     .filter((key) => key !== "heartbeatDeadline").every((key) => actual[key] === identity[key])) return false;
   if (!["marker", "started", "result", "not_started"].includes(String(value.kind))) return false;
-  return value.kind !== "result" || (object(value.result) && Number.isInteger(value.result.exitCode)
-    && Number.isFinite(value.result.seconds) && (value.result.seconds as number) >= 0);
+  // Guest result receipts are untrusted: only the exact two fields the
+  // supervisor writes cross this boundary, with a safe-integer exit in
+  // 0..255 and finite non-negative seconds. Extra keys (a guest-asserted
+  // cancelled/timedOut/status) or out-of-range facts fail the match so the
+  // recovery path holds unknown instead of adopting them.
+  if (value.kind !== "result") return true;
+  if (!object(value.result)) return false;
+  const facts = value.result as Record<string, unknown>;
+  return Object.keys(facts).every((key) => key === "exitCode" || key === "seconds")
+    && Number.isSafeInteger(facts.exitCode) && (facts.exitCode as number) >= 0 && (facts.exitCode as number) <= 255
+    && typeof facts.seconds === "number" && Number.isFinite(facts.seconds) && (facts.seconds as number) >= 0;
 }
 
 function parseRecord(value: unknown, key: string): OffloadRecord {
@@ -443,7 +457,7 @@ export class OffloadJournal {
         await this.commit(record, { state: "running", remoteStarted: true });
         await this.commit(record, { state: "syncing_out" });
       });
-      const syncBack = await this.syncOut(sandboxId, command);
+      const syncBack = await this.syncOutAfterTransport(sandboxId, command);
       return { ...result, ...(syncBack ? { syncBack } : {}) };
     } catch (error) {
       if (!transported) await this.deps.sync.discard?.(sandboxId, command);
@@ -453,6 +467,31 @@ export class OffloadJournal {
 
   private async syncOut(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
     const collected = await this.deps.sync.collect(sandboxId, command);
+    const staged = await this.deps.sync.stage(sandboxId, command, collected);
+    return staged === undefined ? undefined : structuredClone(staged);
+  }
+
+  /**
+   * Collect after the transport already returned an exit. A *deterministic*
+   * collect failure — the sync adapter tags it `collectDeterministic` when
+   * guest mirror content (a special file, an over-limit scan, a malformed
+   * scan result) makes collection impossible no matter how often it is
+   * retried — is not an execution unknown: the command completed, so report
+   * its real exit with a truncated sync-back, mark the mirror suspect for a
+   * wipe on the next push, and drop the upload. Every other collect failure
+   * (transport loss during collect, say) keeps the held-for-reconciliation
+   * path, and stage failures always do.
+   */
+  private async syncOutAfterTransport(sandboxId: string, command: OffloadCommand): Promise<OffloadSyncBack | void> {
+    let collected: unknown;
+    try {
+      collected = await this.deps.sync.collect(sandboxId, command);
+    } catch (error) {
+      if ((error as { collectDeterministic?: unknown } | null)?.collectDeterministic !== true) throw error;
+      await this.deps.sync.markSuspect(sandboxId, command).catch(() => undefined);
+      await this.deps.sync.discard?.(sandboxId, command).catch(() => undefined);
+      return { state: "truncated", changedPaths: [], conflictPaths: [], artifactId: null };
+    }
     const staged = await this.deps.sync.stage(sandboxId, command, collected);
     return staged === undefined ? undefined : structuredClone(staged);
   }
@@ -470,6 +509,17 @@ export class OffloadJournal {
       // failure is therefore a known non-start, not identity-less uncertainty.
       if (PRE_START.has(record.state) && result.status === "unknown") {
         result = this.unavailable(command, "command failed before durable starting intent");
+      }
+      // Guest-controlled facts never commit unvalidated: a malformed exit
+      // commits unknown (holding the reservation) instead of throwing past
+      // it. The no-lifecycle journal path runs runCommand with no upstream
+      // validator, so this is the fence for that reachable path.
+      if (result.status !== "unavailable") {
+        const exit = (result as { exitCode?: unknown }).exitCode;
+        const secs = (result as { seconds?: unknown }).seconds;
+        if (!Number.isInteger(exit) || !Number.isFinite(secs) || (secs as number) < 0) {
+          result = this.unknown(record);
+        }
       }
       if (result.status === "unavailable") {
         if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
@@ -545,10 +595,15 @@ export class OffloadJournal {
       if (answer.kind === "result") {
         const raw = answer.result!;
         // Resume only output collection/staging, never command execution.
+        // Rebuild from named facts: a receipt that passed matchingReceipt
+        // carries exactly exitCode/seconds, but spread would still adopt any
+        // future extra key (cancelled/status/syncBack). Clamp the duration
+        // to the one-day learning bound like every other guest measurement.
         await this.commit(record, { state: "syncing_out", remoteStarted: true });
-        const syncBack = await this.syncOut(record.identity.sandboxId, record.command!);
+        const syncBack = await this.syncOutAfterTransport(record.identity.sandboxId, record.command!);
         const result: OffloadResult = { status: "completed", commandId: record.commandId, sandboxId: record.identity.sandboxId,
-          warm: "cold" as OffloadWarm, queueWaitMs: 0, ...raw, dollars: 0, ...(syncBack ? { syncBack } : {}) };
+          warm: "cold" as OffloadWarm, queueWaitMs: 0, exitCode: raw.exitCode,
+          seconds: Math.min(raw.seconds, MAX_DURATION_SECONDS), dollars: 0, ...(syncBack ? { syncBack } : {}) };
         await this.commit(record, { state: "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
         await this.release(record);
         return result;

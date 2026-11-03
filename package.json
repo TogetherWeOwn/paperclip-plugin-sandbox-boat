@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-sandbox-boat",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "boat.dev sandbox provider for Paperclip: one VM per card, started only while a run needs it and stopped on release, with a budget guard and per-run cost accounting. Built on the official @boatdev/sdk.",
   "license": "MIT",
   "type": "module",
@@ -46,7 +46,7 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
-    "@boatdev/sdk": "1.10.0",
+    "@boatdev/sdk": "1.13.0",
     "@paperclipai/plugin-sdk": "2026.1023.0"
   },
   "devDependencies": {

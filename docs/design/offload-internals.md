@@ -165,7 +165,9 @@ follows durable host intent. The watchdog kills the subtree on execution deadlin
 expired client interest or supervisor loss. Heartbeats renew the guest watchdog
 and host timer; reads renew neither. Losing a result/output channel is uncertain,
 not permission to replay. Output is capped at 1 MiB; overflow fails closed rather
-than returning truncated success. New pool VMs keep monitoring on. The existing
+than returning truncated success. New pool VMs follow the environment's
+monitoring setting (default on), and the pool compatibility key carries the
+opt-out so a VM is never reused across monitoring policies. The existing
 native sweep job owns stop retry/reconciliation; no host pacer is added.
 
 **Fallback:** without functional cgroup-v2 delegation and a verified outside

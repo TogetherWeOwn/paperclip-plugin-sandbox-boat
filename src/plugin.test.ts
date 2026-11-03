@@ -202,10 +202,10 @@ describe("AcquireLease", () => {
     const sshKey = fake.callsOf("sshKey");
     expect(sshKey[0].args).toMatchObject({ sandboxId, key: "ssh-ed25519 AAAATESTPUBLICKEY paperclip-boat" });
     const master = ssh.masters()[0];
-    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes", "ForwardAgent=no"]));
+    expect(master.args).toEqual(expect.arrayContaining(["-R", "127.0.0.1:8317:cliproxy:8317", "ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", `HostKeyAlias=${sandboxId}`, "BatchMode=yes", "ForwardAgent=no", "-F", "/dev/null"]));
     expect(master.args.at(-1)).toBe("user@203.0.113.10");
     const knownHosts = master.args.find((arg) => arg.startsWith("UserKnownHostsFile="))!.slice("UserKnownHostsFile=".length);
-    expect(readFileSync(knownHosts, "utf8")).toBe(`${sandboxId} ssh-ed25519 AAAAHOSTKEY${sandboxId}\n`);
+    expect(readFileSync(knownHosts, "utf8")).toBe(`${sandboxId} ssh-ed25519 AAAAHOSTKEY${sandboxId.replace(/[^A-Za-z0-9+/]/g, "")}\n`);
   });
 
   it("still runs commands when the reverse tunnel cannot be opened, and says so", async () => {
@@ -2160,7 +2160,9 @@ describe("offload API routes", () => {
   it.each(["release", "destroy"])("a %s of the run's lease forgets its whole-run workspace bindings", async (end) => {
     const lease = await acquire(RUN_ID);
     await seedWorkspace();
-    expect(workspaceBindings()).toHaveLength(1);
+    // The binding is persisted under both host-owned ids of the workspace
+    // (execution workspace id and project workspace id).
+    expect(workspaceBindings()).toHaveLength(2);
     if (end === "release") await release(lease);
     else await plugin.definition.onEnvironmentDestroyLease!({ ...base(), providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata } as never);
     expect(workspaceBindings()).toEqual([]);

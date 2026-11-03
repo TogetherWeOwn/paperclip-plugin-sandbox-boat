@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { OffloadExecutor } from "../offload.js";
-import type { OffloadCommand, OffloadDeps, OffloadResult } from "../offload.js";
+import type { OffloadCommand, OffloadDeps, OffloadLifecycleDeps, OffloadResult } from "../offload.js";
 import type { StateClientLike } from "../state.js";
 import type { OffloadStore } from "../offload-journal.js";
 import type { BoatApiLike } from "../boat-client.js";
@@ -286,7 +286,8 @@ export async function fixture() {
   let keepDescendants = false;
   let output: Array<["stdout" | "stderr", Uint8Array]> = [];
   const executors: OffloadExecutor[] = [];
-  const make = (config: Partial<OffloadDeps["config"]> = {}, disk = state) => {
+  const make = (config: Partial<OffloadDeps["config"]> = {}, disk = state,
+    runCommand: OffloadLifecycleDeps["runCommand"] | null = null) => {
     const deps = {
       boat: boat as unknown as BoatApiLike, logger: {
         info: (message: string, meta?: Record<string, unknown>) => { logs.push({ message, meta }); },
@@ -304,8 +305,9 @@ export async function fixture() {
         push: sync.push,
         collect: (vm: string, cmd: OffloadCommand) => sync.collect(vm, cmd as LifecycleCommand),
         stage: (_vm: string, cmd: OffloadCommand, collected: unknown) => sync.stage(cmd as LifecycleCommand, collected),
+        markSuspect: async () => {},
       },
-      runCommand: async (sandboxId: string, raw: OffloadCommand, context?: RunContext) => {
+      runCommand: runCommand ?? (async (sandboxId: string, raw: OffloadCommand, context?: RunContext) => {
         const cmd = raw as LifecycleCommand;
         const start = { sandboxId, commandId: cmd.commandId, context, persisted: undefined as unknown };
         starts.push(start);
@@ -318,7 +320,7 @@ export async function fixture() {
         try { await phase("exec", cmd.commandId); }
         finally { guest.exit(cmd.commandId, keepDescendants); }
         return completed();
-      },
+      }),
     };
     const executor = new OffloadExecutor(deps);
     executors.push(executor);

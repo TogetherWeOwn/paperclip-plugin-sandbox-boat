@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.2.8
+
+Hardening follow-up to 0.2.7: offload binding and result handling, SSH
+session hygiene, and ledger strictness. Offload and whole-run behaviour
+stay off by default; nothing is enabled by upgrading.
+
+### Fixed
+
+* Offload binding resolves runs under both host workspace ids, so shim
+  requests no longer miss when the two ids differ (#83). Guest results are
+  validated and command durations are measured on the host (#78). Stale
+  mirror output and special files can no longer fail later commands (#73).
+  The monitoring opt-out is honoured, and the auth-token and SSH key pools
+  are scrubbed per credential (#72).
+
+* SSH sessions close on worker shutdown and VM release, concurrent master
+  starts are deduped, and stale key directories whose owner process is
+  verifiably gone are swept (#74). Provider endpoint data is validated and
+  operator ssh config is ignored (#69).
+
+* Ledger start holds expire and the VM-hour cap is strict (#70). Every
+  created VM is tracked and stopped when its delete or its usage recording
+  fails (#77).
+
+* Test runs no longer leak run-record files into host `/tmp` (#84). The live
+  smoke acquires its VM as an agent-scoped card lease (#82) and expects the
+  withheld scrub diagnostics (#76).
+
+### Changed
+
+* Bumped `@boatdev/sdk` from 1.10.0 to 1.13.0 (#81).
+
+* The pilot runbook config now includes the required
+  `offloadLocalSourceRoots` key, without which every local-run bind refuses
+  closed (#79).
+
+## 0.2.7
+
+Hardening release: the P0 audit batches that the interim pilot config
+was waiting on. Offload and whole-run behaviour stay off by default;
+nothing is enabled by upgrading.
+
+### Fixed
+
+* Host safety: workspace probe files (toolchain pins, lockfiles) are read
+  with no-follow opens and size caps, and run-directory prefixes must be
+  real directories, so a repo symlink can no longer make the host read an
+  unbounded file (#57). Boat API calls now have per-request timeouts and the
+  idle sweep runs under a deadline with per-VM bounds, so one stalled call
+  cannot freeze the sweep while idle VMs keep billing (#58). `SshManager`
+  remote commands and the offload rsync push enforce their timeouts
+  (supervised path, process-group kills, stalled guest receivers killed and
+  fenced mirrors resynced), so a hung guest cannot pin the card lock or the
+  mirror lock while the VM bills (#66). (The host tar-receiver budgets of
+  #61 already shipped in the 0.2.6 tarball.)
+
+* Credential delivery is policy-gated: `ANTHROPIC_AUTH_TOKEN` reaches a VM
+  only through the reverse tunnel and, when `modelProxyKeyFingerprint` is
+  set, only when it is that dedicated key; a managed AI-connection pool
+  credential is dropped rather than delivered. The managed-GitHub names
+  (`PAPERCLIP_GITHUB_BROKER_TOKEN`, `ZDOTDIR`, `BASH_ENV`) are dropped
+  unless the new `managedGithub: true` driver setting opts in. Secret-name
+  and secret-value detection for run env was widened (#62).
+
+* Card-VM reuse boundary: card VMs are keyed by card and agent (an acquire
+  with no agent gets a per-run VM deleted on release), and a reused VM is
+  never handed to a different principal or under a different env policy than
+  the one it was created with (#64).
+
+* Offload data exposure: sync now sends only git-tracked files, a tracked
+  file carrying a credential shape aborts capture, and secret-bearing
+  workspaces stay local (#59). Local-run binding requires the source under
+  an operator-set `offloadLocalSourceRoots` root and proves repo identity
+  from the on-disk git origin at bind and at every resolve, instead of
+  trusting the workspace row (#65). Pool VMs are isolated per workspace
+  trust domain, delta pushes verify mirror content by hash instead of
+  trusting a guest-writable marker, guest commands get a root-owned `PATH`
+  and a fresh per-command `HOME`, and retired pool VMs are deleted at the
+  provider before being forgotten (#63).
+
 ## 0.2.6
 
 ### Fixed

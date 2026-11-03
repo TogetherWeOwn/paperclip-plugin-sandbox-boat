@@ -5,14 +5,23 @@ import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { chmod, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it } from "vitest";
 import { cancelRemoteCommand, finalizeRemoteCommand } from "./shell.js";
 
 const children: ChildProcess[] = [];
 const records: string[] = [];
+
+// Records live in a per-test directory, never host /tmp: the cancel script
+// may leave an admission tombstone behind by design, and removing the whole
+// directory in afterEach collects it with everything else.
+let recordDir = "";
+
+beforeEach(async () => {
+  recordDir = await mkdtemp(path.join(tmpdir(), "paperclip-boat-registry-"));
+});
 
 afterEach(async () => {
   // Reap every owned process even when an assertion failed (mutant RED).
@@ -40,6 +49,7 @@ afterEach(async () => {
   for (const record of records.splice(0)) {
     await rm(record, { force: true });
   }
+  await rm(recordDir, { recursive: true, force: true });
 });
 
 function newRunId(): string {
@@ -47,7 +57,7 @@ function newRunId(): string {
 }
 
 function recordPath(runId: string): string {
-  return `/tmp/paperclip-boat-run-${runId}`;
+  return path.join(recordDir, `paperclip-boat-run-${runId}`);
 }
 
 function procIdentity(pid: number): { running: boolean; group: number | null; start: string | null } {
@@ -75,13 +85,13 @@ function spawnOwnedGroup(): { child: ChildProcess; pid: number; start: string } 
 }
 
 function runCancel(runId: string) {
-  const command = cancelRemoteCommand(runId);
+  const command = cancelRemoteCommand(runId, recordDir);
   expect(command).toContain(recordPath(runId));
   return spawnSync("sh", ["-c", command], { encoding: "utf8", timeout: 8000 });
 }
 
 function runFinalize(runId: string) {
-  const command = finalizeRemoteCommand(runId);
+  const command = finalizeRemoteCommand(runId, recordDir);
   expect(command).toContain(recordPath(runId));
   return spawnSync("sh", ["-c", command], { encoding: "utf8", timeout: 8000 });
 }
@@ -172,8 +182,7 @@ it("locked record times out with a diagnostic and is left untouched", async () =
   const start = procIdentity(pid).start!;
   const record = await writeRecord(runId, JSON.stringify({ pgid: pid, start }));
   const before = await readFile(record, "utf8");
-  const ready = path.join(tmpdir(), `paperclip-boat-lock-ready-${runId}`);
-  records.push(ready);
+  const ready = path.join(recordDir, `paperclip-boat-lock-ready-${runId}`);
   const holder = spawn(
     "python3",
     ["-c", `import fcntl, pathlib, time; f = open(${JSON.stringify(record)}, 'r+'); fcntl.flock(f, fcntl.LOCK_EX); pathlib.Path(${JSON.stringify(ready)}).write_text('held'); time.sleep(6)`],
@@ -219,4 +228,17 @@ it("control: a fresh valid record is accepted and the owned group is cancelled",
   expect(result.status, `accept valid record, stderr: ${result.stderr}`).toBe(0);
   expect(procIdentity(pid).running, "valid cancellation must stop the owned group").toBe(false);
   expect(existsSync(record), "valid cancellation removes its record").toBe(false);
+});
+
+it("cancel before admission leaves its tombstone in the record directory, not /tmp", async () => {
+  const runId = newRunId();
+  const record = recordPath(runId);
+  records.push(record);
+
+  const result = runCancel(runId);
+
+  expect(result.status, `admission revocation, stderr: ${result.stderr}`).toBe(0);
+  expect(existsSync(record), "the tombstone is kept for the delayed invocation").toBe(true);
+  expect(JSON.parse(await readFile(record, "utf8"))).toEqual({ cancelled: true });
+  expect(existsSync(`/tmp/paperclip-boat-run-${runId}`), "nothing is written to host /tmp").toBe(false);
 });

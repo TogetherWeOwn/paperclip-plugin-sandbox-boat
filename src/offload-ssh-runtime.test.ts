@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, scryptSync } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
-import { SshOffloadRuntime, hasCargoRegistryAuth } from "./offload-ssh-runtime.js";
+import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc } from "./offload-ssh-runtime.js";
+import { shellQuote } from "./shell.js";
+import type { SshManager } from "./ssh.js";
 import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
@@ -55,6 +57,56 @@ afterEach(async () => {
   await runtime?.shutdown(); await ssh?.cleanup();
 }, 20_000);
 
+describe("project workspace alias", () => {
+  it("withdraws an alias two execution workspaces claim with different sources", async () => {
+    const projectWorkspaceId = randomUUID();
+    const first = native();
+    const firstRequest = first.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown>>;
+    firstRequest.source!.projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(true);
+    const otherWorkspaceId = randomUUID();
+    const otherSource = path.join(ssh.root, "other-checkout");
+    const second = native();
+    second.workspace.localPath = otherSource;
+    const secondRequest = second.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, Record<string, unknown> | string>;
+    secondRequest.executionWorkspaceId = otherWorkspaceId;
+    (secondRequest.source as Record<string, unknown>).localPath = otherSource;
+    (secondRequest.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    runtime.remember(second);
+    // The shared id resolves to neither checkout; each workspace keeps its own.
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+    expect(runtime.has(companyId, runId, executionWorkspaceId)).toBe(true);
+    expect(runtime.has(companyId, runId, otherWorkspaceId)).toBe(true);
+    // Re-realizing the first workspace does not resurrect the ambiguous alias.
+    runtime.remember(first);
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
+  });
+
+  it("a whole-run realization without the alias supersedes the local-run alias binding", async () => {
+    const localRunId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const mutate = (params: PluginEnvironmentRealizeWorkspaceParams, fn: (request: Record<string, unknown>) => void) => {
+      const request = params.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, unknown>;
+      request.heartbeatRunId = localRunId;
+      fn(request);
+      return params;
+    };
+    runtime.remember(mutate(native(), (request) => {
+      request.localRun = true;
+      (request.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    }));
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    // The whole-run payload for the same run and workspace omits the alias.
+    runtime.remember(mutate(native(), () => undefined));
+    // With no local source roots configured, a local-run binding under the
+    // alias could not resolve; the whole-run binding the alias now answers
+    // with can.
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    expect(await runtime.resolve({ ...command(), runId: localRunId, executionWorkspaceId: projectWorkspaceId }, config)).not.toBe(null);
+  });
+});
+
 describe("stock concrete executor factory", () => {
   it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
     const executor = (await runtime.resolve(command(), config))!;
@@ -80,6 +132,23 @@ describe("stock concrete executor factory", () => {
     const resolving = runtime.resolve(command(), config);
     await runtime.shutdown();
     expect(await resolving).toBe(null);
+    expect(boat.calls).toHaveLength(0);
+  });
+  it("fences a resolution awaiting the credential digest when shutdown starts", async () => {
+    const resolving = runtime.resolve(command(), config);
+    // Park resolve on the async KDF before starting shutdown: the digest
+    // promise is memoized on the binding before it is awaited, so observing it
+    // means resolve is inside the digest await, past the earlier closing check.
+    const view = runtime as unknown as { bindings: Map<string, { credentialDigest?: Promise<string> }>, pools: Map<string, unknown> };
+    let settled = false;
+    void resolving.then(() => { settled = true; }, () => { settled = true; });
+    while (!settled && ![...view.bindings.values()].some((binding) => binding.credentialDigest !== undefined)) {
+      await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+    }
+    expect([...view.bindings.values()].some((binding) => binding.credentialDigest !== undefined)).toBe(true);
+    await runtime.shutdown();
+    expect(await resolving).toBe(null);
+    expect(view.pools.size).toBe(0);
     expect(boat.calls).toHaveLength(0);
   });
   it("wires the stock worker from native params without injecting a lifecycle executor", async () => {
@@ -382,11 +451,14 @@ describe("stock concrete executor factory", () => {
 });
 
 describe("templateSnapshot pool wiring", () => {
-  // Pool identity before templateSnapshot existed. Existing pools persist their
-  // VMs under this id, so an unset template must keep it byte-for-byte.
+  // Pool identity: template selection is not part of it, but the credential
+  // digest is, so template changes keep this id byte-for-byte for an unchanged
+  // API key (native() uses "test-only").
   function legacyPoolId(profileId = "rust-public-1") {
-    return createHash("sha256").update(JSON.stringify([companyId, "env", "repo:https://github.com/example/public", profileId,
-      DEFAULT_API_BASE, "small", config.offloadCgroupParent, config.offloadArtifactRoot])).digest("hex").slice(0, 24);
+    const baseIdentity = JSON.stringify([companyId, "env", "repo:https://github.com/example/public", profileId,
+      DEFAULT_API_BASE, "small", config.offloadCgroupParent, config.offloadArtifactRoot]);
+    const credentialDigest = scryptSync("test-only", `boat-offload-pool\u0000${DEFAULT_API_BASE}`, 32).toString("hex");
+    return createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest])).digest("hex").slice(0, 24);
   }
   function withTemplate(name: string): PluginEnvironmentRealizeWorkspaceParams {
     const params = native();
@@ -394,7 +466,7 @@ describe("templateSnapshot pool wiring", () => {
     return params;
   }
 
-  it("keeps the legacy pool identity when no template is configured", async () => {
+  it("keeps a stable pool identity when no template is configured", async () => {
     const executor = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
     expect(executor.poolId).toBe(legacyPoolId());
     expect(executor.config.templateSnapshot).toBe(null);
@@ -561,5 +633,60 @@ describe("hasCargoRegistryAuth", () => {
     const deep = Array.from({ length: 40 }, (_, i) => `d${i}`).join("/");
     await mkdir(path.join(dir, deep), { recursive: true });
     expect(await hasCargoRegistryAuth(dir, deep)).toBe(true);
+  });
+});
+
+describe("pool credential identity and guest token scrub", () => {
+  function nativeWithKey(apiKey: string): PluginEnvironmentRealizeWorkspaceParams {
+    const params = native();
+    params.config = { apiKey, maxOffloadVms: 1, offloadIdleStopSeconds: 1 };
+    return params;
+  }
+
+  it("binds a new pool to a rotated API key and sweeps the superseded pool", async () => {
+    const seenKeys: Array<string | null> = [];
+    const harness = createFakeContext();
+    const rotating = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+      boat: (cfg) => { seenKeys.push(cfg.apiKey); return boat as unknown as BoatApiLike; }, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "true"] } });
+    try {
+      rotating.remember(nativeWithKey("key-a"));
+      const first = (await rotating.resolve(command(), config))!;
+      expect(first).not.toBeNull();
+      const sweepFirst = vi.spyOn(first, "sweep");
+
+      rotating.remember(nativeWithKey("key-b"));
+      const second = (await rotating.resolve(command(), config))!;
+      expect(second).not.toBeNull();
+      expect(second).not.toBe(first);
+      // The factory built a new client from the rotated key, and the pool
+      // bound to the old credential was swept under it before retirement.
+      expect(seenKeys).toEqual(["key-a", "key-b"]);
+      expect(sweepFirst).toHaveBeenCalled();
+
+      // Same key again resolves to the same cached pool.
+      expect(await rotating.resolve(command(), config)).toBe(second);
+      expect(seenKeys).toEqual(["key-a", "key-b"]);
+    } finally {
+      await rotating.shutdown();
+    }
+  });
+
+  it("removes boat's seeded ASCII_TOKEN line from ~/.bashrc over loopback ssh", async () => {
+    const bashrc = path.join(ssh.root, ".bashrc");
+    await writeFile(bashrc, "# user rc\nexport ASCII_TOKEN=seeded-secret\nkeep=1\n");
+    // The loopback sshd logs in as the host user, so point HOME at the
+    // fixture root for this call instead of touching the real ~/.bashrc; the
+    // scrub itself is the exact command the session factory runs.
+    const manager = ssh.manager;
+    const homeBound = { run: (session: never, remoteCommand: string, options: never) =>
+      manager.run(session, `HOME=${shellQuote(ssh.root)} ${remoteCommand}`, options) } as unknown as SshManager;
+    await scrubOffloadGuestBashrc(homeBound, ssh.session);
+    expect(await readFile(bashrc, "utf8")).toBe("# user rc\nkeep=1\n");
+  });
+
+  it("never fails the session when the scrub command fails", async () => {
+    const failing = { run: async () => { throw new Error("ssh down"); } } as unknown as SshManager;
+    await expect(scrubOffloadGuestBashrc(failing, ssh.session)).resolves.toBeUndefined();
   });
 });

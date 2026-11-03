@@ -45,9 +45,12 @@ const log = (level) => (message, meta) => {
   console.log(`[${new Date().toISOString()}] ${level} ${message}${meta ? " " + JSON.stringify(meta) : ""}`);
 };
 const manager = new BoatVmManager({
+  // The full host state contract (plugin.state.write): release deletes the
+  // run's offload workspace bindings, so get/set alone is not enough.
   state: {
     get: async (input) => (state.has(key(input)) ? structuredClone(state.get(key(input))) : null),
     set: async (input, value) => void state.set(key(input), structuredClone(value)),
+    delete: async (input) => void state.delete(key(input)),
   },
   logger: { info: log("info"), warn: log("warn"), error: log("error") },
   issues: null,
@@ -64,12 +67,21 @@ const config = {
   envAllowlist: [...DEFAULT_ENV_ALLOWLIST, "SMOKE_SENTINEL"],
 };
 const base = { driverKey: "boat", companyId: "smoke-company", environmentId: "smoke-env", config };
+// One agent principal for every acquire: the VM key is scoped to it (plus the
+// execution workspace), which is what makes this a card VM that release stops
+// for the next run to resume. Without a principal the key falls back to the
+// run id, release deletes the VM, and no later acquire can find it again.
+const AGENT = "smoke-agent";
 // Names of boat's in-VM credentials, matched at the start of an environ line (names only, never values).
 const BOAT_TOKEN_NAMES = "^(ASCII_TOKEN|BOAT_[A-Z0-9_]+)=";
 const workspace = `smoke-ws-${stamp}`;
 const t0 = Date.now();
 const step = (name) => console.log(`\n=== ${name} (+${((Date.now() - t0) / 1000).toFixed(1)} s)`);
 let sandboxId = null;
+// Every lease id an acquire returns: a resume whose disk was cancelled or
+// expired comes back as a replacement VM, and cleanup must delete that one
+// too, not only the first VM.
+const sandboxIds = new Set();
 let failed = false;
 
 async function exec(lease, script, env = {}) {
@@ -117,8 +129,9 @@ try {
   console.log(JSON.stringify({ ok: probe.ok, diagnostics: probe.diagnostics }, null, 1));
 
   step("acquire run 1 (create)");
-  const lease1 = await manager.acquire({ ...base, runId: `smoke-run-1-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+  const lease1 = await manager.acquire({ ...base, runId: `smoke-run-1-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
   sandboxId = lease1.providerLeaseId;
+  sandboxIds.add(sandboxId);
   console.log(JSON.stringify(lease1.metadata));
 
   step("execute: identity, env, argv check, env file gone, tunnel, marker file");
@@ -221,8 +234,16 @@ try {
   );
   console.log(`capture_refused=${refused?.code ?? "no"}`);
   if (refused?.code !== "BOAT_RUNTIME_SCRUB_FAILED") throw new Error(`smoke check failed: expected BOAT_RUNTIME_SCRUB_FAILED, got ${refused?.code ?? "a capture"}`);
-  if (!logs.slice(savesBefore).some((entry) => entry.message.includes("could not verify") && String(entry.meta?.detail ?? "").includes("smoke-locked"))) {
-    throw new Error("smoke check failed: the refusal did not name the unreadable directory");
+  // The plugin never names the unreadable directory: guest stderr is
+  // untrusted, so the scrub withholds it by design (the unit tests assert
+  // the path never reaches the logs). Check for the withheld detail, and
+  // that no log from the refused capture leaks the guest path.
+  const refusalLogs = logs.slice(savesBefore);
+  if (!refusalLogs.some((entry) => entry.message.includes("could not verify") && entry.meta?.detail === "walk incomplete (diagnostics withheld)")) {
+    throw new Error("smoke check failed: the refusal was not logged as an incomplete walk with diagnostics withheld");
+  }
+  if (JSON.stringify(refusalLogs).includes("smoke-locked")) {
+    throw new Error("smoke check failed: the refusal log leaked the unreadable guest directory");
   }
   // The refused capture's scrub still removed what it could reach, the stand-in included: put it back for the release check.
   const unlocked = await exec(
@@ -303,7 +324,8 @@ try {
   };
 
   step("acquire run 2 (resume the same card VM within 10 minutes: the same machine)");
-  const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+  const lease2 = await manager.acquire({ ...base, runId: `smoke-run-2-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
+  sandboxIds.add(lease2.providerLeaseId);
   console.log(JSON.stringify(lease2.metadata));
   if (lease2.providerLeaseId !== sandboxId) throw new Error("expected the same VM on resume");
   const skills2 = await checkRuntimeAfterResume(lease2, "run 2");
@@ -313,18 +335,19 @@ try {
   if (sameMachine && skills2 !== "skills=present skill_mcp_config=present") throw new Error(`smoke check failed: the scrub removed a skill's own mcp-config (${skills2})`);
 
   step("release run 2 (stop)");
-  console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease2.metadata }, "release")));
+  console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: lease2.providerLeaseId, leaseMetadata: lease2.metadata }, "release")));
 
   if (process.env.SMOKE_NEW_MACHINE === "1") {
     step("wait 11 minutes (boat keeps the stopped machine 10 minutes, unbilled), then resume on a new machine");
     await sleep(11 * 60_000);
-    const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null });
+    const lease3 = await manager.acquire({ ...base, runId: `smoke-run-3-${stamp}`, executionWorkspaceId: workspace, issueId: null, agentId: AGENT });
+    sandboxIds.add(lease3.providerLeaseId);
     console.log(JSON.stringify(lease3.metadata));
     const skills3 = await checkRuntimeAfterResume(lease3, "run 3");
     if (skills3 !== "skills=gone skill_mcp_config=gone") throw new Error("smoke check failed: the restored snapshot had files below .paperclip-runtime");
     console.log("runtime_dir_after_new_machine_resume=empty skills=gone");
     step("release run 3 (stop)");
-    console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: sandboxId, leaseMetadata: lease3.metadata }, "release")));
+    console.log(JSON.stringify(await manager.release({ ...base, providerLeaseId: lease3.providerLeaseId, leaseMetadata: lease3.metadata }, "release")));
   }
 
   step("usage summary");
@@ -334,13 +357,15 @@ try {
   failed = true;
   console.error("SMOKE FAILED:", error instanceof Error ? `${error.name} ${error.code ?? ""} ${error.message}` : String(error));
 } finally {
-  if (sandboxId) {
-    step("destroy (delete the VM)");
-    try {
-      console.log(JSON.stringify(await manager.destroy({ ...base, providerLeaseId: sandboxId })));
-    } catch (error) {
-      failed = true;
-      console.error("DELETE FAILED, delete by hand with: boat delete", sandboxId, "--yes", error?.message);
+  if (sandboxIds.size > 0) {
+    step("destroy (delete every VM an acquire returned)");
+    for (const id of sandboxIds) {
+      try {
+        console.log(JSON.stringify(await manager.destroy({ ...base, providerLeaseId: id })));
+      } catch (error) {
+        failed = true;
+        console.error("DELETE FAILED, delete by hand with: boat delete", id, "--yes", error?.message);
+      }
     }
   }
   await manager.shutdown();

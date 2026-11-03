@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { command, EPOCH, fixture, until } from "./test-support/offload-lifecycle-contract.js";
 import type { Fixture } from "./test-support/offload-lifecycle-contract.js";
-import { commandKey, matchingReceipt, type OffloadRecord } from "./offload-journal.js";
+import { commandKey, matchingReceipt, type OffloadIdentity, type OffloadRecord } from "./offload-journal.js";
+import { OffloadLifecycle, type GuestController, type GuestIdentity } from "./offload-lifecycle.js";
+import type { OffloadCommand } from "./offload.js";
 
 let s: Fixture;
 beforeEach(async () => { s = await fixture(); });
@@ -74,6 +76,26 @@ describe("guest lifecycle boundary regressions", () => {
     expect(s.starts.map((v) => v.commandId)).toEqual(["first"]);
   });
 
+  it("a guest-fabricated exit fact ends unknown without touching the ledger or cancel state", async () => {
+    // A compromised guest answers with a megabyte exitCode, an infinite
+    // duration and a cancel nobody requested. None of it may reach durable
+    // state: the command ends unknown, the shared account document stays
+    // small, and no cancelled state is recorded without a host cancel.
+    const fabricated = { exitCode: "x".repeat(100_000), seconds: 1e300, cancelled: true, timedOut: true };
+    const hostile = s.make({}, s.state, (async () => fabricated) as never);
+    const result = await hostile.execute(command("fabricated"));
+    expect(result).toMatchObject({ status: "unknown", fallbackSafe: false, exitCode: 75 });
+    expect("cancelled" in result).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("xxxx");
+    const receipt = await hostile.readCommand("company-a", "run-a", "fabricated");
+    expect(JSON.stringify(receipt)).not.toContain("xxxx");
+    expect(JSON.stringify(receipt)).not.toContain("cancelled");
+    const doc = await s.state.all();
+    const account = Object.entries(doc).find(([key]) => key.includes("boat-account"));
+    expect(account).toBeDefined();
+    expect(JSON.stringify(account![1]).length).toBeLessThan(8_192);
+  });
+
   it("matches guest receipts across renewed interest but not changed subtree ownership", async () => {
     await s.execute(command("receipt"));
     const identity = s.starts[0]!.context!.identity;
@@ -129,5 +151,57 @@ describe("start and output API regressions", () => {
     await s.execute(command("same", { runId: "run-b" }));
     await expect(s.executor.read("same")).rejects.toThrow("OFFLOAD_COMMAND_SCOPE_REQUIRED");
     expect(await s.executor.readCommand("company-a", "run-a", "same")).toMatchObject({ state: "completed" });
+  });
+});
+
+describe("prepare deadline mapping regressions", () => {
+  const timers = { set: () => 0 as unknown, clear: () => undefined };
+  const baseCommand = (commandId: string, timeoutMs: number): OffloadCommand => ({
+    companyId: "company-a", runId: "run-a", commandId, tool: "cargo", runner: "cargo",
+    argv: ["test"], env: {}, cwdRelative: ".", timeoutMs,
+  } as OffloadCommand);
+  const baseIdentity = (cmd: OffloadCommand): OffloadIdentity => ({
+    companyId: cmd.companyId, runId: cmd.runId, commandId: cmd.commandId, digest: "abc",
+    sandboxId: "sandbox-a", guestBootId: "boot-a", journalGeneration: 1,
+  });
+  // The supervisor stamps guest absolutes (including guestNow) when it creates
+  // the child, before the prepare response travels back over SSH.
+  const fakeGuest = (hooks: { transitMs: number; now: () => number }): GuestController => ({
+    preflight: async () => ({ cgroupV2Delegated: true as const, outsideWatchdogVerified: true as const }),
+    prepare: async (_sandboxId, cmd) => {
+      const created = hooks.now();
+      for (let i = 0; i < hooks.transitMs; i += 1) hooks.now();
+      return {
+        guestBootId: "boot-a", processGroupId: 4100, cgroupPath: `/delegated/commands/${cmd.commandId}`,
+        journalGeneration: 1, heartbeatDeadline: created + 30_000,
+        guestDeadline: created + (cmd.timeoutMs ?? 120_000), guestNow: created,
+      } satisfies GuestIdentity;
+    },
+    armDeadline: async () => ({ verified: true, outsideCommandCgroup: true }),
+    inspect: async (_sandboxId, identity) => ({ identity, populated: false, receipt: "never_started" }),
+    term: async () => undefined,
+    kill: async () => undefined,
+    verifyEmpty: async () => true,
+  });
+
+  it("refuses preparation when the guest deadline already expired in transit", async () => {
+    let t = EPOCH;
+    const lifecycle = new OffloadLifecycle(fakeGuest({ transitMs: 1_200, now: () => t++ }), () => t, timers);
+    const cmd = baseCommand("expired-in-transit", 1_000);
+    // Mapping the creation-stamped guest deadline forward by the 1.2 s
+    // response transit would admit an identity the guest already refuses.
+    await expect(lifecycle.prepare("sandbox-a", cmd, baseIdentity(cmd)))
+      .rejects.toMatchObject({ code: "OFFLOAD_GUEST_IDENTITY_INVALID" });
+  });
+
+  it("maps guest deadlines from the pre-send host clock, never the receive clock", async () => {
+    let t = EPOCH;
+    const lifecycle = new OffloadLifecycle(fakeGuest({ transitMs: 1_200, now: () => t++ }), () => t, timers);
+    const cmd = baseCommand("conservative-map", 120_000);
+    const identity = await lifecycle.prepare("sandbox-a", cmd, baseIdentity(cmd));
+    // Conservative: the child may have been created any time after the send,
+    // so its deadline is at most send + timeout, never receive + timeout.
+    expect(identity.guestDeadline).toBe(EPOCH + 120_000);
+    expect(identity.heartbeatDeadline).toBe(EPOCH + 30_000);
   });
 });

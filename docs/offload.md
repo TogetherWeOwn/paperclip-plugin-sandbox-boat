@@ -38,7 +38,15 @@ Semantics the shim guarantees: incremental stdout/stderr with exit/signal passth
 
 A pool VM is only ever reused by the execution workspace that first claimed it: the host resolves each submit's trust domain from its (host-fetched) execution workspace, and the pool compatibility key includes it, so code from one workspace — for example an untrusted PR branch — never runs on a VM another workspace later reuses warm or resumed. Commands without a resolvable workspace fail closed to per-workspace isolation in the executor. Repos listed in `offloadEphemeralRepos` go further: every command creates a fresh VM and deletes it at the provider after collect, and an incompatible VM retired from the pool is likewise deleted rather than left as a stopped disk. Each guest command runs with a root-owned-only `PATH` (`/usr/local/bin:/usr/bin:/bin`, plus a uv venv bin when applicable) and a fresh per-command `HOME`, so guest templates must install toolchains under root-owned paths and home-directory state never carries between commands. Toolchain caches (`CARGO_HOME`, and `PYTHONUSERBASE` for python commands) live outside `HOME` in a per-VM directory under the state root: cargo cache priming and pip user-site installs write there and commands read from there, so warm-VM caches survive across commands, but the tree is never on `PATH` and never leaves the VM's trust domain. Cargo configuration is executable state, not cache: the guest supervisor deletes `config.toml`/`config` from the per-VM `CARGO_HOME` before each command and before cache priming (which additionally refuses to run at all when any cargo config it would load names a credential provider), so a wrapper or alias planted by one command cannot ride the cache into the next.
 
+Pool identity also includes a KDF digest of the API credential (the digest is persisted inside the pool id, never the key). A run's binding captures its credential at bind time, so rotating or re-pointing the key takes effect for the next binding that presents the new key — the next run or workspace realization, or the first bind after a worker restart — without any pool surgery: that resolve builds a pool bound to the new credential, and the superseded pool is swept under the old credential and retired, with its journal retained for the normal retired-pool retention instead of being orphaned. A run that is already bound keeps its bind-time credential until it ends, and its pool is never handed to a new-credential binding; to cut a compromised key off immediately, also end live runs or restart the worker.
+
 The delta push does not trust the guest-side mirror marker alone: files the delta would skip are hashed on the guest against the host manifest on every push, and any missing or differing file is resent before the command runs, so a tampered mirror (including a poisoned lockfile) is repaired instead of executed or staged back.
+
+A released pool VM also releases its SSH session: a confirmed idle stop, retirement, quarantine, or failed pending delete closes and forgets that VM's cached control session (a next command re-opens on demand), and runtime shutdown closes any sessions left cached. Session cleanup never loses a stop receipt: hook failures are logged and swallowed.
+
+Collect compares the mirror against both the uploaded manifest and the previous command's host-kept post-collect guest scan: guest-only output a previous command already reported (test caches, reports, generated files outside the return set) is not staged again, and a guest-only unsupported create never turns a successful remote exit into 74 or keeps an artifact on its own — it is listed as unsupported in the result instead. Files the host uploaded are always compared against the baseline (push restores them before every command), so a repeated edit or delete of an uploaded file stages on every command that makes it. Common tool caches (`.hypothesis/`, `.mypy_cache/`, `.ruff_cache/`, `.tox/`, `.nox/`, `test-results/`, `playwright-report/`, `*.egg-info/`, `*.profraw`) are sync-excluded outright. FIFOs, sockets and devices in the mirror are recorded as metadata-only special files and files past the 256 MiB scan hash budget as unhashed; hitting the scan entry or serialized-size limit truncates the scan, and a truncated scan never stages deletions for files it did not reach — none of these make collect throw. When collect still fails deterministically on guest mirror content after the transport returned an exit, the command completes with its real exit code and a `truncated` sync-back (no artifact, no replay), the VM is released normally, and the mirror is wiped and fully resynced on the next push; transport failures during collect keep the held-for-reconciliation path. Retained artifact directories are swept by age; the count cap only evicts artifacts older than the one-day result-retention window, oldest first, so an artifact a retained result can still name is never deleted early.
+
+Pool creates carry the reservation id as the `Idempotency-Key`, so a create whose reply is lost never bills a second VM: the next claim replays the same key and adopts the replayed VM when it is compatible, or stops it and frees the slot when another trust domain retries first. The replay resends the exact persisted create body (type, ttl, monitoring, failFast, noEnv, fork source), because the provider refuses a same-key retry with a different body; a refusal that proves nothing about the lost VM (409/422/429/503 and transport errors) keeps the placeholder quarantined for the next claim instead of retiring it. Adoption funds the adopting command warm — the live VM already holds its provider active slot, so no second active/start charge is admitted — extends the provider TTL whenever the remaining provider life cannot cover the adopter's funded envelope (the deadline runs from the original create, not the replay, so a delayed replay renews even for a shorter adopter; the replay response's archiveAfter is the verified remaining deadline when present), renews the original hold through a granted extension before receipting the adopter, and releases the original hold only after the adopter is receipted and the pool write is durable; a failed receipt, TTL extension, or pool write fails the new hold and keeps the placeholder quarantined for the next same-key replay.
 
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
@@ -62,10 +70,27 @@ profile + normalized-command-signature duration history (last 20 runs,
 30-day TTL) in its existing company-scoped state. A Node/Python command is a
 remote candidate only when its recorded median meets
 `offloadMinExpectedSeconds` (default 120); unknown signatures run local first
-and record, so the second identical long run can go remote. Recordings come
-from completed remote runs (server-side) and from shim-reported local runs
-(`POST /offload/report`, agent-authed, bounded samples). Rust keeps its
-existing behaviour and is never gated by this setting.
+and record, so the second identical long run can go remote. The gate learns
+host-measured wall time only: a completed remote run records the host-side
+elapsed interval (the guest-reported value can only shorten it, never
+lengthen it), and every sample is clamped to one day. Recordings come from
+completed remote runs (server-side) and from shim-reported local runs
+(`POST /offload/report`, agent-authed, bounded samples). Reports for
+local-mode signatures (watch mode, single-file filters, inline code,
+unrecognized scripts) are refused before any state write, and each run is
+rate-limited (a short burst, then one report per second, 200 per run); excess
+samples are dropped. History keeps the last 20 runs per signature with a
+30-day TTL, and at most 500 signature keys per company scope (shared across
+repos): evicted
+and expired keys are deleted during the pool sweep, so unique-argv report
+loops cannot grow plugin state without bound. Guest-reported exit facts are
+untrusted input: only an integer exit code 0..255 with finite non-negative
+seconds is accepted, `cancelled`/`timedOut` come from host state only, and
+anything else ends the command `unknown` instead of entering the journal or
+the account ledger. Heartbeats renew interest with a duration, never an
+absolute timestamp, so a skewed guest clock can neither fail renewals nor
+refuse prepare. Rust keeps its existing behaviour and is never gated by this
+setting.
 
 Short commands must stay local: sync plus VM overhead (~30 s) makes anything
 shorter slower remotely. Watch modes, single-file filters, lint/typecheck/

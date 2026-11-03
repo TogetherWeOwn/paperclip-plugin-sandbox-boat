@@ -49,9 +49,12 @@ async function bindOnFirstRequest(boat: BoatVmManager, input: PluginApiRequestIn
   const workspaceId = (input.body as { executionWorkspaceId?: unknown } | null)?.executionWorkspaceId;
   if (!runId || typeof workspaceId !== "string" || !UUID.test(workspaceId) || !bindLocalRun) return;
   const issueId = boat.localRunIssue(input.companyId, runId);
-  // A run that already holds any offload binding never re-binds from a request:
-  // probing with random workspace ids must not spend secret resolutions.
-  if (!issueId || boat.hasAnyOffloadBinding(input.companyId, runId)) return;
+  // Skip only when this run is already bound under the requested id: a run
+  // bound under a different host-owned id of the same workspace (execution vs
+  // project workspace id) can still complete a validated bind for the id it
+  // reports. A bogus id never reaches a secret resolution: bindLocalRun's
+  // expected-workspace check refuses it first.
+  if (!issueId || boat.hasOffloadBinding(input.companyId, runId, workspaceId)) return;
   const pendingKey = JSON.stringify([input.companyId, runId]);
   let pending = pendingBinds.get(pendingKey);
   if (!pending) {
@@ -112,7 +115,9 @@ const plugin = definePlugin({
         canonicalPath: fsCanonicalPath,
         onDiskRepoUrl: readGitOriginUrl,
         apiKey: async (secretRef, company) => await ctx.secrets.resolve(secretRef as never, { companyId: company, configPath: "offloadLocalApiKeySecretRef" }),
-      }, { expectedWorkspaceId }).catch((error: unknown) => {
+      }, { expectedWorkspaceId,
+        onRefuse: (reason) => ctx.logger.warn("boat: local-run offload binding refused", { runId, issueId, reason }),
+      }).catch((error: unknown) => {
         ctx.logger.warn("boat: local-run offload binding skipped", { error: error instanceof Error ? error.message : String(error) });
         return null;
       });
@@ -121,7 +126,11 @@ const plugin = definePlugin({
         ctx.logger.warn("boat: local-run offload binding not persisted", { error: error instanceof Error ? error.message : String(error) });
         return false;
       }) : false;
-      if (bound) ctx.logger.info("boat: bound local run for offload", { runId });
+      if (bound && params) {
+        const request = params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+        const workspaceId = typeof request?.executionWorkspaceId === "string" ? request.executionWorkspaceId : null;
+        ctx.logger.info("boat: bound local run for offload", { runId, workspaceId });
+      }
       return bound;
     };
     ctx.events.on("agent.run.started", async (event) => {
@@ -230,18 +239,27 @@ const plugin = definePlugin({
   },
 
   async onEnvironmentReleaseLease(params) {
-    const receipt = await requireManager().release(params, "release");
-    requireManager().sweepSoon("release");
-    return receipt;
+    // The sweep runs even when the release throws (a failed delete still
+    // stopped the VM; the sweep retries the delete from the record).
+    try {
+      return await requireManager().release(params, "release");
+    } finally {
+      requireManager().sweepSoon("release");
+    }
   },
 
   async onEnvironmentStopLease(params) {
+    // No sweep here: release-review interleavings call the manager directly
+    // to keep fire-and-forget sweeps out. A failed stop stays tracked
+    // (stopping, no tombstone) for the scheduled sweep to retry.
     const receipt = await requireManager().release(params, "stop");
     if (!receipt) throw new Error("boat stop was not confirmed.");
     return receipt;
   },
 
   async onEnvironmentDestroyLease(params) {
+    // No sweep here, matching StopLease above. A failed delete stops the VM
+    // and keeps it tracked (stopped, no tombstone) for the scheduled sweep.
     return await requireManager().destroy(params);
   },
 

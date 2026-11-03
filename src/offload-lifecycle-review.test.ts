@@ -169,7 +169,7 @@ describe("review: durable lifecycle result safety", () => {
       guestReceipts: { read: async () => ({ version: 1, kind: "result", identity: stored.identity,
         result: { exitCode: 0, seconds: 1 } }) },
       resolveRunState: async () => ({ permanentlyTerminal: false, terminatedAt: null, tokenExpiresAt: s.clock.t + 86_400_000 }),
-      sync: { push: async () => {}, collect: async () => {}, stage: async () => {} },
+      sync: { push: async () => {}, collect: async () => {}, stage: async () => {}, markSuspect: async () => {} },
     }, s.clock.now, { hold: async () => {}, release, cancel: async () => {} },
     new OffloadLifecycle(s.guest, s.clock.now, { set: s.clock.set, clear: s.clock.clear }));
     const launch = vi.fn(async () => { throw new Error("must not relaunch"); });

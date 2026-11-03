@@ -98,6 +98,7 @@ function busyExecutor(store?: FileStore) {
       push: async (_vm, cmd) => { syncEffects.push(`${cmd.commandId}/push`); },
       collect: async (_vm, cmd) => { syncEffects.push(`${cmd.commandId}/collect`); },
       stage: async (_vm, cmd) => { syncEffects.push(`${cmd.commandId}/stage`); },
+      markSuspect: async () => {},
     },
     runCommand: async (_vm, cmd) => {
       effects.push(cmd.commandId);
@@ -116,7 +117,7 @@ describe("durable pre-start sync failures", () => {
     const cmd = command("push-failed");
     const first = h.openExecutor({ sync: {
       push: async () => { throw new Error("INJECTED_SYNC_PUSH_FAILURE"); },
-      collect: async () => {}, stage: async () => {},
+      collect: async () => {}, stage: async () => {}, markSuspect: async () => {},
     } });
     const refusal = await settled(first.executor.execute(cmd));
     expect.soft(h.attempts).toHaveLength(0);
@@ -136,7 +137,7 @@ describe("durable pre-start sync failures", () => {
     store.commit.release();
     const first = h.openExecutor({ journalStore: store, sync: {
       push: async () => { throw new Error("INJECTED_SYNC_PUSH_FAILURE"); },
-      collect: async () => {}, stage: async () => {},
+      collect: async () => {}, stage: async () => {}, markSuspect: async () => {},
     } });
     const result = await settled(first.executor.execute(cmd));
     expect.soft(result).not.toMatchObject({ fallbackSafe: true });
@@ -190,6 +191,7 @@ describe("live pre-spawn cancellation", () => {
       push: async () => { syncEffects.push("push"); pushing.release(); await releasePush.promise; },
       collect: async () => { syncEffects.push("collect"); },
       stage: async () => { syncEffects.push("stage"); },
+      markSuspect: async () => {},
     } });
     const execution = track(executor.execute(cmd));
     await pushing.promise;

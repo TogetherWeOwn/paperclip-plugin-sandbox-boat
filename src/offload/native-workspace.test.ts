@@ -60,6 +60,52 @@ describe("native workspace binding", () => {
     expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
   });
 
+  it("answers under the host payload's project workspace id as well", async () => {
+    // The shim reports PAPERCLIP_WORKSPACE_ID, which carries the project
+    // workspace id, while the realization keys on the execution workspace id.
+    const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
+    await setup();
+    await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace({
+      source: { localPath: "/work/public-rust", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" },
+    }));
+    const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
+    expect(response).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+  });
+
+  it("refuses a project alias two execution workspaces of one run claim with different sources", async () => {
+    // The shim can only send the shared project id, so an alias naming two
+    // checkouts must fail closed instead of serving the later one.
+    const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
+    const otherWorkspaceId = "22222222-2222-4222-8222-222222222222";
+    await setup();
+    await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace({
+      source: { localPath: "/work/public-rust", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" },
+    }));
+    const second = nativeWorkspace({ executionWorkspaceId: otherWorkspaceId,
+      source: { localPath: "/work/other-checkout", projectId: "project-a", projectWorkspaceId,
+        repoUrl: "https://github.com/example/public-rust" } });
+    second.workspace.localPath = "/work/other-checkout";
+    await plugin.definition.onEnvironmentRealizeWorkspace!(second);
+    const byAlias = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
+    expect(byAlias).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    const byOther = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
+      body: { ...body, executionWorkspaceId: otherWorkspaceId }, params: {}, query: {} } as never);
+    expect(byOther).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+  });
+
+  it("logs the run, workspace and reason when the exec route refuses with 503", async () => {
+    const harness = await setup();
+    expect((await submit()).status).toBe(503);
+    expect(harness.logs.some((entry) => entry.message === "boat: offload exec refused"
+      && entry.meta?.runId === runId && entry.meta?.workspaceId === workspaceId
+      && String(entry.meta?.reason).includes("unknown execution workspace"))).toBe(true);
+  });
+
   it("persists only source metadata and survives a worker restart", async () => {
     const t = await setup();
     const params = nativeWorkspace({ runtimeOverlay: { provisionCommand: "sensitive-not-to-persist" } });

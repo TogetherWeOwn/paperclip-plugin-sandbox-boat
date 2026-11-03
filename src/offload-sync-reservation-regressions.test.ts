@@ -17,7 +17,7 @@ describe("sync receipt plumbing", () => {
     const journal = new OffloadJournal({ journalStore: s.state.store(),
       guestReceipts: { bootId: async () => "boot-a", read: async () => null },
       resolveRunState: async () => ({ permanentlyTerminal: false, terminatedAt: null, tokenExpiresAt: EPOCH + 86_400_000 }),
-      sync: { push: async () => {}, collect: async () => collected, stage },
+      sync: { push: async () => {}, collect: async () => collected, stage, markSuspect: async () => {} },
     }, s.clock.now, { hold: async () => {}, release: async () => {}, cancel: async () => {} });
     const result = await journal.execute(cmd, async () => {
       const raw = await journal.run("sync-vm", cmd, async () => ({ exitCode: 0, seconds: 1 }));

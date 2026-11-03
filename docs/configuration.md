@@ -26,11 +26,11 @@ Set these on the Paperclip sandbox environment, driver `boat`. Only `apiKey` is 
 | `managedGithub` | false | Deliver Paperclip's managed-GitHub capability and its `git`/`gh` launcher shells, so the agent can push. Off by default: any VM process can exchange the capability for a GitHub credential with the run's grants while the run is live. Leave off for public repos and PR branches. |
 | `envAllowlist` | built-in list | Run env names that may reach the VM. See [Run env allowlist](security.md#run-env-allowlist). A list you set replaces the built-in one; an empty list (`[]`) sends nothing. |
 | `noEnv` | true | |
-| `monitoring` | true | Explicit opt-out: `false` for **new** VMs. Existing VMs keep their creation policy. Never changes an account-wide switch; see [monitoring privacy](security.md#monitoring-retention-and-privacy). |
+| `monitoring` | true | Explicit opt-out: `false` for **new** VMs, whole-run and offload pool alike. Existing VMs keep their creation policy, and offload pool reuse never crosses the policy boundary. Never changes an account-wide switch; see [monitoring privacy](security.md#monitoring-retention-and-privacy). |
 | `boatEnvironment` | account default | |
 | `remoteWorkspaceDir` | `$HOME/paperclip-workspace` | A plain absolute path below `/home/user`, used as typed (no `~` or `$HOME`), with no `$`, backtick or backslash (bash would expand them in the launcher's `BASH_ENV`). Anything else is a config error (`BOAT_CONFIG_INVALID` at acquire, before any start): the home `.boatignore` applies only there. |
 | `namePrefix` | `paperclip` | |
-| `costApiKey` | main key | An optional read-only key for usage reads. |
+| `costApiKey` | main key | An optional read-only key for usage reads. Blank: this environment's `apiKey`. The host `BOAT_READONLY_KEY` is used only when the ops key also comes from the host (`BOAT_API_KEY`), never in place of an environment's own `apiKey` — the two may belong to different boat accounts. |
 | `timeoutMs` / `stopConfirmTimeoutMs` / `sshConnectTimeoutSec` | 300000 / 120000 / 15 | |
 | `syncOutMaxBytes` | 8589934592 (8 GiB) | Host safety: refuse a guest sync-out archive whose files total more than this. Hard bound 32 GiB. See [Sync-out receiver budgets](security.md#sync-out-receiver-budgets). |
 | `syncOutMaxFiles` | 200000 | Host safety: refuse a guest sync-out archive with more entries (files, directories, symlinks) than this. Hard bound 1000000. |

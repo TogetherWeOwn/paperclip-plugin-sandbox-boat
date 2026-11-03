@@ -255,9 +255,16 @@ export function resolveApiKey(config: BoatDriverConfig): string {
   return fromEnv;
 }
 
-/** Read-only key for cost reads when configured; otherwise the ops key. */
+/**
+ * Read-only key for cost reads when configured; otherwise the ops key. The
+ * host BOAT_READONLY_KEY is only a fallback for environments whose ops key
+ * also comes from the host: an environment with its own apiKey may belong to
+ * a different Boat account than the host key, and cost reads under the wrong
+ * account 404 and silently degrade to estimates.
+ */
 export function resolveCostApiKey(config: BoatDriverConfig): string {
   if (config.costApiKey) return config.costApiKey;
+  if (config.apiKey) return config.apiKey;
   const fromEnv = hostKeysAllowed(config) ? process.env.BOAT_READONLY_KEY?.trim() : undefined;
   return fromEnv ? fromEnv : resolveApiKey(config);
 }

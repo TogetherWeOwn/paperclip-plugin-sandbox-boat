@@ -115,7 +115,9 @@ export interface OffloadOutputEvent {
 }
 
 export interface OffloadSyncBack {
-  state: "clean" | "staged" | "conflict";
+  /** truncated: the command completed but collecting its writes failed or was
+   * cut short; the exit code is real, no artifact exists, nothing replays. */
+  state: "clean" | "staged" | "conflict" | "truncated";
   changedPaths: string[];
   conflictPaths: string[];
   artifactId: string | null;

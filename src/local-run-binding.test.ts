@@ -72,6 +72,39 @@ describe("local-run offload binding", () => {
     expect(apiKey).not.toHaveBeenCalled();
   });
 
+  it("accepts the project workspace id the shim reports for an execution-branch bind", async () => {
+    // The live smoke failure: the bind keys on the execution
+    // workspace id, but PAPERCLIP_WORKSPACE_ID carries the project workspace id.
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      workspace: async () => ({ projectId: "project", projectWorkspaceId, path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
+    }), { expectedWorkspaceId: projectWorkspaceId });
+    expect(params).toMatchObject({
+      workspace: { localPath: "/srv/work/repo", metadata: { workspaceRealizationRequest: {
+        heartbeatRunId: runId, executionWorkspaceId: workspaceId, localRun: true,
+        source: { localPath: "/srv/work/repo", repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId },
+      } } },
+    });
+  });
+
+  it("falls back to the execution workspace cwd when its path is null", async () => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      workspace: async () => ({ projectId: "project", projectWorkspaceId, path: null, cwd: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
+    }));
+    expect(params).toMatchObject({ workspace: { localPath: "/srv/work/repo" } });
+  });
+
+  it.each([
+    ["disabled", { ...enabled, offloadLocalRunsEnabled: false }, host(), {}, "not enabled"],
+    ["outside the roots", enabled, host({ workspace: async () => ({ projectId: "p", projectWorkspaceId: null, path: "/home/other/repo", repoUrl: "https://github.com/example/public" }) }), {}, "outside the configured roots"],
+    ["expected workspace differs", enabled, host(), { expectedWorkspaceId: projectWorkspaceId }, "does not match"],
+    ["on-disk origin differs", enabled, host({ onDiskRepoUrl: async () => "https://github.com/example/private" }), {}, "does not match"],
+  ])("reports a refusal reason the caller can log: %s", async (_name, settings, fakeHost, options, reason) => {
+    const reasons: string[] = [];
+    expect(await localRunRealization(started, localRunSettings(settings), fakeHost, { ...options, onRefuse: (r) => reasons.push(r) })).toBe(null);
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain(reason);
+  });
+
   it("binds the project workspace when the live issue shape leaves executionWorkspaceId null", async () => {
     const params = await localRunRealization(started, localRunSettings(enabled), host({
       issueWorkspaceId: async () => null,
@@ -181,6 +214,46 @@ describe("plugin wiring", () => {
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
   });
 
+  it("answers under the project workspace id the shim reports for an execution-branch bind", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    await harness.emit("agent.run.started", started);
+    const bound = harness.logs.find((entry) => entry.message === "boat: bound local run for offload");
+    expect(bound?.meta).toMatchObject({ runId, workspaceId });
+    const response = await exec(runId, projectWorkspaceId);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ mode: "remote_candidate" });
+    expect((await exec(runId, workspaceId)).status).toBe(200);
+    const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+    // A workspace id the host never named for this run still refuses.
+    expect((await exec(runId, randomUUID())).status).toBe(503);
+  });
+
+  it("completes the bind on request when the started bind registered only the execution id", async () => {
+    const harness = await setup(enabled);
+    // The started bind sees no project workspace link yet: primary id only.
+    await harness.emit("agent.run.started", started);
+    const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(false);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+    // Probing afterwards with random ids still spends no secret resolution.
+    let resolutions = 0;
+    const originalResolve = harness.ctx.secrets.resolve;
+    harness.ctx.secrets.resolve = async (ref: { secretId?: string } | null) => { resolutions += 1; return originalResolve(ref); };
+    try {
+      for (let i = 0; i < 10; i += 1) expect((await exec(runId, randomUUID())).status).toBe(503);
+      expect(resolutions).toBe(0);
+    } finally {
+      harness.ctx.secrets.resolve = originalResolve;
+    }
+  });
+
   it("binds on the first offload request when the workspace was prepared after the started event", async () => {
     const harness = await setup(enabled);
     harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
@@ -288,6 +361,177 @@ describe("plugin wiring", () => {
     }
   });
 
+  it("a racing whole-run realization without the project alias still claims the alias the local bind registered", async () => {
+    // The local bind's workspace metadata carries the project workspace id,
+    // but the racing whole-run payload omits it: the alias record the local
+    // write just made must end up serving the whole-run source in both
+    // stores, not the local checkout.
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-race-alias-"));
+    const nativeEnv = randomUUID();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const writing = new Promise<void>((resolve) => { reached = resolve; });
+    const originalSet = harness.ctx.state.set;
+    let gated = false;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces" && !gated) { gated = true; reached(); await gate; }
+      return originalSet(input, value);
+    };
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await writing;
+      const realizing = plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      release();
+      await Promise.all([pending, realizing]);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(nativeSource);
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(nativeSource);
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    } finally {
+      harness.ctx.state.set = originalSet;
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  // State writes in the two restoration-race tests below, in order: the local
+  // record under both ids (1-2), the whole-run realization's own persisted
+  // record and alias claim (3-4), then the restoration write inside
+  // rememberLocalRun (5). Gating write 5 holds the restoration in flight.
+  const gateRestorationWrites = (harness: Awaited<ReturnType<typeof setup>>) => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstReached!: () => void;
+    const firstWriting = new Promise<void>((resolve) => { firstReached = resolve; });
+    let releaseRestore!: () => void;
+    const restoreGate = new Promise<void>((resolve) => { releaseRestore = resolve; });
+    let restoreReached!: () => void;
+    const restoreWriting = new Promise<void>((resolve) => { restoreReached = resolve; });
+    const originalSet = harness.ctx.state.set;
+    let writes = 0;
+    harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
+      if (input.namespace === "boat-offload-workspaces") {
+        writes += 1;
+        if (writes === 1) { firstReached(); await firstGate; }
+        if (writes === 5) { restoreReached(); await restoreGate; }
+      }
+      return originalSet(input, value);
+    };
+    return { firstWriting, restoreWriting, releaseFirst, releaseRestore,
+      restore: () => { harness.ctx.state.set = originalSet; } };
+  };
+  const realizeWholeRun = (source: string, projectId: string) => {
+    const nativeEnv = randomUUID();
+    return plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+      config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+      workspace: { localPath: source, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+        environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+        source: { localPath: source, repoUrl: null, projectId, projectWorkspaceId: null } } } } } as never);
+  };
+
+  it("a terminal event while the whole-run restoration is written leaves no binding under either id", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-restore-terminal-"));
+    const gates = gateRestorationWrites(harness);
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await gates.firstWriting;
+      const realizing = realizeWholeRun(nativeSource, "native-project");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseFirst();
+      await gates.restoreWriting;
+      const ending = harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseRestore();
+      await Promise.all([pending, realizing, ending]);
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+      expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(false);
+      expect((await exec(runId)).status).toBe(403);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(403);
+    } finally {
+      gates.restore();
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  it("a newer whole-run realization landing during the restoration is the one both stores serve", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    const sourceA = await mkdtemp(path.join(tmpdir(), "boat-native-restore-a-"));
+    const sourceB = await mkdtemp(path.join(tmpdir(), "boat-native-restore-b-"));
+    const gates = gateRestorationWrites(harness);
+    try {
+      const pending = harness.emit("agent.run.started", started);
+      await gates.firstWriting;
+      const realizingA = realizeWholeRun(sourceA, "native-project-a");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseFirst();
+      await gates.restoreWriting;
+      const realizingB = realizeWholeRun(sourceB, "native-project-b");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      gates.releaseRestore();
+      await Promise.all([pending, realizingA, realizingB]);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(sourceB);
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(sourceB);
+      // hasOffloadBinding is boolean, so read the runtime binding's source
+      // directly: it must be B under both ids, not the stale captured A.
+      const manager = (await import("./plugin.js")).currentManager();
+      const runtime = manager as unknown as { nativeOffload: { bindings: Map<string, { source: string }> } };
+      expect(runtime.nativeOffload.bindings.get(JSON.stringify([companyId, runId, workspaceId]))?.source).toBe(sourceB);
+      expect(runtime.nativeOffload.bindings.get(JSON.stringify([companyId, runId, projectWorkspaceId]))?.source).toBe(sourceB);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    } finally {
+      gates.restore();
+      await rm(sourceA, { recursive: true, force: true });
+      await rm(sourceB, { recursive: true, force: true });
+    }
+  });
+
+  it("a whole-run realization without the project alias supersedes a completed local bind under the alias in both stores", async () => {
+    const harness = await setup(enabled);
+    harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
+      projectWorkspaceId, path: dir, cwd: dir });
+    await harness.emit("agent.run.started", started);
+    expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-after-local-"));
+    const nativeEnv = randomUUID();
+    try {
+      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId: null } } } } } as never);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(nativeSource);
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(nativeSource);
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(true);
+      expect((await exec(runId, projectWorkspaceId)).status).toBe(200);
+      expect((await exec(runId, workspaceId)).status).toBe(200);
+    } finally {
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
   it("a failed state write on the first offload request falls back locally and stays retryable", async () => {
     const harness = await setup(enabled);
     harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
@@ -344,6 +588,32 @@ describe("plugin wiring", () => {
       expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
       await harness.emit("agent.run.started", started);
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    } finally {
+      await rm(nativeSource, { recursive: true, force: true });
+    }
+  });
+
+  it("never replaces a whole-run realization under its project workspace alias", async () => {
+    const harness = await setup(enabled);
+    const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-alias-"));
+    const nativeEnv = randomUUID();
+    try {
+      await plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
+        config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
+        workspace: { localPath: nativeSource, metadata: { workspaceRealizationRequest: { version: 1, companyId,
+          environmentId: nativeEnv, heartbeatRunId: runId, executionWorkspaceId: workspaceId,
+          source: { localPath: nativeSource, repoUrl: null, projectId: "native-project", projectWorkspaceId } } } } } as never);
+      // The issue now presents without an execution workspace, so the started
+      // local bind takes the project branch and keys on the alias alone.
+      harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+      harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",
+        path: harness.workspaces.get(workspaceId)!.path, repoUrl: "https://github.com/example/public" });
+      await harness.emit("agent.run.started", started);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
+      expect(saved.find((record) => record.workspaceId === projectWorkspaceId)?.workspace?.path).toBe(nativeSource);
+      expect(saved.find((record) => record.workspaceId === workspaceId)?.workspace?.path).toBe(nativeSource);
     } finally {
       await rm(nativeSource, { recursive: true, force: true });
     }

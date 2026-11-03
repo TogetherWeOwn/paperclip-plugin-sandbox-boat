@@ -116,7 +116,10 @@ uncertain command locally. Broker restart still holds unresolved commands for
 reconciliation; the [executor backend adapter](design/offload-internals.md#executor-backend-adapter) does not
 automatically reattach lost handles.
 The stock lifecycle executor uses the existing native sweep/recovery/shutdown
-integration. Loopback SSH acceptance tests exercise actual kernel enforcement;
+integration. Worker shutdown bounds the offload drain at a real-time 5 s and then closes all
+SSH state (control masters, tunnels, key dir) even when the drain hangs or
+rejects, so a stuck offload shutdown cannot leak SSH processes or key material.
+Loopback SSH acceptance tests exercise actual kernel enforcement;
 no deployment, live Boat call or live Boat enforcement claim is part of them.
 
 The shim's own rollback and the native network-policy rollback rules are in [Cargo offload shim](offload.md#cargo-offload-shim-binboat-offload-cargo) and [Native task network-policy admission](security.md#native-task-network-policy-admission-not-network-isolation).
@@ -260,13 +263,22 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 
   A warning log line names the limit. If the limits cannot be read, nothing is started.
 * **Fail-fast starts.** A start that finds no ready machine gets `503 no_ready_machine` at once. Nothing is started or billed. The plugin retries twice, 5 s apart, then fails with `BOAT_NO_READY_MACHINE`.
-* **Retries never double-bill.** Creates send an `Idempotency-Key`. boat documents the key for create and fork only, and the SDK has no key for resume. A resume retry therefore checks the VM state first and treats `sandbox_resuming` as done.
+* **Retries never double-bill.** Creates send an `Idempotency-Key`. boat documents the key for create and fork only, and the SDK has no key for resume. A resume retry therefore checks the VM state first and treats `sandbox_resuming` as done. Pool creates carry the reservation id as the key, so a retry after a lost reply replays the same provider effect instead of billing a second VM: a compatible retry adopts the VM and runs on it, an incompatible one stops it, settles the reservation, and frees the slot for a fresh create.
+* **A failed delete stops.** If the provider delete fails on release of a per-run VM (or on destroy), the plugin stops the VM instead so billing stops, records the stop, and rethrows the delete error. No tombstone is written: the record keeps the VM tracked (stopped) so later sweep passes still see it.
 
 ### Offload VM-hour cap
 
 `offloadMonthlyVmHourCap` (default 0, disabled) caps the month's tracked
 offload VM-hours per company against the existing account-ledger usage rows;
-once reached, new commands run local until next month.
+once reached, new commands run local until next month. The check is strict:
+admission counts settled usage plus pending envelopes plus the new request's
+own command-plus-tail envelope, so a request that would cross the cap is
+refused instead of admitting one extra envelope past it. Stop lag does not
+inflate the month: a tail closed on late terminal evidence ends at the stop
+deadline plus a 5-minute grace (or the funded tail plus a 5-minute grace), and a still-open tail
+counts at most its funded tail plus grace. Ambiguous or never-reported starts
+hold capacity only until their provider TTL plus 10 minutes, then retire as
+`aborted_start` instead of locking the account forever.
 
 ### Usage accounting
 
