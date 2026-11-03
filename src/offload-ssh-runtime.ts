@@ -799,7 +799,7 @@ export class SshOffloadRuntime {
       guestReceipts: { read: inert },
       resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
         tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
-      sync: { push: inert, collect: inert, stage: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
+      sync: { push: inert, collect: inert, stage: inert, markSuspect: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
     const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     const now = Date.now();
     // Fields a concurrent claim changes; compared against a reload before
