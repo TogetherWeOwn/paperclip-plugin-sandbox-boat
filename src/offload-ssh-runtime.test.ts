@@ -117,6 +117,46 @@ describe("project workspace alias", () => {
   });
 });
 
+describe("project workspace alias across runs", () => {
+  it("keys the alias per run: two runs sharing one project workspace never resolve each other's source", async () => {
+    const projectWorkspaceId = randomUUID();
+    const otherRunId = randomUUID();
+    const emptySource = path.join(ssh.root, "empty-checkout");
+    await mkdir(emptySource);
+    // A valid cargo checkout except for one secret-bearing tracked name, so
+    // the gate refuses it with exactly one source-dependent reason.
+    await writeFile(path.join(emptySource, "Cargo.lock"), "local-lock");
+    await writeFile(path.join(emptySource, "Cargo.toml"), "public source");
+    await writeFile(path.join(emptySource, "deploy.key"), "not a real key");
+    const realize = (forRunId: string, localPath: string, workspaceId: string) => {
+      const params = native();
+      params.workspace.localPath = localPath;
+      const request = params.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, unknown>;
+      request.heartbeatRunId = forRunId;
+      request.executionWorkspaceId = workspaceId;
+      const src = request.source as Record<string, unknown>;
+      src.localPath = localPath;
+      src.projectWorkspaceId = projectWorkspaceId;
+      return params;
+    };
+    // Bound within the same tick, as two runs starting together would be.
+    runtime.remember(realize(runId, source, executionWorkspaceId));
+    runtime.remember(realize(otherRunId, emptySource, randomUUID()));
+    expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(true);
+    expect(runtime.has(companyId, otherRunId, projectWorkspaceId)).toBe(true);
+    // The first run resolves through the shared alias to its own checkout.
+    mustResolve(await runtime.resolve({ ...command(), executionWorkspaceId: projectWorkspaceId }, config));
+    // The second run gets its own checkout, so the read-only gates refuse it
+    // for its own secret-bearing file — never the first run's clean source,
+    // and never a missing binding.
+    const refused = await runtime.resolve({ ...command(), runId: otherRunId, executionWorkspaceId: projectWorkspaceId }, config);
+    expect(isExecutorRefusal(refused)).toBe(true);
+    if (isExecutorRefusal(refused)) {
+      expect(refused.refusalReason).toBe("tracked secret-bearing file keeps the command local");
+    }
+  });
+});
+
 describe("stock concrete executor factory", () => {
   it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
     const executor = mustResolve(await runtime.resolve(command(), config));

@@ -117,6 +117,43 @@ const PRE_START = new Set<OffloadState>(["accepted", "queued", "syncing_in"]);
 const STATES = new Set<OffloadState>([...TERMINAL, ...PRE_START, "starting", "running", "syncing_out", "unknown"]);
 export const offloadError = (code: string) => Object.assign(new Error(code), { code });
 
+/** The pre-start steps of `OffloadJournal.run()`, in dispatch order. A failure
+ * in any of them happens before transport, so it is a known non-start — but
+ * which step failed (and its error code) is exactly what an operator needs,
+ * and what the generic "command failed before durable starting intent" used
+ * to discard. */
+export type PreStartStep = "sync-in journal commit" | "sync push" | "guest boot identity"
+  | "guest lifecycle prepare" | "durable starting intent commit" | "pool identity bind";
+
+export interface PreStartFailure {
+  step: PreStartStep;
+  /** Sanitized first-party/errno error code, or null. */
+  code: string | null;
+  /** Server-authored reason safe for the journal result and shim announcement. */
+  reason: string;
+}
+
+// The failure record is journal-authored: the step comes from the call site,
+// the reason is built here, and only the error's `code` may join it — and
+// only when it is a known first-party prefix or an errno token. Raw error
+// messages never cross (they can carry guest diagnostics, source paths or
+// environment bytes; see the guest RPC boundary), and metadata is never
+// read from or written to an adapter-owned error object, whose accessors,
+// frozen state or reuse across commands must not affect attribution. The
+// single property read is guarded: describing a failure never throws.
+const SAFE_ERROR_CODE = /^(?:(?:OFFLOAD|SYNC|BOAT)_[A-Z0-9_]{1,56}|E[A-Z]{2,11})$/;
+function describePreStartFailure(step: PreStartStep, error: unknown): PreStartFailure {
+  let code: string | null = null;
+  try {
+    const raw = (error as { code?: unknown } | null)?.code;
+    if (typeof raw === "string" && SAFE_ERROR_CODE.test(raw)) code = raw;
+  } catch { /* A throwing accessor contributes no code. */ }
+  const reason = code === "OFFLOAD_COMMAND_NOT_STARTED"
+    ? "cancelled before durable starting intent"
+    : `${step} failed before the command could start${code ? ` (${code})` : ""}`;
+  return { step, code, reason };
+}
+
 export function commandDigest(command: OffloadCommand): string {
   const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
     : value && typeof value === "object" ? Object.fromEntries(Object.entries(value)
@@ -218,6 +255,11 @@ export class OffloadJournal {
   private startup: Promise<void> | null = null;
   private readonly inFlight = new Map<string, { digest: string; task: Promise<OffloadResult>; ready: Promise<OffloadCommandView> }>();
   private readonly active = new Map<string, OffloadRecord>();
+  /** Journal-authored record of the pre-start step that failed for a live
+   * command, so `finish()` converts its `unknown` into a `not_started` that
+   * names the site and the executor can log it. Set by `run()`, consumed by
+   * `finish()`, and dropped when the execution settles either way. */
+  private readonly preStartFailures = new Map<string, PreStartFailure>();
   private readonly held = new Map<string, OffloadIdentity>();
   private readonly transitions = new Map<string, Promise<unknown>>();
 
@@ -237,6 +279,14 @@ export class OffloadJournal {
   preStartResult(command: OffloadCommand): OffloadResult | null {
     const record = this.active.get(commandKey(command));
     return record?.state === "not_started" ? record.result : null;
+  }
+
+  /** The pre-start failure `run()` recorded for this command, if any, until
+   * the execution settles. Lets the executor log and surface the exact site
+   * without inspecting the (adapter-owned) thrown error. */
+  preStartFailure(command: OffloadCommand): PreStartFailure | null {
+    const failure = this.preStartFailures.get(commandKey(command));
+    return failure ? { ...failure } : null;
   }
 
   // Re-read durable state inside the record fence. A snapshot taken before the
@@ -417,6 +467,7 @@ export class OffloadJournal {
       return result.status === "unavailable" ? await this.finish(command, result) : result;
     } finally {
       this.active.delete(key);
+      this.preStartFailures.delete(key);
     }
   }
 
@@ -429,25 +480,44 @@ export class OffloadJournal {
   async run(sandboxId: string, command: OffloadCommand,
     transport: (sandboxId: string, command: OffloadCommand, identity?: OffloadIdentity) => Promise<CommandExit>) {
     const record = this.active.get(commandKey(command))!;
-    await this.beforeStart(record, { state: "syncing_in" });
+    // Every pre-start step records its failure under its own name for
+    // finish() and the executor log: a non-start must say which site refused,
+    // never collapse into one generic string for all of them. The original
+    // error is rethrown untouched.
+    this.preStartFailures.delete(commandKey(command));
+    const step = async <T>(name: PreStartStep, fn: () => Promise<T>): Promise<T> => {
+      try { return await fn(); } catch (error) {
+        this.preStartFailures.set(commandKey(command), describePreStartFailure(name, error));
+        throw error;
+      }
+    };
+    await step("sync-in journal commit", () => this.beforeStart(record, { state: "syncing_in" }));
     // Start the sync in the same continuation as the state check. A subsequent
     // cancellation can fence spawn, but need not abort an already-running push.
-    if (record.state === "not_started" || record.cancelRequested) throw offloadError("OFFLOAD_COMMAND_NOT_STARTED");
-    await this.deps.sync.push(sandboxId, command);
+    if (record.state === "not_started" || record.cancelRequested) {
+      const cancelled = offloadError("OFFLOAD_COMMAND_NOT_STARTED");
+      this.preStartFailures.set(commandKey(command), describePreStartFailure("sync push", cancelled));
+      throw cancelled;
+    }
+    await step("sync push", () => this.deps.sync.push(sandboxId, command));
     // Once the transport is invoked the guest may have run: a later failure,
     // transport or collect/stage alike, keeps the upload (and any partially
     // staged return) for receipt reconciliation; the retention sweep reclaims
     // it. Only a failure before transport ends the command's use of it.
     let transported = false;
     try {
-      const bootId = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
-      if (!bootId) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+      const bootId = await step("guest boot identity", async () => {
+        const id = this.deps.guestReceipts.bootId ? await this.deps.guestReceipts.bootId(sandboxId) : `unverified:${randomUUID()}`;
+        if (!id) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+        return id;
+      });
       const base: OffloadIdentity = { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
         digest: record.digest, sandboxId, guestBootId: bootId, journalGeneration: 1 };
-      const identity = this.lifecycle ? await this.lifecycle.prepare(sandboxId, command, base) : base;
+      const identity = this.lifecycle
+        ? await step("guest lifecycle prepare", () => this.lifecycle!.prepare(sandboxId, command, base)) : base;
       try {
-        await this.beforeStart(record, { state: "starting", identity, remoteStarted: null });
-        await this.pool.bind?.(identity);
+        await step("durable starting intent commit", () => this.beforeStart(record, { state: "starting", identity, remoteStarted: null }));
+        await step("pool identity bind", async () => { await this.pool.bind?.(identity); });
       } catch (error) {
         // A failed commit or pre-start cancellation must not retain an entry
         // registered by prepare(); neither watchdog nor transport was invoked.
@@ -512,8 +582,11 @@ export class OffloadJournal {
       }
       // No transport is invoked before the starting commit. A sync/boot-ID
       // failure is therefore a known non-start, not identity-less uncertainty.
+      // Name the step that failed (recorded by run()); the generic string
+      // remains only for a pre-start unknown no step claimed.
       if (PRE_START.has(record.state) && result.status === "unknown") {
-        result = this.unavailable(command, "command failed before durable starting intent");
+        result = this.unavailable(command,
+          this.preStartFailures.get(commandKey(command))?.reason ?? "command failed before durable starting intent");
       }
       // Guest-controlled facts never commit unvalidated: a malformed exit
       // commits unknown (holding the reservation) instead of throwing past
@@ -529,6 +602,7 @@ export class OffloadJournal {
       if (result.status === "unavailable") {
         if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
         await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        this.preStartFailures.delete(commandKey(command));
       } else if (result.status === "unknown") {
         await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
       } else {
