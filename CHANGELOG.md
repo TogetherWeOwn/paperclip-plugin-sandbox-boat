@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.14
+
+Follow-up to 0.2.13: offload preflight can recover from a stale SSH
+control master accepted before the guest sshd applied its delegated
+session config. Offload and whole-run behaviour stay off by default;
+nothing is enabled by upgrading.
+
+### Fixed
+
+* Guest preflight refusal tokens now name whether the SSH session is
+  inside the configured delegated parent. Only a `session_not_delegated`
+  refusal triggers one session refresh and an identical re-probe;
+  concurrent refreshes share one reopen. Eligibility still requires
+  literal `true` from the unchanged probe, and client-facing refusal
+  reasons and local-fallback semantics are unchanged. Only fixed,
+  validated placement words reach the server log, never guest membership
+  paths (#98).
+* The stalled-rsync cleanup test waits boundedly for spawned receiver
+  and wrapper identities before the kill assertion and for process exit
+  afterward. Its wrapper stays alive until signaled, so natural expiry
+  cannot hide a missed kill; this fixes the ubuntu-24.04 CI race without
+  changing runtime cleanup behaviour (#99).
+
+### Documentation
+
+* The delegated guest template recipe documents the per-boot sshd
+  settle service and config-watch path units, and requires preflight to
+  print literal `true` after a hands-off reboot. Release guidance also
+  clarifies that a green non-production tag needs no separate approval,
+  while money, credential and security changes retain their gates and
+  host-only steps stay with the operator (#97).
+
 ## 0.2.13
 
 Follow-up to 0.2.12: a guest-ineligible refusal at lifecycle prepare now
