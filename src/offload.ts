@@ -201,6 +201,24 @@ function sandboxStateOf(response: unknown, sandboxId: string): string | null {
     ? root.sandbox.state : null;
 }
 
+// The provider's verified remaining deadline for a replayed sandbox, when the
+// replay response carries it. Dates arrive as Date objects from some surfaces
+// and ISO strings from others; anything else falls back to the reservation's
+// own at+ttl deadline model.
+function archiveAfterOf(response: unknown): number | null {
+  if (!response || typeof response !== "object") return null;
+  const sandbox = (response as { sandbox?: unknown }).sandbox;
+  if (!sandbox || typeof sandbox !== "object") return null;
+  const raw = (sandbox as { archiveAfter?: unknown }).archiveAfter;
+  if (raw instanceof Date) return Number.isFinite(raw.getTime()) ? raw.getTime() : null;
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw === "string") {
+    const ms = Date.parse(raw);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
 const DEFAULTS = {
   queueLimit: 32,
   queueTimeoutMs: 30_000,
@@ -857,6 +875,7 @@ export class OffloadExecutor {
     const legacyJobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
     const legacyTtlSeconds = Math.max(60, Math.ceil(legacyJobSeconds + reservation.tailSeconds));
     let id: string;
+    let response: unknown = null;
     try {
       // Same key + same body: replay the exact persisted create body. A
       // provider that refuses a mismatched body proves nothing about the lost
@@ -864,34 +883,34 @@ export class OffloadExecutor {
       // predate the persisted body fall back to the current config.
       const pending = vm.pendingCreate;
       if (pending?.kind === "fork" && pending.sourceSandboxId) {
-        const response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
+        response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
           ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
           noEnv: pending.noEnv, idempotencyKey });
         const replayed = sandboxIdOf(response);
         if (!replayed) throw new Error("fork returned no sandbox id");
         id = replayed;
       } else if (pending) {
-        const response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
+        response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
           monitoring: pending.monitoring, failFast: pending.failFast, noEnv: pending.noEnv,
           ...(pending.from ? { from: pending.from } : {}), idempotencyKey });
         const replayed = sandboxIdOf(response);
         if (!replayed) throw new Error("create returned no sandbox id");
         id = replayed;
       } else if (this.config.templateSnapshot) {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
           monitoring: this.config.monitoring, failFast: true, noEnv: true,
           from: this.config.templateSnapshot, idempotencyKey });
         const replayed = sandboxIdOf(response);
         if (!replayed) throw new Error("create returned no sandbox id");
         id = replayed;
       } else if (this.config.templateSourceSandboxId) {
-        const response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+        response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
           ttlSeconds: legacyTtlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
         const replayed = sandboxIdOf(response);
         if (!replayed) throw new Error("fork returned no sandbox id");
         id = replayed;
       } else {
-        const response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
           monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
         const replayed = sandboxIdOf(response);
         if (!replayed) throw new Error("create returned no sandbox id");
@@ -923,15 +942,30 @@ export class OffloadExecutor {
       const funded = await this.admitCommand(command, "warm", id);
       if ("kind" in funded) return null;
       const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
-      // The replay resent the persisted (original) body, so a longer adopter
-      // would otherwise lose its VM mid-run. Extend the provider TTL to the
-      // funded envelope before dispatch; a refused extension keeps the VM
-      // (and the placeholder) tracked instead of running past its deadline.
+      // The provider deadline runs from the original create (≈ reservation.at),
+      // not from the replay: a delayed replay can leave almost no life even
+      // when the adopter envelope is shorter than the original TTL. Extend
+      // whenever the remaining life cannot cover the funded envelope,
+      // preferring the replay response's archiveAfter as the verified remaining
+      // deadline and falling back to the reservation's own at+ttl model. A
+      // refused extension keeps the VM (and the placeholder) tracked instead
+      // of running past its deadline.
       const originalTtl = vm.pendingCreate?.ttlSeconds ?? legacyTtlSeconds;
       let tailSeconds = funded.tailSeconds;
       try {
         const neededTtl = Math.max(60, Math.ceil(jobSeconds + funded.tailSeconds));
-        if (neededTtl > originalTtl) await this.boat.update({ sandboxId: id, ttlSeconds: neededTtl });
+        const verifiedAfter = archiveAfterOf(response);
+        const verifiedRemainingMs = verifiedAfter != null ? verifiedAfter - this.now() : null;
+        const remainingMs = verifiedRemainingMs ?? (reservation.at + originalTtl * 1000 - this.now());
+        if (remainingMs < neededTtl * 1000) {
+          await this.boat.update({ sandboxId: id, ttlSeconds: neededTtl });
+          // The provider deadline moved past the original hold: renew the
+          // original hold through it before receipting the adopter, so a later
+          // receipt or pool-write failure cannot leave the extended VM billing
+          // with no live reservation. The next same-key replay retries.
+          const elapsedS = Math.max(0, (this.now() - reservation.at) / 1000);
+          await ledger.extendTtl(reservation, Math.ceil(elapsedS + neededTtl));
+        }
         tailSeconds = await ledger.started(this.boat, funded, id);
       } catch {
         // The receipt write or the TTL extension failed: fail the new hold so

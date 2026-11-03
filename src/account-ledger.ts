@@ -569,6 +569,17 @@ export class AccountLedger {
     });
   }
 
+  /** Renew an unsettled intent's provider-deadline bound after a confirmed
+   * TTL extension, so the hold survives through the real auto-stop instead of
+   * the original TTL. Only ever raises the bound. */
+  async extendTtl(reservation: AccountReservation, ttlSeconds: number): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
+      if (Number.isFinite(ttlSeconds) && ttlSeconds > intent.ttlSeconds) intent.ttlSeconds = Math.ceil(ttlSeconds);
+      await this.write(doc);
+    });
+  }
+
   async failed(reservation: AccountReservation, definitive: boolean): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;

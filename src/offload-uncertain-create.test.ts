@@ -1,6 +1,7 @@
 // B13: a pool create whose reply is lost must not bill a second VM. The retry
 // reuses the same idempotency key: a compatible retry adopts the replayed VM,
 // an incompatible one stops it and frees the slot. Uses fakes only.
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { BoatApiLike } from "./boat-client.js";
 import { OffloadExecutor } from "./offload.js";
@@ -42,7 +43,15 @@ function setup(runCommand: OffloadDeps["runCommand"] = async () => ({ exitCode: 
     config: { maxOffloadVms: 1, offloadIdleStopSeconds: 15, queueLimit: 0, ...config },
     runCommand,
   });
-  return { executor, fake, account };
+  return { executor, fake, account, clock };
+}
+
+function ledgerDoc(s: ReturnType<typeof setup>) {
+  const key = JSON.stringify(["instance", null, "boat-account",
+    createHash("sha256").update(s.account.accountId).digest("hex")]);
+  return JSON.parse(s.account.state.rows.get(key)!) as {
+    intents: Array<{ id: string; status: string; operation: string; ttlSeconds: number; sandboxId: string | null }>;
+  };
 }
 
 describe("offload uncertain create", () => {
@@ -269,6 +278,76 @@ describe("offload uncertain create", () => {
     expect(third).toMatchObject({ status: "completed" });
     expect(s.fake.boxes.size).toBe(1);
     expect(third).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
+  });
+
+  it("extends the provider TTL when the replay is delayed even for a shorter adopter", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 600_000 })).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(615);
+
+    // 600 s of the 615 s TTL elapsed before the next claim. The shorter
+    // adopter (135 s envelope) would otherwise lose its VM ~15 s into the
+    // run, so the adoption must renew the deadline from now.
+    s.clock.t += 600_000;
+    const second = await s.executor.execute(command("cmd-2"));
+    expect(second).toMatchObject({ status: "completed" });
+
+    const [id] = [...s.fake.boxes.keys()];
+    const updates = s.fake.callsOf("update");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 135 });
+    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(135);
+    expect(second).toMatchObject({ sandboxId: id });
+  });
+
+  it("keeps the placeholder quarantined when the adoption TTL extension is refused", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 60_000 })).toMatchObject({ status: "unavailable" });
+
+    // The longer adopter needs a TTL extension, but the provider refuses: fail
+    // closed without dispatching, and keep the VM tracked for the next replay.
+    s.fake.failNext("update", () => responseError(500, { code: "internal" }));
+    expect(await s.executor.execute({ ...command("cmd-2"), timeoutMs: 600_000 })).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.size).toBe(1);
+    expect(s.executor.getUsage().filter((row) => row.commandId === "cmd-2").map((row) => row.kind))
+      .toEqual(["failed_start"]);
+
+    const third = await s.executor.execute({ ...command("cmd-3"), timeoutMs: 600_000 });
+    expect(third).toMatchObject({ status: "completed" });
+    expect(s.fake.boxes.size).toBe(1);
+    expect(s.fake.callsOf("update")).toHaveLength(2);
+  });
+
+  it("renews the original hold through the extended deadline when the adopter receipt fails", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 60_000 })).toMatchObject({ status: "unavailable" });
+
+    const innerSet = s.account.state.set.bind(s.account.state);
+    s.account.state.set = (async (key: never, value: unknown) => {
+      if (JSON.stringify(value).includes('"status":"running"')) throw new Error("synthetic receipt failure");
+      return innerSet(key as never, value as never);
+    }) as typeof innerSet;
+    expect(await s.executor.execute({ ...command("cmd-2"), timeoutMs: 600_000 })).toMatchObject({ status: "unavailable" });
+    s.account.state.set = innerSet;
+
+    // The extension landed (provider deadline now 615 s) and the adopter hold
+    // failed; the original hold was renewed through the extended deadline.
+    expect(s.fake.callsOf("update")).toHaveLength(1);
+    expect(s.executor.getUsage().filter((row) => row.commandId === "cmd-2").map((row) => row.kind))
+      .toEqual(["failed_start"]);
+    const original = ledgerDoc(s).intents.find((i) => i.operation === "create");
+    expect(original?.status).not.toBe("rejected");
+    expect(original?.ttlSeconds).toBe(615);
+
+    // Past the original 75 s TTL plus the stale-hold margin, the renewed hold
+    // still covers the VM: the next claim adopts it instead of leaking it.
+    s.clock.t += 700_000;
+    const third = await s.executor.execute({ ...command("cmd-3"), timeoutMs: 600_000 });
+    expect(third).toMatchObject({ status: "completed" });
+    expect(s.fake.boxes.size).toBe(1);
   });
 
   it("keeps an incompatible replay tracked when its stop is unconfirmed", async () => {
