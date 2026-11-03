@@ -1354,14 +1354,14 @@ export class BoatVmManager {
    * TTL (`boat extend`). Only called while a command runs, so an idle VM is never
    * kept alive by this.
    */
-  async maybeExtend(config: BoatDriverConfig, sandboxId: string): Promise<void> {
+  async maybeExtend(config: BoatDriverConfig, companyId: string, sandboxId: string): Promise<void> {
     const ttlMs = config.autoStopMinutes * 60 * 1000;
     const known = this.deadlines.get(sandboxId);
     if (known != null && known - this.now() > ttlMs / 2) return;
-    // After a restart the map is empty until a lease path repopulates it; fall
-    // back to the persisted record via the VM's company when it is known.
-    const companyId = this.sandboxCompany.get(sandboxId);
-    const hard = companyId ? await this.hardDeadlineMsFor(companyId, sandboxId) : (this.hardDeadlines.get(sandboxId) ?? null);
+    // After a restart the maps are empty until a lease path repopulates them;
+    // the persisted record is the durable source, keyed by the caller's
+    // company. A VM this path never acquired must not extend past its cap.
+    const hard = await this.hardDeadlineMsFor(companyId, sandboxId);
     let ttlSeconds = config.autoStopMinutes * 60;
     if (hard != null) ttlSeconds = Math.min(ttlSeconds, Math.floor((hard - this.now()) / 1000));
     if (ttlSeconds < 60) return;
@@ -1405,7 +1405,7 @@ export class BoatVmManager {
     }
     if (!this.extendTimers.has(sandboxId)) {
       const timer = setInterval(() => {
-        void this.maybeExtend(config, sandboxId);
+        void this.maybeExtend(config, companyId, sandboxId);
       }, EXTEND_CHECK_INTERVAL_MS);
       timer.unref?.();
       this.extendTimers.set(sandboxId, timer);
@@ -1712,7 +1712,7 @@ export class BoatVmManager {
         const remote = await this.prepareRemote(config, session);
         // Before the lease goes back to Paperclip, which then syncs the run's runtime assets (the MCP config with the run JWT among them).
         const runtimeDir = await this.prepareRuntimeDir(session, remote.remoteCwd);
-        if (startKind! === "reuse_running") await this.maybeExtend(config, sandboxId);
+        if (startKind! === "reuse_running") await this.maybeExtend(config, params.companyId, sandboxId);
         await this.store.update(params.companyId, (state) => {
           const record = state.vms[key];
           if (record) {
@@ -2609,7 +2609,7 @@ export class BoatVmManager {
         if (await this.sessionLost(config, sandboxId)) session = await this.liveSession(config, params.companyId, sandboxId);
         else await this.ssh.ensureMaster(session);
       }
-      await this.maybeExtend(config, sandboxId);
+      await this.maybeExtend(config, params.companyId, sandboxId);
       const remoteRoot = str(params.lease.metadata?.remoteCwd) ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
       const result = await syncFiles({
         ssh: this.ssh, session, timeoutMs: config.timeoutMs, remoteRoot,
@@ -2712,7 +2712,7 @@ export class BoatVmManager {
           await this.ssh.ensureMaster(session);
         }
       }
-      await this.maybeExtend(config, sandboxId);
+      await this.maybeExtend(config, params.companyId, sandboxId);
 
       // The filter approved the model token for a tunnel the config asks
       // for; if this session's tunnel could not be opened (ssh falls back
@@ -2903,7 +2903,11 @@ export class BoatVmManager {
     const name = sanitizeSnapshotName(params.templateLabel, `${config.namePrefix}-tpl-${params.environmentId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase()}-${this.now().toString(36)}`);
     // A VM this capture resumed is stopped again on every path below (its
     // disk is kept: it is the card's). A VM that was already up is left alone.
-    const before = await this.getSandbox(api, sandboxId).catch(() => null);
+    // A failed lookup propagates: getSandbox already returns null for a gone
+    // VM (liveSession reports BOAT_VM_GONE), so swallowing any other error
+    // here would mistake a transient 5xx for "already up" and leave a resumed
+    // VM billing after the capture.
+    const before = await this.getSandbox(api, sandboxId);
     const resumedForCapture = !!before && !UP_STATES.has(before.state);
     try {
       // A named snapshot outlives every run and seeds new VMs, so it must never
@@ -2939,12 +2943,17 @@ export class BoatVmManager {
       // Check and save hold one lock: concurrent captures of different cards
       // share no card lock, so without this both could see a free slot. The
       // poll below runs unlocked.
+      // A re-capture under an existing name adds no new snapshot, so the
+      // post-ready over-allowance check must not delete that pre-existing
+      // template. Hoist the pre-check result out of the lock for it.
+      let existedBefore = false;
       await this.withLock("boat:named-snapshots", async () => {
         const list = (await api.listNamedSnapshots()) as {
           snapshots?: Array<{ name?: string }>;
           allowance?: { free?: number; used?: number };
         };
         const exists = (list.snapshots ?? []).some((entry) => entry.name === name);
+        existedBefore = exists;
         const free = list.allowance?.free ?? 10;
         const used = list.allowance?.used ?? (list.snapshots ?? []).length;
         if (!exists && used >= free && !config.allowPaidNamedSnapshots) {
@@ -2963,7 +2972,7 @@ export class BoatVmManager {
         if (status === "ready") {
           // Another client may have filled the allowance since: never keep a
           // paid snapshot without permission, so delete the just-saved one.
-          if (!config.allowPaidNamedSnapshots) {
+          if (!config.allowPaidNamedSnapshots && !existedBefore) {
             const verify = (await api.listNamedSnapshots()) as {
               snapshots?: Array<{ name?: string }>;
               allowance?: { free?: number; used?: number };
@@ -3002,7 +3011,18 @@ export class BoatVmManager {
       }
     } finally {
       if (resumedForCapture) {
-        await this.stopAndConfirm(config, sandboxId, config.stopConfirmTimeoutMs).catch(() => false);
+        const stopped = await this.stopAndConfirm(config, sandboxId, config.stopConfirmTimeoutMs).catch(() => false);
+        // The record was marked running on resume; pin the stop the same way
+        // release and stopAfterFailedDelete do, so usage never counts a
+        // capture-resumed VM as running.
+        await this.store
+          .update(params.companyId, (doc) => {
+            const record = findBySandboxId(doc, sandboxId);
+            if (!record) return;
+            record.status = stopped ? "stopped" : "stopping";
+            record.lastStoppedAt = this.nowIso();
+          })
+          .catch(() => undefined);
       }
     }
   }

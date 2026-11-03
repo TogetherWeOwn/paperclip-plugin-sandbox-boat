@@ -2,6 +2,7 @@
 // account admission. One authoritative worker; this is not a multi-worker lock.
 import { createHash } from "node:crypto";
 import type { AccountReservation } from "./account-ledger.js";
+import type { BoatSize } from "./size-policy.js";
 import { validIdentity, type OffloadIdentity } from "./offload-journal.js";
 import type { OffloadExecutorConfig } from "./offload.js";
 import type { StateClientLike } from "./state.js";
@@ -29,6 +30,19 @@ export interface PoolVm {
   workspaceKey?: string | null;
   accountReservation?: AccountReservation;
   tailSeconds?: number;
+  // Exact provider body of an unconfirmed create (or fork), so a same-key
+  // replay resends the identical body instead of rebuilding it from the
+  // current command. Cleared once the sandbox id is recorded.
+  pendingCreate?: {
+    kind: "create" | "fork";
+    type: BoatSize;
+    ttlSeconds: number;
+    monitoring: boolean;
+    failFast: boolean;
+    noEnv: boolean;
+    from?: string;
+    sourceSandboxId?: string;
+  };
 }
 type StoredVm = Omit<PoolVm, "idleHandle">;
 interface PoolDoc { version: 1; config: OffloadExecutorConfig; vms: StoredVm[] }
@@ -61,6 +75,14 @@ export class OffloadPoolStore {
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0
         || (vm.tailSeconds !== undefined && !finite(vm.tailSeconds))
+        || (vm.pendingCreate !== undefined && (
+          !vm.pendingCreate || (vm.pendingCreate.kind !== "create" && vm.pendingCreate.kind !== "fork")
+          || typeof vm.pendingCreate.type !== "string" || !vm.pendingCreate.type
+          || !finite(vm.pendingCreate.ttlSeconds)
+          || typeof vm.pendingCreate.monitoring !== "boolean" || typeof vm.pendingCreate.failFast !== "boolean"
+          || typeof vm.pendingCreate.noEnv !== "boolean"
+          || (vm.pendingCreate.from !== undefined && typeof vm.pendingCreate.from !== "string")
+          || (vm.pendingCreate.sourceSandboxId !== undefined && typeof vm.pendingCreate.sourceSandboxId !== "string")))
         || (vm.compatibilityKey !== undefined && (typeof vm.compatibilityKey !== "string" || !vm.compatibilityKey))
         || (vm.workspaceKey !== undefined && vm.workspaceKey !== null && (typeof vm.workspaceKey !== "string" || !vm.workspaceKey))
         || (vm.identity !== null && (!validIdentity(vm.identity) || vm.identity.sandboxId !== vm.sandboxId))

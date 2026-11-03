@@ -4,7 +4,7 @@ import type { AccountUsageRow, AdmissionRequest } from "./account-ledger.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig } from "./config.js";
 import { responseError } from "./test-support/fake-boat.js";
-import { EPOCH, advance, command, fixture, limits, starts } from "./test-support/account-admission.fixture.js";
+import { COMPANY, EPOCH, advance, command, fixture, limits, starts } from "./test-support/account-admission.fixture.js";
 
 let f: ReturnType<typeof fixture>;
 beforeEach(() => {
@@ -32,7 +32,7 @@ describe("review safety mutation pins", () => {
     f.boat.limitsResponse = limits({ creditBalanceSeconds: 3601 });
     const updates = f.boat.callsOf("update").length;
     const intents = journal().intents;
-    await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), id);
+    await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), COMPANY, id);
     expect(f.boat.callsOf("update")).toHaveLength(updates);
     expect(f.boat.boxes.get(id)!.archiveAfter).toEqual(oldDeadline);
     expect(journal().intents).toEqual(intents);
@@ -46,7 +46,7 @@ describe("review safety mutation pins", () => {
     await advance(31_000);
     f.boat.update = async () => { throw responseError(status, { code: "synthetic_update_failure" }); };
     const before = journal().intents.length;
-    await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), id);
+    await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), COMPANY, id);
     const intents = journal().intents;
     expect(intents).toHaveLength(before + 1);
     const warm = intents.at(-1)!;

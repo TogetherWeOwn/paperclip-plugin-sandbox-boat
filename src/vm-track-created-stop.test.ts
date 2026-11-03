@@ -10,6 +10,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { setBoatApiFactoryForTests } from "./boat-client.js";
+import { parseDriverConfig } from "./config.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { DRIVER_KEY } from "./manifest.js";
 import plugin, { setManagerOverridesForTests } from "./plugin.js";
@@ -199,5 +200,79 @@ describe("template capture", () => {
     await expect(capture(sandboxId, "warm")).rejects.toMatchObject({ code: "BOAT_RUNTIME_SCRUB_FAILED" });
     expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([sandboxId, sandboxId]);
+  });
+
+  it("deletes a just-saved snapshot when another client filled the allowance", async () => {
+    fake.namedAllowance = { free: 1, used: 0 };
+    const sandboxId = (await stoppedVm("run-1")).providerLeaseId!;
+    const innerList = fake.listNamedSnapshots.bind(fake);
+    let lists = 0;
+    fake.listNamedSnapshots = (async () => {
+      lists += 1;
+      const result = await innerList() as { allowance: { free: number; used: number } };
+      // The first list is the pre-save check; the second is the post-ready
+      // verify. Another client fills the last free slot in between.
+      if (lists === 2) result.allowance.used += 1;
+      return result;
+    }) as typeof fake.listNamedSnapshots;
+
+    await expect(capture(sandboxId, "warm")).rejects.toMatchObject({ code: "BOAT_NAMED_SNAPSHOT_NOT_FREE" });
+    const saved = fake.callsOf("saveNamedSnapshot");
+    expect(saved).toHaveLength(1);
+    expect(fake.callsOf("deleteNamedSnapshot").map((call) => call.args.name)).toEqual([saved[0]!.args.name]);
+    expect(fake.named.has(String(saved[0]!.args.name))).toBe(false);
+  });
+
+  it("keeps a pre-existing snapshot when re-capturing its name over allowance", async () => {
+    fake.namedAllowance = { free: 1, used: 0 };
+    const sandboxId = (await stoppedVm("run-1")).providerLeaseId!;
+    const t = clock.t;
+    clock.t = t;
+    expect((await capture(sandboxId, "warm")).templateRef).toBe("warm");
+    const name = String(fake.callsOf("saveNamedSnapshot").at(-1)!.args.name);
+
+    // Other clients' snapshots push the account over the free allowance, but
+    // re-capturing the same name adds no new slot.
+    fake.namedAllowance.used = 2;
+    clock.t = t;
+    expect((await capture(sandboxId, "warm")).templateRef).toBe("warm");
+    expect(fake.callsOf("deleteNamedSnapshot")).toHaveLength(0);
+    expect(fake.named.has(name)).toBe(true);
+
+    // The capture-resumed VM is stopped and the stop is recorded, so usage
+    // never counts it as running.
+    const record = Object.values(vmDoc()!.vms).find((entry) => entry.sandboxId === sandboxId)!;
+    expect(record.status).toBe("stopped");
+  });
+
+  it("fails closed when the pre-capture lookup fails", async () => {
+    const sandboxId = (await stoppedVm("run-1")).providerLeaseId!;
+    fake.get = (async () => { throw responseError(500, { code: "internal" }); }) as typeof fake.get;
+
+    await expect(capture(sandboxId, "warm")).rejects.toMatchObject({ code: "BOAT_API_ERROR" });
+    expect(fake.callsOf("resume")).toHaveLength(0);
+    expect(fake.callsOf("saveNamedSnapshot")).toHaveLength(0);
+  });
+});
+
+describe("auto-stop extension", () => {
+  it("clamps the extension from the persisted record for the owning company", async () => {
+    const lease = await acquire("run-1", { requestedExpiresAt: new Date(clock.t + 30 * 60 * 1000).toISOString() });
+    const sandboxId = lease.providerLeaseId!;
+    // A worker that never saw the lease threads the caller's company, so the
+    // durable cap applies even though its maps are empty.
+    const restarted = restartedManager();
+    const config = parseDriverConfig({ ...baseConfig, autoStopMinutes: 120 });
+    const updatesBefore = fake.callsOf("update").length;
+    await restarted.maybeExtend(config, COMPANY, sandboxId);
+    const ownedTtls = fake.callsOf("update").slice(updatesBefore).map((call) => call.args.ttlSeconds);
+    expect(ownedTtls).toEqual([1800]);
+
+    // Another company has no record for this VM: no cap applies. A fresh
+    // manager keeps the in-memory cache out of the assertion.
+    const foreignBefore = fake.callsOf("update").length;
+    await restartedManager().maybeExtend(config, "99999999-9999-4999-8999-999999999999", sandboxId);
+    const foreignTtls = fake.callsOf("update").slice(foreignBefore).map((call) => call.args.ttlSeconds);
+    expect(foreignTtls).toEqual([7200]);
   });
 });
