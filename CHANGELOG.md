@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.11
+
+Follow-up to 0.2.10: tracked `.pem` files that prove to be public
+certificates no longer keep every offload command local. Offload and
+whole-run behaviour stay off by default; nothing is enabled by
+upgrading.
+
+### Fixed
+
+* A tracked `.pem` file is admitted to offload sync only when its bytes
+  prove to be exactly X.509 certificates and nothing else: CERTIFICATE
+  blocks only, strict base64, each DER parses and byte-equals the parsed
+  certificate so no trailing bytes can hide in a block, bounded size and
+  block count, and the credential-shape scan must also pass. The proof
+  is enforced at admission and again at capture of the frozen bytes, so
+  a swap between the two still refuses; anything else in a `.pem` keeps
+  the command local exactly as before. Verified certificates sync to
+  the guest but are never staged back from it (#91).
+
 ## 0.2.10
 
 Follow-up to 0.2.9: sweep liveness after a worker restart and reasoned
