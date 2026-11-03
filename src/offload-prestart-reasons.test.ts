@@ -191,7 +191,7 @@ describe("executor logs and releases on a pre-start failure", () => {
       reason: "sync push failed before the command could start" });
     // The injected adapter message must not leak into the journaled reason.
     expect(JSON.stringify(result)).not.toContain("injected push failure");
-    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before starting intent");
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
     expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "sync push", code: null,
       reason: "sync push failed before the command could start" });
     expect(typeof warn?.meta?.sandboxId).toBe("string");
@@ -213,7 +213,7 @@ describe("executor logs and releases on a pre-start failure", () => {
     const result = await s.execute(cmd);
     expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
       reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
-    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before starting intent");
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
     expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
       code: "OFFLOAD_GUEST_INELIGIBLE" });
     expect(s.starts).toEqual([]);

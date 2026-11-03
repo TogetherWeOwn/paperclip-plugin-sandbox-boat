@@ -1271,7 +1271,7 @@ export class OffloadExecutor {
       // raw adapter messages can carry guest diagnostics or source paths.
       const preStart = this.durable?.preStartFailure(command) ?? null;
       if (preStart) {
-        this.logger.warn("boat offload command failed before starting intent", {
+        this.logger.warn("boat offload command failed before transport", {
           commandId: command.commandId, sandboxId: vm.sandboxId,
           step: preStart.step, code: preStart.code, reason: preStart.reason,
         });
