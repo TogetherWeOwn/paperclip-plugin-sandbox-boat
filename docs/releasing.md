@@ -5,7 +5,7 @@ Releases are git tags with a GitHub Release. Each release has the staged package
 ## Cut a release
 
 1. In one PR, set the new version in `package.json` (and `package-lock.json`, with `npm version --no-git-tag-version X.Y.Z`) and in `PLUGIN_VERSION` in `src/manifest.ts`. Add a `## X.Y.Z` section to `CHANGELOG.md`. Merge it to `main`.
-2. Get the owner's approval for the tag and name the exact commit. Then tag that merge commit on `main` and push the tag:
+2. Name the exact commit — the merged version-bump commit on `main` — and confirm CI is green on it. A non-production tag needs no separate approval once that commit is green; stop and ask only when the release itself spends money, creates or rotates a credential, or weakens the security posture, and leave steps only the host operator can do (installing on the host, plugin or host config) to them. Then tag that merge commit on `main` and push the tag:
 
    ```sh
    git fetch origin

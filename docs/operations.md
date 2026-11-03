@@ -140,6 +140,20 @@ default VM:
    `Match User user` and `ForceCommand /usr/local/sbin/paperclip-delegated-ssh`.
    Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
    with stdio and exit status unchanged.
+
+   Two more units are required, because the platform rewrites
+   `/etc/ssh/sshd_config.d/00-ascii-lockdown.conf` a few seconds after the
+   SSH listener starts: on a fresh boot the already-running sshd then misses
+   the `ForceCommand` above even though the on-disk config is correct, SSH
+   sessions land outside the delegated scope, and the step-5 preflight fails
+   with `probe_admit_failed`. Install and enable
+   `paperclip-sshd-settle.service`, which runs once per boot
+   (`sleep 15; systemctl restart ssh`, after the platform's rewrite has
+   landed), and `paperclip-sshd-config.path`, which watches the sshd config
+   and triggers `paperclip-sshd-config.service`
+   (`sleep 2; sshd -t && systemctl restart ssh`) on any later change. Both
+   units are additive only: they never edit the platform's config, they just
+   restart sshd so it re-reads what is on disk.
 3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
    guest PATH is fixed to root-owned directories and has no `RUSTUP_HOME`.
    Each command also runs with a fresh per-command `HOME`, and its
@@ -157,9 +171,14 @@ default VM:
    receiver cannot be proven dead, the next command's push fences that
    mirror first (kill, wipe, full resync), so expect one slower full sync
    after such a failure rather than a delta.
-5. Reboot, then run the preflight with `offloadCgroupParent`
+5. Reboot — hands-off: after the reboot, touch nothing by hand (in
+   particular, no manual `systemctl restart ssh`) — then run the preflight
+   with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
-   `true`. Any other output is a token naming the failing probe sub-step
+   literal `true` on that untouched boot. A template that only prints `true`
+   after a manual sshd restart is missing the step-2 settle/path units and
+   is not done: every pool VM forked or booted from it would fail the same
+   way. Any other output is a token naming the failing probe sub-step
    (`parent_invalid`, `parent_not_delegated`, `probe_mkdir_failed:EACCES`,
    `probe_admit_failed`, `probe_outside_failed`, `probe_kill_failed`); the
    same token appears as `detail=` on the server's "failed before transport"
