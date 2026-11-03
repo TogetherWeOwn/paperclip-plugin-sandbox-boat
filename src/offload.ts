@@ -1264,7 +1264,19 @@ export class OffloadExecutor {
     } catch {
       const seconds = Math.max(0, (this.now() - startedAt) / 1000);
       const dollars = (seconds / 3600) * PRICE_PER_HOUR[this.config.size];
-      result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: "command transport failed; reconcile the guest receipt before replay or VM reuse" };
+      // A pre-start failure is recorded by the journal with the exact step
+      // that failed. Name it in the server log and in the result reason the
+      // journal converts to not_started — never discard it into a generic
+      // transport failure. The thrown error itself is never inspected here:
+      // raw adapter messages can carry guest diagnostics or source paths.
+      const preStart = this.durable?.preStartFailure(command) ?? null;
+      if (preStart) {
+        this.logger.warn("boat offload command failed before starting intent", {
+          commandId: command.commandId, sandboxId: vm.sandboxId,
+          step: preStart.step, code: preStart.code, reason: preStart.reason,
+        });
+      }
+      result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: preStart?.reason ?? "command transport failed; reconcile the guest receipt before replay or VM reuse" };
     }
     try {
       if (this.durable) result = await this.durable.finish(command, result);
