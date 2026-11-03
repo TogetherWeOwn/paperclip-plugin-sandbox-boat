@@ -332,19 +332,39 @@ export function sandboxNameFor(prefix: string, companyId: string, environmentId:
  * recommends) rather than a fast hash: fast hashes of key material are exactly
  * what that query flags, and a KDF keeps the stored value resistant even if a
  * key ever carries less entropy than assumed. Deterministic (salted by the
- * apiBase) so equality checks work across restarts. Memoized: rememberConfig
- * runs on every driver op and scrypt is deliberately slow; live keys already
- * live in memory, so caching digests adds no new secret exposure, and entries
- * are bounded by the distinct keys the process has seen.
+ * apiBase) so equality checks work across restarts. The stored form carries a
+ * `scrypt:` format prefix: a digest written by an older (or future) primitive
+ * never compares equal, so a stale format fails closed — skipped until a hook
+ * rewrites it — instead of silently matching the wrong account. Memoized:
+ * rememberConfig runs on every driver op and scrypt is deliberately slow. The
+ * memo is LRU-bounded and dropped on shutdown, so a rotated key stops being
+ * recoverable from worker memory; eviction only costs a recompute.
  */
+const SWEEP_DIGEST_PREFIX = "scrypt:";
+const SWEEP_DIGEST_CACHE_MAX = 16;
 const sweepDigestCache = new Map<string, string>();
 function sweepAccountDigest(apiBase: string, apiKey: string): string {
   const preimage = `${apiBase}\u0000${apiKey}`;
   const hit = sweepDigestCache.get(preimage);
-  if (hit !== undefined) return hit;
-  const digest = scryptSync(apiKey, apiBase, 32).toString("hex");
+  if (hit !== undefined) {
+    // Refresh recency so hot environment keys survive eviction.
+    sweepDigestCache.delete(preimage);
+    sweepDigestCache.set(preimage, hit);
+    return hit;
+  }
+  const digest = `${SWEEP_DIGEST_PREFIX}${scryptSync(apiKey, apiBase, 32).toString("hex")}`;
   sweepDigestCache.set(preimage, digest);
+  while (sweepDigestCache.size > SWEEP_DIGEST_CACHE_MAX) {
+    const oldest = sweepDigestCache.keys().next();
+    if (oldest.done) break;
+    sweepDigestCache.delete(oldest.value);
+  }
   return digest;
+}
+
+/** Test hook: the cache is keyed by key-derived preimages, so the suite pins its bound. */
+export function sweepDigestCacheSizeForTests(): number {
+  return sweepDigestCache.size;
 }
 
 function iso(value: unknown): string | null {
@@ -944,7 +964,9 @@ export class BoatVmManager {
 
   /** True when the current host key digests to the descriptor's account. */
   private sameAccountAsHost(descriptor: SweepDescriptor): boolean {
-    if (typeof descriptor.accountDigest !== "string" || !descriptor.accountDigest) return false;
+    // A digest without the current format prefix is stale (an older
+    // primitive): never trusted, so it stays skipped until a hook rewrites it.
+    if (typeof descriptor.accountDigest !== "string" || !descriptor.accountDigest.startsWith(SWEEP_DIGEST_PREFIX)) return false;
     const rawBase = (descriptor.config as Record<string, unknown>).apiBase;
     const apiBase = typeof rawBase === "string" && rawBase ? rawBase : DEFAULT_API_BASE;
     // Host keys are only sent to the default API; a foreign base with an
@@ -3763,6 +3785,10 @@ export class BoatVmManager {
   }
 
   async shutdown(): Promise<void> {
+    // The digest memo is keyed by key-derived preimages: drop it so rotated
+    // keys stop being recoverable from worker memory. Live keys stay in the
+    // configs; the memo rebuilds on demand.
+    sweepDigestCache.clear();
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
     // Bound the offload drain, never the session close: a hanging or
     // rejecting offload shutdown must not outlive the worker or strand SSH

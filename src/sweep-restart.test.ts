@@ -15,6 +15,7 @@ import { scryptSync } from "node:crypto";
 import { DEFAULT_API_BASE } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { sweepDigestCacheSizeForTests } from "./vm-manager.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { VmStateStore } from "./state.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
@@ -179,7 +180,7 @@ describe("sweep after a worker restart", () => {
   it("re-persists the sweep descriptor when only the inline key changes", async () => {
     const keyA = "boat_inline_key_account_a_not_real";
     const keyB = "boat_inline_key_account_b_not_real";
-    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
+    const digestOf = (key: string) => `scrypt:${scryptSync(key, DEFAULT_API_BASE, 32).toString("hex")}`;
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;
@@ -203,6 +204,59 @@ describe("sweep after a worker restart", () => {
       await new Promise((resolve) => setImmediate(resolve));
     }
     expect(await readDigest()).toBe(digestOf(keyB));
+  });
+
+  it("versions the account digest and never rehydrates a pre-scrypt descriptor", async () => {
+    const legacyKey = "boat_inline_key_legacy_format_not_real";
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({
+      companyId, environmentId, driverKey: "boat", config: { ...baseConfig, apiKey: legacyKey }, runId: "run-legacy",
+      issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+    });
+    const sandboxId = lease.providerLeaseId!;
+    // The release's stop is accepted but never takes effect: the record stays stopping.
+    fake.stopMode = "stays_up";
+    await expect(release(lease)).resolves.toBeUndefined();
+    const saved = await untilSweepDescriptor();
+    const persisted = saved.envs?.[environmentId] as { accountDigest?: unknown; config?: Record<string, unknown> };
+    // The stored form carries the KDF format prefix: a digest written by an
+    // older primitive never compares equal after an upgrade.
+    expect(typeof persisted?.accountDigest).toBe("string");
+    expect(persisted.accountDigest as string).toMatch(/^scrypt:[0-9a-f]{64}$/);
+    await currentManager().sweepInFlight()?.catch(() => undefined);
+
+    // A pre-scrypt descriptor (fast-hash hex, no prefix) for the same key,
+    // seen under the same host key, stays absent: the format mismatch fails
+    // closed until a hook rewrites it, so the stopping VM is left alone
+    // instead of being stopped under a mismatched account. Overwrite after
+    // the restart, when no hook can rewrite the doc under the test.
+    process.env.BOAT_API_KEY = legacyKey;
+    await restart();
+    const store = new VmStateStore(harness.ctx.state);
+    await store.saveSweepDescriptor(companyId, environmentId, {
+      version: 1, companyId, environmentId, seenAt: clock, config: { ...(persisted.config ?? {}) },
+      hadInlineKey: true, accountDigest: "ab".repeat(32),
+    });
+    fake.stopMode = "immediate";
+    clock += 10 * 60_000;
+    // The release above already made one stop call: only post-restart calls count.
+    const stopsBefore = fake.callsOf("stop").length;
+    const report = await currentManager().sweep("schedule", { force: true });
+    expect(report.stopped ?? []).not.toContain(sandboxId);
+    expect(fake.callsOf("stop").slice(stopsBefore).map((call) => call.args.sandboxId)).not.toContain(sandboxId);
+  });
+
+  it("bounds the digest memo and drops it on shutdown", async () => {
+    for (let n = 0; n < 20; n += 1) {
+      await plugin.definition.onEnvironmentAcquireLease!({
+        companyId, environmentId, driverKey: "boat",
+        config: { ...baseConfig, apiKey: `boat_test_rotating_key_${n}_not_real` },
+        runId: `run-memo-${n}`, issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+      });
+    }
+    // More distinct keys than the memo holds: retired keys are evicted, not kept.
+    expect(sweepDigestCacheSizeForTests()).toBeLessThanOrEqual(16);
+    await plugin.definition.onShutdown!();
+    expect(sweepDigestCacheSizeForTests()).toBe(0);
   });
 
   it("an unloaded-pool sweep leaves a reservation made mid-sweep alone", async () => {
@@ -304,7 +358,7 @@ describe("sweep after a worker restart", () => {
   it("an A→B→A hook burst leaves the latest descriptor digest on disk", async () => {
     const keyA = "boat_burst_key_a_not_real";
     const keyB = "boat_burst_key_b_not_real";
-    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
+    const digestOf = (key: string) => `scrypt:${scryptSync(key, DEFAULT_API_BASE, 32).toString("hex")}`;
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;
@@ -363,7 +417,7 @@ describe("sweep after a worker restart", () => {
 
   it("retries the descriptor when a duplicate hook arrives during a failed first write", async () => {
     const keyA = "boat_retry_key_a_not_real";
-    const digestOf = (key: string) => scryptSync(key, DEFAULT_API_BASE, 32).toString("hex");
+    const digestOf = (key: string) => `scrypt:${scryptSync(key, DEFAULT_API_BASE, 32).toString("hex")}`;
     const readDigest = async () => (await harness.ctx.state.get(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" }) as {
       envs?: Record<string, { accountDigest?: unknown }>;
