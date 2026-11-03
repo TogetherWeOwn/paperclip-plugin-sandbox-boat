@@ -57,7 +57,10 @@ describe("native workspace binding", () => {
   it("classifies from native realization metadata without the SDK workspace client", async () => {
     await setup();
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
-    expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    // Classification is remote, but the dry-run now also answers the executor
+    // gates: this fake config never enables the executor, so the predictive
+    // answer is local with that reason (a binding miss would 503 instead).
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
   });
 
   it("answers under the host payload's project workspace id as well", async () => {
@@ -71,7 +74,7 @@ describe("native workspace binding", () => {
     }));
     const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
-    expect(response).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    expect(response).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
   });
 
   it("refuses a project alias two execution workspaces of one run claim with different sources", async () => {
@@ -92,10 +95,10 @@ describe("native workspace binding", () => {
     const byAlias = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
     expect(byAlias).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
-    expect(await submit()).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
     const byOther = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: otherWorkspaceId }, params: {}, query: {} } as never);
-    expect(byOther).toMatchObject({ status: 200, body: { mode: "remote_candidate" } });
+    expect(byOther).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
   });
 
   it("logs the run, workspace and reason when the exec route refuses with 503", async () => {

@@ -29,6 +29,14 @@ import { SshManager, cleanupStaleKeyDirs } from "./ssh.js";
 import type { SshSession } from "./ssh.js";
 import { BoatVmManager, SHUTDOWN_DRAIN_TIMEOUT_MS } from "./vm-manager.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { isExecutorRefusal, type ExecutorRefusal } from "./offload/broker.js";
+
+/** resolve() returns a reasoned refusal instead of bare null; narrow where a test needs the executor. */
+function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor {
+  if (isExecutorRefusal(value)) throw new Error(`unexpected offload refusal: ${value.refusalReason}`);
+  return value;
+}
+
 import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import type { BackendCommand } from "./offload/broker.js";
 
@@ -432,8 +440,7 @@ describe("runtime release-hook wiring (no guest)", () => {
     const cmd = (commandId: string): BackendCommand => ({ companyId, runId, executionWorkspaceId, commandId,
       cardId: "card", repoId: "repo:https://github.com/example/public", profileId: "rust-public-1",
       argv: ["test", "--locked"], cwdRelative: ".", env: {}, timeoutMs: 10_000, queueTimeoutMs: 0 });
-    const executor = await runtime.resolve(cmd("cmd-1"), settings);
-    expect(executor).not.toBeNull();
+    const executor = mustResolve(await runtime.resolve(cmd("cmd-1"), settings));
     expect(boat.calls).toHaveLength(0);
     const pools = (runtime as unknown as { pools: Map<string, { sessions: Map<string, SshSession> }> }).pools;
     const entry = [...pools.values()][0]!;

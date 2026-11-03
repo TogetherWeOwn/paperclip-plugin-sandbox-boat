@@ -138,6 +138,13 @@ export interface OffloadReadResponse {
   state: OffloadCommandState;
   remoteStarted: boolean;
   fallbackSafe: boolean;
+  /**
+   * Why a never-started command was refused before start, when the refusing
+   * site named one. The shim prints it with its local-fallback notice so a
+   * fallback is never indistinguishable from a remote run. Absent on views
+   * produced before this field existed.
+   */
+  fallbackReason?: string | null;
   events: OffloadOutputEvent[];
   nextCursor: number;
   result: OffloadTerminalResult | null;

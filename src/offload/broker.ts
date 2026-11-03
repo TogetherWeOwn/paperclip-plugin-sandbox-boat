@@ -40,6 +40,20 @@ export interface BrokerAuth {
   runId: string;
 }
 
+/**
+ * A pre-start refusal that names its gate. Executor resolution returns this
+ * instead of a bare null so the specific reason reaches the journal, the read
+ * view and the shim's local-fallback notice instead of being discarded.
+ */
+export interface ExecutorRefusal {
+  refusalReason: string;
+}
+
+export function isExecutorRefusal(value: unknown): value is ExecutorRefusal {
+  return typeof value === "object" && value !== null
+    && typeof (value as ExecutorRefusal).refusalReason === "string";
+}
+
 /** Placeholder backend until the executor follow-up grows start/cancel. */
 export class NeverDispatchBackend implements OffloadBackend {
   start(): OffloadBackendHandle {
@@ -124,6 +138,8 @@ interface JournalRecord {
   state: OffloadCommandState;
   remoteStarted: boolean;
   fallbackSafe: boolean;
+  /** Site-specific pre-start refusal reason; absent on records written before it existed. */
+  fallbackReason?: string | null;
   events: OffloadOutputEvent[];
   outputBytes: number;
   result: OffloadTerminalResult | null;
@@ -169,6 +185,28 @@ function digestOf(request: OffloadSubmitRequest): string {
     q: request.queueTimeoutMs,
     t: request.timeoutMs,
   });
+}
+
+const DEFAULT_RUNNER: Readonly<Record<string, string>> = { node: "npm", python: "pytest" };
+
+/**
+ * Every digest that spells this same command. Journal rows written before the
+ * route layer normalised an omitted Node/Python `runner` carry the broker's
+ * old cargo default in their digest; the same body after that change digests
+ * with npm/pytest. Both spellings mean the tool's default runner — an explicit
+ * cargo runner is rejected upstream for Node/Python profiles, so a cargo
+ * digest there can only mean "omitted". New rows keep the primary (normalised)
+ * digest; the legacy spelling is accepted only when matching an existing row.
+ */
+function acceptedDigests(request: OffloadSubmitRequest): string[] {
+  const primary = digestOf(request);
+  const fallback = DEFAULT_RUNNER[request.tool ?? "cargo"];
+  if (!fallback) return [primary];
+  const runner = request.runner ?? "cargo";
+  if (runner !== fallback && runner !== "cargo") return [primary];
+  const legacy = digestOf({ ...request, runner: "cargo" });
+  const normalised = digestOf({ ...request, runner: fallback });
+  return primary === legacy ? [primary, normalised] : [primary, legacy];
 }
 
 export interface OffloadBrokerDeps {
@@ -236,6 +274,7 @@ export class OffloadBroker {
       state: record.state,
       remoteStarted: record.remoteStarted,
       fallbackSafe: record.fallbackSafe,
+      fallbackReason: record.fallbackReason ?? null,
       events,
       nextCursor,
       result: record.result,
@@ -269,15 +308,16 @@ export class OffloadBroker {
    * with the caller's pre-check — returns that record's verdict instead, so
    * the caller never answers fallback-safe over a started command.
    */
-  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<BrokerResponse | null> {
+  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, reason: string): Promise<BrokerResponse | null> {
     return this.chain(`run:${principal.runId}`, async () => {
-      const digest = digestOf(request);
+      const digests = acceptedDigests(request);
+      const digest = digests[0];
       const existing = await this.load(request.commandId);
       if (existing) {
-        if (existing.digest !== digest) {
+        if (!digests.includes(existing.digest)) {
           throw Object.assign(new Error(`OFFLOAD_IDEMPOTENCY_CONFLICT: commandId ${request.commandId} was already accepted with a different payload.`), { code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
         }
-        return this.existingResponse(existing, digest, principal);
+        return this.existingResponse(existing, digests, principal);
       }
       const count = ((await this.store.get(countKey(principal.runId))) as number | null) ?? 0;
       if (count >= OFFLOAD_BOUNDS.maxCommandsPerRun) return null;
@@ -297,6 +337,10 @@ export class OffloadBroker {
         state: "not_started",
         remoteStarted: false,
         fallbackSafe: true,
+        // Same 256-char bound failToStart applies: a classification reason can
+        // embed argv-derived names, and the journal must not persist or serve
+        // an unbounded caller-influenced string on every read.
+        fallbackReason: reason.slice(0, 256),
         events: [],
         outputBytes: 0,
         result: null,
@@ -413,8 +457,8 @@ export class OffloadBroker {
     else this.known.add(record.commandId);
   }
 
-  private async existingResponse(existing: JournalRecord, digest: string, principal: BrokerAuth): Promise<BrokerResponse> {
-    if (existing.digest !== digest) {
+  private async existingResponse(existing: JournalRecord, digests: string[], principal: BrokerAuth): Promise<BrokerResponse> {
+    if (!digests.includes(existing.digest)) {
       return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId: existing.commandId }) };
     }
     if (existing.companyId !== principal.companyId || existing.runId !== principal.runId) {
@@ -441,7 +485,7 @@ export class OffloadBroker {
    */
   async existingSubmission(request: OffloadSubmitRequest, principal: BrokerAuth): Promise<BrokerResponse | null> {
     return this.chain(`run:${principal.runId}`, async () => {
-      const digest = digestOf(request);
+      const digests = acceptedDigests(request);
       const existing = await this.load(request.commandId);
       if (!existing) {
         const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
@@ -450,16 +494,17 @@ export class OffloadBroker {
         }
         return null;
       }
-      return this.existingResponse(existing, digest, principal);
+      return this.existingResponse(existing, digests, principal);
     });
   }
 
   async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<BrokerResponse> {
     // Serialized per run so the 512-command admission bound cannot race.
     return this.chain(`run:${principal.runId}`, async () => {
-      const digest = digestOf(request);
+      const digests = acceptedDigests(request);
+      const digest = digests[0];
       const existing = await this.load(request.commandId);
-      if (existing) return this.existingResponse(existing, digest, principal);
+      if (existing) return this.existingResponse(existing, digests, principal);
       const tomb = (await this.store.get(tombKey(request.commandId))) as Tombstone | null;
       if (tomb) {
         return { status: 410, body: offloadError("OFFLOAD_RESULT_EXPIRED", "commandId already expired; never remint an ID", { commandId: request.commandId }) };
@@ -486,6 +531,7 @@ export class OffloadBroker {
         state: "queued",
         remoteStarted: false,
         fallbackSafe: false,
+        fallbackReason: null,
         events: [],
         outputBytes: 0,
         result: null,
@@ -531,6 +577,7 @@ export class OffloadBroker {
         // The backend refused before any spawn: durable never-started receipt.
         record.state = "not_started";
         record.fallbackSafe = true;
+        record.fallbackReason = "executor backend refused to start";
         record.terminalAt = this.now();
         await this.save(record);
       }
@@ -616,6 +663,7 @@ export class OffloadBroker {
           } else if (!resolved.remoteStarted) {
             resolved.state = "not_started";
             resolved.fallbackSafe = true;
+            resolved.fallbackReason = "cancelled before the command started";
             resolved.result = null;
           } else {
             resolved.state = "cancelled";
@@ -765,7 +813,7 @@ export class OffloadBroker {
           return { save: true };
         });
       },
-      failToStart: (_reason) => {
+      failToStart: (reason) => {
         const at = this.now();
         mutate((record) => {
           if (record.remoteStarted) {
@@ -774,6 +822,9 @@ export class OffloadBroker {
           }
           record.state = "not_started";
           record.fallbackSafe = true;
+          // The refusing site's own words, bounded: the journal record is
+          // persisted and the shim prints this verbatim on its notice line.
+          record.fallbackReason = typeof reason === "string" && reason !== "" ? reason.slice(0, 256) : "executor refused before start";
           record.terminalAt = at;
           this.handles.delete(commandId);
           return { save: true };

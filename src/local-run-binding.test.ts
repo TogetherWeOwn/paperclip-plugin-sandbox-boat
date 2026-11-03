@@ -223,7 +223,9 @@ describe("plugin wiring", () => {
     expect(bound?.meta).toMatchObject({ runId, workspaceId });
     const response = await exec(runId, projectWorkspaceId);
     expect(response.status).toBe(200);
-    expect(response.body).toMatchObject({ mode: "remote_candidate" });
+    // Remote classification under the alias, then the executor gate answers:
+    // this config enables local-run binding, not the executor.
+    expect(response.body).toMatchObject({ mode: "local", reason: "offload executor is not enabled" });
     expect((await exec(runId, workspaceId)).status).toBe(200);
     const manager = (await import("./plugin.js")).currentManager();
     expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);

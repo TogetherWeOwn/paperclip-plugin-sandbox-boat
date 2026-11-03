@@ -6,7 +6,7 @@
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
 import path from "node:path";
-import type { OffloadBroker, BrokerPrincipal } from "./broker.js";
+import type { OffloadBroker, BrokerPrincipal, BackendCommand } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js";
@@ -92,6 +92,13 @@ export interface OffloadRouteHost {
   durations?: DurationStore;
   /** Observability hook for fallback-safe refusals; the shim only prints the code to the agent. */
   logRefusal?: (entry: { runId: string; workspaceId: string; reason: string }) => void;
+  /**
+   * Read-only executor gates for the dry-run decision: the refusal reason a
+   * real submit of this command would hit before any VM effect, or null when
+   * every such gate passes. Absent when no native executor is wired; the
+   * dry-run then promises classification only, as before.
+   */
+  preflight?: (command: BackendCommand) => Promise<string | null>;
 }
 
 export interface RouteResponse {
@@ -359,7 +366,13 @@ export async function handleExec(
   if (!validated.ok) {
     return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
   }
-  const request = validated.value;
+  // Normalise tool/runner once, before every broker call: a Node/Python
+  // request may omit `runner`, and the broker defaults an omitted runner to
+  // cargo. Without this, dry-run/preflight would judge npm/pytest while the
+  // real submit (and its idempotency digest) judged cargo.
+  const tool = validated.value.tool ?? profileTool(profile);
+  const runner = validated.value.runner ?? defaultRunnerFor(tool);
+  const request = { ...validated.value, tool, runner };
   if (!request.dryRun) {
     // A lost workspace binding is not proof that this ID never started. Consult
     // the journal before any unjournaled 503 below; an unknown ID still returns
@@ -367,8 +380,6 @@ export async function handleExec(
     const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
     if (known) return known;
   }
-  const tool = request.tool ?? profileTool(profile);
-  const runner = request.runner ?? defaultRunnerFor(tool);
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
   if (!settings.offloadProfiles.includes(profile.id)) {
     // Not journaled as a refusal: enabling the profile later must accept the
@@ -402,8 +413,49 @@ export async function handleExec(
   const principal = principalFor(input.companyId, runId, workspace, profile, request.executionWorkspaceId);
   if (request.dryRun) {
     // Dry run validates and classifies with no VM, sync, budget reservation
-    // or journal effect. A remote candidate is not a capacity promise.
+    // or journal effect. A remote candidate is not a capacity promise, but it
+    // must not promise past a gate the real submit would refuse on: every
+    // read-only real-exec gate is answered here too, as local + reason.
+    if (workspace.path == null && workspace.cwd == null) {
+      return {
+        status: 200,
+        body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: "local", reason: "execution workspace is not locally realized; cannot snapshot source", profileId: profile.id },
+      };
+    }
     const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
+    if (classification.mode === "remote_candidate" && host.preflight) {
+      let refusal: string | null;
+      try {
+        refusal = await host.preflight({
+          commandId: request.commandId,
+          companyId: input.companyId,
+          runId,
+          cardId: principal.cardId,
+          repoId: principal.repoId,
+          profileId: principal.profileId,
+          tool,
+          runner,
+          executionWorkspaceId: request.executionWorkspaceId,
+          trustDomainId: principal.trustDomainId,
+          cwdRelative: request.cwdRelative,
+          argv: request.argv,
+          env: request.env,
+          queueTimeoutMs: request.queueTimeoutMs,
+          timeoutMs: request.timeoutMs,
+        });
+      } catch {
+        // A preflight that cannot answer must not promise remote: local with
+        // the reason is the visible, safe direction.
+        refusal = "executor preflight unavailable";
+      }
+      if (refusal !== null) {
+        host.logRefusal?.({ runId, workspaceId: request.executionWorkspaceId, reason: refusal });
+        return {
+          status: 200,
+          body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: "local", reason: refusal, profileId: profile.id },
+        };
+      }
+    }
     return {
       status: 200,
       body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: classification.mode, reason: classification.reason, profileId: profile.id },

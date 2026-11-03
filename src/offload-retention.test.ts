@@ -7,6 +7,15 @@ import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import type { OffloadExecutor } from "./offload.js";
+import { isExecutorRefusal, type ExecutorRefusal } from "./offload/broker.js";
+
+/** resolve() returns a reasoned refusal instead of bare null; narrow where a test needs the executor. */
+function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor {
+  if (isExecutorRefusal(value)) throw new Error(`unexpected offload refusal: ${value.refusalReason}`);
+  return value;
+}
+
 import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import { OffloadJournal, type OffloadSync } from "./offload-journal.js";
 import { command as lifecycleCommand, DiskState, EPOCH } from "./test-support/offload-lifecycle-contract.js";
@@ -134,7 +143,7 @@ describe("stock runtime journal retention", () => {
   it("deletes a finished run's tombstones after the retention window though the host reports no terminatedAt", async () => {
     // The executor captures Date.now at resolution: fake only Date, beforehand.
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
-    const executor = (await runtime.resolve(command(), config))!;
+    const executor = mustResolve(await runtime.resolve(command(), config));
     const cmd = command();
     await executor.start(cmd);
     await expect.poll(async () => (await executor.readOutput(companyId, runId, cmd.commandId)).state,
@@ -157,7 +166,7 @@ describe("stock runtime journal retention", () => {
 
   it("reaches a finished pool's tombstones and staging dirs after a restart, with no command resolving it again", async () => {
     vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
-    const executor = (await runtime.resolve(command(), config))!;
+    const executor = mustResolve(await runtime.resolve(command(), config));
     const cmd = command();
     await executor.start(cmd);
     await expect.poll(async () => (await executor.readOutput(companyId, runId, cmd.commandId)).state,
@@ -195,8 +204,8 @@ describe("stock runtime journal retention", () => {
     runtime.remember(native());
     const resolved = await Promise.race([runtime.resolve(command(), config),
       new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 3_000))]);
-    if (resolved === "blocked" || !resolved) throw new Error(`resolve: ${resolved}`);
-    const executor = resolved;
+    if (resolved === "blocked") throw new Error("resolve: blocked");
+    const executor = mustResolve(resolved);
     lose(new Error("registry write lost"));
     const cmd = command();
     await executor.start(cmd);

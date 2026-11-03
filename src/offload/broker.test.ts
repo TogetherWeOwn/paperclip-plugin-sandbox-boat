@@ -122,6 +122,36 @@ describe("submit", () => {
     expect(conflict.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
   });
 
+  it.each([
+    ["node", "npm"],
+    ["python", "pytest"],
+  ] as const)("accepts a normalised %s retry against a pre-normalisation journal row", async (tool, runner) => {
+    const { broker, backend } = setup();
+    // A row written before route runner-normalisation: the request omitted
+    // `runner`, so the stored digest carries the broker's old cargo default.
+    const legacy = { ...submitFor(), tool, env: {}, argv: ["test"] };
+    expect((await broker.submit(legacy, PRINCIPAL)).status).toBe(202);
+    // The same body after deploy arrives normalised to the tool's default
+    // runner. It is the same command, not an idempotency conflict.
+    const retry = await broker.submit({ ...legacy, runner }, PRINCIPAL);
+    expect(retry.status).toBe(200);
+    expect((retry.body as OffloadReadResponse).commandId).toBe(CMD);
+    expect(backend.starts.length).toBe(1);
+    // The pre-acceptance journal lookup resolves the legacy row the same way.
+    const known = await broker.existingSubmission({ ...legacy, runner }, PRINCIPAL);
+    expect(known?.status).toBe(200);
+  });
+
+  it("still conflicts when a normalised retry changes runner or payload against a legacy row", async () => {
+    const { broker } = setup();
+    const legacy = { ...submitFor(), tool: "node" as const, env: {}, argv: ["test"] };
+    await broker.submit(legacy, PRINCIPAL);
+    const otherRunner = await broker.submit({ ...legacy, runner: "pnpm" }, PRINCIPAL);
+    expect(otherRunner.status).toBe(409);
+    const otherArgv = await broker.submit({ ...legacy, runner: "npm", argv: ["build"] }, PRINCIPAL);
+    expect(otherArgv.status).toBe(409);
+  });
+
   it("refuses new admissions past 512 commands per run without dispatching", async () => {
     const { broker, backend } = setup();
     for (let i = 0; i < 512; i += 1) {
@@ -163,6 +193,16 @@ describe("recordRefusal", () => {
     await broker.recordRefusal(submitFor(), PRINCIPAL, "x");
     await broker.recordRefusal(submitFor(), PRINCIPAL, "x");
     await expect(broker.recordRefusal({ ...submitFor(), argv: ["build"] }, PRINCIPAL, "x")).rejects.toThrow("OFFLOAD_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("does not conflict when a normalised refusal lands on a pre-normalisation row", async () => {
+    const { broker, backend } = setup();
+    const legacy = { ...submitFor(), tool: "node" as const, env: {}, argv: ["test"] };
+    await broker.recordRefusal(legacy, PRINCIPAL, "x");
+    const raced = await broker.recordRefusal({ ...legacy, runner: "npm" }, PRINCIPAL, "x");
+    expect(raced?.status).toBe(200);
+    expect((raced?.body as OffloadReadResponse).state).toBe("not_started");
+    expect(backend.starts.length).toBe(0);
   });
 
   it("lets a duplicate submit observe the refusal without a second dispatch", async () => {

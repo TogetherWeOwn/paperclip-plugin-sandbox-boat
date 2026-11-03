@@ -2,8 +2,10 @@
 // Installed as the wrapped executable ahead of the real one (passthrough), or
 // invoked directly as a diagnostic binary ([--dry-run] [--json]
 // [--runner <name>] -- <argv...>) (diagnostic). Ordinary passthrough preserves
-// stdout, stderr and exit status; only staged/conflict/unknown outcomes add an
-// explicit stderr report, as the stage-first contract requires.
+// stdout, stderr and exit status; staged/conflict/unknown outcomes add an
+// explicit stderr report, as the stage-first contract requires, and so does
+// every local fallback of a command classified as a remote candidate: a
+// silent fallback reads exactly like a successful remote run.
 
 import path from "node:path";
 import { reportDuration, runDryRun, runOffload, type BrokerHttp, type ClientDeps, type ShimRequest } from "./client.js";
@@ -166,6 +168,11 @@ function fallbackEnv(env: ShimDeps["env"], shimDir: string): Record<string, stri
   return out;
 }
 
+/** Server-supplied reasons are printed on one stderr line; never let one forge extra lines. */
+function oneLine(reason: string): string {
+  return reason.replace(/[\r\n]+/g, " ").slice(0, 256);
+}
+
 function spawnExit(result: SpawnResult): number {
   if (result.code !== null && result.code !== undefined) return result.code;
   if (result.signal && SIGNAL_EXIT[result.signal] !== undefined) return SIGNAL_EXIT[result.signal]!;
@@ -309,6 +316,9 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     reportUnknown: (info) => {
       writeStderr(`offload: execution state unknown for ${info.commandId}; exit 75, no local replay.\n`);
     },
+    reportFallback: (info) => {
+      writeStderr(`offload: running local (${oneLine(info.reason)})\n`);
+    },
   };
   // A remote-candidate command that ends up running locally teaches the
   // server duration gate. Cargo never reports; pre-opt-in runs never report.
@@ -352,16 +362,23 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
 
   // Server dry-run is authoritative (profile toolchains, workload policy);
   // any dry-run failure degrades to the default local path: a dry run never
-  // journals, so running local is always safe here.
+  // journals, so running local is always safe here. The prefilter already
+  // called this argv a remote candidate, so either local path is announced:
+  // an unannounced fallback is indistinguishable from a remote run. Only the
+  // dry-run call is inside the catch: a rejecting local spawn must surface
+  // once, never be mistaken for a dry-run failure and run a second time.
+  let classification: Awaited<ReturnType<typeof runDryRun>>;
   try {
-    const classification = await runDryRun(request, clientDeps);
-    if (classification.mode === "local") {
-      const exit = await runLocalMeasured(toolArgv);
-      if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "local", reason: classification.reason, exitCode: exit })}\n`, "utf8"));
-      return exit;
-    }
-  } catch {
+    classification = await runDryRun(request, clientDeps);
+  } catch (error) {
+    writeStderr(`offload: running local (dry-run failed: ${oneLine(error instanceof Error ? error.message : String(error))})\n`);
     return runLocalMeasured(toolArgv);
+  }
+  if (classification.mode === "local") {
+    writeStderr(`offload: running local (${oneLine(classification.reason)})\n`);
+    const exit = await runLocalMeasured(toolArgv);
+    if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "local", reason: classification.reason, exitCode: exit })}\n`, "utf8"));
+    return exit;
   }
   const exit = await runOffload(request, clientDeps);
   if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "remote", exitCode: exit })}\n`, "utf8"));

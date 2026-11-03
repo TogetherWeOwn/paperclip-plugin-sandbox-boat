@@ -48,6 +48,13 @@ export interface ClientDeps {
   runLocal: (argv: string[]) => Promise<number>;
   reportStaged: (syncBack: OffloadSyncBack) => void;
   reportUnknown: (info: { commandId: string }) => void;
+  /**
+   * Called once, before the local run starts, whenever a command that was
+   * submitted for offload ends up running locally instead. Optional so older
+   * embedders keep compiling; the shim always provides it, because a silent
+   * fallback is indistinguishable from a successful remote run.
+   */
+  reportFallback?: (info: { reason: string }) => void;
 }
 
 export interface DryRunResult {
@@ -224,6 +231,7 @@ async function finishIfTerminal(ctx: PollContext, view: OffloadReadResponse): Pr
   if (view.terminalError === "OFFLOAD_OUTPUT_LIMIT") return OFFLOAD_EXIT.syncStaged;
   if (!view.result) {
     if (view.state === "not_started" && view.remoteStarted === false && view.fallbackSafe === true) {
+      ctx.deps.reportFallback?.({ reason: view.fallbackReason || "executor refused before start" });
       return ctx.deps.runLocal(ctx.request.argv);
     }
     return OFFLOAD_EXIT.executionUnknown;
@@ -344,7 +352,10 @@ function isLive(state: OffloadCommandState | string): boolean {
 export async function runOffload(request: ShimRequest, deps: ClientDeps): Promise<number> {
   const tool = request.tool ?? "cargo";
   const env = buildEnv(request.processEnv, tool);
-  if (env.local) return deps.runLocal(request.argv);
+  if (env.local) {
+    deps.reportFallback?.({ reason: env.reason });
+    return deps.runLocal(request.argv);
+  }
   const commandId = deps.randomId();
   let pending: "SIGINT" | "SIGTERM" | null = null;
   deps.onSignal((signal) => {
@@ -392,7 +403,10 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     return OFFLOAD_EXIT.invalidRequest;
   }
   const decision = exitForError(envelope);
-  if (decision.action === "fallback") return deps.runLocal(request.argv);
+  if (decision.action === "fallback") {
+    deps.reportFallback?.({ reason: envelope.detail });
+    return deps.runLocal(request.argv);
+  }
   // A structured 503 without a never-started guarantee is still ambiguous.
   if (submit.status === 503) return recover(ctx);
   return decision.code;

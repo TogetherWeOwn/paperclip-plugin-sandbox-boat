@@ -19,7 +19,7 @@ import { durationKey, normalizeSignature, pruneDurations, recordDuration } from 
 import { canonicalRepoId, classifyCargoWorkspace, defaultRunnerFor, normalizeOffloadSettings, NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, type ServerProfile } from "./offload/routes.js";
 import { cargoToolchain, classifyNode, classifyPython, isCargoOffline } from "./offload/router.js";
 import { LONE_SURROGATE } from "./offload/validate.js";
-import type { BackendCommand } from "./offload/broker.js";
+import type { BackendCommand, ExecutorRefusal } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
@@ -462,69 +462,134 @@ export class SshOffloadRuntime {
     return !!onDiskRepoUrl && canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) === binding.repoId;
   }
 
-  async resolve(command: BackendCommand, settings: Record<string, unknown>) {
+  /**
+   * Every read-only pre-start gate, in dispatch order. Each refusal names its
+   * site: the reason is journaled on the never-started receipt and printed by
+   * the shim, so a local fallback is never silent. `resolve` runs this before
+   * any pool/VM effect, and `preflight` exposes the same verdict to the
+   * dry-run route so a `remote_candidate` answer is predictive for every gate
+   * that can be checked without starting a VM.
+   */
+  private async gate(command: BackendCommand, settings: Record<string, unknown>):
+    Promise<{ binding: Binding; profile: ServerProfile; cgroupParent: string; artifactRoot: string } | ExecutorRefusal> {
+    const refuse = (refusalReason: string): ExecutorRefusal => ({ refusalReason });
     this.localRunRootsByCompany.set(command.companyId, localSourceRoots(settings));
-    if (this.closing || settings.offloadExecutorEnabled !== true || settings.offloadGuestTransportEnabled !== true
-      || !plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")
-      || !plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)
-      || !Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) return null;
+    if (this.closing) return refuse("offload runtime is shutting down");
+    if (settings.offloadExecutorEnabled !== true) return refuse("offload executor is not enabled");
+    if (settings.offloadGuestTransportEnabled !== true) return refuse("offload guest transport is not enabled");
+    if (!plain(settings.offloadCgroupParent) || !settings.offloadCgroupParent.startsWith("/sys/fs/cgroup/")) {
+      return refuse("offload cgroup parent is not configured");
+    }
+    if (!plain(settings.offloadArtifactRoot) || !path.isAbsolute(settings.offloadArtifactRoot)) {
+      return refuse("offload artifact root is not configured");
+    }
+    if (!Array.isArray(settings.offloadAllowedRepos) || !settings.offloadAllowedRepos.includes(command.repoId)) {
+      return refuse("repo is not on the offload allowlist");
+    }
     const binding = this.bindings.get(key(command.companyId, command.runId, command.executionWorkspaceId));
-    if (!binding || Date.now() - binding.seenAt > 24 * 60 * 60_000 || binding.repoId !== command.repoId) return null;
+    if (!binding) return refuse("no offload binding for this run and workspace");
+    if (Date.now() - binding.seenAt > 24 * 60 * 60_000) return refuse("offload binding for this run has expired");
+    if (binding.repoId !== command.repoId) return refuse("offload binding repo does not match the workspace repo");
     // The workspace row behind a local-run binding is agent-mutable, so the
     // operator-owned facts are re-proven on every resolve, not only at bind.
-    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) return null;
+    if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) {
+      return refuse("local-run source no longer passes roots/origin validation");
+    }
     const profile = profileForId(command.profileId);
-    if (!profile || !normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) return null;
+    if (!profile) return refuse(`unknown offload profile ${command.profileId}`);
+    if (!normalizeOffloadSettings(settings).offloadProfiles.includes(profile.id)) {
+      return refuse(`profile ${profile.id} is not enabled for offload`);
+    }
     const tool = command.tool ?? (profile.id === V1_PROFILE.id ? "cargo" : profile.id === NODE_PROFILE.id ? "node" : "python");
     const runner = command.runner ?? defaultRunnerFor(tool);
     const runners = profile.id === V1_PROFILE.id ? ["cargo"] : profile.id === NODE_PROFILE.id ? NODE_PROFILE.runners! : PYTHON_PROFILE.runners!;
-    if (!runners.includes(runner)) return null;
+    if (!runners.includes(runner)) return refuse(`runner ${runner} is not allowed on profile ${profile.id}`);
     // Cargo re-reads the toolchain pin from the host-owned source, not the route's view.
     const classified = tool === "cargo" ? await classifyCargoWorkspace(V1_PROFILE, command.argv, binding.source, command.cwdRelative)
       : tool === "node" ? classifyNode(runner, command.argv, profile)
       : classifyPython(runner, command.argv, profile);
-    if (classified.mode !== "remote_candidate" || classified.profileId !== profile.id) return null;
-    if (!this.confined(command, tool)) return null;
+    if (classified.mode !== "remote_candidate") return refuse(`workload is not a remote candidate: ${classified.reason}`);
+    if (classified.profileId !== profile.id) return refuse("classification profile does not match the command profile");
+    if (!this.confined(command, tool)) return refuse("command escapes workspace confinement");
     // The guest runs in the mirrored cwd: an empty or sync-excluded directory
     // is absent there, so the command could not start remotely.
-    if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) return null;
+    if (!await snapshotHasDirectory(binding.source, command.cwdRelative).catch(() => false)) {
+      return refuse("command directory is not present in the synced workspace");
+    }
     // Tracked files only, for every tool: a non-git source, an empty index,
     // or a tracked file carrying a known credential shape keeps the command
     // local before any VM is reserved. The push re-checks both (the tree can
     // change after admission); this gate keeps a secret-bearing or untracked
     // workspace from ever spending a VM.
     const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(binding.source).catch(() => null);
-    if (!tracked || tracked.size === 0) return null;
+    if (!tracked || tracked.size === 0) return refuse("workspace has no tracked files to sync");
     const syncable = [...tracked].filter((rel) => !isDefaultSyncExcluded(rel));
-    if (syncable.length === 0) return null;
+    if (syncable.length === 0) return refuse("no tracked files are syncable");
     // A tracked secret-bearing name (a public test cert, a .docker/ context)
     // is withheld from sync, so the guest tree would silently lack a file the
     // build may read: stay local for every tool, cargo included.
     if ([...tracked].some((rel) => { const parts = rel.split("/");
-      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) return null;
+      return isSecretBearingName(parts.at(-1)!) || parts.some((part) => STAY_LOCAL_DIRS.has(part)); })) {
+      return refuse("tracked secret-bearing file keeps the command local");
+    }
     // Git lists normalized paths: "./src" or "src/." name the same directory.
     const cwd = path.posix.normalize(command.cwdRelative).replace(/\/$/, "");
-    if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) return null;
-    if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) return null;
+    if (cwd !== "." && !syncable.some((rel) => rel.startsWith(`${cwd}/`))) {
+      return refuse("command directory has no syncable tracked files");
+    }
+    if (await hasSecretInFiles(binding.source, syncable).catch(() => true)) {
+      return refuse("tracked file content matches a credential shape; stays local");
+    }
     // An --offline build cannot download missing crates: a private-registry
     // config in the source would fail the guest fetch, so the command stays
     // local. This is prepare-time's stay-local decision; the guest cannot see
     // the host source once the command is admitted.
     if (tool === "cargo" && isCargoOffline(command.argv)
-      && await hasCargoRegistryAuth(binding.source, command.cwdRelative).catch(() => true)) return null;
+      && await hasCargoRegistryAuth(binding.source, command.cwdRelative).catch(() => true)) {
+      return refuse("cargo config needs private registry auth; stays local");
+    }
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
       // stays local: its token is excluded from sync, so the guest could not
       // authenticate a private registry without it.
       const plan = await planDependencies(binding.source, tool).catch(() => null);
-      if (!plan) return null;
-      if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) return null;
-      if (await hasRegistryCredentials(binding.source).catch(() => true)) return null;
+      if (!plan) return refuse("no lockfile-based dependency plan; stays local");
+      if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) {
+        return refuse("nested lockfile below the workspace root; stays local");
+      }
+      if (await hasRegistryCredentials(binding.source).catch(() => true)) {
+        return refuse("registry credential config present; stays local");
+      }
     }
     // Source and credentials only from host-authored native params. An API
     // caller cannot choose a host root, provider endpoint, executable or pool.
-    if (await realpath(binding.source).catch(() => null) !== binding.source || this.closing || !resolveApiKey(binding.config)) return null;
+    if (await realpath(binding.source).catch(() => null) !== binding.source) return refuse("offload source path is not canonical");
+    if (this.closing) return refuse("offload runtime is shutting down");
+    if (!resolveApiKey(binding.config)) return refuse("offload credential is not configured");
+    return { binding, profile, cgroupParent: settings.offloadCgroupParent, artifactRoot: settings.offloadArtifactRoot };
+  }
+
+  /**
+   * Dry-run verdict: the refusal reason `resolve` would return for this
+   * command right now, or null when every read-only gate passes. Capacity and
+   * pool admission are deliberately not promised here; those refusals still
+   * surface as journaled reasons on the real submit.
+   */
+  async preflight(command: BackendCommand, settings: Record<string, unknown>): Promise<string | null> {
+    const gated = await this.gate(command, settings);
+    return "refusalReason" in gated ? gated.refusalReason : null;
+  }
+
+  async resolve(command: BackendCommand, settings: Record<string, unknown>): Promise<OffloadExecutor | ExecutorRefusal> {
+    const gated = await this.gate(command, settings);
+    if ("refusalReason" in gated) {
+      this.deps.logger.info("boat: offload executor refused", {
+        runId: command.runId, workspaceId: command.executionWorkspaceId, reason: gated.refusalReason,
+      });
+      return gated;
+    }
+    const { binding, profile, cgroupParent, artifactRoot } = gated;
     // The credential digest is part of pool identity: persisted executor state
     // stays credential-free (a KDF digest is not the key), and a rotated or
     // re-pointed key must not keep operating pools, journals or VMs under the
@@ -541,7 +606,7 @@ export class SshOffloadRuntime {
     // Re-fence here (and after every later await) so no executor can be
     // registered after that snapshot; from the last check to pools.set the
     // path is synchronous, so shutdown cannot interleave.
-    if (this.closing) return null;
+    if (this.closing) return { refusalReason: "offload runtime is shutting down" };
     const baseIdentity = JSON.stringify([binding.companyId, binding.environmentId, binding.repoId,
       command.profileId, binding.config.apiBase, binding.config.size, settings.offloadCgroupParent, settings.offloadArtifactRoot]);
     const poolId = createHash("sha256").update(JSON.stringify([baseIdentity, credentialDigest]))
@@ -556,7 +621,7 @@ export class SshOffloadRuntime {
         // journal is retained and ages out through collectRetiredPool; no
         // new resolve can reach it because its poolId embeds the old digest.
         await superseded.executor.sweep().catch(() => undefined);
-        if (this.closing) return null;
+        if (this.closing) return { refusalReason: "offload runtime is shutting down" };
       }
     }
     // Neither template selection is deliberately part of the pool identity:
@@ -566,7 +631,7 @@ export class SshOffloadRuntime {
     let existing = this.pools.get(poolId);
     if (!existing && this.retiredSweeps.has(poolId)) {
       await this.retiredSweeps.get(poolId);
-      if (this.closing) return null;
+      if (this.closing) return { refusalReason: "offload runtime is shutting down" };
       existing = this.pools.get(poolId);
     }
     if (existing) {
@@ -618,7 +683,7 @@ export class SshOffloadRuntime {
       }
       return native.source;
     };
-    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot: settings.offloadArtifactRoot,
+    const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
       // Warm commands reuse the cached session and its control master. After a
       // resume (new machine, IP and host key) the first guest op fails on the
@@ -632,7 +697,7 @@ export class SshOffloadRuntime {
       if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
       return sync.directory(cmd);
     };
-    const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent: settings.offloadCgroupParent,
+    const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent,
       workspace: (vm, cmd) => sync.cwd(vm, cmd),
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       profileEnv: profileGuestEnv,
@@ -684,7 +749,7 @@ export class SshOffloadRuntime {
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
-    this.pools.set(poolId, { companyId: command.companyId, artifactRoot: settings.offloadArtifactRoot, executor, guest, sync, sessions });
+    this.pools.set(poolId, { companyId: command.companyId, artifactRoot, executor, guest, sync, sessions });
     this.poolByBaseIdentity.set(baseIdentity, poolId);
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
     // lost write is retried by every sweep while the pool is loaded.

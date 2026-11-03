@@ -447,6 +447,20 @@ describe("durable host journal: retention and broker-facing semantics", () => {
     expect(h.attempts).toHaveLength(0);
   });
 
+  it("a not_started view carries the unavailable result's admission reason, bounded", async () => {
+    await seed("not_started", command(), {
+      result: {
+        status: "unavailable", code: "OFFLOAD_UNAVAILABLE", commandId: "command-1",
+        remoteStarted: false, fallbackSafe: true, reason: `queue full (32 pending) ${"x".repeat(300)}`,
+      },
+    });
+    const { executor } = h.openExecutor();
+    const read = await view(executor);
+    expect(read).toMatchObject({ state: "not_started", remoteStarted: false, fallbackSafe: true });
+    expect(read.fallbackReason).toBe(`queue full (32 pending) ${"x".repeat(300)}`.slice(0, 256));
+    expect(read.fallbackReason).toHaveLength(256);
+  });
+
   it("queued cancellation durably prevents later start and duplicate cancellation is stable", async () => {
     await seed("queued");
     const { executor } = h.openExecutor(); method(executor, "cancelCommand");

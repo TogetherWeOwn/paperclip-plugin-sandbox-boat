@@ -93,6 +93,10 @@ export interface OffloadCommandView {
   state: OffloadState;
   remoteStarted: boolean | null;
   fallbackSafe: boolean;
+  /** Why a never-started command was refused (bounded, server-authored).
+   * Present only on `not_started` views whose unavailable result carried a
+   * reason, so the bridge can journal it instead of a generic refusal. */
+  fallbackReason?: string;
   result: {
     exitCode: number;
     signal: null;
@@ -361,7 +365,8 @@ export class OffloadJournal {
       // The existing bounded-ID admission can refuse without allocating a
       // record; start must settle too, without suggesting a remote effect.
       if (result.status === "unavailable") accepted({ version: 1, commandId: command.commandId,
-        state: "not_started", remoteStarted: false, fallbackSafe: true, result: null });
+        state: "not_started", remoteStarted: false, fallbackSafe: true,
+        fallbackReason: result.reason.slice(0, 256), result: null });
     }, rejected);
     void task.finally(() => { if (this.inFlight.get(key) === entry) this.inFlight.delete(key); }).catch(() => {});
     return entry;
@@ -691,8 +696,14 @@ export class OffloadJournal {
       syncBack: record.result.status === "completed" && record.result.syncBack
         ? structuredClone(record.result.syncBack) : { state: "clean" as const, changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null,
     } : null;
+    // A never-started record's unavailable result names the admission gate
+    // (queue, cap, quarantine…); surface it bounded so a local fallback can
+    // say which one refused instead of a generic "never started".
+    const fallbackReason = record.state === "not_started" && record.result?.status === "unavailable"
+      ? record.result.reason.slice(0, 256) : null;
     return { version: 1, commandId: record.commandId, state: record.state,
-      remoteStarted: record.remoteStarted, fallbackSafe: record.fallbackSafe, result };
+      remoteStarted: record.remoteStarted, fallbackSafe: record.fallbackSafe,
+      ...(fallbackReason !== null ? { fallbackReason } : {}), result };
   }
 
   async heartbeatCommand(companyId: string, runId: string, commandId: string, generation?: number): Promise<OffloadCommandView> {

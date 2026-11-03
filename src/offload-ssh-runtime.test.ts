@@ -16,6 +16,15 @@ import type { BackendCommand } from "./offload/broker.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
 import { DEFAULT_API_BASE } from "./config.js";
+import type { OffloadExecutor } from "./offload.js";
+import { isExecutorRefusal, type ExecutorRefusal } from "./offload/broker.js";
+
+/** resolve() returns a reasoned refusal instead of bare null; narrow where a test needs the executor. */
+function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor {
+  if (isExecutorRefusal(value)) throw new Error(`unexpected offload refusal: ${value.refusalReason}`);
+  return value;
+}
+
 
 let ssh: LoopbackSsh;
 let runtime: SshOffloadRuntime;
@@ -103,13 +112,13 @@ describe("project workspace alias", () => {
     // alias could not resolve; the whole-run binding the alias now answers
     // with can.
     expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
-    expect(await runtime.resolve({ ...command(), runId: localRunId, executionWorkspaceId: projectWorkspaceId }, config)).not.toBe(null);
+    mustResolve(await runtime.resolve({ ...command(), runId: localRunId, executionWorkspaceId: projectWorkspaceId }, config));
   });
 });
 
 describe("stock concrete executor factory", () => {
   it("fences new pool resolution before awaiting shutdown of an existing pool", async () => {
-    const executor = (await runtime.resolve(command(), config))!;
+    const executor = mustResolve(await runtime.resolve(command(), config));
     let release!: () => void;
     const draining = new Promise<void>((resolve) => { release = resolve; });
     const shutdown = vi.spyOn(executor, "shutdown").mockImplementation(() => draining);
@@ -120,7 +129,7 @@ describe("stock concrete executor factory", () => {
       another.environmentId = "another-env";
       (another.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).environmentId = "another-env";
       runtime.remember(another);
-      expect(await runtime.resolve(command(), config)).toBe(null);
+      expect(await runtime.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
       expect(boat.calls).toHaveLength(0);
     } finally {
       release();
@@ -131,7 +140,7 @@ describe("stock concrete executor factory", () => {
   it("fences a resolution already awaiting native source validation when shutdown starts", async () => {
     const resolving = runtime.resolve(command(), config);
     await runtime.shutdown();
-    expect(await resolving).toBe(null);
+    expect(await resolving).toEqual({ refusalReason: "offload runtime is shutting down" });
     expect(boat.calls).toHaveLength(0);
   });
   it("fences a resolution awaiting the credential digest when shutdown starts", async () => {
@@ -147,7 +156,7 @@ describe("stock concrete executor factory", () => {
     }
     expect([...view.bindings.values()].some((binding) => binding.credentialDigest !== undefined)).toBe(true);
     await runtime.shutdown();
-    expect(await resolving).toBe(null);
+    expect(await resolving).toEqual({ refusalReason: "offload runtime is shutting down" });
     expect(view.pools.size).toBe(0);
     expect(boat.calls).toHaveLength(0);
   });
@@ -186,7 +195,7 @@ describe("stock concrete executor factory", () => {
     expect(boat.calls.some((call) => call.method === "create")).toBe(true);
   }, 20_000);
   it.each([{}, { offloadExecutorEnabled: true }, { ...{}, offloadGuestTransportEnabled: true }])("does not dispatch with incomplete gates %j", async (settings) => {
-    expect(await runtime.resolve(command(), settings)).toBe(null);
+    expect(await runtime.resolve(command(), settings)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("re-validates a local-run binding's roots and on-disk origin on every resolve", async () => {
@@ -198,12 +207,12 @@ describe("stock concrete executor factory", () => {
     (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
-    expect(await runtime.resolve(command(), rooted)).not.toBe(null);
+    mustResolve(await runtime.resolve(command(), rooted));
     await origin("https://github.com/example/private");
-    expect(await runtime.resolve(command(), rooted)).toBe(null);
+    expect(await runtime.resolve(command(), rooted)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await origin("https://github.com/example/public");
-    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
-    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("refuses a queued local-run upload when the origin flips or the roots drop after resolve", async () => {
@@ -215,7 +224,7 @@ describe("stock concrete executor factory", () => {
     (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
-    const executor = (await runtime.resolve(command(), rooted))!;
+    const executor = mustResolve(await runtime.resolve(command(), rooted));
     expect(executor).not.toBe(null);
     const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
     const sync = [...pools.values()][0]!.sync;
@@ -226,7 +235,7 @@ describe("stock concrete executor factory", () => {
     // Restoring the origin but dropping the configured roots (observed by the
     // next resolve) refuses the still-queued push the same way.
     await origin("https://github.com/example/public");
-    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
     expect(boat.calls).toHaveLength(0);
     // End to end: with roots restored, a post-resolve origin flip makes the
@@ -250,31 +259,31 @@ describe("stock concrete executor factory", () => {
     (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
-    const executor = (await runtime.resolve(command(), rooted))!;
+    const executor = mustResolve(await runtime.resolve(command(), rooted));
     expect(executor).not.toBe(null);
     const pools = (runtime as unknown as { pools: Map<string, { sync: { push(sandboxId: string, cmd: BackendCommand): Promise<void> } }> }).pools;
     const sync = [...pools.values()][0]!.sync;
     const otherCompanyId = "cccccccc-cccc-4ccc-cccc-cccccccccccc";
     // Config is per-company: company B resolving with empty roots (it has no
     // binding, so resolve returns null) must not cancel company A's queued push.
-    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, { ...config, offloadLocalSourceRoots: [] })).toBe(null);
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, { ...config, offloadLocalSourceRoots: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await expect(sync.push("sandbox-queued", command())).resolves.toBeUndefined();
     // Symmetrically, once A drops its own roots, B resolving with roots that
     // cover the source must not resurrect A's queued push.
-    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toBe(null);
-    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, rooted)).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...command(), companyId: otherCompanyId }, rooted)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
     expect(boat.calls).toHaveLength(0);
   }, 20_000);
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
-      expect(await runtime.resolve(command(), { ...config, [setting]: value })).toBe(null);
+      expect(await runtime.resolve(command(), { ...config, [setting]: value })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     }
     expect(boat.calls).toHaveLength(0);
   });
   it("requires explicit repository approval even after both flags are enabled", async () => {
-    expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: [] })).toBe(null);
-    expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: ["repo:another"] })).toBe(null);
+    expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve(command(), { ...config, offloadAllowedRepos: ["repo:another"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   // Real-git admission (no trackedFiles seam): the default listing gates resolve().
@@ -292,7 +301,7 @@ describe("stock concrete executor factory", () => {
   it("keeps a non-git source local: resolve returns null and no VM is spent", async () => {
     const rt = realGitRuntime();
     try {
-      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
@@ -302,7 +311,7 @@ describe("stock concrete executor factory", () => {
     gitIn(source, "add", "Cargo.toml", "Cargo.lock", "config.rs");
     const rt = realGitRuntime();
     try {
-      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
@@ -312,7 +321,7 @@ describe("stock concrete executor factory", () => {
     gitIn(source, "add", "Cargo.toml", "Cargo.lock");
     const rt = realGitRuntime();
     try {
-      expect(await rt.resolve(command(), config)).not.toBe(null);
+      mustResolve(await rt.resolve(command(), config));
     } finally { await rt.shutdown(); }
   });
   it("keeps cargo local when a tracked secret-bearing file would be withheld from sync", async () => {
@@ -322,37 +331,36 @@ describe("stock concrete executor factory", () => {
     gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/ca.pem");
     const rt = realGitRuntime();
     try {
-      expect(await rt.resolve(command(), config)).toBe(null);
+      expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
   it("binds only native company/run/workspace metadata and rejects path-bearing cargo escapes", async () => {
-    expect(await runtime.resolve({ ...command(), runId: "another-run" }, config)).toBe(null);
-    expect(await runtime.resolve({ ...command(), argv: ["test", "--manifest-path=/etc/Cargo.toml"] }, config)).toBe(null);
-    expect(await runtime.resolve({ ...command(), cwdRelative: "../escape" }, config)).toBe(null);
+    expect(await runtime.resolve({ ...command(), runId: "another-run" }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...command(), argv: ["test", "--manifest-path=/etc/Cargo.toml"] }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...command(), cwdRelative: "../escape" }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("defensively refuses argv controls and lone surrogates in argv or cwd before resolving an executor or spending any VM starts", async () => {
     for (const code of [...Array.from({ length: 32 }, (_, i) => i), 127]) {
-      expect(await runtime.resolve({ ...command(), argv: ["test", `filter${String.fromCharCode(code)}suffix`] }, config)).toBe(null);
+      expect(await runtime.resolve({ ...command(), argv: ["test", `filter${String.fromCharCode(code)}suffix`] }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     }
     for (const lone of ["\ud800", "\udfff"]) {
-      expect(await runtime.resolve({ ...command(), argv: ["test", `a${lone}b`] }, config)).toBe(null);
-      expect(await runtime.resolve({ ...command(), cwdRelative: `crates/${lone}` }, config)).toBe(null);
+      expect(await runtime.resolve({ ...command(), argv: ["test", `a${lone}b`] }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+      expect(await runtime.resolve({ ...command(), cwdRelative: `crates/${lone}` }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     }
     expect(boat.calls).toHaveLength(0);
-    expect(await runtime.resolve(command(), config)).not.toBe(null);
+    mustResolve(await runtime.resolve(command(), config));
   });
 
   it("executes a native-bound command through the real SSH lifecycle, freezes source and stages returns without live writeback", async () => {
-    const executor = await runtime.resolve(command(), config);
-    expect(executor).not.toBe(null);
+    const executor = mustResolve(await runtime.resolve(command(), config));
     expect(boat.calls).toHaveLength(0); // resolving a binding is side-effect free
     const cmd = command();
-    await executor!.start(cmd);
-    let view = await executor!.readOutput(companyId, runId, cmd.commandId);
+    await executor.start(cmd);
+    let view = await executor.readOutput(companyId, runId, cmd.commandId);
     await expect.poll(async () => {
-      view = await executor!.readOutput(companyId, runId, cmd.commandId);
+      view = await executor.readOutput(companyId, runId, cmd.commandId);
       return ["completed", "not_started", "unknown"].includes(view.state);
     }, { timeout: 15_000 }).toBe(true);
     if (process.env.PAPERCLIP_TEST_CGROUP_REQUIRED === "1") {
@@ -370,18 +378,18 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, "package-lock.json"), "{}");
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
-    expect(await runtime.resolve(node, enabled)).not.toBe(null);
+    mustResolve(await runtime.resolve(node, enabled));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps node local without an enabled profile, a lockfile, or a remote-candidate shape", async () => {
     await writeFile(path.join(source, "package-lock.json"), "{}");
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
-    expect(await runtime.resolve(node, config)).toBe(null);
-    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"], offloadAllowedRepos: [] })).toBe(null);
-    expect(await runtime.resolve({ ...node, argv: ["run", "dev"] }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
-    expect(await runtime.resolve({ ...node, runner: "bun" }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(await runtime.resolve(node, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"], offloadAllowedRepos: [] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...node, argv: ["run", "dev"] }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...node, runner: "bun" }, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await rm(path.join(source, "package-lock.json"), { force: true });
-    expect(await runtime.resolve({ ...node } as BackendCommand, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(await runtime.resolve({ ...node } as BackendCommand, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps node local when a registry credential file is present", async () => {
@@ -389,7 +397,7 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
-    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(await runtime.resolve(node, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps node local when a nested credential file is present", async () => {
@@ -398,7 +406,7 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, "packages/app/.npmrc"), "//registry.npmjs.org/:_authToken=secret\n");
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] };
-    expect(await runtime.resolve(node, enabled)).toBe(null);
+    expect(await runtime.resolve(node, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps a command local when its directory would be absent from the guest mirror", async () => {
@@ -408,20 +416,20 @@ describe("stock concrete executor factory", () => {
     await mkdir(path.join(source, "secrets"));
     await writeFile(path.join(source, "secrets/.env"), "DO_NOT_UPLOAD=secret");
     for (const cwdRelative of ["scratch", "crates/foo/target", "missing", "secrets"]) {
-      expect(await runtime.resolve({ ...command(), cwdRelative }, config)).toBe(null);
+      expect(await runtime.resolve({ ...command(), cwdRelative }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     }
     expect(boat.calls).toHaveLength(0);
     await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
-    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config)).not.toBe(null);
-    expect(await runtime.resolve({ ...command(), cwdRelative: "./crates/foo" }, config)).not.toBe(null);
-    expect(await runtime.resolve({ ...command(), cwdRelative: "crates/foo/." }, config)).not.toBe(null);
+    mustResolve(await runtime.resolve({ ...command(), cwdRelative: "crates/foo" }, config));
+    mustResolve(await runtime.resolve({ ...command(), cwdRelative: "./crates/foo" }, config));
+    mustResolve(await runtime.resolve({ ...command(), cwdRelative: "crates/foo/." }, config));
   });
   it("keeps a node command in a separately locked sub-project local", async () => {
     await writeFile(path.join(source, "package-lock.json"), "{}");
     await mkdir(path.join(source, "tools/app"), { recursive: true });
     await writeFile(path.join(source, "tools/app/package-lock.json"), "{}");
     const node = { ...command(), profileId: "node-public-1", tool: "node", runner: "npm", argv: ["run", "test"], cwdRelative: "tools/app" } as BackendCommand;
-    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toBe(null);
+    expect(await runtime.resolve(node, { ...config, offloadProfiles: ["rust-public-1", "node-public-1"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps python local when uv auth config is present", async () => {
@@ -429,23 +437,23 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, "uv.toml"), "[index]\n");
     const py = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
-    expect(await runtime.resolve(py, enabled)).toBe(null);
+    expect(await runtime.resolve(py, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     await rm(path.join(source, "uv.toml"), { force: true });
     await writeFile(path.join(source, "pyproject.toml"), `[project]\nname = "app"\n[tool.uv]\nindex-url = "https://user:secret@example.com/simple"\n`);
-    expect(await runtime.resolve(py, enabled)).toBe(null);
+    expect(await runtime.resolve(py, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps python local for inline code, absolute paths and escaping path flags", async () => {
     await writeFile(path.join(source, "requirements.txt"), "pytest==7.4.2 \\\n    --hash=sha256:abc123\n");
     const base = { ...command(), profileId: "python-public-1", tool: "python", runner: "python", argv: ["-m", "pytest"] } as BackendCommand;
     const enabled = { ...config, offloadProfiles: ["rust-public-1", "python-public-1"] };
-    expect(await runtime.resolve(base, enabled)).not.toBe(null);
-    expect(await runtime.resolve({ ...base, argv: ["-c", "print(1)"] }, enabled)).toBe(null);
+    mustResolve(await runtime.resolve(base, enabled));
+    expect(await runtime.resolve({ ...base, argv: ["-c", "print(1)"] }, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     // pytest's own -c/--config after -m is a config file, not inline code.
-    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "-c", "pytest.ini", "tests/"] }, enabled)).not.toBe(null);
-    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toBe(null);
-    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toBe(null);
-    expect(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled)).not.toBe(null);
+    mustResolve(await runtime.resolve({ ...base, argv: ["-m", "pytest", "-c", "pytest.ini", "tests/"] }, enabled));
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "/etc/passwd"] }, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await runtime.resolve({ ...base, argv: ["-m", "pytest", "--rootdir", ".."] }, enabled)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    mustResolve(await runtime.resolve({ ...base, runner: "pytest", argv: ["tests/", "--rootdir", "tests"] }, enabled));
     expect(boat.calls).toHaveLength(0);
   });
 });
@@ -467,28 +475,28 @@ describe("templateSnapshot pool wiring", () => {
   }
 
   it("keeps a stable pool identity when no template is configured", async () => {
-    const executor = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    const executor = mustResolve(await runtime.resolve(command(), config)) as unknown as { poolId: string; config: { templateSnapshot: string | null } };
     expect(executor.poolId).toBe(legacyPoolId());
     expect(executor.config.templateSnapshot).toBe(null);
   });
 
   it("updates a cached executor when a later binding selects another template", async () => {
-    const first = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    const first = mustResolve(await runtime.resolve(command(), config)) as unknown as { config: { templateSnapshot: string | null } };
     runtime.remember(withTemplate("tmpl-a"));
-    const a = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    const a = mustResolve(await runtime.resolve(command(), config)) as unknown as { config: { templateSnapshot: string | null } };
     expect(a).toBe(first);
     expect(a.config.templateSnapshot).toBe("tmpl-a");
     runtime.remember(withTemplate("tmpl-b"));
-    const b = (await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } };
+    const b = mustResolve(await runtime.resolve(command(), config)) as unknown as { config: { templateSnapshot: string | null } };
     expect(b).toBe(first);
     expect(b.config.templateSnapshot).toBe("tmpl-b");
     runtime.remember(native());
-    expect(((await runtime.resolve(command(), config))! as unknown as { config: { templateSnapshot: string | null } }).config.templateSnapshot).toBe(null);
+    expect((mustResolve(await runtime.resolve(command(), config)) as unknown as { config: { templateSnapshot: string | null } }).config.templateSnapshot).toBe(null);
     expect(boat.calls).toHaveLength(0);
   });
   it("forwards the configured template and keeps the pool identity, so recorded VMs stay owned", async () => {
     runtime.remember(withTemplate("tmpl-a"));
-    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string; config: { templateSnapshot: string | null } };
+    const a = mustResolve(await runtime.resolve(command(), config)) as unknown as { poolId: string; config: { templateSnapshot: string | null } };
     expect(a.config.templateSnapshot).toBe("tmpl-a");
     expect(a.poolId).toBe(legacyPoolId());
     expect(boat.calls).toHaveLength(0);
@@ -497,7 +505,7 @@ describe("templateSnapshot pool wiring", () => {
     const params = native();
     params.config = { ...params.config, templateSourceSandboxId: "bx_archived-fork" };
     runtime.remember(params);
-    const a = (await runtime.resolve(command(), config))! as unknown as { poolId: string;
+    const a = mustResolve(await runtime.resolve(command(), config)) as unknown as { poolId: string;
       config: { templateSnapshot: string | null; templateSourceSandboxId: string | null } };
     expect(a.config.templateSnapshot).toBe(null);
     expect(a.config.templateSourceSandboxId).toBe("bx_archived-fork");
@@ -505,7 +513,7 @@ describe("templateSnapshot pool wiring", () => {
     expect(boat.calls).toHaveLength(0);
   });
   it("pushes a changed or cleared fork source to the reused executor", async () => {
-    const view = async () => (await runtime.resolve(command(), config))! as unknown as
+    const view = async () => mustResolve(await runtime.resolve(command(), config)) as unknown as
       { poolId: string; config: { templateSourceSandboxId: string | null } };
     const first = native();
     first.config = { ...first.config, templateSourceSandboxId: "bx_archived-a" };
@@ -531,25 +539,25 @@ describe("templateSnapshot pool wiring", () => {
 describe("offline cargo registry guard", () => {
   const offline = (): BackendCommand => ({ ...command(), argv: ["test", "--offline"] });
   it("resolves an offline command with a clean source", async () => {
-    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    mustResolve(await runtime.resolve(offline(), config));
     expect(boat.calls).toHaveLength(0);
   });
   it("keeps an offline command local when the source pins a private registry", async () => {
-    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    mustResolve(await runtime.resolve(offline(), config));
     await mkdir(path.join(source, ".cargo"), { recursive: true });
     await writeFile(path.join(source, ".cargo/config.toml"), '[source.crates-io]\nreplace-with = "private"\n');
-    expect(await runtime.resolve(offline(), config)).toBe(null);
+    expect(await runtime.resolve(offline(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     // A non-offline command is unaffected: no guest fetch would run.
-    expect(await runtime.resolve(command(), config)).not.toBe(null);
+    mustResolve(await runtime.resolve(command(), config));
     expect(boat.calls).toHaveLength(0);
     await rm(path.join(source, ".cargo"), { recursive: true, force: true });
-    expect(await runtime.resolve(offline(), config)).not.toBe(null);
+    mustResolve(await runtime.resolve(offline(), config));
   });
   it("keeps an offline command local when a nested checkout overrides the registry", async () => {
     await mkdir(path.join(source, "crates/foo/.cargo"), { recursive: true });
     await writeFile(path.join(source, "crates/foo/lib.rs"), "fn main() {}");
     await writeFile(path.join(source, "crates/foo/.cargo/config"), '[registries.private]\nindex = "https://example.com"\n');
-    expect(await runtime.resolve({ ...offline(), cwdRelative: "crates/foo" }, config)).toBe(null);
+    expect(await runtime.resolve({ ...offline(), cwdRelative: "crates/foo" }, config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
 });
@@ -651,12 +659,12 @@ describe("pool credential identity and guest token scrub", () => {
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "true"] } });
     try {
       rotating.remember(nativeWithKey("key-a"));
-      const first = (await rotating.resolve(command(), config))!;
+      const first = mustResolve(await rotating.resolve(command(), config));
       expect(first).not.toBeNull();
       const sweepFirst = vi.spyOn(first, "sweep");
 
       rotating.remember(nativeWithKey("key-b"));
-      const second = (await rotating.resolve(command(), config))!;
+      const second = mustResolve(await rotating.resolve(command(), config));
       expect(second).not.toBeNull();
       expect(second).not.toBe(first);
       // The factory built a new client from the rotated key, and the pool
