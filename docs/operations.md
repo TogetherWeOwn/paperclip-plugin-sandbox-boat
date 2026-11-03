@@ -263,7 +263,8 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 
   A warning log line names the limit. If the limits cannot be read, nothing is started.
 * **Fail-fast starts.** A start that finds no ready machine gets `503 no_ready_machine` at once. Nothing is started or billed. The plugin retries twice, 5 s apart, then fails with `BOAT_NO_READY_MACHINE`.
-* **Retries never double-bill.** Creates send an `Idempotency-Key`. boat documents the key for create and fork only, and the SDK has no key for resume. A resume retry therefore checks the VM state first and treats `sandbox_resuming` as done.
+* **Retries never double-bill.** Creates send an `Idempotency-Key`. boat documents the key for create and fork only, and the SDK has no key for resume. A resume retry therefore checks the VM state first and treats `sandbox_resuming` as done. Pool creates carry the reservation id as the key, so a retry after a lost reply replays the same provider effect instead of billing a second VM: a compatible retry adopts the VM and runs on it, an incompatible one stops it, settles the reservation, and frees the slot for a fresh create.
+* **A failed delete stops.** If the provider delete fails on release of a per-run VM (or on destroy), the plugin stops the VM instead so billing stops, records the stop, and rethrows the delete error. No tombstone is written: the record keeps the VM tracked (stopped) so later sweep passes still see it.
 
 ### Offload VM-hour cap
 
