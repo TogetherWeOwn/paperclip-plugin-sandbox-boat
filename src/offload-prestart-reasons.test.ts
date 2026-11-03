@@ -292,6 +292,21 @@ describe("executor logs and releases on a pre-start failure", () => {
     expect(s.starts).toEqual([]);
   });
 
+  it("placement-suffixed probe sub-cause reaches the warn detail, never the result reason", async () => {
+    s.guest.delegated = false;
+    s.guest.watchdog = false;
+    s.guest.preflightReason = "probe_admit_failed:EACCES:session_not_delegated";
+    const cmd = lifecycleCommand("exec-prepare-placement-fail");
+    const result = await s.execute(cmd);
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
+      reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    expect(JSON.stringify(result)).not.toContain("session_not_delegated");
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
+    expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
+      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "probe_admit_failed:EACCES:session_not_delegated" });
+    expect(s.starts).toEqual([]);
+  });
+
   it("preflight RPC failure is a distinct warn detail from a guest-reported refusal", async () => {
     s.guest.delegated = false;
     s.guest.watchdog = false;

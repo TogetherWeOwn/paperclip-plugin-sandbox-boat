@@ -704,12 +704,33 @@ export class SshOffloadRuntime {
       }
       return native.source;
     };
+    // Warm commands reuse the cached session and its control master. After a
+    // resume (new machine, IP and host key) the first guest op fails on the
+    // stale session, and push re-authorizes exactly once through this refresh.
+    // The guest preflight uses the same refresh once when its probe proves the
+    // cached session runs outside the delegated cgroup parent (a master
+    // accepted by a pre-restart sshd listener never enters the template's
+    // ForceCommand scope). Single-flight per VM, like the opener above:
+    // concurrent refreshers share one reopen instead of each reopening
+    // closing the master the other just started.
+    const refreshing = new Map<string, Promise<SshSession>>();
+    const refreshSession = async (sandboxId: string) => {
+      const ongoing = refreshing.get(sandboxId);
+      if (ongoing) return ongoing;
+      const reopening = (async (): Promise<SshSession> => {
+        sessions.delete(sandboxId);
+        return session(sandboxId);
+      })();
+      refreshing.set(sandboxId, reopening);
+      try {
+        return await reopening;
+      } finally {
+        if (refreshing.get(sandboxId) === reopening) refreshing.delete(sandboxId);
+      }
+    };
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
-      // Warm commands reuse the cached session and its control master. After a
-      // resume (new machine, IP and host key) the first guest op fails on the
-      // stale session, and push re-authorizes exactly once through this refresh.
-      refreshSession: async (sandboxId: string) => { sessions.delete(sandboxId); return session(sandboxId); } });
+      refreshSession });
     const uvVenvRoot = async (cmd: OffloadCommand): Promise<string | null> => {
       if ((cmd.tool ?? "cargo") !== "python") return null;
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
@@ -718,7 +739,7 @@ export class SshOffloadRuntime {
       if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
       return sync.directory(cmd);
     };
-    const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, cgroupParent,
+    const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, refreshSession, cgroupParent,
       workspace: (vm, cmd) => sync.cwd(vm, cmd),
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       profileEnv: profileGuestEnv,

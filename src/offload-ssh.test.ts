@@ -63,7 +63,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     const unavailable = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session,
       cgroupParent: path.join(ssh.root, "not-a-cgroup"), stateRoot: ssh.root, workspace: async () => ssh.root });
     expect(await unavailable.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
-      outsideWatchdogVerified: false, ineligibleReason: "parent_not_delegated" });
+      outsideWatchdogVerified: false, ineligibleReason: "parent_not_delegated:session_not_delegated" });
     await unavailable.shutdown();
   });
 
@@ -74,6 +74,14 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       // A guest-reported probe refusal carries its allowlisted step token.
       ["probe token", `import json; print(json.dumps("probe_mkdir_failed:EACCES"))`, "probe_mkdir_failed:EACCES"],
       ["probe token without errno", `import json; print(json.dumps("probe_kill_failed"))`, "probe_kill_failed"],
+      // Placement suffixes map verbatim (delegated, not delegated, unknown,
+      // with and without an errno); an unlisted suffix or a bare placement
+      // word is not a token and collapses to the generic refusal.
+      ["delegated placement", `import json; print(json.dumps("probe_admit_failed:EACCES:session_delegated"))`, "probe_admit_failed:EACCES:session_delegated"],
+      ["not-delegated placement", `import json; print(json.dumps("probe_admit_failed:EACCES:session_not_delegated"))`, "probe_admit_failed:EACCES:session_not_delegated"],
+      ["unknown placement without errno", `import json; print(json.dumps("probe_kill_failed:session_placement_unknown"))`, "probe_kill_failed:session_placement_unknown"],
+      ["unlisted placement", `import json; print(json.dumps("probe_admit_failed:EACCES:session_somewhere"))`, "guest_reported_ineligible"],
+      ["placement without a step", `import json; print(json.dumps("session_delegated"))`, "guest_reported_ineligible"],
       // A legacy guest's bare false and any unrecognized guest string both
       // collapse to the generic token; guest bytes are never echoed.
       ["legacy false", `import json; print(json.dumps(False))`, "guest_reported_ineligible"],
@@ -105,9 +113,71 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       cgroupParent: link, stateRoot: ssh.root, workspace: async () => ssh.root });
     try {
       expect(await symlinked.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
-        outsideWatchdogVerified: false, ineligibleReason: "parent_invalid" });
+        outsideWatchdogVerified: false, ineligibleReason: "parent_invalid:session_placement_unknown" });
     } finally {
       await symlinked.shutdown();
+    }
+  });
+
+  it("preflight refreshes a not-delegated session once and re-runs the identical probe", async () => {
+    // The counter lives guest-side (the loopback root): it proves how many
+    // times the probe actually ran, which is what separates "refreshed and
+    // re-probed" from "mapped the same token twice".
+    const counting = (name: string, answers: unknown[]) => {
+      const counter = path.join(ssh.root, name);
+      const script = "import json, pathlib\n"
+        + `count_file = pathlib.Path(${JSON.stringify(counter)})\n`
+        + "n = int(count_file.read_text()) if count_file.exists() else 0\n"
+        + "count_file.write_text(str(n + 1))\n"
+        + `answers = json.loads(${JSON.stringify(JSON.stringify(answers))})\n`
+        + "print(json.dumps(answers[min(n, len(answers) - 1)]))\n";
+      return { counter, script };
+    };
+    const attempt = async (name: string, answers: unknown[]) => {
+      const { counter, script } = counting(name, answers);
+      let refreshes = 0;
+      let sessionCalls = 0;
+      const candidate = new SshOffloadGuest({ ssh: ssh.manager,
+        session: async () => { sessionCalls++; return ssh.session; },
+        refreshSession: async () => { refreshes++; return ssh.session; },
+        cgroupParent: parent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
+      try {
+        const capabilities = await candidate.preflight(ssh.session.sandboxId, cmd());
+        return { capabilities, refreshes, sessionCalls, probes: Number(await readFile(counter, "utf8")) };
+      } finally {
+        await candidate.shutdown();
+      }
+    };
+    // Stale-session refusal, eligible on the fresh session: one refresh, two
+    // probes, and only the second probe's literal true admits. The re-probe
+    // is pinned to the refreshed session (no second session() lookup).
+    await expect(attempt("probe-stale", ["probe_admit_failed:EACCES:session_not_delegated", true]))
+      .resolves.toEqual({ capabilities: { cgroupV2Delegated: true, outsideWatchdogVerified: true }, refreshes: 1, sessionCalls: 1, probes: 2 });
+    // Still outside the parent after the refresh: the same refusal stands,
+    // and the refresh is never looped.
+    await expect(attempt("probe-outside", ["probe_admit_failed:EACCES:session_not_delegated"]))
+      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
+        ineligibleReason: "probe_admit_failed:EACCES:session_not_delegated" }, refreshes: 1, sessionCalls: 1, probes: 2 });
+    // A delegated session whose admit still failed is a template fault: no
+    // refresh, one probe. Same for an unreadable placement.
+    await expect(attempt("probe-delegated", ["probe_admit_failed:EACCES:session_delegated", true]))
+      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
+        ineligibleReason: "probe_admit_failed:EACCES:session_delegated" }, refreshes: 0, sessionCalls: 1, probes: 1 });
+    await expect(attempt("probe-unknown", ["probe_admit_failed:EACCES:session_placement_unknown", true]))
+      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
+        ineligibleReason: "probe_admit_failed:EACCES:session_placement_unknown" }, refreshes: 0, sessionCalls: 1, probes: 1 });
+    // Without a refresh path the not-delegated token is reported as-is after
+    // a single probe (the token-table case above covers the mapping; this
+    // pins the probe count).
+    const { counter, script } = counting("probe-no-refresh", ["probe_admit_failed:EACCES:session_not_delegated", true]);
+    const noRefresh = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session,
+      cgroupParent: parent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
+    try {
+      expect(await noRefresh.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
+        outsideWatchdogVerified: false, ineligibleReason: "probe_admit_failed:EACCES:session_not_delegated" });
+      expect(Number(await readFile(counter, "utf8"))).toBe(1);
+    } finally {
+      await noRefresh.shutdown();
     }
   });
 

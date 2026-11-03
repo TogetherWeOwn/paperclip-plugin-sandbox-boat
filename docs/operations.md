@@ -180,11 +180,17 @@ default VM:
    is not done: every pool VM forked or booted from it would fail the same
    way. Any other output is a token naming the failing probe sub-step
    (`parent_invalid`, `parent_not_delegated`, `probe_mkdir_failed:EACCES`,
-   `probe_admit_failed`, `probe_outside_failed`, `probe_kill_failed`); the
-   same token appears as `detail=` on the server's "failed before transport"
-   warn line. Fix that sub-step on the template and re-run until it prints
-   `true` — a template that does not print `true` refuses every remote
-   command, so never smoke against one.
+   `probe_admit_failed`, `probe_outside_failed`, `probe_kill_failed`),
+   suffixed with the SSH session's own placement (`:session_delegated`,
+   `:session_not_delegated` or `:session_placement_unknown`: whether the
+   probe process itself ran inside the configured parent); the same token
+   appears as `detail=` on the server's "failed before transport" warn
+   line. A `:session_not_delegated` refusal is the connection, not the
+   template — a control master accepted by a pre-restart sshd listener
+   never enters the `ForceCommand` scope, so the plugin drops that session
+   once, reconnects and re-probes before refusing. Fix that sub-step on
+   the template and re-run until it prints `true` — a template that does
+   not print `true` refuses every remote command, so never smoke against one.
 6. Save the VM as a named snapshot (not available during the boat free trial)
    and set the driver `templateSnapshot` to that name. Offload pool VMs then
    boot from it, as whole-run leases do; a missing snapshot is a refused start
