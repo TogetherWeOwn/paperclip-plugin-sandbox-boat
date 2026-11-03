@@ -569,7 +569,23 @@ export class BoatVmManager {
     // A whole-run realization may have landed while the write was in flight: it keeps both stores.
     const whole = wholeRun();
     if (whole) {
-      await this.offloadWorkspaces.remember(whole.params);
+      // The whole-run payload may omit the project alias this local request
+      // just registered (host workspace metadata carries it; the realization
+      // payload need not). Fill it in from this request — the same
+      // host-owned id pair for the same execution workspace — or the alias
+      // record written above would keep serving the local source.
+      let restored = whole.params;
+      const wholeRequest = whole.params.workspace.metadata?.workspaceRealizationRequest as Record<string, unknown> | undefined;
+      const wholeSource = wholeRequest?.source as { projectWorkspaceId?: unknown } | undefined;
+      if (typeof aliasId === "string" && aliasId && aliasId !== workspaceId && wholeRequest
+        && typeof wholeSource?.projectWorkspaceId !== "string") {
+        restored = { ...whole.params, workspace: { ...whole.params.workspace,
+          metadata: { ...whole.params.workspace.metadata,
+            workspaceRealizationRequest: { ...wholeRequest, source: { ...(wholeSource ?? {}), projectWorkspaceId: aliasId } } } },
+        } as PluginEnvironmentRealizeWorkspaceParams;
+      }
+      await this.offloadWorkspaces.remember(restored);
+      this.nativeOffload.remember(restored);
       return false;
     }
     this.nativeOffload.remember(params);

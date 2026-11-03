@@ -82,6 +82,29 @@ describe("project workspace alias", () => {
     runtime.remember(first);
     expect(runtime.has(companyId, runId, projectWorkspaceId)).toBe(false);
   });
+
+  it("a whole-run realization without the alias supersedes the local-run alias binding", async () => {
+    const localRunId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const mutate = (params: PluginEnvironmentRealizeWorkspaceParams, fn: (request: Record<string, unknown>) => void) => {
+      const request = params.workspace.metadata!.workspaceRealizationRequest as unknown as Record<string, unknown>;
+      request.heartbeatRunId = localRunId;
+      fn(request);
+      return params;
+    };
+    runtime.remember(mutate(native(), (request) => {
+      request.localRun = true;
+      (request.source as Record<string, unknown>).projectWorkspaceId = projectWorkspaceId;
+    }));
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    // The whole-run payload for the same run and workspace omits the alias.
+    runtime.remember(mutate(native(), () => undefined));
+    // With no local source roots configured, a local-run binding under the
+    // alias could not resolve; the whole-run binding the alias now answers
+    // with can.
+    expect(runtime.has(companyId, localRunId, projectWorkspaceId)).toBe(true);
+    expect(await runtime.resolve({ ...command(), runId: localRunId, executionWorkspaceId: projectWorkspaceId }, config)).not.toBe(null);
+  });
 });
 
 describe("stock concrete executor factory", () => {

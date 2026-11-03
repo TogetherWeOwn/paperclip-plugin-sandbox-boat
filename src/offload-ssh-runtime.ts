@@ -429,6 +429,20 @@ export class SshOffloadRuntime {
         this.ambiguousAliases.add(aliasKey);
       }
     }
+    if (!binding.localRun) {
+      // A local-run bind may have registered this same execution workspace
+      // under a project alias this whole-run payload omits; whole-run
+      // precedence covers that alias too, so claim it for the whole-run
+      // binding instead of leaving the local checkout served under it
+      // (mirrors NativeOffloadWorkspaces). Bindings of another execution
+      // workspace are identified by their workspaceId and left alone.
+      for (const [id, existing] of this.bindings) {
+        if (id !== primaryKey && existing.companyId === binding.companyId && existing.runId === binding.runId
+          && existing.workspaceId === binding.workspaceId && !this.ambiguousAliases.has(id)) {
+          this.bindings.set(id, binding);
+        }
+      }
+    }
   }
 
   /** Re-prove a local-run binding's operator-owned facts: the source still sits

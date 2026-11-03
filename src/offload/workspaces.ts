@@ -106,6 +106,24 @@ export class NativeOffloadWorkspaces {
           executionWorkspaceId: workspaceId, localRun, workspace,
         });
       }
+      if (!localRun) {
+        // A local-run bind may have registered this same execution workspace
+        // under a project alias this whole-run payload omits (the alias there
+        // came from host workspace metadata for the same workspace).
+        // Whole-run precedence covers that alias too: claim it for the
+        // whole-run source instead of leaving the local checkout served
+        // under it. Aliases of another execution workspace (and withdrawn
+        // ambiguous ones) are left alone.
+        for (const id of workspaces) {
+          if (ids.includes(id)) continue;
+          const existing = record(await this.state.get(scope(params.companyId, id, runId)));
+          if (existing.ambiguous === true || text(existing.executionWorkspaceId) !== workspaceId) continue;
+          await this.state.set(scope(params.companyId, id, runId), {
+            version: 1, companyId: params.companyId, runId, workspaceId: id,
+            executionWorkspaceId: workspaceId, localRun, workspace,
+          });
+        }
+      }
     });
   }
 
