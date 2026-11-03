@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.8
+
+Hardening follow-up to 0.2.7: offload binding and result handling, SSH
+session hygiene, and ledger strictness. Offload and whole-run behaviour
+stay off by default; nothing is enabled by upgrading.
+
+### Fixed
+
+* Offload binding resolves runs under both host workspace ids, so shim
+  requests no longer miss when the two ids differ (#83). Guest results are
+  validated and command durations are measured on the host (#78). Stale
+  mirror output and special files can no longer fail later commands (#73).
+  The monitoring opt-out is honoured, and the auth-token and SSH key pools
+  are scrubbed per credential (#72).
+
+* SSH sessions close on worker shutdown and VM release, concurrent master
+  starts are deduped, and stale key directories whose owner process is
+  verifiably gone are swept (#74). Provider endpoint data is validated and
+  operator ssh config is ignored (#69).
+
+* Ledger start holds expire and the VM-hour cap is strict (#70). Every
+  created VM is tracked and stopped when its delete or its usage recording
+  fails (#77).
+
+* Test runs no longer leak run-record files into host `/tmp` (#84). The live
+  smoke acquires its VM as an agent-scoped card lease (#82) and expects the
+  withheld scrub diagnostics (#76).
+
+### Changed
+
+* Bumped `@boatdev/sdk` from 1.10.0 to 1.13.0 (#81).
+
+* The pilot runbook config now includes the required
+  `offloadLocalSourceRoots` key, without which every local-run bind refuses
+  closed (#79).
+
 ## 0.2.7
 
 Hardening release: the P0 audit batches that the interim pilot config
