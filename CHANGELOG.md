@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.12
+
+Follow-up to 0.2.11: pre-start offload failures now name the step that
+failed instead of collapsing into one generic reason. Offload and
+whole-run behaviour stay off by default; nothing is enabled by
+upgrading.
+
+### Fixed
+
+* A command that fails before transport now carries its own step-named,
+  journal-authored reason in the journal result, the local-fallback
+  announcement and the server log — sync-in journal commit, sync push,
+  guest boot-identity read, guest lifecycle prepare, the durable
+  starting-intent commit, or the pool identity bind — with only an
+  allowlisted error-code token and never a raw adapter or guest message.
+  Fallback semantics are unchanged: pre-commit failures still settle as
+  fallback-safe `not_started`, a pool-bind failure after the starting
+  commit still settles `unknown` with `fallbackSafe: false`, and the
+  generic string remains only when no step claimed the failure (#93).
+
 ## 0.2.11
 
 Follow-up to 0.2.10: tracked `.pem` files that prove to be public
