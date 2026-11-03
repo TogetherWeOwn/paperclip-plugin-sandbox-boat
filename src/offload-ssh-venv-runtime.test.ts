@@ -5,6 +5,15 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import type { OffloadExecutor } from "./offload.js";
+import { isExecutorRefusal, type ExecutorRefusal } from "./offload/broker.js";
+
+/** resolve() returns a reasoned refusal instead of bare null; narrow where a test needs the executor. */
+function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor {
+  if (isExecutorRefusal(value)) throw new Error(`unexpected offload refusal: ${value.refusalReason}`);
+  return value;
+}
+
 import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
@@ -78,8 +87,7 @@ describe("runtime uv venv wiring", () => {
     const { runtime, config, seen } = backend(source);
     try {
       const cmd = pyCommand();
-      const executor = await runtime.resolve(cmd, config);
-      expect(executor).not.toBe(null);
+      mustResolve(await runtime.resolve(cmd, config));
       const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as { guest: { prepare: (vm: string, c: unknown) => Promise<unknown> } };
       await pool.guest.prepare("vm-1", { ...cmd, commandId: cmd.commandId, companyId, runId, cardId: "", repoId: cmd.repoId, profileId: cmd.profileId, tool: "python", runner: "python", argv: cmd.argv, cwdRelative: ".", env: {} });
       const input = seen[0] as Record<string, unknown>;
@@ -99,8 +107,7 @@ describe("runtime uv venv wiring", () => {
     const { runtime, config, seen } = backend(source);
     try {
       const cmd = pyCommand();
-      const executor = await runtime.resolve(cmd, config);
-      expect(executor).not.toBe(null);
+      mustResolve(await runtime.resolve(cmd, config));
       const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as { guest: { prepare: (vm: string, c: unknown) => Promise<unknown> } };
       await pool.guest.prepare("vm-1", { ...cmd, commandId: cmd.commandId, companyId, runId, cardId: "", repoId: cmd.repoId, profileId: cmd.profileId, tool: "python", runner: "python", argv: cmd.argv, cwdRelative: ".", env: {} });
       const input = seen[0] as Record<string, unknown>;

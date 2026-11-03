@@ -4,8 +4,9 @@
 import type { OffloadExecutor, OffloadCommand } from "../offload.js";
 import type { OffloadReadView } from "../offload-journal.js";
 import { runOutsideInvocation } from "../proactive.js";
-import type {
-  BackendCancellation, BackendCommand, OffloadBackend, OffloadBackendHandle, OffloadOutputSink,
+import {
+  isExecutorRefusal,
+  type BackendCancellation, type BackendCommand, type ExecutorRefusal, type OffloadBackend, type OffloadBackendHandle, type OffloadOutputSink,
 } from "./broker.js";
 
 export interface ExecutorPort extends Pick<OffloadExecutor, "readOutput" | "heartbeatCommand" | "cancelCommand"> {
@@ -13,8 +14,10 @@ export interface ExecutorPort extends Pick<OffloadExecutor, "readOutput" | "hear
 }
 export interface ExecutorBackendDeps {
   /** Trusted host binding only. Resolution must not dispatch a command itself.
-   * Return null unless a lifecycle-enabled executor with confined sync is installed. */
-  resolveExecutor(command: BackendCommand): Promise<ExecutorPort | null>;
+   * Return a reasoned refusal unless a lifecycle-enabled executor with
+   * confined sync is installed; a bare null still refuses, with a generic
+   * reason, so older bindings keep working. */
+  resolveExecutor(command: BackendCommand): Promise<ExecutorPort | ExecutorRefusal | null>;
   pollIntervalMs?: number;
 }
 
@@ -55,10 +58,11 @@ export class ExecutorBackend implements OffloadBackend {
       })();
       return cancellation;
     };
-    const ready = runOutsideInvocation(async () => {
+    const ready: Promise<{ refusal: string } | { executor: ExecutorPort; initial: OffloadReadView }> = runOutsideInvocation(async () => {
       const resolved = await this.deps.resolveExecutor(command);
+      if (!resolved) return { refusal: "offload executor is disabled or not installed" };
+      if (isExecutorRefusal(resolved)) return { refusal: resolved.refusalReason };
       executor = resolved;
-      if (!resolved) return null;
       // A rejection from start is ambiguous: admission may have persisted and
       // dispatched before the acknowledgement was lost. Never retry/remint.
       dispatched = true;
@@ -70,8 +74,8 @@ export class ExecutorBackend implements OffloadBackend {
     const done = runOutsideInvocation(async () => {
       try {
         const active = await ready;
-        if (!active) {
-          sink.failToStart("offload executor is disabled or not installed");
+        if ("refusal" in active) {
+          sink.failToStart(active.refusal);
           outcome = { state: "not_started", remoteStarted: false, fallbackSafe: true, result: null };
           return;
         }
@@ -80,7 +84,7 @@ export class ExecutorBackend implements OffloadBackend {
         // trying to read a nonexistent row would turn safe fallback into unknown.
         if (active.initial.state === "not_started") {
           outcome = terminal(active.initial);
-          sink.failToStart("verified executor never-started admission receipt");
+          sink.failToStart("executor admission refused the command before start");
           return;
         }
         sawStart = active.initial.remoteStarted === true || active.initial.state === "starting"
@@ -109,7 +113,7 @@ export class ExecutorBackend implements OffloadBackend {
           if (result?.state === "not_started" && sawStart) throw uncertain();
           if (result) {
             outcome = result;
-            if (result.state === "not_started") sink.failToStart("verified executor never-started receipt");
+            if (result.state === "not_started") sink.failToStart("executor reported the command never started");
             else sink.complete(result.result);
             return;
           }

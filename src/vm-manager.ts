@@ -420,9 +420,12 @@ export class BoatVmManager {
   private sweeping: { scope: string | null; report: Promise<TaggedSweepReport> } | null = null;
   private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
   private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
+  /** A caller-supplied executor replaces the native gates, so dry-run preflight has no opinion. */
+  private readonly hasCustomOffloadExecutor: boolean;
 
   constructor(deps: ManagerDeps) {
     this.offloadConfigFn = deps.offloadConfig ?? null;
+    this.hasCustomOffloadExecutor = deps.offloadExecutor !== undefined;
     this.store = new VmStateStore(deps.state);
     this.logger = deps.logger;
     this.issues = deps.issues ?? null;
@@ -433,7 +436,13 @@ export class BoatVmManager {
         const config = await deps.offloadConfig?.(command.companyId);
         // Strict boolean opt-in, checked for each new command. Toggling the
         // setting never discards a broker, its live handles or old receipts.
-        if (config?.offloadExecutorEnabled !== true) return null;
+        // The refusal names itself so the shim's local fallback is never silent.
+        if (config?.offloadExecutorEnabled !== true) {
+          this.logger.info("boat: offload executor refused", {
+            runId: command.runId, workspaceId: command.executionWorkspaceId, reason: "offload executor is not enabled",
+          });
+          return { refusalReason: "offload executor is not enabled" };
+        }
         return deps.offloadExecutor ? await deps.offloadExecutor(command) : await this.nativeOffload.resolve(command, config);
       },
     });
@@ -677,6 +686,15 @@ export class BoatVmManager {
       durations: this.offloadDurations(companyId),
       logRefusal: ({ runId, workspaceId, reason }: { runId: string; workspaceId: string; reason: string }) => {
         this.logger.warn("boat: offload exec refused", { runId, workspaceId, reason });
+      },
+      // Dry-run predictiveness: the same read-only executor gates the real
+      // submit runs, answered against the raw company config this host was
+      // built with. A custom executor has no native gates to preflight.
+      preflight: async (command: BackendCommand) => {
+        if (this.hasCustomOffloadExecutor) return null;
+        const config = settings ?? {};
+        if (config.offloadExecutorEnabled !== true) return "offload executor is not enabled";
+        return this.nativeOffload.preflight(command, config);
       },
     };
   }

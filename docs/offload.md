@@ -32,7 +32,9 @@ boat-offload-cargo --dry-run --json -- test --locked # versioned envelope on std
 boat-offload-cargo --json -- test --locked           # run; result envelope on stderr
 ```
 
-Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
+Dry-run applies every executor gate checkable without starting a VM (config, binding, profile, allowlist, tracked-file secret scan), so a `remote_candidate` answer predicts what the identical real invocation will do, up to capacity and start-time conditions; a gate refusal answers `local` with that gate's reason.
+
+Semantics the shim guarantees: incremental stdout/stderr with exit/signal passthrough (`128+N`); cancel kills the remote process group; a durable never-started receipt falls back locally exactly once; any command classified remote that ends up running locally prints one stderr line naming the pre-start refusal reason (`offload: running local (<reason>)`) — a classified-remote command never falls back silently, while commands classified local from the start print nothing extra; an ambiguous submit reconciles the same command ID for 10 s, then exits 75 with that ID and no replay; staged/conflicting remote outputs exit 74 with an artifact to apply explicitly; submit errors map to 64 (request), 77 (auth) or 75 (unknown/expired). Rollback is `BOAT_OFFLOAD=0`, which restores exactly the pre-existing local path.
 
 ## Pool isolation and mirror verification
 

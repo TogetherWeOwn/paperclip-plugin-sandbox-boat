@@ -2243,7 +2243,9 @@ describe("offload API routes", () => {
     await seedWorkspace();
     const dry = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody({ dryRun: true }) }) as never);
     expect(dry.status).toBe(200);
-    expect(dry.body).toMatchObject({ mode: "remote_candidate", profileId: "rust-public-1" });
+    // The dry-run answers the executor gates too; this harness config leaves
+    // the executor disabled, so remote classification reads back as local.
+    expect(dry.body).toMatchObject({ mode: "local", reason: "offload executor is not enabled", profileId: "rust-public-1" });
     const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never);
     expect(read.status).toBe(400);
   });

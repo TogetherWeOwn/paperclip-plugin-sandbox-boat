@@ -40,6 +40,20 @@ export interface BrokerAuth {
   runId: string;
 }
 
+/**
+ * A pre-start refusal that names its gate. Executor resolution returns this
+ * instead of a bare null so the specific reason reaches the journal, the read
+ * view and the shim's local-fallback notice instead of being discarded.
+ */
+export interface ExecutorRefusal {
+  refusalReason: string;
+}
+
+export function isExecutorRefusal(value: unknown): value is ExecutorRefusal {
+  return typeof value === "object" && value !== null
+    && typeof (value as ExecutorRefusal).refusalReason === "string";
+}
+
 /** Placeholder backend until the executor follow-up grows start/cancel. */
 export class NeverDispatchBackend implements OffloadBackend {
   start(): OffloadBackendHandle {
@@ -124,6 +138,8 @@ interface JournalRecord {
   state: OffloadCommandState;
   remoteStarted: boolean;
   fallbackSafe: boolean;
+  /** Site-specific pre-start refusal reason; absent on records written before it existed. */
+  fallbackReason?: string | null;
   events: OffloadOutputEvent[];
   outputBytes: number;
   result: OffloadTerminalResult | null;
@@ -236,6 +252,7 @@ export class OffloadBroker {
       state: record.state,
       remoteStarted: record.remoteStarted,
       fallbackSafe: record.fallbackSafe,
+      fallbackReason: record.fallbackReason ?? null,
       events,
       nextCursor,
       result: record.result,
@@ -269,7 +286,7 @@ export class OffloadBroker {
    * with the caller's pre-check — returns that record's verdict instead, so
    * the caller never answers fallback-safe over a started command.
    */
-  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, _reason: string): Promise<BrokerResponse | null> {
+  async recordRefusal(request: OffloadSubmitRequest, principal: BrokerPrincipal, reason: string): Promise<BrokerResponse | null> {
     return this.chain(`run:${principal.runId}`, async () => {
       const digest = digestOf(request);
       const existing = await this.load(request.commandId);
@@ -297,6 +314,7 @@ export class OffloadBroker {
         state: "not_started",
         remoteStarted: false,
         fallbackSafe: true,
+        fallbackReason: reason,
         events: [],
         outputBytes: 0,
         result: null,
@@ -486,6 +504,7 @@ export class OffloadBroker {
         state: "queued",
         remoteStarted: false,
         fallbackSafe: false,
+        fallbackReason: null,
         events: [],
         outputBytes: 0,
         result: null,
@@ -531,6 +550,7 @@ export class OffloadBroker {
         // The backend refused before any spawn: durable never-started receipt.
         record.state = "not_started";
         record.fallbackSafe = true;
+        record.fallbackReason = "executor backend refused to start";
         record.terminalAt = this.now();
         await this.save(record);
       }
@@ -616,6 +636,7 @@ export class OffloadBroker {
           } else if (!resolved.remoteStarted) {
             resolved.state = "not_started";
             resolved.fallbackSafe = true;
+            resolved.fallbackReason = "cancelled before the command started";
             resolved.result = null;
           } else {
             resolved.state = "cancelled";
@@ -765,7 +786,7 @@ export class OffloadBroker {
           return { save: true };
         });
       },
-      failToStart: (_reason) => {
+      failToStart: (reason) => {
         const at = this.now();
         mutate((record) => {
           if (record.remoteStarted) {
@@ -774,6 +795,9 @@ export class OffloadBroker {
           }
           record.state = "not_started";
           record.fallbackSafe = true;
+          // The refusing site's own words, bounded: the journal record is
+          // persisted and the shim prints this verbatim on its notice line.
+          record.fallbackReason = typeof reason === "string" && reason !== "" ? reason.slice(0, 256) : "executor refused before start";
           record.terminalAt = at;
           this.handles.delete(commandId);
           return { save: true };
