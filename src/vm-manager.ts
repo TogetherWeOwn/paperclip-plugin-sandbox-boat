@@ -10,7 +10,7 @@
 //     is actually running (docs.boat.dev/long-running-tasks/auto-stop);
 //   - every start (create, resume) passes the budget guard first and uses
 //     fail-fast, so nothing waits for a machine or a rate window.
-import { createHash } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import { createConnection } from "node:net";
 import type {
   PluginEnvironmentAcquireLeaseParams,
@@ -39,7 +39,7 @@ import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
 import type { AccountReservation } from "./account-ledger.js";
-import { PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
+import { DEFAULT_API_BASE, PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
 import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
@@ -68,7 +68,7 @@ import type { SshSession } from "./ssh.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { syncFiles } from "./file-sync.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
-import type { RunSession, StartKind, StateClientLike, StateDoc, UsageReading, VmKeyKind, VmRecord } from "./state.js";
+import type { RunSession, StartKind, StateClientLike, StateDoc, SweepDescriptor, UsageReading, VmKeyKind, VmRecord } from "./state.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
@@ -322,6 +322,49 @@ function resumeEnvPolicy(config: BoatDriverConfig): { noEnv?: true; environment?
 export function sandboxNameFor(prefix: string, companyId: string, environmentId: string, key: string): string {
   const digest = createHash("sha256").update(`${companyId}\u0000${environmentId}\u0000${key}`).digest("hex").slice(0, 16);
   return `${prefix}-${digest}`;
+}
+
+/**
+ * Non-secret account-equality fingerprint: lets a restarted sweep check that
+ * the host key belongs to the same account as an inline-key descriptor without
+ * ever persisting key bytes. The digest itself is persisted, so it uses a
+ * password-hash-grade KDF (scrypt, the remediation `js/insufficient-password-hash`
+ * recommends) rather than a fast hash: fast hashes of key material are exactly
+ * what that query flags, and a KDF keeps the stored value resistant even if a
+ * key ever carries less entropy than assumed. Deterministic (salted by the
+ * apiBase) so equality checks work across restarts. The stored form carries a
+ * `scrypt:` format prefix: a digest written by an older (or future) primitive
+ * never compares equal, so a stale format fails closed — skipped until a hook
+ * rewrites it — instead of silently matching the wrong account. Memoized:
+ * rememberConfig runs on every driver op and scrypt is deliberately slow. The
+ * memo is LRU-bounded and dropped on shutdown, so a rotated key stops being
+ * recoverable from worker memory; eviction only costs a recompute.
+ */
+const SWEEP_DIGEST_PREFIX = "scrypt:";
+const SWEEP_DIGEST_CACHE_MAX = 16;
+const sweepDigestCache = new Map<string, string>();
+function sweepAccountDigest(apiBase: string, apiKey: string): string {
+  const preimage = `${apiBase}\u0000${apiKey}`;
+  const hit = sweepDigestCache.get(preimage);
+  if (hit !== undefined) {
+    // Refresh recency so hot environment keys survive eviction.
+    sweepDigestCache.delete(preimage);
+    sweepDigestCache.set(preimage, hit);
+    return hit;
+  }
+  const digest = `${SWEEP_DIGEST_PREFIX}${scryptSync(apiKey, apiBase, 32).toString("hex")}`;
+  sweepDigestCache.set(preimage, digest);
+  while (sweepDigestCache.size > SWEEP_DIGEST_CACHE_MAX) {
+    const oldest = sweepDigestCache.keys().next();
+    if (oldest.done) break;
+    sweepDigestCache.delete(oldest.value);
+  }
+  return digest;
+}
+
+/** Test hook: the cache is keyed by key-derived preimages, so the suite pins its bound. */
+export function sweepDigestCacheSizeForTests(): number {
+  return sweepDigestCache.size;
 }
 
 function iso(value: unknown): string | null {
@@ -701,6 +744,9 @@ export class BoatVmManager {
   }
 
   async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
+    // Remember the company so an unscoped sweep after a restart still covers
+    // its pools even when no whole-run hook ever cached a config for it.
+    void this.store.rememberCompany(companyId).catch(() => undefined);
     return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
   }
 
@@ -810,9 +856,139 @@ export class BoatVmManager {
     return boatApi({ apiKey: resolveCostApiKey(config), apiBase: config.apiBase });
   }
 
-  /** Keep the latest resolved config per environment in memory for the sweeper. Never persisted. */
+  /**
+   * Keep the latest resolved config per environment in memory for the sweeper,
+   * and persist its non-secret fields alongside it. After a worker restart the
+   * in-memory map is empty, so the sweep rehydrates these descriptors
+   * (ensureSweepConfigs) instead of reporting no_config_seen. Secrets are
+   * never persisted: a rehydrated entry authenticates through the host key.
+   * An environment with an inline key is only rehydrated when the host key
+   * belongs to the same account (matching account digest); otherwise it stays
+   * absent until a hook re-caches it, so the sweep can never forget another
+   * account's live VMs from a host-account listing.
+   */
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
     this.configs.set(environmentId, { companyId, environmentId, config, seenAt: this.now() });
+    void this.persistSweepDescriptor(companyId, environmentId, config).catch((error) =>
+      this.logger.warn("boat: could not persist the sweep config", { environmentId, error: errorText(error) }),
+    );
+  }
+
+  /**
+   * Last durably persisted descriptor per environment, so hot hooks skip
+   * redundant writes. It is only marked after both state writes succeed: an
+   * optimistic claim would let a duplicate hook skip its write while the first
+   * is still pending, and a failure would then lose the descriptor entirely.
+   */
+  private readonly persistedSweeps = new Map<string, string>();
+
+  /**
+   * Per-environment persistence chain. Identical hooks join the in-flight
+   * write instead of skipping on a stale cache hit: each queued step re-checks
+   * durability after its predecessor settles, so a duplicate arriving during a
+   * failed first write retries it, and an A→B→A burst still lands the latest
+   * content last. The tail never rejects, so later hooks always run; each
+   * caller still observes its own write's failure through the returned promise.
+   */
+  private readonly sweepDescriptorWrites = new Map<string, Promise<void>>();
+
+  private persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
+    const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
+    // A non-secret same-account marker: the ops listing runs under the inline
+    // key's account, so rehydration through the host key is only safe when the
+    // host key resolves to that same account. A digest, never the key itself.
+    const accountDigest = config.apiKey != null
+      ? sweepAccountDigest(config.apiBase, config.apiKey)
+      : null;
+    // Dedupe on the persisted content, not the write time: seenAt changes on
+    // every hook, so including it would defeat the cache with a write per call.
+    // The marker and digest are part of the identity: a key-only rotation must
+    // re-persist, or a stale digest would let a restarted sweep match the old
+    // account's host key against the new account's live VMs and forget them.
+    const encoded = JSON.stringify([companyId, publicFields, config.apiKey != null, accountDigest]);
+    if (this.persistedSweeps.get(environmentId) === encoded && !this.sweepDescriptorWrites.has(environmentId)) {
+      return Promise.resolve();
+    }
+    const predecessor = this.sweepDescriptorWrites.get(environmentId) ?? Promise.resolve();
+    const write = predecessor.catch(() => undefined).then(async () => {
+      if (this.persistedSweeps.get(environmentId) === encoded) return;
+      const descriptor: SweepDescriptor = { version: 1, companyId, environmentId, seenAt: this.now(), config: publicFields,
+        hadInlineKey: config.apiKey != null, accountDigest };
+      await this.store.saveSweepDescriptor(companyId, environmentId, descriptor);
+      await this.store.rememberCompany(companyId);
+      this.persistedSweeps.set(environmentId, encoded);
+    });
+    const tail = write.catch(() => undefined);
+    this.sweepDescriptorWrites.set(environmentId, tail);
+    void tail.then(() => {
+      if (this.sweepDescriptorWrites.get(environmentId) === tail) this.sweepDescriptorWrites.delete(environmentId);
+    });
+    return write;
+  }
+
+  /**
+   * Rehydrate persisted sweep descriptors into the in-memory map after a
+   * restart. Live (keyed) entries always win; rehydrated ones carry no key.
+   * Descriptors from an inline-key environment are skipped unless the host key
+   * digests to the same account: rehydrating them under a different account's
+   * key would list the wrong account and forget their live records.
+   */
+  private async ensureSweepConfigs(scope: string | null): Promise<void> {
+    const companies = new Set<string>();
+    if (scope !== null) companies.add(scope);
+    else {
+      for (const companyId of await this.store.companies().catch(() => [] as string[])) companies.add(companyId);
+      for (const entry of this.configs.values()) companies.add(entry.companyId);
+    }
+    for (const companyId of companies) {
+      let saved: Record<string, SweepDescriptor>;
+      try {
+        saved = await this.store.sweepDescriptors(companyId);
+      } catch {
+        continue;
+      }
+      for (const [environmentId, descriptor] of Object.entries(saved)) {
+        if (this.configs.has(environmentId)) continue;
+        // Legacy descriptors predate the marker: rehydrate as before; the next
+        // hook rewrites them with the marker.
+        if (descriptor.hadInlineKey === true && !this.sameAccountAsHost(descriptor)) continue;
+        try {
+          const config = parseDriverConfig({ ...descriptor.config, apiKey: null, costApiKey: null });
+          this.configs.set(environmentId, { companyId, environmentId, config, seenAt: descriptor.seenAt });
+        } catch {
+          // An invalid descriptor is only a cache: the next hook re-caches it.
+        }
+      }
+    }
+  }
+
+  /** True when the current host key digests to the descriptor's account. */
+  private sameAccountAsHost(descriptor: SweepDescriptor): boolean {
+    // A digest without the current format prefix is stale (an older
+    // primitive): never trusted, so it stays skipped until a hook rewrites it.
+    if (typeof descriptor.accountDigest !== "string" || !descriptor.accountDigest.startsWith(SWEEP_DIGEST_PREFIX)) return false;
+    const rawBase = (descriptor.config as Record<string, unknown>).apiBase;
+    const apiBase = typeof rawBase === "string" && rawBase ? rawBase : DEFAULT_API_BASE;
+    // Host keys are only sent to the default API; a foreign base with an
+    // inline key can never rehydrate until a hook re-caches it.
+    if (apiBase !== DEFAULT_API_BASE) return false;
+    const hostKey = process.env.BOAT_API_KEY?.trim() ?? "";
+    if (!hostKey) return false;
+    return sweepAccountDigest(apiBase, hostKey) === descriptor.accountDigest;
+  }
+
+  /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */
+  private sweepBoatFor(companyId: string): BoatApiLike | null {
+    const cached = [...this.configs.values()].filter((entry) => entry.companyId === companyId)
+      .sort((a, b) => Number(b.config.apiKey != null) - Number(a.config.apiKey != null));
+    for (const entry of cached) {
+      try {
+        return this.opsApi(entry.config);
+      } catch {
+        // No usable key on this environment; try the next.
+      }
+    }
+    return null;
   }
 
   private ttlSeconds(config: BoatDriverConfig, hardDeadlineMs: number | null): number {
@@ -3200,17 +3376,29 @@ export class BoatVmManager {
   private async doSweep(reason: string, scope: string | null): Promise<TaggedSweepReport> {
     const report: TaggedSweepReport = { skipped: null, stopped: [], deleted: [], forgotten: [], errors: [] };
     const tag = (companyId: string | null, value: string) => ({ companyId, value });
+    // The in-memory config map is empty after a restart: rehydrate the
+    // persisted sweep descriptors first, so idle/stale stops and the company
+    // list below do not wait for the next whole-run hook.
+    await this.ensureSweepConfigs(scope).catch((error) =>
+      this.logger.warn("boat: sweep config rehydration failed", { error: errorText(error) }));
     // Offload upkeep spans companies: unscoped sweeps only.
+    // Retention: after a restart a company's broker and pools exist only once
+    // a command or config is seen again, so cover every known company: live
+    // brokers, cached configs, and every remembered company (offload routes
+    // remember theirs, so an offload-only company is covered too).
+    const offloadCompanies = scope !== null ? new Set<string>()
+      : new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId),
+        ...(await this.store.companies().catch(() => [] as string[]))]);
     if (scope === null) {
-      // Retention: after a restart a company's broker and pools exist only once
-      // a command or config is seen again, so cover every known company.
-      const offloadCompanies = new Set([...this.offloadBrokers.keys(), ...[...this.configs.values()].map((entry) => entry.companyId)]);
       // Existing native job owns stop retry/reconciliation; no host pacer.
       // All upkeep runs concurrently under one shared budget: a blocked pool
       // sweep or broker chain is reported unverified and must not delay the
       // whole-run VM stops below, however many companies are blocked.
+      // Unloaded pools get a company client (a rehydrated config through the
+      // host key) so past-due VMs stop without a new command resolving them.
       await Promise.all([
-        withDeadline(this.nativeOffload.sweep(offloadCompanies), this.offloadUpkeepTimeoutMs, "offload pool sweep")
+        withDeadline(this.nativeOffload.sweep(offloadCompanies, { boatFor: (companyId) => this.sweepBoatFor(companyId) }),
+          this.offloadUpkeepTimeoutMs, "offload pool sweep")
           .catch(() => report.errors.push(tag(null, "offload pool sweep unverified"))),
         ...[...offloadCompanies].map((companyId) =>
           withDeadline(this.offloadBroker(companyId).collectGarbage(), this.offloadUpkeepTimeoutMs, "offload broker retention")
@@ -3218,7 +3406,9 @@ export class BoatVmManager {
         ),
       ]);
     }
-    if (this.configs.size === 0) {
+    // Offload-only companies have upkeep above but no whole-run config: they
+    // sweep pools without reporting no_config_seen.
+    if (this.configs.size === 0 && offloadCompanies.size === 0) {
       report.skipped = "no_config_seen";
       return report;
     }
@@ -3595,6 +3785,10 @@ export class BoatVmManager {
   }
 
   async shutdown(): Promise<void> {
+    // The digest memo is keyed by key-derived preimages: drop it so rotated
+    // keys stop being recoverable from worker memory. Live keys stay in the
+    // configs; the memo rebuilds on demand.
+    sweepDigestCache.clear();
     for (const sandboxId of [...this.extendTimers.keys()]) this.clearExtendTimer(sandboxId);
     // Bound the offload drain, never the session close: a hanging or
     // rejecting offload shutdown must not outlive the worker or strand SSH

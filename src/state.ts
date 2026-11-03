@@ -93,6 +93,7 @@ export interface StateClientLike {
 const NAMESPACE = "boat-sandbox";
 const VMS_KEY = "vms";
 const COMPANIES_KEY = "companies";
+const SWEEPS_KEY = "sweep-configs";
 const MAX_SESSIONS_PER_VM = 100;
 const TOMBSTONE_KEEP_MS = 30 * 24 * 3600 * 1000;
 
@@ -100,11 +101,45 @@ function emptyDoc(): StateDoc {
   return { version: 1, vms: {} };
 }
 
+// Fail closed: only a never-written document reads as empty. Any other value
+// that is not {version:1, vms:object} throws, so update() rejects instead of
+// overwriting it and the sweep leaves that company's VMs alone (it already
+// tracks unreadable companies and refuses to treat their VMs as orphans).
 function normalizeDoc(value: unknown): StateDoc {
-  if (!value || typeof value !== "object") return emptyDoc();
+  if (value === null || value === undefined) return emptyDoc();
   const doc = value as Partial<StateDoc>;
-  if (doc.version !== 1 || !doc.vms || typeof doc.vms !== "object") return emptyDoc();
+  if (doc.version !== 1 || !doc.vms || typeof doc.vms !== "object") {
+    throw new Error(`boat: vm state unreadable (version ${docVersion(value)})`);
+  }
   return { version: 1, vms: { ...doc.vms } };
+}
+
+function docVersion(value: unknown): string {
+  const version = (value as { version?: unknown } | null)?.version;
+  return typeof version === "number" || typeof version === "string" ? String(version) : "unknown";
+}
+
+/**
+ * What the sweep needs after a worker restart, without the secrets: the
+ * non-secret driver fields per environment. The apiKey/costApiKey are never
+ * persisted; a rehydrated descriptor authenticates through the host key
+ * (BOAT_API_KEY/BOAT_READONLY_KEY) when the environment left them unset. An
+ * environment with an inline key carries a non-secret same-account marker
+ * (hadInlineKey + a digest of apiBase and key, never the key): the sweep only
+ * rehydrates it when the host key digests to the same account, and otherwise
+ * leaves it absent until a hook re-caches its config.
+ */
+export interface SweepDescriptor {
+  version: 1;
+  companyId: string;
+  environmentId: string;
+  seenAt: number;
+  /** Parsed driver config minus apiKey/costApiKey. */
+  config: Record<string, unknown>;
+  /** True when the cached config carried its own apiKey. Absent on legacy descriptors. */
+  hadInlineKey?: boolean;
+  /** Opaque same-account digest (`scrypt:`-prefixed scrypt of the key, salted by apiBase), or null. Absent on legacy descriptors; a digest without the prefix is never trusted. */
+  accountDigest?: string | null;
 }
 
 export class VmStateStore {
@@ -168,6 +203,44 @@ export class VmStateStore {
   async companies(): Promise<string[]> {
     const raw = await this.state.get({ scopeKind: "instance", namespace: NAMESPACE, stateKey: COMPANIES_KEY });
     return Array.isArray(raw) ? raw.filter((entry): entry is string => typeof entry === "string") : [];
+  }
+
+  /** Descriptors seen by whole-run hooks, so the sweep survives a restart. A
+   * malformed document reads as empty (it is only a cache; the next hook
+   * re-caches it) and never breaks the sweep. */
+  async sweepDescriptors(companyId: string): Promise<Record<string, SweepDescriptor>> {
+    const raw = await this.state.get({ scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: SWEEPS_KEY });
+    if (raw === null || raw === undefined) return {};
+    const doc = raw as { version?: unknown; envs?: unknown };
+    if (!doc || typeof doc !== "object" || doc.version !== 1 || !doc.envs || typeof doc.envs !== "object") return {};
+    const envs: Record<string, SweepDescriptor> = {};
+    for (const [environmentId, entry] of Object.entries(doc.envs as Record<string, unknown>)) {
+      const descriptor = entry as Partial<SweepDescriptor>;
+      if (!descriptor || typeof descriptor !== "object" || descriptor.version !== 1
+        || descriptor.companyId !== companyId || descriptor.environmentId !== environmentId
+        || typeof descriptor.seenAt !== "number" || !descriptor.config || typeof descriptor.config !== "object"
+        || Array.isArray(descriptor.config)) continue;
+      envs[environmentId] = { version: 1, companyId, environmentId, seenAt: descriptor.seenAt, config: { ...(descriptor.config as Record<string, unknown>) },
+        // Legacy descriptors predate the same-account marker: absent reads as
+        // keyless, and the sweep treats them as before until a hook rewrites them.
+        ...(descriptor.hadInlineKey === true ? { hadInlineKey: true as const } : {}),
+        ...(typeof descriptor.accountDigest === "string" ? { accountDigest: descriptor.accountDigest } : {}) };
+    }
+    return envs;
+  }
+
+  /** Serialized with every other write, so a hook's later updates flush after it. */
+  async saveSweepDescriptor(companyId: string, environmentId: string, descriptor: SweepDescriptor): Promise<void> {
+    await this.serialize(async () => {
+      const raw = await this.state.get({ scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: SWEEPS_KEY });
+      const doc = raw as { version?: unknown; envs?: Record<string, unknown> } | null;
+      const envs = doc && typeof doc === "object" && doc.version !== 1 ? {} : { ...((doc?.envs as Record<string, unknown>) ?? {}) };
+      envs[environmentId] = descriptor;
+      await this.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: NAMESPACE, stateKey: SWEEPS_KEY },
+        { version: 1, envs },
+      );
+    });
   }
 }
 
