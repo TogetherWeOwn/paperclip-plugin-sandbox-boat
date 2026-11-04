@@ -115,7 +115,7 @@ describe("manifest", () => {
       expect.arrayContaining(["environment.drivers.register", "plugin.state.read", "plugin.state.write", "jobs.schedule", "api.routes.register", "issues.read"]),
     );
     expect(manifest.jobs?.[0]).toMatchObject({ jobKey: SWEEP_JOB_KEY, schedule: "*/5 * * * *" });
-    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_heartbeat", "offload_cancel", "offload_report"]);
+    expect(manifest.apiRoutes?.map((route) => route.routeKey)).toEqual(["usage", "sweep", "offload_exec", "offload_read", "offload_verify", "offload_heartbeat", "offload_cancel", "offload_report"]);
     expect(harness.jobs.has(SWEEP_JOB_KEY)).toBe(true);
   });
 
@@ -2215,9 +2215,9 @@ describe("offload API routes", () => {
   it("declares agent-authenticated offload routes", () => {
     const routes = manifest.apiRoutes ?? [];
     expect(routes.map((route) => route.routeKey)).toEqual(
-      expect.arrayContaining(["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]),
+      expect.arrayContaining(["offload_exec", "offload_read", "offload_verify", "offload_heartbeat", "offload_cancel"]),
     );
-    for (const key of ["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel"]) {
+    for (const key of ["offload_exec", "offload_read", "offload_verify", "offload_heartbeat", "offload_cancel"]) {
       expect(routes.find((route) => route.routeKey === key)).toMatchObject({ auth: "agent", capability: "api.routes.register" });
     }
     // execution.workspaces.read serves only the local-run binding (local-run-binding.ts), never the request body.
@@ -2238,6 +2238,22 @@ describe("offload API routes", () => {
     const cancel = await plugin.definition.onApiRequest!(apiInput("offload_cancel", { params: { commandId: CMD_ID }, body: { reason: "client_signal" } }) as never);
     expect(cancel.status).toBe(200);
     expect(cancel.body).toMatchObject({ state: "not_started" });
+  });
+
+  it("verifies pinned payloads without admission or re-binding after flags and grants change", async () => {
+    await seedWorkspace();
+    expect((await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody() }) as never)).status).toBe(202);
+    setGrant({});
+    const before = structuredClone([...harness.state.entries()]);
+    const verify = (body: unknown, extra: Record<string, unknown> = {}) => plugin.definition.onApiRequest!(apiInput("offload_verify", {
+      params: { commandId: CMD_ID }, body, ...extra,
+    }) as never);
+    // No authenticatedRunId is needed for existing receipts; ownership still is.
+    const actor = { actorType: "agent", actorId: AGENT_ID, agentId: AGENT_ID, runId: RUN_ID };
+    expect((await verify(submitBody(), { actor })).status).toBe(200);
+    expect((await verify(submitBody({ argv: ["build"] }), { actor })).status).toBe(409);
+    expect((await verify(submitBody(), { actor: { ...actor, agentId: "other-agent" } })).status).toBe(403);
+    expect([...harness.state.entries()]).toEqual(before);
   });
 
   it("denies user actors and unknown workspaces at the dispatch", async () => {

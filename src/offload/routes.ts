@@ -645,6 +645,34 @@ export async function handleRead(
   return host.broker.read(auth.commandId, { companyId: input.companyId, runId: auth.runId }, after, limitBytes);
 }
 
+/** Payload-bound receipt read only: never calls admission, binding or submit. */
+export async function handleVerify(
+  input: { actor: RouteActor; companyId: string; params: { commandId?: string }; body: unknown },
+  host: OffloadRouteHost,
+): Promise<RouteResponse> {
+  const auth = readAuth(input);
+  if (!isAuthed(auth)) return auth;
+  if (bodyTooLarge(JSON.stringify(input.body ?? null))) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "request body exceeds 64 KiB", {}) };
+  }
+  const tool = toolOfBody(input.body);
+  if (tool === null) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "tool must be cargo, node or python", {}) };
+  // Validate wire shape, not current profile eligibility: retained receipts must
+  // survive profile/grant/flag changes. Nothing here authorizes fresh execution.
+  const validated = validateSubmit(input.body, { tool, allowRustflags: true });
+  if (!validated.ok) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
+  // The broker's legacy cargo spelling means an *omitted* Node/Python runner.
+  // Preserve submit's invariant that callers cannot explicitly request that alias.
+  if (tool !== "cargo" && validated.value.runner === "cargo") {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "cargo runner is not valid for node/python receipts", {}) };
+  }
+  const request = { ...validated.value, tool, runner: validated.value.runner ?? defaultRunnerFor(tool) };
+  if (request.commandId !== auth.commandId || request.dryRun) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "receipt requires matching commandId and dryRun false", {}) };
+  }
+  return host.broker.read(auth.commandId, { companyId: input.companyId, runId: auth.runId }, 0, OFFLOAD_BOUNDS.readLimitBytes, request);
+}
+
 export async function handleHeartbeat(
   input: { actor: RouteActor; companyId: string; params: { commandId?: string } },
   host: OffloadRouteHost,

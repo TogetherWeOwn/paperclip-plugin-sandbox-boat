@@ -612,10 +612,14 @@ export class OffloadBroker {
     });
   }
 
-  async read(commandId: string, principal: BrokerAuth, after: number, limitBytes: number = OFFLOAD_BOUNDS.readLimitBytes): Promise<BrokerResponse> {
+  async read(commandId: string, principal: BrokerAuth, after: number, limitBytes: number = OFFLOAD_BOUNDS.readLimitBytes, request?: OffloadSubmitRequest): Promise<BrokerResponse> {
     return this.chain(`cmd:${commandId}`, async () => {
       const resolved = await this.resolve(commandId, principal);
       if (!isRecord(resolved)) return resolved;
+      // Receipt verification shares submit compatibility, after ownership is proven.
+      if (request && !acceptedDigests(request).includes(resolved.digest)) {
+        return { status: 409, body: offloadError("OFFLOAD_IDEMPOTENCY_CONFLICT", "commandId already used with a different payload", { commandId }) };
+      }
       return { status: 200, body: this.view(resolved, Math.max(0, after), Math.max(1, limitBytes)) };
     });
   }

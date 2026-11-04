@@ -309,6 +309,58 @@ describe("read", () => {
     expect(crossCompany.status).toBe(403);
   });
 
+  describe("receipt verification (optional request)", () => {
+    it("returns the view for the same payload and 409 for a different one, without dispatching", async () => {
+      const { broker, backend } = setup();
+      await broker.submit(submitFor(), PRINCIPAL);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, submitFor())).status).toBe(200);
+      const conflict = await broker.read(CMD, PRINCIPAL, 0, undefined, { ...submitFor(), argv: ["build"] });
+      expect(conflict.status).toBe(409);
+      expect(conflict.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+      expect(backend.starts.length).toBe(1);
+    });
+
+    it("checks ownership before the payload and keeps unknown IDs at 400", async () => {
+      const { broker, store } = setup();
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, submitFor())).status).toBe(400);
+      expect(store.data.size).toBe(0);
+      await broker.submit(submitFor(), PRINCIPAL);
+      const changed = { ...submitFor(), argv: ["build"] };
+      expect((await broker.read(CMD, { ...PRINCIPAL, runId: OTHER_RUN }, 0, undefined, changed)).status).toBe(403);
+      expect((await broker.read(CMD, { ...PRINCIPAL, companyId: OTHER_COMPANY }, 0, undefined, changed)).status).toBe(403);
+    });
+
+    it.each([
+      ["node", "npm"],
+      ["python", "pytest"],
+    ] as const)("accepts a normalised %s verify against a legacy row and still conflicts on a different runner", async (tool, runner) => {
+      const { broker, backend } = setup();
+      const legacy = { ...submitFor(), tool, env: {}, argv: ["test"] };
+      await broker.submit(legacy, PRINCIPAL);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, runner })).status).toBe(200);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, runner: "other" })).status).toBe(409);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, runner, argv: ["build"] })).status).toBe(409);
+      expect(backend.starts.length).toBe(1);
+    });
+
+    it("keeps the order-sensitive pre-canonical env digest contract", async () => {
+      const { broker, store, backend } = setup();
+      const legacy = { ...submitFor(), env: { ZED: "1", ALPHA: "2" } };
+      await broker.submit(legacy, PRINCIPAL);
+      const row = persisted(store) as { digest: string };
+      const legacyDigest = JSON.stringify({
+        ws: legacy.executionWorkspaceId, cwd: legacy.cwdRelative, tool: "cargo", runner: "cargo",
+        argv: legacy.argv, env: legacy.env, q: legacy.queueTimeoutMs, t: legacy.timeoutMs,
+      });
+      expect(row.digest).not.toBe(legacyDigest);
+      store.data.set(`offload.cmd.${CMD}`, { ...row, digest: legacyDigest });
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, env: { ZED: "1", ALPHA: "2" } })).status).toBe(200);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, env: { ALPHA: "2", ZED: "1" } })).status).toBe(409);
+      expect((await broker.read(CMD, PRINCIPAL, 0, undefined, { ...legacy, env: { ZED: "9", ALPHA: "2" } })).status).toBe(409);
+      expect(backend.starts.length).toBe(1);
+    });
+  });
+
   it("returns ordered cursor batches bounded to 64 KiB per response", async () => {
     const { broker, backend } = setup();
     await broker.submit(submitFor(), PRINCIPAL);

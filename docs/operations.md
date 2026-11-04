@@ -142,19 +142,32 @@ and treat any such hazard as a reason to keep admission closed.
 
 Shim. `BOAT_OFFLOAD_COMMAND_ID` is a selector only: it must be the exact
 pinned UUID of the grant, with no local fallback and no remint. A real retry
-of a pinned command is receipt-only and skips discovery. The shim first reads
-that ID under existing receipt authorization, even if the current environment
-now contains local-only settings such as `DATABASE_URL` or `RUSTFLAGS`. It
-returns or polls the original receipt without another exec submission. Only an
-explicit unknown-ID response allows fresh workload validation and submission;
-an ambiguous read never permits launch. Local-only settings still refuse fresh
-work without submitting or running locally. An old shim, or one without a pin,
-still meets the server gate and is refused without a matching grant.
+of a pinned command is receipt-only and skips discovery. The shim first calls
+`POST /offload/commands/:commandId/verify` with the normalized execution payload
+(the exec body, `dryRun: false`). This route uses existing receipt authorization,
+then the journal's payload-digest comparison before returning any output/result.
+It never binds a workspace, checks/consumes admission, or submits work. Changed
+workspace, cwd, tool/runner, argv, transmitted env or timeout fields conflict
+(HTTP 409; shim exit 64), without replaying the old result or dispatching again.
 
-Direct submit retries retain the journal's payload-digest check. New digests
-canonicalize environment key order; legacy rows retain their original
-order-sensitive contract, so submit retries must preserve their environment
-insertion order. An authorized receipt read by ID does not resubmit a payload.
+Local-only settings such as newly present `DATABASE_URL` or `RUSTFLAGS` are not
+transmitted execution fields; an otherwise identical invocation still verifies
+and returns/polls its receipt without another exec submission. Only an explicit
+unknown-ID response allows fresh workload validation and submission; an
+ambiguous/unavailable verification never permits launch or downgrade to an
+unverified result. Local-only settings still refuse fresh work without submitting
+or running locally. Direct authenticated GET reads remain available for explicit
+receipt/reconciliation access, independent of current flags/grants/profiles;
+a raw read is not evidence that a different invocation succeeded. An old shim,
+or one without a pin, still meets the server gate and is refused without a
+matching grant.
+
+Direct submit and receipt-verification retries share the journal's compatibility
+rules. Tool/runner defaults are normalized as on submit, including legacy
+Node/Python default-runner digests. New digests canonicalize environment key
+order; legacy rows retain their original order-sensitive contract, so retries
+must preserve their environment insertion order. Verification does not broaden
+legacy matching or resubmit a payload.
 A deterministic never-started refusal also fixes that command ID's payload,
 without consuming a dispatch slot: it is not permission to reuse the ID for a
 different workload.

@@ -197,6 +197,10 @@ const plugin = definePlugin({
       const response = await boat.offloadRead(input.companyId, toRouteActor(input.actor), input.params, input.query);
       return { status: response.status, body: response.body };
     }
+    if (input.routeKey === "offload_verify") {
+      const response = await boat.offloadVerify(input.companyId, toRouteActor(input.actor), input.params, input.body);
+      return { status: response.status, body: response.body };
+    }
     if (input.routeKey === "offload_heartbeat") {
       const response = await boat.offloadHeartbeat(input.companyId, toRouteActor(input.actor), input.params);
       return { status: response.status, body: response.body };

@@ -73,7 +73,7 @@ import { OffloadAdmission, type AdmissionState } from "./offload/admission.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
-import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, normalizeOffloadSettings, type RouteActor } from "./offload/routes.js";
+import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, handleVerify, normalizeOffloadSettings, type RouteActor } from "./offload/routes.js";
 import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -791,6 +791,10 @@ export class BoatVmManager {
     query: Record<string, string | string[]>,
   ): Promise<{ status: number; body: unknown }> {
     return handleRead({ actor, companyId, params, query }, this.offloadRouteHost(companyId));
+  }
+
+  async offloadVerify(companyId: string, actor: RouteActor, params: { commandId?: string }, body: unknown): Promise<{ status: number; body: unknown }> {
+    return handleVerify({ actor, companyId, params, body }, this.offloadRouteHost(companyId));
   }
 
   async offloadHeartbeat(companyId: string, actor: RouteActor, params: { commandId?: string }): Promise<{ status: number; body: unknown }> {

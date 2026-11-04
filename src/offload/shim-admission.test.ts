@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HttpResult } from "./client.js";
+import { OffloadBroker, type OffloadBackend } from "./broker.js";
+import type { OffloadSubmitRequest, OffloadTerminalResult } from "./protocol.js";
+import { handleVerify } from "./routes.js";
 import { shimMain, type ShimDeps } from "./shim-main.js";
 
 const PIN = "11111111-2222-4333-8444-555555555555";
@@ -13,6 +16,7 @@ function setup(env: Record<string, string | undefined> = {}) {
   const randomId = vi.fn(() => "99999999-9999-4999-8999-999999999999");
   const post = vi.fn(async (_p: string, _b?: unknown): Promise<HttpResult> => ({ ok: true, status: 500, json: {} }));
   const get = vi.fn(async (_p: string): Promise<HttpResult> => ({ ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST", detail: "unknown commandId", commandId: PIN } }));
+  const verify = vi.fn(async (_p: string, _body?: unknown): Promise<HttpResult> => get(`/offload/commands/${PIN}?after=0`));
   let now = 1_000_000;
   const spawn = vi.fn(async () => ({ code: 0 as number | null, signal: null as string | null }));
   const deps: ShimDeps = {
@@ -24,7 +28,7 @@ function setup(env: Record<string, string | undefined> = {}) {
       BOAT_OFFLOAD_COMMAND_ID: PIN,
       ...env,
     },
-    http: { post, get },
+    http: { post: (p, body) => p.endsWith("/verify") ? verify(p, body) : post(p, body), get },
     now: () => now,
     sleep: async (ms) => { now += ms; },
     stdout: (b) => out.push(Buffer.from(b)),
@@ -37,17 +41,43 @@ function setup(env: Record<string, string | undefined> = {}) {
     readToolchains: () => ["stable"],
     spawn,
   };
-  return { deps, post, get, spawn, randomId, stdout: () => Buffer.concat(out).toString(), stderr: () => Buffer.concat(err).toString() };
+  return { deps, post, get, verify, spawn, randomId, stdout: () => Buffer.concat(out).toString(), stderr: () => Buffer.concat(err).toString() };
 }
 
 function view(state: string, extra: Record<string, unknown> = {}) {
   return { version: 1, commandId: PIN, state, remoteStarted: false, fallbackSafe: false, events: [], nextCursor: 0, result: null, terminalError: null, ...extra };
 }
-const completed = view("completed", {
-  remoteStarted: true,
-  result: { exitCode: 0, signal: null, timedOut: false, cancelled: false, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null },
-});
+const terminalResult: OffloadTerminalResult = { exitCode: 0, signal: null, timedOut: false, cancelled: false, syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null };
+const completed = view("completed", { remoteStarted: true, result: terminalResult });
 const bodyOf = (post: ReturnType<typeof setup>["post"], i = 0) => post.mock.calls[i]![1] as { commandId: string; dryRun: boolean };
+
+function useReceiptBroker(t: ReturnType<typeof setup>) {
+  const data = new Map<string, unknown>();
+  const start = vi.fn<OffloadBackend["start"]>((_cmd, sink) => {
+    sink.started();
+    sink.write("stdout", Buffer.from("original test result\n"));
+    sink.complete(terminalResult);
+    return { done: Promise.resolve(), cancel: async () => {} };
+  });
+  const broker = new OffloadBroker({
+    store: {
+      get: async (key) => structuredClone(data.get(key) ?? null),
+      set: async (key, value) => { data.set(key, structuredClone(value)); },
+      delete: async (key) => { data.delete(key); },
+    },
+    backend: { start },
+    now: t.deps.now,
+  });
+  const principal = { companyId: "company", runId: "run", cardId: "card", repoId: "repo", profileId: "rust-public-1" };
+  // Adapt route responses to the client's transport without any real HTTP/guest.
+  const result = (r: { status: number; body: unknown }): HttpResult => ({ ok: true, status: r.status, json: r.body });
+  t.post.mockImplementation(async (_p, body) => result(await broker.submit(body as OffloadSubmitRequest, principal)));
+  t.get.mockImplementation(async (p) => result(await broker.read(PIN, principal, Number(new URL(p, "http://fixture").searchParams.get("after")))));
+  t.verify.mockImplementation(async (_p, body) => result(await handleVerify({
+    actor: { actorType: "agent", actorId: "agent", runId: "run" }, companyId: "company", params: { commandId: PIN }, body,
+  }, { broker, profile: { id: "rust-public-1", toolchains: ["stable"], allowRustflags: false }, workspaces: { get: async () => { throw new Error("receipt must not resolve workspace"); } } })));
+  return { start };
+}
 
 describe("pinned command mode", () => {
   it("reuses the selector across two invocations that read existing receipts (flags off / expired grant)", async () => {
@@ -99,23 +129,62 @@ describe("pinned command mode", () => {
     for (const script of [AS_CARGO, DIAG]) {
       const t = setup();
       const args = script === DIAG ? ["--", "test"] : ["test"];
-      let submitted = false;
-      t.post.mockImplementation(async () => {
-        submitted = true;
-        return { ok: true, status: 202, json: {} };
-      });
-      t.get.mockImplementation(async () => submitted
-        ? { ok: true, status: 200, json: completed }
-        : { ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST", detail: "unknown commandId", commandId: PIN } });
+      const { start } = useReceiptBroker(t);
       expect(await shimMain(script, args, t.deps)).toBe(0);
       expect(t.post).toHaveBeenCalledTimes(1);
       t.deps.env.DATABASE_URL = "postgres://local-only";
       expect(await shimMain(script, args, t.deps)).toBe(0);
-      expect(t.get).toHaveBeenLastCalledWith(`/offload/commands/${PIN}?after=0`);
+      expect(t.verify).toHaveBeenLastCalledWith(`/offload/commands/${PIN}/verify`, expect.objectContaining({ argv: ["test"], env: {} }));
+      expect(start).toHaveBeenCalledTimes(1);
       expect(t.post).toHaveBeenCalledTimes(1);
       expect(t.spawn).not.toHaveBeenCalled();
       expect(t.randomId).not.toHaveBeenCalled();
     }
+  });
+
+  it("rejects a changed pinned workload instead of replaying another command's success", async () => {
+    for (const script of [AS_CARGO, DIAG]) {
+      const t = setup();
+      const { start } = useReceiptBroker(t);
+      const args = (command: string) => script === DIAG ? ["--", command] : [command];
+      expect(await shimMain(script, args("test"), t.deps)).toBe(0);
+      const originalOutput = t.stdout();
+      expect(originalOutput).toContain("original test result");
+      expect(await shimMain(script, args("build"), t.deps)).toBe(64);
+      expect(t.stdout()).toBe(originalOutput);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(t.verify).toHaveBeenCalledTimes(2);
+      expect(t.post).toHaveBeenCalledTimes(1);
+      expect(t.spawn).not.toHaveBeenCalled();
+      expect(t.randomId).not.toHaveBeenCalled();
+    }
+  });
+
+  it("checks changed execution env even with a newly present local-only env and an ambiguous first read", async () => {
+    const t = setup({ CARGO_TERM_COLOR: "never" });
+    const { start } = useReceiptBroker(t);
+    expect(await shimMain(AS_CARGO, ["test"], t.deps)).toBe(0);
+    const output = t.stdout();
+    t.deps.env.CARGO_TERM_COLOR = "always";
+    t.deps.env.DATABASE_URL = "postgres://local-only";
+    t.verify.mockResolvedValueOnce({ ok: false, error: "read lost" });
+    expect(await shimMain(AS_CARGO, ["test"], t.deps)).toBe(64);
+    expect(t.stdout()).toBe(output);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(t.post).toHaveBeenCalledTimes(1);
+    expect(t.spawn).not.toHaveBeenCalled();
+    expect(t.randomId).not.toHaveBeenCalled();
+  });
+
+  it("never downgrades to an unverified read when the receipt verification route is unavailable", async () => {
+    const t = setup();
+    t.verify.mockResolvedValue({ ok: true, status: 404, json: {} });
+    t.get.mockResolvedValue({ ok: true, status: 200, json: completed });
+    expect(await shimMain(AS_CARGO, ["build"], t.deps)).toBe(75);
+    expect(t.get).not.toHaveBeenCalled();
+    expect(t.post).not.toHaveBeenCalled();
+    expect(t.stdout()).toBe("");
+    expect(t.spawn).not.toHaveBeenCalled();
   });
 
   it("resumes polling an existing pinned receipt before classifying local-only env", async () => {

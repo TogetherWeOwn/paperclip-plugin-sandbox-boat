@@ -74,6 +74,13 @@ const manifest: PaperclipPluginManifestV1 = {
       capability: "api.routes.register",
     },
     {
+      routeKey: "offload_verify",
+      method: "POST",
+      path: "/offload/commands/:commandId/verify",
+      auth: "agent",
+      capability: "api.routes.register",
+    },
+    {
       routeKey: "offload_heartbeat",
       method: "POST",
       path: "/offload/commands/:commandId/heartbeat",
