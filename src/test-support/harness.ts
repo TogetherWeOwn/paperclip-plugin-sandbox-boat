@@ -355,6 +355,13 @@ export function createFakeContext(
   };
   const ctx = {
     state: {
+      // Atomic fake host insertion: no await between absence test and write.
+      create: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }, value: unknown) => {
+        check("state.create", input);
+        if (state.has(keyOf(input))) return false;
+        state.set(keyOf(input), structuredClone(value));
+        return true;
+      },
       get: async (input: { scopeKind: string; scopeId?: string; namespace?: string; stateKey: string }) => {
         check("state.get", input);
         return state.has(keyOf(input)) ? structuredClone(state.get(keyOf(input))) : null;

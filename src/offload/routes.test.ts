@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NeverDispatchBackend, OffloadBroker, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
-import { canonicalRepoId, handleCancel, handleExec, handleHeartbeat, handleRead, V1_PROFILE, type OffloadRouteHost, type RouteActor } from "./routes.js";
+import type { OffloadSubmitRequest } from "./protocol.js";
+import { canonicalRepoId, handleCancel, handleExec, handleHeartbeat, handleRead, handleVerify, V1_PROFILE, type OffloadRouteHost, type RouteActor } from "./routes.js";
 
 const COMPANY = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const RUN = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
@@ -61,6 +62,9 @@ function setup(backend: OffloadBackend = new NeverDispatchBackend(), now: () => 
   workspaces.set(WS, { repoUrl: "https://github.com/TogetherWeOwn/two-bot-next", projectId: "proj-1", projectWorkspaceId: "pws-1", path: "/work/two-bot-next", cwd: "/work/two-bot-next" });
   const host: OffloadRouteHost = {
     broker,
+    // Test-only: this fixture exercises classifier/receipt/preflight behavior, not exact-run admission.
+    // The real security gate is covered by admission.test.ts.
+    admission: { check: async () => null, consume: async () => null },
     workspaces: { get: async (id: string) => workspaces.get(id) ?? null },
     profile: { id: "rust-public-1", toolchains: ["stable", "1.88.0"], allowRustflags: false },
   };
@@ -387,6 +391,127 @@ describe("handleRead/handleHeartbeat/handleCancel", () => {
     const cancelled = await handleCancel({ actor: ACTOR, companyId: COMPANY, params: { commandId: CMD }, body: { reason: "client_signal" } }, t.host);
     expect(cancelled.status).toBe(200);
     expect(cancelled.body).toMatchObject({ state: "not_started" });
+  });
+});
+
+describe("handleVerify", () => {
+  const OTHER_COMPANY = "dddddddd-dddd-4ddd-dddd-dddddddddddd";
+  const principal = { companyId: COMPANY, runId: RUN, cardId: "card-1", repoId: "repo-1", profileId: "rust-public-1" };
+  const verify = (t: ReturnType<typeof setup>, body: unknown, over: { actor?: RouteActor; companyId?: string; commandId?: string } = {}, host: OffloadRouteHost = t.host) =>
+    handleVerify({ actor: over.actor ?? ACTOR, companyId: over.companyId ?? COMPANY, params: { commandId: over.commandId ?? CMD }, body }, host);
+  /** Host whose every submit-side dependency throws: verify must touch none of them. */
+  function tripwireHost(t: ReturnType<typeof setup>): { host: OffloadRouteHost; touched: string[] } {
+    const touched: string[] = [];
+    const trip = (name: string) => async () => { touched.push(name); throw new Error(`${name} must not be called`); };
+    const broker = Object.create(t.host.broker) as OffloadBroker;
+    for (const name of ["submit", "existingSubmission", "recordRefusal"] as const) {
+      (broker as unknown as Record<string, unknown>)[name] = trip(`broker.${name}`);
+    }
+    return {
+      touched,
+      host: {
+        broker,
+        admission: { check: trip("admission.check"), consume: trip("admission.consume") },
+        workspaces: { get: trip("workspaces.get") },
+        // Settings absent, profile ineligible, no extra profiles: nothing fresh can be authorized.
+        profile: { id: "disabled", toolchains: [], allowRustflags: false },
+      } as OffloadRouteHost,
+    };
+  }
+  async function seed(t: ReturnType<typeof setup>, over: Record<string, unknown> = {}) {
+    const request = { ...submitBody(over), tool: "cargo", runner: "cargo" } as OffloadSubmitRequest;
+    expect((await t.host.broker.submit(request, principal)).status).toBe(202);
+  }
+
+  it("returns 200 for the same payload while settings, grants, profiles and binding are unavailable", async () => {
+    const t = setup(new RemoteBackend());
+    await seed(t);
+    const { host, touched } = tripwireHost(t);
+    const response = await verify(t, submitBody(), {}, host);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ commandId: CMD });
+    expect(touched).toEqual([]);
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("rejects each changed field with 409 and never redispatches", async () => {
+    const t = setup(new RemoteBackend());
+    await seed(t);
+    const { host, touched } = tripwireHost(t);
+    const changes: Record<string, unknown>[] = [
+      { argv: ["build", "--locked"] },
+      { executionWorkspaceId: "00000000-0000-4000-8000-0000000000aa" },
+      { cwdRelative: "sub" },
+      { tool: "node", runner: "npm", argv: ["test"], env: {} },
+      { env: { CARGO_TERM_COLOR: "always" } },
+      { queueTimeoutMs: 1000 },
+      { timeoutMs: 1000 },
+    ];
+    for (const change of changes) {
+      const response = await verify(t, submitBody(change), {}, host);
+      expect(response.status, JSON.stringify(change)).toBe(409);
+      expect(response.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+    }
+    expect(touched).toEqual([]);
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("rejects a changed runner with 409", async () => {
+    const t = setup(new RemoteBackend());
+    expect((await t.host.broker.submit({ ...submitBody(), tool: "node", runner: "npm", env: {}, argv: ["test"] } as OffloadSubmitRequest, principal)).status).toBe(202);
+    const response = await verify(t, submitBody({ tool: "node", runner: "pnpm", env: {}, argv: ["test"] }));
+    expect(response.status).toBe(409);
+    expect(t.starts.length).toBe(1);
+  });
+
+  it.each([["node", "npm"], ["python", "pytest"]] as const)("rejects an explicit cargo runner on %s while retaining omitted-runner legacy recovery", async (tool, runner) => {
+    const t = setup(new RemoteBackend());
+    const request = { ...submitBody(), tool, runner, env: {}, argv: ["test"] } as OffloadSubmitRequest;
+    expect((await t.host.broker.submit(request, principal)).status).toBe(202);
+    const explicit = await verify(t, { ...request, runner: "cargo" });
+    expect(explicit.status).toBe(400);
+    expect(explicit.body).toMatchObject({ code: "OFFLOAD_INVALID_REQUEST" });
+    const { runner: _runner, ...omitted } = request;
+    expect((await verify(t, omitted)).status).toBe(200);
+    expect(t.starts.length).toBe(1);
+  });
+
+  it("answers 400 for an unknown ID and journals nothing", async () => {
+    const t = setup();
+    const { host, touched } = tripwireHost(t);
+    const response = await verify(t, submitBody(), {}, host);
+    expect(response.status).toBe(400);
+    expect(t.store.data.size).toBe(0);
+    expect(touched).toEqual([]);
+    expect(t.starts.length).toBe(0);
+  });
+
+  it("denies another run or company with 403 before comparing the payload", async () => {
+    const t = setup(new RemoteBackend());
+    await seed(t);
+    const mismatched = submitBody({ argv: ["build"] });
+    const otherRun = await verify(t, mismatched, { actor: { ...ACTOR, runId: "other-run" } });
+    expect(otherRun.status).toBe(403);
+    expect(otherRun.body).toMatchObject({ code: "OFFLOAD_FORBIDDEN" });
+    expect((await verify(t, mismatched, { companyId: OTHER_COMPANY })).status).toBe(403);
+    expect((await verify(t, submitBody(), { actor: { ...ACTOR, runId: "other-run" } })).status).toBe(403);
+  });
+
+  it("rejects unauthenticated callers, bad IDs, malformed or oversized bodies, ID mismatch and dryRun", async () => {
+    const t = setup(new RemoteBackend());
+    await seed(t);
+    const before = structuredClone([...t.store.data.entries()]);
+    const anon = { actorType: "user", actorId: "u", runId: null } as RouteActor;
+    expect((await verify(t, submitBody(), { actor: anon })).status).toBe(401);
+    expect((await verify(t, submitBody(), { commandId: "nope" })).status).toBe(400);
+    expect((await verify(t, submitBody({ shell: true }))).status).toBe(400);
+    expect((await verify(t, submitBody({ tool: "ruby" }))).status).toBe(400);
+    expect((await verify(t, null)).status).toBe(400);
+    expect((await verify(t, submitBody({ env: { CARGO_TERM_COLOR: "x".repeat(70 * 1024) } }))).status).toBe(400);
+    expect((await verify(t, submitBody({ commandId: "00000000-0000-4000-8000-000000000001" }))).status).toBe(400);
+    expect((await verify(t, submitBody({ dryRun: true }))).status).toBe(400);
+    expect([...t.store.data.entries()]).toEqual(before);
+    expect(t.starts.length).toBe(1);
   });
 });
 

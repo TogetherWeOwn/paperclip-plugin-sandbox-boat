@@ -213,11 +213,15 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
     setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked,
       guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
-    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => config } } as never);
-    await plugin.definition.onEnvironmentRealizeWorkspace!(native());
     const cmd = command();
     const agentId = randomUUID();
-    const actor = { actorType: "agent", actorId: agentId, agentId, runId };
+    // Fixture only: the operator-issued exact-run grant and the fake host's verified run identity.
+    const now = Date.now();
+    const granted = { ...config, offloadAdmission: { version: 1, companyId, agentId, runId, executionWorkspaceId,
+      commandId: cmd.commandId, issuedAt: new Date(now - 60_000).toISOString(), expiresAt: new Date(now + 60 * 60_000).toISOString() } };
+    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => granted } } as never);
+    await plugin.definition.onEnvironmentRealizeWorkspace!(native());
+    const actor = { actorType: "agent", actorId: agentId, agentId, runId, authenticatedRunId: runId };
     await currentManager().startLocalRun(companyId, runId, randomUUID(), agentId);
     await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor, params: {}, query: {},
       body: { version: 1, commandId: cmd.commandId, executionWorkspaceId, argv: cmd.argv, cwdRelative: ".", env: {},

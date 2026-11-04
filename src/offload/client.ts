@@ -15,6 +15,7 @@ import {
   type OffloadErrorEnvelope,
   type OffloadReadResponse,
   type OffloadSyncBack,
+  type OffloadSubmitRequest,
 } from "./protocol.js";
 
 export type HttpResult = { ok: true; status: number; json: unknown } | { ok: false; error: string };
@@ -35,6 +36,11 @@ export interface ShimRequest {
   queueTimeoutMs: number;
   timeoutMs: number;
   processEnv: Record<string, string | undefined>;
+  /**
+   * Default true. False (operator-pinned command ID) means this request must
+   * never run locally: every would-be fallback stops with exit 75 instead.
+   */
+  allowLocalFallback?: boolean;
 }
 
 export interface ClientDeps {
@@ -129,12 +135,34 @@ export function buildEnv(processEnv: ShimRequest["processEnv"], tool: "cargo" | 
   if ((rustflags != null && rustflags !== "") || (rustdocflags != null && rustdocflags !== "")) {
     return { local: true, reason: "RUSTFLAGS/RUSTDOCFLAGS set; profile cannot validate them yet" };
   }
+  return { local: false, env: executionEnv(processEnv, tool) };
+}
+
+/** Only wire execution fields participate in receipt identity, not local-only env. */
+function executionEnv(processEnv: ShimRequest["processEnv"], tool: "cargo" | "node" | "python"): Record<string, string> {
+  if (tool !== "cargo") return {};
   const env: Record<string, string> = {};
   const termColor = processEnv.CARGO_TERM_COLOR;
   if (termColor !== undefined && TERM_COLOR.has(termColor)) env.CARGO_TERM_COLOR = termColor;
   const backtrace = processEnv.RUST_BACKTRACE;
   if (backtrace !== undefined && BACKTRACE.has(backtrace)) env.RUST_BACKTRACE = backtrace;
-  return { local: false, env };
+  return env;
+}
+
+function executionRequest(request: ShimRequest, commandId: string): OffloadSubmitRequest {
+  const tool = request.tool ?? "cargo";
+  return {
+    version: OFFLOAD_VERSION,
+    commandId,
+    executionWorkspaceId: request.executionWorkspaceId,
+    cwdRelative: request.cwdRelative,
+    ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
+    argv: request.argv,
+    env: executionEnv(request.processEnv, tool),
+    queueTimeoutMs: request.queueTimeoutMs,
+    timeoutMs: request.timeoutMs,
+    dryRun: false,
+  };
 }
 
 function asReadView(json: unknown, commandId: string, after = 0): OffloadReadResponse | null {
@@ -203,6 +231,17 @@ interface PollContext {
   deps: ClientDeps;
   commandId: string;
   pendingSignal: () => "SIGINT" | "SIGTERM" | null;
+  verifyRequest?: OffloadSubmitRequest;
+  verified?: boolean;
+}
+
+async function readReceipt(ctx: PollContext, cursor: number): Promise<HttpResult> {
+  if (ctx.verifyRequest && !ctx.verified) {
+    const response = await ctx.deps.http.post(`/offload/commands/${ctx.commandId}/verify`, ctx.verifyRequest);
+    if (response.ok && response.status === 200 && asReadView(response.json, ctx.commandId)) ctx.verified = true;
+    return response;
+  }
+  return ctx.deps.http.get(`/offload/commands/${ctx.commandId}?after=${cursor}`);
 }
 
 async function cancelBestEffort(ctx: PollContext): Promise<void> {
@@ -226,11 +265,20 @@ function render(ctx: PollContext, view: OffloadReadResponse): void {
  * Every size-limited page carries state/result, even with more output unread.
  * Local fallback happens only on a durable never-started receipt.
  */
+function refuseLocal(request: ShimRequest, deps: ClientDeps, reason: string): number {
+  const text = reason.replace(/[\r\n]+/g, " ").slice(0, 256);
+  deps.stderr(Buffer.from(`offload: pinned command ID; local fallback refused (${text}); exit 75, no local run.\n`, "utf8"));
+  return OFFLOAD_EXIT.executionUnknown;
+}
+
 async function finishIfTerminal(ctx: PollContext, view: OffloadReadResponse): Promise<number | null> {
   if (!TERMINAL.has(view.state) || view.events.length > 0) return null;
   if (view.terminalError === "OFFLOAD_OUTPUT_LIMIT") return OFFLOAD_EXIT.syncStaged;
   if (!view.result) {
     if (view.state === "not_started" && view.remoteStarted === false && view.fallbackSafe === true) {
+      if (ctx.request.allowLocalFallback === false) {
+        return refuseLocal(ctx.request, ctx.deps, view.fallbackReason || "executor refused before start");
+      }
       ctx.deps.reportFallback?.({ reason: view.fallbackReason || "executor refused before start" });
       return ctx.deps.runLocal(ctx.request.argv);
     }
@@ -256,7 +304,7 @@ async function poll(ctx: PollContext, cursor: number): Promise<number> {
     }
     let response: HttpResult;
     try {
-      response = await deps.http.get(`/offload/commands/${commandId}?after=${cursor}`);
+      response = await readReceipt(ctx, cursor);
     } catch {
       response = { ok: false, error: "read failed" };
     }
@@ -317,7 +365,7 @@ async function recover(ctx: PollContext): Promise<number> {
     }
     let response: HttpResult;
     try {
-      response = await deps.http.get(`/offload/commands/${commandId}?after=${cursor}`);
+      response = await readReceipt(ctx, cursor);
     } catch {
       response = { ok: false, error: "read failed" };
     }
@@ -336,6 +384,7 @@ async function recover(ctx: PollContext): Promise<number> {
     } else if (response.ok && (response.status === 401 || response.status === 403)) {
       return OFFLOAD_EXIT.auth;
     }
+    if (response.ok && response.status === 409 && asError(response.json)?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT") return OFFLOAD_EXIT.invalidRequest;
     // 400 unknown-command and transport failures: the submit may still land.
     if (deps.now() >= deadline) {
       deps.reportUnknown({ commandId });
@@ -351,11 +400,6 @@ function isLive(state: OffloadCommandState | string): boolean {
 
 export async function runOffload(request: ShimRequest, deps: ClientDeps): Promise<number> {
   const tool = request.tool ?? "cargo";
-  const env = buildEnv(request.processEnv, tool);
-  if (env.local) {
-    deps.reportFallback?.({ reason: env.reason });
-    return deps.runLocal(request.argv);
-  }
   const commandId = deps.randomId();
   let pending: "SIGINT" | "SIGTERM" | null = null;
   deps.onSignal((signal) => {
@@ -363,20 +407,45 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
   });
   const ctx: PollContext = { request, deps, commandId, pendingSignal: () => pending };
 
+  if (request.allowLocalFallback === false) {
+    // Verify the normalized payload before rendering an existing result. This
+    // receipt-only route never submits; local-only env still cannot hide a receipt.
+    ctx.verifyRequest = executionRequest(request, commandId);
+    let receipt: HttpResult;
+    try {
+      receipt = await readReceipt(ctx, 0);
+    } catch {
+      receipt = { ok: false, error: "read failed" };
+    }
+    if (receipt.ok && receipt.status === 200) {
+      const view = asReadView(receipt.json, commandId);
+      if (!view) return recover(ctx);
+      render(ctx, view);
+      const done = await finishIfTerminal(ctx, view);
+      if (done !== null) return done;
+      return poll(ctx, view.nextCursor);
+    }
+    if (receipt.ok && (receipt.status === 401 || receipt.status === 403)) return OFFLOAD_EXIT.auth;
+    if (receipt.ok && receipt.status === 410) return OFFLOAD_EXIT.executionUnknown;
+    const error = receipt.ok ? asError(receipt.json) : null;
+    if (receipt.ok && receipt.status === 409 && error?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT") return OFFLOAD_EXIT.invalidRequest;
+    // Only an explicit unknown-ID response permits fresh validation/submission.
+    // An unavailable, malformed or ambiguous read is never permission to launch.
+    if (!receipt.ok || receipt.status !== 400 || error?.code !== "OFFLOAD_INVALID_REQUEST"
+      || error.detail !== "unknown commandId" || error.commandId !== commandId) return recover(ctx);
+    if (pending) return signalExit(pending);
+  }
+
+  const env = buildEnv(request.processEnv, tool);
+  if (env.local) {
+    if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);
+    deps.reportFallback?.({ reason: env.reason });
+    return deps.runLocal(request.argv);
+  }
+
   let submit: HttpResult;
   try {
-    submit = await deps.http.post("/offload/exec", {
-      version: OFFLOAD_VERSION,
-      commandId,
-      executionWorkspaceId: request.executionWorkspaceId,
-      cwdRelative: request.cwdRelative,
-      ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
-      argv: request.argv,
-      env: env.env,
-      queueTimeoutMs: request.queueTimeoutMs,
-      timeoutMs: request.timeoutMs,
-      dryRun: false,
-    });
+    submit = await deps.http.post("/offload/exec", executionRequest(request, commandId));
   } catch {
     submit = { ok: false, error: "submit failed" };
   }
@@ -385,8 +454,12 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     return signalExit(pending);
   }
   if (!submit.ok) return recover(ctx);
-  if (submit.status === 202) return poll(ctx, 0);
+  if (submit.status === 202) {
+    ctx.verified = true;
+    return poll(ctx, 0);
+  }
   if (submit.status === 200) {
+    ctx.verified = true;
     // Duplicate submit: the body is the current read view.
     const view = asReadView(submit.json, commandId);
     if (!view) return recover(ctx);
@@ -404,6 +477,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
   }
   const decision = exitForError(envelope);
   if (decision.action === "fallback") {
+    if (request.allowLocalFallback === false) return refuseLocal(request, deps, envelope.detail);
     deps.reportFallback?.({ reason: envelope.detail });
     return deps.runLocal(request.argv);
   }

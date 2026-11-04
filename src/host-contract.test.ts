@@ -34,7 +34,14 @@ const issueId = randomUUID();
 const workspaceId = randomUUID();
 const environmentId = randomUUID();
 const secretId = randomUUID();
+const commandId = randomUUID();
+const issuedAt = Date.now() - 60_000;
 const config = {
+  // Operator-issued exact-run grant. Stock 2026.1023.0 still cannot admit it:
+  // it supplies no authenticated run identity and no atomic state create.
+  offloadExecutorEnabled: true,
+  offloadAdmission: { version: 1, companyId, agentId, runId, executionWorkspaceId: workspaceId, commandId,
+    issuedAt: new Date(issuedAt).toISOString(), expiresAt: new Date(issuedAt + 60 * 60_000).toISOString() },
   offloadLocalRunsEnabled: true,
   offloadLocalEnvironmentId: environmentId,
   offloadLocalApiKeySecretRef: { type: "secret_ref", secretId },
@@ -193,12 +200,32 @@ function startHost(source: string, options: { bindings?: Array<{ secretId: strin
 }
 
 const exec = manifest.apiRoutes!.find((route) => route.routeKey === "offload_exec")!;
-const execBody = () => ({ version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId, argv: ["test", "--locked"],
+const execBody = () => ({ version: 1, commandId, executionWorkspaceId: workspaceId, argv: ["test", "--locked"],
   cwdRelative: ".", env: {}, queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true });
+
+type ExecReply = { status: number; body: { code?: string; detail?: string } };
+const NOT_OWNER = "run is not known to belong to this agent";
 
 describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
   let source: string;
   let host: ReturnType<typeof startHost>;
+  const execAs = (actor: { agentId: string; companyId: string; runId: string | null }) =>
+    host.call<ExecReply>("handleApiRequest", scopedRouteInput(exec, actor, execBody()), companyId);
+  /** The start event is asynchronous and only records ownership: wait until the run is no longer a stranger. */
+  async function untilOwned(actor: { agentId: string; companyId: string; runId: string | null }): Promise<ExecReply> {
+    for (const deadline = Date.now() + 5000; ; await new Promise((resolve) => setTimeout(resolve, 10))) {
+      const reply = await execAs(actor);
+      if (reply.body.detail !== NOT_OWNER) return reply;
+      if (Date.now() > deadline) throw new Error("timed out waiting for run ownership");
+    }
+  }
+  /** A stock host cannot admit new work: no verified run identity, no atomic create. */
+  const failsClosed = (reply: ExecReply) => {
+    expect(reply.status).toBe(403);
+    expect(reply.body.code).toBe("OFFLOAD_FORBIDDEN");
+    expect(reply.body.detail).not.toBe(NOT_OWNER);
+  };
+  const eagerBindingCalls = () => host.calls.filter((entry) => ["issues.get", "executionWorkspaces.get", "secrets.resolve"].includes(entry.method));
   beforeEach(async () => {
     source = await mkdtemp(path.join(tmpdir(), "boat-host-contract-"));
     await mkdir(path.join(source, ".git"));
@@ -234,36 +261,27 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     }
   });
 
-  it("(1-4) binds a started local run from host data and admits that run's own auth:agent route", async () => {
+  it("(1-4) a started local run records ownership only; a stock host fails closed for new work and never binds eagerly", async () => {
     host = startHost(source);
     expect((await host.initialize()).ok).toBe(true);
     const actor = { agentId, companyId, runId };
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, actor, execBody()), companyId)).status).toBe(403);
+    expect((await execAs(actor)).body.detail).toBe(NOT_OWNER);
 
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
-    await host.until(() => host.logs.includes("boat: bound local run for offload"), "local-run binding");
-
-    // Every worker->host call on the binding path ran inside the event's company scope and passed the SDK gate.
-    const bindingCalls = host.calls.filter((entry) => ["issues.get", "executionWorkspaces.get", "secrets.resolve"].includes(entry.method));
-    expect(bindingCalls.map((entry) => entry.method)).toEqual(["issues.get", "executionWorkspaces.get", "secrets.resolve"]);
-    for (const entry of bindingCalls) {
-      expect(entry.scope).toBe(companyId);
-      expect(manifest.capabilities).toContain(getRequiredCapability(entry.method as never));
-    }
-    expect(bindingCalls[0]!.params).toMatchObject({ issueId, companyId });
-    expect(bindingCalls[1]!.params).toMatchObject({ workspaceId, companyId });
-    expect(bindingCalls[2]!.params).toMatchObject({ secretRef: config.offloadLocalApiKeySecretRef, companyId, configPath: "offloadLocalApiKeySecretRef" });
-
-    const admitted = await host.call<{ status: number; body: unknown }>("handleApiRequest", scopedRouteInput(exec, actor, execBody()), companyId);
-    expect(admitted.status).toBe(200);
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { ...actor, runId: randomUUID() }, execBody()), companyId)).status).toBe(403);
+    // The exact grant matches the request, yet the stock host supplies no
+    // authenticated run identity, so the dry-run is denied rather than admitted.
+    failsClosed(await untilOwned(actor));
+    expect(host.logs).not.toContain("boat: bound local run for offload");
+    // No issue, workspace or secret read happens before an admitted real submit.
+    expect(eagerBindingCalls()).toEqual([]);
+    expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
   }, TIMEOUT);
 
   it("(1) an agent key replaying another agent's run id in X-Paperclip-Run-Id is refused", async () => {
     host = startHost(source);
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
-    await host.until(() => host.logs.includes("boat: bound local run for offload"), "local-run binding");
+    failsClosed(await untilOwned({ agentId, companyId, runId }));
     // middleware/auth.js agent_key path: runId is the unsigned header, agentId is the key's own agent.
     const spoofed = { agentId: randomUUID(), companyId, runId };
     for (const routeKey of ["offload_exec", "offload_read", "offload_heartbeat", "offload_cancel", "offload_report"]) {
@@ -274,41 +292,38 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     }
   }, TIMEOUT);
 
-  it("(2) a run without an issue in its context snapshot binds nothing", async () => {
+  it("(2) a run without an issue in its context snapshot reads nothing and fails closed", async () => {
     host = startHost(source);
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId: null }) }, companyId);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    failsClosed(await untilOwned({ agentId, companyId, runId }));
     expect(host.calls.some((entry) => entry.method === "issues.get")).toBe(false);
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
   }, TIMEOUT);
 
-  it("(3) a workspace with no local cwd (provider ref only) binds nothing", async () => {
+  it("(3) a workspace with no local cwd (provider ref only) is never read at run start", async () => {
     host = startHost(source);
     await host.initialize();
     host.workspaceRows.set(workspaceId, { ...host.workspaceRows.get(workspaceId)!, cwd: null, providerRef: "remote:vm-1" });
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
-    await host.until(() => host.calls.some((entry) => entry.method === "executionWorkspaces.get"), "workspace read");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(host.calls.some((entry) => entry.method === "secrets.resolve")).toBe(false);
+    failsClosed(await untilOwned({ agentId, companyId, runId }));
+    expect(eagerBindingCalls()).toEqual([]);
     expect(host.logs).not.toContain("boat: bound local run for offload");
   }, TIMEOUT);
 
-  it("(4) a secret ref saved without its plugin binding is not resolved", async () => {
+  it("(4) a secret ref saved without its plugin binding is never resolved at run start", async () => {
     host = startHost(source, { bindings: [{ secretId, configPath: "someOtherField", versionSelector: "latest" }] });
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
-    await host.until(() => host.logs.includes("boat: local-run offload binding skipped"), "binding skip");
-    expect((await host.call<{ status: number }>("handleApiRequest", scopedRouteInput(exec, { agentId, companyId, runId }, execBody()), companyId)).status).toBe(503);
+    failsClosed(await untilOwned({ agentId, companyId, runId }));
+    expect(host.calls.some((entry) => entry.method === "secrets.resolve")).toBe(false);
   }, TIMEOUT);
 
-  it("(2) host reads stay inside the event's company: a cross-company issue is invisible", async () => {
+  it("(2) host reads stay inside the event's company: a cross-company start reads nothing", async () => {
     host = startHost(source);
     await host.initialize();
     host.notify("onEvent", { event: runStartedEvent({ companyId: otherCompanyId, runId, agentId, issueId }) }, otherCompanyId);
-    await host.until(() => host.calls.some((entry) => entry.method === "issues.get"), "issue read");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(host.calls.find((entry) => entry.method === "issues.get")).toMatchObject({ scope: otherCompanyId, params: { companyId: otherCompanyId } });
-    expect(host.calls.some((entry) => entry.method === "executionWorkspaces.get")).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(host.calls.some((entry) => entry.method === "issues.get" || entry.method === "executionWorkspaces.get")).toBe(false);
+    expect((await execAs({ agentId, companyId, runId })).body.detail).toBe(NOT_OWNER);
   }, TIMEOUT);
 });

@@ -6,6 +6,7 @@
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
 import path from "node:path";
+import type { OffloadAdmission } from "./admission.js";
 import type { OffloadBroker, BrokerPrincipal, BackendCommand } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
@@ -39,6 +40,9 @@ export interface RouteActor {
   actorType: "user" | "agent";
   actorId: string;
   runId: string | null;
+  agentId?: string | null;
+  /** Host-owned verified JWT identity; absent on older hosts. */
+  authenticatedRunId?: string | null;
 }
 
 export interface OffloadWorkspaceMeta {
@@ -83,6 +87,9 @@ export interface OffloadSettings {
 
 export interface OffloadRouteHost {
   broker: OffloadBroker;
+  admission?: Pick<OffloadAdmission, "check" | "consume">;
+  /** May resolve secrets/persist a binding: only after new-admission check. */
+  bindWorkspace?: () => Promise<void>;
   workspaces: {
     get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null>;
   };
@@ -343,6 +350,7 @@ export async function handleExec(
   input: { actor: RouteActor; companyId: string; body: unknown },
   host: OffloadRouteHost,
 ): Promise<RouteResponse> {
+  input = { ...input, actor: { ...input.actor } };
   const runId = authed(input.actor);
   if (!runId) return { status: 401, body: offloadError("OFFLOAD_UNAUTHORIZED", "agent run authentication required", {}) };
   // The host delivers a parsed body; bound its re-encoded size (host ingress
@@ -372,13 +380,24 @@ export async function handleExec(
   // real submit (and its idempotency digest) judged cargo.
   const tool = validated.value.tool ?? profileTool(profile);
   const runner = validated.value.runner ?? defaultRunnerFor(tool);
-  const request = { ...validated.value, tool, runner };
+  const request = { ...validated.value, tool, runner, argv: [...validated.value.argv], env: { ...validated.value.env } };
   if (!request.dryRun) {
     // A lost workspace binding is not proof that this ID never started. Consult
     // the journal before any unjournaled 503 below; an unknown ID still returns
     // null here and journals nothing.
     const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
     if (known) return known;
+  }
+  if (!host.admission) return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "exact-run admission is unavailable", { commandId: request.commandId }) };
+  const refused = await host.admission.check(input.companyId, input.actor, request);
+  if (refused) {
+    // An admission check may have raced another accepted submit. Only the
+    // journal may replace this refusal with an existing receipt, never launch.
+    if (!request.dryRun) {
+      const raced = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+      if (raced) return raced;
+    }
+    return refused;
   }
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
   if (!settings.offloadProfiles.includes(profile.id)) {
@@ -390,6 +409,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
+  if (!request.dryRun) await host.bindWorkspace?.();
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
     if (!request.dryRun) {
@@ -480,7 +500,8 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", `incompatible workload: ${classification.reason}`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  return host.broker.submit(request, principal);
+  const admission = host.admission;
+  return host.broker.submit(request, principal, () => admission.consume(input.companyId, input.actor, request, principal));
 }
 
 /** Read the requested tool off the raw body before profile validation. Null when invalid. */
@@ -622,6 +643,34 @@ export async function handleRead(
   const limitParsed = limitRaw === null ? OFFLOAD_BOUNDS.readLimitBytes : Number(limitRaw);
   const limitBytes = Number.isFinite(limitParsed) ? Math.min(Math.max(1, Math.floor(limitParsed)), OFFLOAD_BOUNDS.readLimitBytes) : OFFLOAD_BOUNDS.readLimitBytes;
   return host.broker.read(auth.commandId, { companyId: input.companyId, runId: auth.runId }, after, limitBytes);
+}
+
+/** Payload-bound receipt read only: never calls admission, binding or submit. */
+export async function handleVerify(
+  input: { actor: RouteActor; companyId: string; params: { commandId?: string }; body: unknown },
+  host: OffloadRouteHost,
+): Promise<RouteResponse> {
+  const auth = readAuth(input);
+  if (!isAuthed(auth)) return auth;
+  if (bodyTooLarge(JSON.stringify(input.body ?? null))) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "request body exceeds 64 KiB", {}) };
+  }
+  const tool = toolOfBody(input.body);
+  if (tool === null) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "tool must be cargo, node or python", {}) };
+  // Validate wire shape, not current profile eligibility: retained receipts must
+  // survive profile/grant/flag changes. Nothing here authorizes fresh execution.
+  const validated = validateSubmit(input.body, { tool, allowRustflags: true });
+  if (!validated.ok) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail, {}) };
+  // The broker's legacy cargo spelling means an *omitted* Node/Python runner.
+  // Preserve submit's invariant that callers cannot explicitly request that alias.
+  if (tool !== "cargo" && validated.value.runner === "cargo") {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "cargo runner is not valid for node/python receipts", {}) };
+  }
+  const request = { ...validated.value, tool, runner: validated.value.runner ?? defaultRunnerFor(tool) };
+  if (request.commandId !== auth.commandId || request.dryRun) {
+    return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", "receipt requires matching commandId and dryRun false", {}) };
+  }
+  return host.broker.read(auth.commandId, { companyId: input.companyId, runId: auth.runId }, 0, OFFLOAD_BOUNDS.readLimitBytes, request);
 }
 
 export async function handleHeartbeat(

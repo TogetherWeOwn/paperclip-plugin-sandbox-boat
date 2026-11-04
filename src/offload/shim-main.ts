@@ -179,13 +179,32 @@ function spawnExit(result: SpawnResult): number {
   return 128;
 }
 
+const PINNED_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function shimMain(scriptPath: string, args: string[], deps: ShimDeps, tool: ToolShim = CARGO_SHIM): Promise<number> {
+  // Optional operator-preselected command ID: a consistency selector, never
+  // authority. Validated before any spawn or network call.
+  const rawPinned = deps.env.BOAT_OFFLOAD_COMMAND_ID;
+  let pinnedId: string | null = null;
+  if (rawPinned !== undefined) {
+    if (!PINNED_ID_RE.test(rawPinned)) {
+      deps.stderr(Buffer.from(`${tool.diagnosticName}: BOAT_OFFLOAD_COMMAND_ID must be a canonical UUID; exit 64, nothing run.\n`, "utf8"));
+      return 64;
+    }
+    pinnedId = rawPinned.toLowerCase();
+  }
   const installedAs = path.basename(scriptPath);
   const diagnostic = !tool.exeNames.includes(installedAs);
   const diag = tool.diagnosticName;
   const shimDir = path.dirname(scriptPath);
   const writeStderr = (text: string) => deps.stderr(Buffer.from(text, "utf8"));
   const writeStdout = (text: string) => deps.stdout(Buffer.from(text, "utf8"));
+  const idOrRandom = (): string => pinnedId ?? deps.randomId();
+  /** Pinned real mode never runs locally: stop with a clear reason and exit 75. */
+  const refusePinned = (reason: string): number => {
+    writeStderr(`${diag}: pinned command ${pinnedId}; local run refused (${oneLine(reason)}); exit 75, nothing run locally.\n`);
+    return 75;
+  };
 
   let toolArgv: string[];
   let dryRun = false;
@@ -223,6 +242,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     // Explicit diagnostic invocation bypasses BOAT_OFFLOAD, but re-entry still
     // short-circuits: a fallbacked command must never route back into the shim.
     if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) {
+      if (pinnedId) return refusePinned("shim re-entry");
       const real = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", runner, deps);
       if (!real) {
         writeStderr(`${diag}: no real ${runner} on PATH\n`);
@@ -234,8 +254,9 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     toolArgv = args;
   }
 
-  const realExe = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", diagnostic ? runner : installedAs, deps);
-  if (!realExe) {
+  const pinnedReal = pinnedId !== null && !(diagnostic && dryRun);
+  const realExe = pinnedReal ? null : resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", diagnostic ? runner : installedAs, deps);
+  if (!realExe && !pinnedReal) {
     writeStderr(`${diag}: no real ${diagnostic ? runner : installedAs} on PATH\n`);
     return 127;
   }
@@ -259,35 +280,38 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     return spawnExit(result);
   };
-  const runLocal = async (argv: string[]): Promise<number> => spawnLocal(realExe, argv, localEnv);
+  const runLocal = async (argv: string[]): Promise<number> => {
+    if (pinnedReal || !realExe) return refusePinned("local run");
+    return spawnLocal(realExe, argv, localEnv);
+  };
 
   const workspaceId = deps.env.PAPERCLIP_WORKSPACE_ID;
   if (!diagnostic) {
     // Passthrough gating: strict opt-in, re-entry guard, workspace binding.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return runLocal(toolArgv);
-    if (deps.env.BOAT_OFFLOAD !== "1") return runLocal(toolArgv);
-    if (!workspaceId) return runLocal(toolArgv);
+    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return pinnedReal ? refusePinned("shim re-entry") : runLocal(toolArgv);
+    if (deps.env.BOAT_OFFLOAD !== "1") return pinnedReal ? refusePinned("BOAT_OFFLOAD is not 1") : runLocal(toolArgv);
+    if (!workspaceId) return pinnedReal ? refusePinned("no workspace binding") : runLocal(toolArgv);
   } else if (!workspaceId) {
     if (dryRun) {
-      const envelope = { version: OFFLOAD_VERSION, commandId: deps.randomId(), mode: "local", reason: "no workspace binding", profileId: "" };
+      const envelope = { version: OFFLOAD_VERSION, commandId: idOrRandom(), mode: "local", reason: "no workspace binding", profileId: "" };
       writeStdout(json ? `${JSON.stringify(envelope)}\n` : "mode: local (no workspace binding)\n");
       return 0;
     }
-    return runLocal(toolArgv);
+    return pinnedReal ? refusePinned("no workspace binding") : runLocal(toolArgv);
   }
   // Remote runs execute in the same workspace-relative directory as the caller;
   // a cwd outside the workspace (or no resolvable root) stays local.
   const located = workspaceRelativeCwd(deps);
   if ("reason" in located) {
     if (diagnostic && dryRun) {
-      const envelope = { version: OFFLOAD_VERSION, commandId: deps.randomId(), mode: "local", reason: located.reason, profileId: "" };
+      const envelope = { version: OFFLOAD_VERSION, commandId: idOrRandom(), mode: "local", reason: located.reason, profileId: "" };
       writeStdout(json ? `${JSON.stringify(envelope)}\n` : `mode: local (${located.reason})\n`);
       return 0;
     }
-    return runLocal(toolArgv);
+    return pinnedReal ? refusePinned(located.reason) : runLocal(toolArgv);
   }
 
-  const commandId = deps.randomId();
+  const commandId = idOrRandom();
   const request: ShimRequest = {
     tool: tool.tool,
     runner,
@@ -297,6 +321,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     queueTimeoutMs: parseQueueTimeoutMs(deps.env.BOAT_OFFLOAD_QUEUE_TIMEOUT_MS),
     timeoutMs: parseCommandTimeoutMs(deps.env.BOAT_OFFLOAD_TIMEOUT_MS),
     processEnv: deps.env,
+    ...(pinnedReal ? { allowLocalFallback: false } : {}),
   };
   const clientDeps: ClientDeps = {
     http: deps.http,
@@ -306,7 +331,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     stderr: deps.stderr,
     onSignal: deps.onSignal,
     randomId: () => commandId,
-    runLocal: (argv) => runLocalMeasured(argv),
+    runLocal: (argv) => (pinnedReal ? Promise.resolve(refusePinned("local run")) : runLocalMeasured(argv)),
     reportStaged: (syncBack) => {
       writeStderr(
         `offload: remote run ${syncBack.state} ${syncBack.changedPaths.length + syncBack.conflictPaths.length} path(s); ` +
@@ -344,6 +369,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
       writeStderr(`offload dry-run failed: ${error instanceof Error ? error.message : String(error)}\n`);
       return 64;
     }
+  }
+
+  // Pinned real mode goes straight to the authoritative path: a prefilter or
+  // dry-run could hide an existing receipt behind a local decision.
+  if (pinnedReal) {
+    const pinnedExit = await runOffload(request, clientDeps);
+    if (diagnostic && json) deps.stderr(Buffer.from(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, mode: "remote", exitCode: pinnedExit })}\n`, "utf8"));
+    return pinnedExit;
   }
 
   // Syntactic pre-filter avoids a network round trip for obviously local argv.

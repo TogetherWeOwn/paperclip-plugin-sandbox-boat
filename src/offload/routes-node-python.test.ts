@@ -57,6 +57,9 @@ function setup(backend: OffloadBackend = new NeverDispatchBackend(), settings?: 
   workspaces.set(WS, { repoUrl: "https://github.com/example/app", projectId: "proj-1", projectWorkspaceId: "pws-1", path: "/work/app", cwd: "/work/app" });
   const host: OffloadRouteHost = {
     broker,
+    // Test-only: this fixture exercises classifier/receipt/preflight behavior, not exact-run admission.
+    // The real security gate is covered by admission.test.ts.
+    admission: { check: async () => null, consume: async () => null },
     workspaces: { get: async (id: string) => workspaces.get(id) ?? null },
     profile: { id: "rust-public-1", toolchains: ["stable"], allowRustflags: false },
     extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],
