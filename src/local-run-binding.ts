@@ -11,9 +11,9 @@
 // inside an `offloadLocalSourceRoots` entry, and the checkout's own on-disk
 // `remote.origin.url` canonicalizes to the same repo id as the row's repoUrl
 // (the payload then carries the on-disk URL). Both facts are re-checked on
-// every executor resolve (offload-ssh-runtime). Reports use only the source
-// facts. For an admitted bind, the Boat secret is resolved last, after every
-// check, so reports and refused binds never spend secret resolutions.
+// every executor resolve (offload-ssh-runtime). These current-workspace facts
+// do not prove where a run started, so unbound reports must not use them. For
+// an admitted bind, the Boat secret is resolved last, after every check.
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -86,8 +86,8 @@ export interface LocalRunWorkspace {
   source: { localPath: string; repoUrl: string; projectId: string; projectWorkspaceId: string | null };
 }
 
-/** Resolve the run's host-owned source for telemetry or a later admitted bind.
- * This seam cannot resolve a credential and does not require an environment. */
+/** Validate the current workspace candidate for an admitted bind, not run-start
+ * provenance. This seam cannot resolve a credential or establish telemetry authority. */
 export async function localRunWorkspace(
   event: { companyId: string; payload: unknown },
   settings: Pick<LocalRunSettings, "enabled" | "sourceRoots">,

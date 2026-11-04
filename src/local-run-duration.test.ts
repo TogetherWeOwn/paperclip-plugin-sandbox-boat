@@ -18,6 +18,9 @@ const projectWorkspaceId = "eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee";
 const agentId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
 const repoUrl = "https://github.com/example/public";
 const started = { companyId, payload: { runId, issueId, agentId } };
+beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); });
+afterEach(() => { vi.useRealTimers(); });
+
 const commands = [
   { tool: "node", runner: "npm", argv: ["test"], profile: "node-public-1" },
   { tool: "python", runner: "pytest", argv: ["tests"], profile: "python-public-1" },
@@ -52,6 +55,7 @@ describe("local-run duration learning through plugin dispatch", () => {
       vi.spyOn(NativeOffloadWorkspaces.prototype, "remember"), vi.spyOn(SshOffloadRuntime.prototype, "remember"),
       vi.spyOn(SshOffloadRuntime.prototype, "resolve")];
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
+    vi.setSystemTime(Date.now() + 1);
     await harness.emit("agent.run.started", started);
   });
 
@@ -76,21 +80,18 @@ describe("local-run duration learning through plugin dispatch", () => {
         argv: command.argv, durationSeconds: 120, ...body }, ...extra } as never);
   const historyEntries = () => [...harness.state.entries()].filter(([key]) => key.includes("offload.duration.v1."));
 
-  it.each(commands)("records one $tool local sample without admission, and reads its bounded persisted history", async (command) => {
+  const unchanged = async (response: ReturnType<typeof report>, status = 403) => {
     const before = structuredClone([...harness.state.entries()]);
-    expect(await report(command)).toMatchObject({ status: 200, body: { recorded: true } });
-    const key = durationKey(`repo:${repoUrl}`, command.profile, normalizeSignature(command.tool, command.runner, command.argv));
-    const store = {
-      get: (stateKey: string) => harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey }),
-      set: async () => {}, delete: async () => {},
-    };
-    const history = await readHistory(store, key);
-    expect(history).toEqual([{ seconds: 120, at: expect.any(Number) }]);
-    expect(medianSeconds(history, Date.now())).toBe(120);
-    expect(historyEntries()).toHaveLength(1);
-    // The only new persistent state is the sample and the bounded duration index.
-    expect([...harness.state.entries()].filter(([k]) => !k.includes("offload.duration"))).toEqual(before);
-    expect([...harness.state.keys()].filter((k) => k.includes("offload.duration-index"))).toHaveLength(1);
+    expect((await response).status).toBe(status);
+    expect([...harness.state.entries()]).toEqual(before);
+    expect(historyEntries()).toEqual([]);
+  };
+
+  // The pinned SDK offers no atomic run source facts, so an unregistered run never learns, not even at start.
+  it.each(commands)("fails closed for an unbound $tool report without reading the host workspace or persisting", async (command) => {
+    const lookup = vi.spyOn(harness.ctx.executionWorkspaces, "get");
+    await unchanged(report(command));
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it("resolves no credential even when a local environment and secret are configured", async () => {
@@ -98,12 +99,12 @@ describe("local-run duration learning through plugin dispatch", () => {
     harness.secrets.set(secretId, "fake-scoped-key");
     config.offloadLocalEnvironmentId = randomUUID();
     config.offloadLocalApiKeySecretRef = { type: "secret_ref", secretId };
-    expect((await report()).status).toBe(200);
+    await unchanged(report());
     expect(JSON.stringify([...harness.state.values()])).not.toContain("fake-scoped-key");
   });
 
-  it.each(commands)("a learned $tool sample cannot admit a fresh real submit or dry-run", async (command) => {
-    expect((await report(command)).status).toBe(200);
+  it.each(commands)("an unbound $tool refusal leaves a fresh real submit or dry-run without admission", async (command) => {
+    await unchanged(report(command));
     const before = structuredClone([...harness.state.entries()]);
     for (const dryRun of [false, true]) {
       const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
@@ -116,16 +117,14 @@ describe("local-run duration learning through plugin dispatch", () => {
     expect([...harness.state.entries()]).toEqual(before);
   });
 
-  it.each([workspaceId, projectWorkspaceId])("accepts only the host-owned execution/project id %s", async (id) => {
-    expect((await report(commands[0], {}, { executionWorkspaceId: id })).status).toBe(200);
-    expect(historyEntries()).toHaveLength(1);
+  it.each([workspaceId, projectWorkspaceId])("refuses the host-owned execution/project id %s while unbound", async (id) => {
+    await unchanged(report(commands[0], {}, { executionWorkspaceId: id }));
   });
 
-  it("uses the issue's project workspace when it has no execution workspace", async () => {
+  it("refuses an issue's project workspace fallback while unbound", async () => {
     harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null, executionRunId: runId });
     harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project", path: dir, repoUrl });
-    expect((await report(commands[1], {}, { executionWorkspaceId: projectWorkspaceId })).status).toBe(200);
-    expect(historyEntries()).toHaveLength(1);
+    await unchanged(report(commands[1], {}, { executionWorkspaceId: projectWorkspaceId }));
   });
 
   it.each(["run", "agent", "company", "workspace", "no run", "user"])("rejects the wrong %s without state changes", async (wrong) => {
@@ -159,27 +158,23 @@ describe("local-run duration learning through plugin dispatch", () => {
     expect(historyEntries()).toEqual([]);
   });
 
-  it("rejects a run ending during the host metadata lookup", async () => {
-    let release!: () => void;
-    let reached!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const reading = new Promise<void>((resolve) => { reached = resolve; });
-    const original = harness.ctx.executionWorkspaces.get;
-    harness.ctx.executionWorkspaces.get = async (id) => { reached(); await gate; return original(id); };
+  it("never reads host workspace metadata for a report, even when the run ends concurrently", async () => {
+    const lookup = vi.spyOn(harness.ctx.executionWorkspaces, "get");
     const pending = report();
-    await reading;
     await harness.emit("agent.run.finished", { companyId, payload: { runId } });
-    release();
     expect((await pending).status).toBe(403);
+    expect(lookup).not.toHaveBeenCalled();
     expect(historyEntries()).toEqual([]);
   });
 
-  it("keeps report validation and rate bounds before any dispatch or metadata persistence", async () => {
+  it("keeps report validation before any dispatch or metadata persistence, and never records while unbound", async () => {
     expect((await report(commands[0], {}, { durationSeconds: 86_401 })).status).toBe(400);
     expect((await report(commands[0], {}, { argv: ["run", "watch"] })).status).toBe(400);
-    for (let i = 0; i < 5; i++) expect((await report()).status).toBe(200);
+    const before = structuredClone([...harness.state.entries()]);
+    for (let i = 0; i < 5; i++) expect((await report()).status).toBe(403);
     expect((await report()).status).toBe(429);
-    expect(historyEntries()[0]?.[1]).toHaveLength(5);
+    expect([...harness.state.entries()]).toEqual(before);
+    expect(historyEntries()).toEqual([]);
   });
 });
 
@@ -195,7 +190,7 @@ describe("local duration reports with registered workspace refusals", () => {
   });
 
   it.each(commands.flatMap((command) => [true, false].map((withdrawn) => ({ ...command, withdrawn }))))(
-    "honors registrations during $tool metadata lookup (withdrawn=$withdrawn)", async (command) => {
+    "honors registrations without host workspace reads for $tool (withdrawn=$withdrawn)", async (command) => {
       resetReportBudgets();
       dir = await mkdtemp(path.join(tmpdir(), "boat-duration-inflight-"));
       const sources = [
@@ -217,6 +212,7 @@ describe("local duration reports with registered workspace refusals", () => {
       const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
       setManagerOverridesForTests({ offloadExecutor: executor });
       await plugin.definition.setup(harness.ctx as never);
+      vi.setSystemTime(Date.now() + 1);
       await harness.emit("agent.run.started", started);
       const secret = vi.spyOn(harness.ctx.secrets, "resolve");
       vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
@@ -224,34 +220,28 @@ describe("local duration reports with registered workspace refusals", () => {
         actor: { actorType: "agent", actorId: agentId, agentId, runId }, params: {}, query: {},
         body: { executionWorkspaceId: id, tool: command.tool, runner: command.runner, argv: command.argv, durationSeconds: 120 },
       } as never);
-      let release!: () => void;
-      let reached!: () => void;
-      const gate = new Promise<void>((resolve) => { release = resolve; });
-      const reading = new Promise<void>((resolve) => { reached = resolve; });
-      const original = harness.ctx.executionWorkspaces.get;
-      harness.ctx.executionWorkspaces.get = async (id) => { reached(); await gate; return original(id); };
+      const lookup = vi.spyOn(harness.ctx.executionWorkspaces, "get");
       const registry = new NativeOffloadWorkspaces(harness.ctx.state);
       expect(await registry.lookup(projectWorkspaceId, companyId, runId)).toBeUndefined();
-      const pending = report(projectWorkspaceId);
-      await reading;
-      // The fallback is loading B; trusted registration meanwhile binds A or withdraws their shared alias.
-      try {
-        for (const source of command.withdrawn ? sources : sources.slice(0, 1)) {
-          await registry.remember({ companyId, environmentId: "environment", workspace: {
-            localPath: source.root, metadata: { workspaceRealizationRequest: {
-              version: 1, companyId, environmentId: "environment", heartbeatRunId: runId,
-              executionWorkspaceId: source.id, localRun: true,
-              source: { localPath: source.root, projectId: "project", projectWorkspaceId, repoUrl: source.repo },
-            } },
-          } } as never);
-        }
-        expect(await registry.lookup(projectWorkspaceId, companyId, runId))
-          .toEqual(command.withdrawn ? null : expect.objectContaining({ repoUrl }));
-      } finally {
-        release();
+      // Unregistered, the shared alias is unbound: refused without any host workspace read or write.
+      const unbound = structuredClone([...harness.state.entries()]);
+      expect(await report(projectWorkspaceId)).toMatchObject({ status: 403 });
+      expect([...harness.state.entries()]).toEqual(unbound);
+      resetReportBudgets();
+      // Trusted registration binds A or withdraws their shared alias.
+      for (const source of command.withdrawn ? sources : sources.slice(0, 1)) {
+        await registry.remember({ companyId, environmentId: "environment", workspace: {
+          localPath: source.root, metadata: { workspaceRealizationRequest: {
+            version: 1, companyId, environmentId: "environment", heartbeatRunId: runId,
+            executionWorkspaceId: source.id, localRun: true,
+            source: { localPath: source.root, projectId: "project", projectWorkspaceId, repoUrl: source.repo },
+          } },
+        } } as never);
       }
+      expect(await registry.lookup(projectWorkspaceId, companyId, runId))
+        .toEqual(command.withdrawn ? null : expect.objectContaining({ repoUrl }));
       const before = structuredClone([...harness.state.entries()]);
-      expect(await pending).toMatchObject({ status: command.withdrawn ? 403 : 200 });
+      expect(await report(projectWorkspaceId)).toMatchObject({ status: command.withdrawn ? 403 : 200 });
       if (command.withdrawn) expect([...harness.state.entries()]).toEqual(before);
       else {
         const key = durationKey(`repo:${repoUrl}`, command.profile, normalizeSignature(command.tool, command.runner, command.argv));
@@ -266,8 +256,19 @@ describe("local duration reports with registered workspace refusals", () => {
         expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: key }))
           .toHaveLength(command.withdrawn ? 1 : 2);
       }
+      // Even valid registered learning is not a grant for another command.
+      const afterLearning = structuredClone([...harness.state.entries()]);
+      for (const dryRun of [false, true]) {
+        expect(await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
+          actor: { actorType: "agent", actorId: agentId, agentId, runId, authenticatedRunId: runId }, params: {}, query: {},
+          body: { version: 1, commandId: randomUUID(), executionWorkspaceId: workspaceId,
+            tool: command.tool, runner: command.runner, argv: command.argv, cwdRelative: ".", env: {},
+            queueTimeoutMs: 0, timeoutMs: 10_000, dryRun } } as never)).toMatchObject({ status: 403 });
+      }
+      expect([...harness.state.entries()]).toEqual(afterLearning);
       expect([...harness.state.entries()].filter(([key]) => !key.includes("offload.duration")))
         .toEqual(before.filter(([key]) => !key.includes("offload.duration")));
+      expect(lookup).not.toHaveBeenCalled();
       expect(secret).not.toHaveBeenCalled();
       expect(executor).not.toHaveBeenCalled();
       expect(fetch).not.toHaveBeenCalled();
@@ -298,6 +299,7 @@ describe("local duration reports with registered workspace refusals", () => {
     const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
     setManagerOverridesForTests({ offloadExecutor: executor });
     await plugin.definition.setup(harness.ctx as never);
+    vi.setSystemTime(Date.now() + 1);
     await harness.emit("agent.run.started", started);
     const registry = new NativeOffloadWorkspaces(harness.ctx.state);
     for (const source of sources) {

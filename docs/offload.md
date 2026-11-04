@@ -77,27 +77,35 @@ profile + normalized-command-signature duration history (last 20 runs,
 30-day TTL) in its existing company-scoped state. A Node/Python command is a
 remote candidate only when its recorded median meets
 `offloadMinExpectedSeconds` (default 120); unknown signatures run local first
-and record, so the second identical long run can go remote. The gate learns
+and, when an exact-run source is registered, record, so the second identical
+long run can go remote. Unbound local runs cannot bootstrap history on the pinned
+SDK. The gate learns
 host-measured wall time only: a completed remote run records the host-side
 elapsed interval (the guest-reported value can only shorten it, never
 lengthen it), and every sample is clamped to one day. Recordings come from
 completed remote runs (server-side) and from shim-reported local runs
-(`POST /offload/report`, agent-authed, bounded samples). For an otherwise-local
-run with no prior offload binding, reporting resolves source metadata on demand
-from the host's run → issue → workspace lookup. This requires
-`offloadLocalRunsEnabled` and a source under `offloadLocalSourceRoots` whose
-on-disk origin matches the workspace repository. It does not require an
-environment, credential, admission grant, executor flag or guest-transport flag.
-The metadata serves only that report: it is never registered for dispatch,
-resolves no secret, and adds no persistent company-upkeep enrollment. Existing
+(`POST /offload/report`, agent-authed, bounded samples). Local-run duration
+reports are accepted only for a run whose source is registered through the
+trusted workspace-realization path, and only for the registered execution ID or
+its unambiguous project alias; that behavior is unchanged. A run with no
+registered source is unbound, and on the pinned Paperclip SDK unbound learning is
+unavailable: the SDK exposes no atomic run-to-source facts, so neither the
+issue's current workspace nor a snapshot taken at `agent.run.started` can be
+trusted, and two matching reads or event timestamps do not prove provenance. The
+start event records run ownership only. An unbound report is refused with 403
+before any host workspace read or state write, whatever the workspace ID, and
+a later workspace move cannot train another repository. A registered report
+reuses the existing exact-run registry without resolving an environment,
+credential, admission grant or executor. Registering an otherwise-local source
+still requires an admitted real submit, `offloadLocalRunsEnabled`, and the
+existing source-root/on-disk-origin checks; reporting cannot create that binding.
+Reporting itself resolves no secret and adds no persistent company-upkeep
+enrollment. Existing
 report-host construction still caches a company broker; unscoped sweeps include
-cached-broker companies for upkeep. Report-only metadata resolution does not
-isolate requests from that preexisting behavior. Explicitly withdrawn workspace
+cached-broker companies for upkeep. Explicitly withdrawn workspace
 aliases and invalid registered bindings remain refused, without falling back to
 current issue metadata. Fresh real submits and dry-runs still need their existing
-exact-run admission; retained
-receipt handling is unchanged. With local runs disabled, an unbound local run
-cannot report. Reports for
+exact-run admission; retained receipt handling is unchanged. Reports for
 local-mode signatures (watch mode, single-file filters, inline code,
 unrecognized scripts) are refused before any state write, and each run is
 rate-limited (a short burst, then one report per second, 200 per run); excess

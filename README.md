@@ -82,7 +82,8 @@ The capabilities are:
 * `jobs.schedule`;
 * `api.routes.register`;
 * `issues.read`, used to see whether a card is done;
-* `events.subscribe` and `execution.workspaces.read`, used to bind a local run to offload on `agent.run.started`;
+* `events.subscribe`, used to record run ownership on `agent.run.started`; the pinned SDK offers no atomic run source facts, so unbound local runs cannot report duration (registered exact-run sources are unchanged);
+* `execution.workspaces.read`, used to resolve a local source only after an admitted real submit;
 * `secrets.read-ref`, used to resolve `offloadLocalApiKeySecretRef`.
 
 After the install, save a plugin config for every company that uses the plugin. It can be empty:
