@@ -789,7 +789,11 @@ export class BoatVmManager {
       workspaces: { get: async (workspaceId, company, run) => {
         const registered = await this.offloadWorkspaces.lookup(workspaceId, company, run);
         // A withdrawn alias or invalid binding is a refusal, not missing metadata.
-        return registered === undefined ? await resolveWorkspace?.(workspaceId, company, run) ?? null : registered;
+        if (registered !== undefined) return registered;
+        const fallback = await resolveWorkspace?.(workspaceId, company, run) ?? null;
+        // Trusted registration may bind or withdraw this id while host lookup waits.
+        const latest = await this.offloadWorkspaces.lookup(workspaceId, company, run);
+        return latest === undefined ? fallback : latest;
       } },
     });
   }

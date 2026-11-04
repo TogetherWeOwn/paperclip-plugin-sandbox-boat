@@ -194,6 +194,86 @@ describe("local duration reports with registered workspace refusals", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it.each(commands.flatMap((command) => [true, false].map((withdrawn) => ({ ...command, withdrawn }))))(
+    "honors registrations during $tool metadata lookup (withdrawn=$withdrawn)", async (command) => {
+      resetReportBudgets();
+      dir = await mkdtemp(path.join(tmpdir(), "boat-duration-inflight-"));
+      const sources = [
+        { id: workspaceId, root: path.join(dir, "a"), repo: repoUrl },
+        { id: randomUUID(), root: path.join(dir, "b"), repo: "https://github.com/example/other" },
+      ];
+      for (const source of sources) {
+        await mkdir(path.join(source.root, ".git"), { recursive: true });
+        await writeFile(path.join(source.root, ".git", "config"), `[remote "origin"]\nurl = ${source.repo}\n`);
+      }
+      const harness = createFakeContext({
+        issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: sources[1]!.id, executionRunId: runId }]]),
+        workspaces: new Map(sources.map((source) => [source.id, {
+          projectId: "project", projectWorkspaceId, path: source.root, cwd: source.root, repoUrl: source.repo,
+        }])),
+      });
+      harness.ctx.config.get = async () => ({ offloadLocalRunsEnabled: true, offloadLocalSourceRoots: [dir],
+        offloadExecutorEnabled: false, offloadGuestTransportEnabled: false });
+      const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
+      setManagerOverridesForTests({ offloadExecutor: executor });
+      await plugin.definition.setup(harness.ctx as never);
+      await harness.emit("agent.run.started", started);
+      const secret = vi.spyOn(harness.ctx.secrets, "resolve");
+      vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
+      const report = (id: string) => plugin.definition.onApiRequest!({ routeKey: "offload_report", companyId,
+        actor: { actorType: "agent", actorId: agentId, agentId, runId }, params: {}, query: {},
+        body: { executionWorkspaceId: id, tool: command.tool, runner: command.runner, argv: command.argv, durationSeconds: 120 },
+      } as never);
+      let release!: () => void;
+      let reached!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const reading = new Promise<void>((resolve) => { reached = resolve; });
+      const original = harness.ctx.executionWorkspaces.get;
+      harness.ctx.executionWorkspaces.get = async (id) => { reached(); await gate; return original(id); };
+      const registry = new NativeOffloadWorkspaces(harness.ctx.state);
+      expect(await registry.lookup(projectWorkspaceId, companyId, runId)).toBeUndefined();
+      const pending = report(projectWorkspaceId);
+      await reading;
+      // The fallback is loading B; trusted registration meanwhile binds A or withdraws their shared alias.
+      try {
+        for (const source of command.withdrawn ? sources : sources.slice(0, 1)) {
+          await registry.remember({ companyId, environmentId: "environment", workspace: {
+            localPath: source.root, metadata: { workspaceRealizationRequest: {
+              version: 1, companyId, environmentId: "environment", heartbeatRunId: runId,
+              executionWorkspaceId: source.id, localRun: true,
+              source: { localPath: source.root, projectId: "project", projectWorkspaceId, repoUrl: source.repo },
+            } },
+          } } as never);
+        }
+        expect(await registry.lookup(projectWorkspaceId, companyId, runId))
+          .toEqual(command.withdrawn ? null : expect.objectContaining({ repoUrl }));
+      } finally {
+        release();
+      }
+      const before = structuredClone([...harness.state.entries()]);
+      expect(await pending).toMatchObject({ status: command.withdrawn ? 403 : 200 });
+      if (command.withdrawn) expect([...harness.state.entries()]).toEqual(before);
+      else {
+        const key = durationKey(`repo:${repoUrl}`, command.profile, normalizeSignature(command.tool, command.runner, command.argv));
+        expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: key }))
+          .toEqual([{ seconds: 120, at: expect.any(Number) }]);
+        expect([...harness.state.entries()].filter(([stateKey]) => stateKey.includes("offload.duration.v1."))).toHaveLength(1);
+      }
+      resetReportBudgets();
+      for (const source of command.withdrawn ? sources : sources.slice(0, 1)) {
+        expect(await report(source.id)).toMatchObject({ status: 200, body: { recorded: true } });
+        const key = durationKey(`repo:${source.repo}`, command.profile, normalizeSignature(command.tool, command.runner, command.argv));
+        expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: key }))
+          .toHaveLength(command.withdrawn ? 1 : 2);
+      }
+      expect([...harness.state.entries()].filter(([key]) => !key.includes("offload.duration")))
+        .toEqual(before.filter(([key]) => !key.includes("offload.duration")));
+      expect(secret).not.toHaveBeenCalled();
+      expect(executor).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(commands)("rejects a withdrawn alias without training either repository for $tool, but accepts primary IDs", async (command) => {
     resetReportBudgets();
     dir = await mkdtemp(path.join(tmpdir(), "boat-duration-alias-"));
