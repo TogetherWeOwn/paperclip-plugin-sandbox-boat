@@ -404,7 +404,8 @@ export function createFakeContext(
     },
   };
   const emit = async (name: string, event: unknown) => {
-    for (const fn of events.get(name) ?? []) await fn(event);
+    const envelope = event && typeof event === "object" ? { occurredAt: new Date().toISOString(), ...event } : event;
+    for (const fn of events.get(name) ?? []) await fn(envelope);
   };
   return { ctx, state, logs, jobs, issues, workspaces, projectWorkspaces, secrets, emit };
 }

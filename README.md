@@ -82,7 +82,7 @@ The capabilities are:
 * `jobs.schedule`;
 * `api.routes.register`;
 * `issues.read`, used to see whether a card is done;
-* `events.subscribe` and `execution.workspaces.read`, used to bind a local run to offload on `agent.run.started`;
+* `events.subscribe` and `execution.workspaces.read`, used to capture credential-free local-run duration sources on `agent.run.started`; execution binding still requires an admitted real submit;
 * `secrets.read-ref`, used to resolve `offloadLocalApiKeySecretRef`.
 
 After the install, save a plugin config for every company that uses the plugin. It can be empty:

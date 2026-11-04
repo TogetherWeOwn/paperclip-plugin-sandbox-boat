@@ -11,7 +11,7 @@ import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import { offloadError } from "./offload/errors.js";
 import type { OffloadRouteHost, RouteActor } from "./offload/routes.js";
-import { fsCanonicalPath, localRunRealization, localRunSettings, localRunWorkspace, readGitOriginUrl, type LocalRunHost } from "./local-run-binding.js";
+import { fsCanonicalPath, localRunRealization, localRunSettings, localRunWorkspace, readGitOriginUrl, type LocalRunHost, type LocalRunWorkspace } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -72,6 +72,7 @@ async function bindOnFirstRequest(boat: BoatVmManager, input: PluginApiRequestIn
 
 const plugin = definePlugin({
   async setup(ctx: PluginContext) {
+    const reportSourcesSince = Date.now();
     manager = new BoatVmManager({
       state: ctx.state,
       logger: ctx.logger,
@@ -114,21 +115,50 @@ const plugin = definePlugin({
       canonicalPath: fsCanonicalPath,
       onDiskRepoUrl: readGitOriginUrl,
     };
-    // Report-only metadata is resolved on demand, never persisted as a dispatch
-    // workspace or runtime binding. No environment, admission or key is needed.
+    // Telemetry-only snapshots, never dispatch records or runtime bindings. The
+    // SDK has no exact-run workspace lookup: capture once at start, while host
+    // issue/run facts agree. Missing/late preparation or worker restart refuses
+    // learning rather than guessing from the issue's later workspace pointer.
+    const reportSources = new Map<string, Promise<LocalRunWorkspace | null>>();
+    const reportSourceKey = (companyId: string, runId: string) => JSON.stringify([companyId, runId]);
+    const captureReportSource = async (companyId: string, runId: string, issueId: string): Promise<LocalRunWorkspace | null> => {
+      const issue = await ctx.issues.get(issueId, companyId);
+      if (!issue || (issue.executionRunId ?? issue.checkoutRunId) !== runId) return null;
+      const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
+      const workspace = await localRunWorkspace({ companyId, payload: { runId, issueId } }, settings,
+        { ...workspaceHost, issueWorkspaceId: async () => issue.executionWorkspaceId ?? null });
+      const latest = await ctx.issues.get(issueId, companyId);
+      if (!workspace || !latest || (latest.executionRunId ?? latest.checkoutRunId) !== runId
+        || latest.executionWorkspaceId !== issue.executionWorkspaceId
+        || latest.projectWorkspaceId !== issue.projectWorkspaceId || latest.projectId !== issue.projectId
+        || (issue.projectWorkspaceId && workspace.source.projectWorkspaceId !== issue.projectWorkspaceId)) return null;
+      return workspace;
+    };
     reportWorkspace = async (workspaceId, companyId, runId) => {
       const boat = requireManager();
       const issueId = boat.localRunIssue(companyId, runId);
-      if (!issueId) return null;
+      const key = reportSourceKey(companyId, runId);
+      const pending = reportSources.get(key);
+      const pinned = await pending;
+      if (!issueId || !pinned || (workspaceId !== pinned.workspaceId && workspaceId !== pinned.source.projectWorkspaceId)) return null;
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
-      const workspace = await localRunWorkspace({ companyId, payload: { runId, issueId } }, settings, workspaceHost,
-        { expectedWorkspaceId: workspaceId }).catch(() => null);
-      // A terminal event during the lookup must not revive reporting authority.
-      if (!workspace || boat.localRunIssue(companyId, runId) !== issueId) return null;
-      return { ...workspace.source, path: workspace.source.localPath, cwd: workspace.source.localPath };
+      // Revalidate only the captured source. A project-only snapshot must not
+      // call getWorkspaceForIssue again; that primary may now belong to B.
+      const projectOnly = pinned.workspaceId === pinned.source.projectWorkspaceId;
+      const workspace = await localRunWorkspace({ companyId, payload: { runId, issueId } }, settings, {
+        ...workspaceHost,
+        issueWorkspaceId: async () => projectOnly ? null : pinned.workspaceId,
+        issueProjectWorkspace: async () => ({ id: pinned.workspaceId, projectId: pinned.source.projectId,
+          path: pinned.source.localPath, repoUrl: pinned.source.repoUrl }),
+      }, { expectedWorkspaceId: workspaceId }).catch(() => null);
+      // Metadata changes and terminal events cannot replace or revive a snapshot.
+      if (!workspace || reportSources.get(key) !== pending || boat.localRunIssue(companyId, runId) !== issueId
+        || workspace.source.localPath !== pinned.source.localPath || workspace.source.repoUrl !== pinned.source.repoUrl
+        || workspace.source.projectId !== pinned.source.projectId || workspace.source.projectWorkspaceId !== pinned.source.projectWorkspaceId) return null;
+      return { ...pinned.source, path: pinned.source.localPath, cwd: pinned.source.localPath };
     };
     // Local runs bind only after exact-run admission on a real submit. Start
-    // events record ownership, never resolve credentials or bind offload.
+    // events record ownership/source facts, never resolve credentials or bind offload.
     bindLocalRun = async (companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => {
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
       if (!settings.enabled) return false;
@@ -167,12 +197,27 @@ const plugin = definePlugin({
       // stays recoverable on the run's first offload request. Only a run on an issue binds locally.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
       const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
-      await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId);
+      const boat = requireManager();
+      const observed = await boat.localRunPreviouslyObserved(event.companyId, payload.runId);
+      if (!(await boat.startLocalRun(event.companyId, payload.runId, issueId, agentId)) || !issueId
+        || boat.localRunIssue(event.companyId, payload.runId) !== issueId) return;
+      const key = reportSourceKey(event.companyId, payload.runId);
+      // Neither a replay nor a pre-worker start may re-pin a run. The trusted
+      // event time also fences restarts when the original ownership write failed.
+      // Equal-millisecond, missing, invalid and future timestamps fail closed.
+      const occurredAt = Date.parse(event.occurredAt);
+      const fresh = occurredAt > reportSourcesSince && occurredAt <= Date.now();
+      if (!reportSources.has(key)) reportSources.set(key, observed || !fresh ? Promise.resolve(null)
+        : captureReportSource(event.companyId, payload.runId, issueId).catch(() => null));
+      await reportSources.get(key);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
       ctx.events.on(done, async (event) => {
         const runId = (event.payload as { runId?: unknown } | null)?.runId;
-        if (typeof runId === "string") await manager?.forgetLocalRun(event.companyId, runId);
+        if (typeof runId === "string") {
+          reportSources.delete(reportSourceKey(event.companyId, runId));
+          await manager?.forgetLocalRun(event.companyId, runId);
+        }
       });
     }
     ctx.logger.info("boat sandbox provider plugin ready");

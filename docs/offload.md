@@ -83,12 +83,27 @@ elapsed interval (the guest-reported value can only shorten it, never
 lengthen it), and every sample is clamped to one day. Recordings come from
 completed remote runs (server-side) and from shim-reported local runs
 (`POST /offload/report`, agent-authed, bounded samples). For an otherwise-local
-run with no prior offload binding, reporting resolves source metadata on demand
-from the host's run → issue → workspace lookup. This requires
-`offloadLocalRunsEnabled` and a source under `offloadLocalSourceRoots` whose
-on-disk origin matches the workspace repository. It does not require an
-environment, credential, admission grant, executor flag or guest-transport flag.
-The metadata serves only that report: it is never registered for dispatch,
+run with no prior offload binding, the plugin captures a credential-free source
+snapshot once on `agent.run.started`, while the host's issue/run association and
+workspace selection agree before and after lookup. The snapshot pins the source
+path, repository and execution/project workspace IDs for that company and run.
+Reports revalidate that source, never select a new source from the issue's mutable
+current workspace. A later move to another checkout (even one sharing the project
+alias) cannot train that other repository; the original primary ID and alias still
+name only the captured source. A rewritten execution workspace row is refused.
+This requires `offloadLocalRunsEnabled` and a source under
+`offloadLocalSourceRoots` whose on-disk origin matches the workspace repository,
+both at capture and report time. It does not require an environment, credential,
+admission grant, executor flag or guest-transport flag. Missing source/run facts,
+lookup failure or preparation after the start event leaves reporting unavailable
+for that run; duplicate starts cannot replace the snapshot. Capture requires a
+previously unobserved run and a trusted event timestamp strictly after this worker
+started and no later than capture time. Missing, invalid, equal-millisecond, old
+or future timestamps refuse learning. This freshness fence also prevents a start
+replayed after restart from reconstructing source from the current issue, even
+when the original ownership write failed or terminal cleanup removed it. Terminal
+events discard snapshots and fence in-flight lookups.
+The metadata serves only telemetry: it is never registered for dispatch,
 resolves no secret, and adds no persistent company-upkeep enrollment. Existing
 report-host construction still caches a company broker; unscoped sweeps include
 cached-broker companies for upkeep. Report-only metadata resolution does not

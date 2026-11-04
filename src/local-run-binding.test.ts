@@ -372,9 +372,9 @@ describe("plugin wiring", () => {
     const harness = await setup(enabled);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    await harness.emit("agent.run.started", started);
     const original = harness.ctx.issues.get;
     harness.ctx.issues.get = async (id: string) => { await gate; return original(id); };
-    await harness.emit("agent.run.started", started);
     const pending = admittedBind();
     await new Promise((resolve) => setTimeout(resolve, 10));
     await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
@@ -668,10 +668,10 @@ describe("plugin wiring", () => {
     let failing = true;
     let reads = 0;
     const harness = await setup(enabled, async () => { reads += 1; if (failing) throw new Error("config unavailable"); return current; });
-    // The start event reads no config and binds nothing.
+    // The telemetry snapshot fails closed; dispatch still retries independently.
     await harness.emit("agent.run.started", started);
-    expect(reads).toBe(0);
     const closed = await exec(runId);
+    expect(reads).toBeGreaterThan(0);
     expect(closed.status).toBe(403);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);

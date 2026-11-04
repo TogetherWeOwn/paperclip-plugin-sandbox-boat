@@ -18,6 +18,9 @@ const projectWorkspaceId = "eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee";
 const agentId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
 const repoUrl = "https://github.com/example/public";
 const started = { companyId, payload: { runId, issueId, agentId } };
+beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); });
+afterEach(() => { vi.useRealTimers(); });
+
 const commands = [
   { tool: "node", runner: "npm", argv: ["test"], profile: "node-public-1" },
   { tool: "python", runner: "pytest", argv: ["tests"], profile: "python-public-1" },
@@ -52,6 +55,7 @@ describe("local-run duration learning through plugin dispatch", () => {
       vi.spyOn(NativeOffloadWorkspaces.prototype, "remember"), vi.spyOn(SshOffloadRuntime.prototype, "remember"),
       vi.spyOn(SshOffloadRuntime.prototype, "resolve")];
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
+    vi.setSystemTime(Date.now() + 1);
     await harness.emit("agent.run.started", started);
   });
 
@@ -217,6 +221,7 @@ describe("local duration reports with registered workspace refusals", () => {
       const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
       setManagerOverridesForTests({ offloadExecutor: executor });
       await plugin.definition.setup(harness.ctx as never);
+      vi.setSystemTime(Date.now() + 1);
       await harness.emit("agent.run.started", started);
       const secret = vi.spyOn(harness.ctx.secrets, "resolve");
       vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
@@ -298,6 +303,7 @@ describe("local duration reports with registered workspace refusals", () => {
     const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
     setManagerOverridesForTests({ offloadExecutor: executor });
     await plugin.definition.setup(harness.ctx as never);
+    vi.setSystemTime(Date.now() + 1);
     await harness.emit("agent.run.started", started);
     const registry = new NativeOffloadWorkspaces(harness.ctx.state);
     for (const source of sources) {

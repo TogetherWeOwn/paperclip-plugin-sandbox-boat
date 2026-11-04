@@ -561,6 +561,14 @@ export class BoatVmManager {
     return { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload-runs", stateKey: runId };
   }
 
+  /** Read before startLocalRun writes ownership. An existing observation (or
+   * unreadable state) must not let telemetry re-capture a later issue workspace. */
+  async localRunPreviouslyObserved(companyId: string, runId: string): Promise<boolean> {
+    const key = this.localRunKey(companyId, runId);
+    if (this.localRuns.has(key) || this.endedLocalRuns.has(key)) return true;
+    return await this.offloadState.get(this.runOwnerScope(companyId, runId)).then((saved) => saved !== null && saved !== undefined).catch(() => true);
+  }
+
   /** Record a started local run and the agent the host started it for. Returns false for a run that already ended. */
   async startLocalRun(companyId: string, runId: string, issueId: string | null, agentId: string | null = null): Promise<boolean> {
     const id = this.localRunKey(companyId, runId);
