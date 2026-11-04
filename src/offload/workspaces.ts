@@ -140,7 +140,14 @@ export class NativeOffloadWorkspaces {
   }
 
   async get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null> {
-    const saved = record(await this.state.get(scope(companyId, workspaceId, runId)));
+    return await this.lookup(workspaceId, companyId, runId) ?? null;
+  }
+
+  /** Only absent records return undefined; withdrawn or invalid bindings remain an explicit refusal. */
+  async lookup(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null | undefined> {
+    const value = await this.state.get(scope(companyId, workspaceId, runId));
+    if (value == null) return undefined;
+    const saved = record(value);
     if (saved.version !== 1 || saved.companyId !== companyId || saved.runId !== runId || saved.workspaceId !== workspaceId
       || saved.ambiguous === true) return null;
     const workspace = record(saved.workspace);

@@ -10,8 +10,8 @@ import { parseDriverConfig, validateDriverConfig } from "./config.js";
 import { BoatProviderError } from "./errors.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import { offloadError } from "./offload/errors.js";
-import type { RouteActor } from "./offload/routes.js";
-import { fsCanonicalPath, localRunRealization, localRunSettings, readGitOriginUrl } from "./local-run-binding.js";
+import type { OffloadRouteHost, RouteActor } from "./offload/routes.js";
+import { fsCanonicalPath, localRunRealization, localRunSettings, localRunWorkspace, readGitOriginUrl, type LocalRunHost } from "./local-run-binding.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -43,6 +43,7 @@ function toRouteActor(actor: PluginApiRequestInput["actor"]): RouteActor {
 }
 
 let bindLocalRun: ((companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => Promise<boolean>) | null = null;
+let reportWorkspace: OffloadRouteHost["workspaces"]["get"] | null = null;
 /** In-flight request-triggered binds per company+run, so parallel requests share one attempt (and one secret resolution). */
 const pendingBinds = new Map<string, Promise<boolean>>();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -96,27 +97,43 @@ const plugin = definePlugin({
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }
     });
+    const workspaceHost: Omit<LocalRunHost, "apiKey"> = {
+      issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
+      // The live issue shape leaves executionWorkspaceId null; the shim then
+      // reports the project workspace id, so resolve that host-owned workspace.
+      issueProjectWorkspace: async (id, company) => {
+        const workspace = await ctx.projects.getWorkspaceForIssue(id, company);
+        return workspace ? {
+          id: typeof workspace.id === "string" ? workspace.id : "",
+          projectId: typeof workspace.projectId === "string" ? workspace.projectId : "",
+          path: typeof workspace.path === "string" ? workspace.path : null,
+          repoUrl: typeof workspace.repoUrl === "string" ? workspace.repoUrl : null,
+        } : null;
+      },
+      workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
+      canonicalPath: fsCanonicalPath,
+      onDiskRepoUrl: readGitOriginUrl,
+    };
+    // Report-only metadata is resolved on demand, never persisted as a dispatch
+    // workspace or runtime binding. No environment, admission or key is needed.
+    reportWorkspace = async (workspaceId, companyId, runId) => {
+      const boat = requireManager();
+      const issueId = boat.localRunIssue(companyId, runId);
+      if (!issueId) return null;
+      const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
+      const workspace = await localRunWorkspace({ companyId, payload: { runId, issueId } }, settings, workspaceHost,
+        { expectedWorkspaceId: workspaceId }).catch(() => null);
+      // A terminal event during the lookup must not revive reporting authority.
+      if (!workspace || boat.localRunIssue(companyId, runId) !== issueId) return null;
+      return { ...workspace.source, path: workspace.source.localPath, cwd: workspace.source.localPath };
+    };
     // Local runs bind only after exact-run admission on a real submit. Start
     // events record ownership, never resolve credentials or bind offload.
     bindLocalRun = async (companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => {
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
       if (!settings.enabled) return false;
       const params = await localRunRealization({ companyId, payload: { runId, issueId } }, settings, {
-        issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
-        // The live issue shape leaves executionWorkspaceId null; the shim then
-        // reports the project workspace id, so bind that host-owned workspace.
-        issueProjectWorkspace: async (id, company) => {
-          const workspace = await ctx.projects.getWorkspaceForIssue(id, company);
-          return workspace ? {
-            id: typeof workspace.id === "string" ? workspace.id : "",
-            projectId: typeof workspace.projectId === "string" ? workspace.projectId : "",
-            path: typeof workspace.path === "string" ? workspace.path : null,
-            repoUrl: typeof workspace.repoUrl === "string" ? workspace.repoUrl : null,
-          } : null;
-        },
-        workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
-        canonicalPath: fsCanonicalPath,
-        onDiskRepoUrl: readGitOriginUrl,
+        ...workspaceHost,
         apiKey: async (secretRef, company) => await ctx.secrets.resolve(secretRef as never, { companyId: company, configPath: "offloadLocalApiKeySecretRef" }),
       }, { expectedWorkspaceId,
         onRefuse: (reason) => ctx.logger.warn("boat: local-run offload binding refused", { runId, issueId, reason }),
@@ -210,7 +227,7 @@ const plugin = definePlugin({
       return { status: response.status, body: response.body };
     }
     if (input.routeKey === "offload_report") {
-      const response = await boat.offloadReport(input.companyId, toRouteActor(input.actor), input.body);
+      const response = await boat.offloadReport(input.companyId, toRouteActor(input.actor), input.body, reportWorkspace ?? undefined);
       return { status: response.status, body: response.body };
     }
     return { status: 404, body: { error: `unknown route ${input.routeKey}` } };
