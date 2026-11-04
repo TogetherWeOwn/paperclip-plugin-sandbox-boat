@@ -24,7 +24,6 @@ import type { HostServices, PluginCapability } from "@paperclipai/plugin-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import manifest from "./manifest.js";
 import plugin from "./plugin.js";
-import { durationKey, normalizeSignature } from "./offload/duration-history.js";
 import { resetReportBudgets } from "./offload/routes.js";
 
 const TIMEOUT = 20_000;
@@ -266,7 +265,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     }
   });
 
-  it("(1-4) a started local run captures source facts only; a stock host fails closed for new work and never binds eagerly", async () => {
+  it("(1-4) a started local run records ownership only; a stock host fails closed for new work and never binds eagerly", async () => {
     host = startHost(source);
     expect((await host.initialize()).ok).toBe(true);
     const actor = { agentId, companyId, runId };
@@ -277,8 +276,8 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     // authenticated run identity, so the dry-run is denied rather than admitted.
     failsClosed(await untilOwned(actor));
     expect(host.logs).not.toContain("boat: bound local run for offload");
-    // Credential-free source capture is not an admitted execution binding.
-    expect(eagerBindingCalls().map((entry) => entry.method)).toEqual(["issues.get", "executionWorkspaces.get", "issues.get"]);
+    // Ownership records do not establish an exact-run source or execution binding.
+    expect(eagerBindingCalls()).toEqual([]);
     expect(host.calls.some((entry) => entry.method === "secrets.resolve")).toBe(false);
     expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
   }, TIMEOUT);
@@ -286,16 +285,26 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
   it.each([
     { tool: "node", runner: "npm", argv: ["test"], profile: "node-public-1" },
     { tool: "python", runner: "pytest", argv: ["tests"], profile: "python-public-1" },
-  ])("pins $tool duration through the SDK host even after a same-alias workspace move", async (command) => {
+  ])("refuses unbound $tool duration reports with no SDK source lookup or write, stable or drifted", async (command) => {
     resetReportBudgets();
     host = startHost(source);
     await host.initialize();
     await host.call("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
+    await untilOwned({ agentId, companyId, runId });
     const aliasId = host.workspaceRows.get(workspaceId)!.projectWorkspaceId;
-    const body = { executionWorkspaceId: aliasId, tool: command.tool, runner: command.runner, argv: command.argv, durationSeconds: 120 };
-    const report = () => host.call<ExecReply>("handleApiRequest", scopedRouteInput({ routeKey: "offload_report" },
-      { companyId, runId, agentId }, body), companyId);
-    expect((await report()).status).toBe(200);
+    if (typeof aliasId !== "string") throw new Error("fixture is missing its project alias");
+    const reportFor = (id: string) => host.call<ExecReply>("handleApiRequest", scopedRouteInput({ routeKey: "offload_report" },
+      { companyId, runId, agentId }, { executionWorkspaceId: id, tool: command.tool, runner: command.runner,
+        argv: command.argv, durationSeconds: 120 }), companyId);
+    const sdkReads = () => host.calls.filter((entry) => ["issues.get", "executionWorkspaces.get", "secrets.resolve"].includes(entry.method)).length;
+    const stateBefore = structuredClone([...host.state.entries()]);
+    const readsBefore = sdkReads();
+    const refuseAll = async () => {
+      for (const id of [aliasId, workspaceId]) expect((await reportFor(id)).status).toBe(403);
+      expect(sdkReads()).toBe(readsBefore);
+      expect([...host.state.entries()]).toEqual(stateBefore);
+    };
+    await refuseAll();
     const other = path.join(source, "other");
     await mkdir(path.join(other, ".git"), { recursive: true });
     await writeFile(path.join(other, ".git", "config"), '[remote "origin"]\nurl = https://github.com/example/other\n');
@@ -303,17 +312,9 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     host.workspaceRows.set(otherId, { ...host.workspaceRows.get(workspaceId)!, id: otherId,
       cwd: other, repoUrl: "https://github.com/example/other" });
     host.issues.set(issueId, { ...host.issues.get(issueId)!, executionWorkspaceId: otherId });
-    expect((await report()).status).toBe(200);
-    const signature = normalizeSignature(command.tool, command.runner, command.argv);
-    const rightKey = durationKey("repo:https://github.com/example/public", command.profile, signature);
-    const wrongKey = durationKey("repo:https://github.com/example/other", command.profile, signature);
-    const samples = [...host.state.entries()].filter(([key]) => key.includes("offload.duration.v1."))
-      .map(([key, value]) => [JSON.parse(key)[3], value]);
-    expect(samples).toEqual([[rightKey, [
-      { seconds: 120, at: expect.any(Number) }, { seconds: 120, at: expect.any(Number) },
-    ]]]);
-    expect([...host.state.keys()].some((key) => JSON.parse(key)[3] === wrongKey)).toBe(false);
-    expect(host.calls.some((entry) => entry.method === "secrets.resolve")).toBe(false);
+    await refuseAll();
+    expect((await reportFor(otherId)).status).toBe(403);
+    expect([...host.state.keys()].some((key) => key.includes("offload.duration"))).toBe(false);
     failsClosed(await execAs({ companyId, runId, agentId }));
   }, TIMEOUT);
 
@@ -362,7 +363,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     host = startHost(source);
     await host.initialize();
     await host.call("onEvent", { event: runStartedEvent({ companyId: otherCompanyId, runId, agentId, issueId }) }, otherCompanyId);
-    expect(eagerBindingCalls()).toEqual([{ method: "issues.get", params: { issueId, companyId: otherCompanyId }, scope: otherCompanyId }]);
+    expect(eagerBindingCalls()).toEqual([]);
     expect(host.calls.some((entry) => entry.method === "secrets.resolve" || entry.method === "executionWorkspaces.get")).toBe(false);
     expect((await execAs({ agentId, companyId, runId })).body.detail).toBe(NOT_OWNER);
   }, TIMEOUT);

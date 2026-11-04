@@ -21,12 +21,13 @@ const agentId = randomUUID();
 const aliasId = randomUUID();
 const started = { companyId, payload: { runId, issueId, agentId } };
 
-describe("unbound exact-run duration source snapshots", () => {
+describe("unbound exact-run duration source refusals", () => {
   let dir: string;
   let harness: ReturnType<typeof createFakeContext>;
   let sources: { id: string; root: string; repo: string }[];
   let effects: ReturnType<typeof vi.spyOn>[];
   let startedEvent: typeof started & { occurredAt: string };
+  let workerStartedAt: number;
 
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -50,6 +51,7 @@ describe("unbound exact-run duration source snapshots", () => {
       offloadExecutorEnabled: false, offloadGuestTransportEnabled: false });
     const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
     setManagerOverridesForTests({ offloadExecutor: executor });
+    workerStartedAt = Date.now();
     await plugin.definition.setup(harness.ctx as never);
     vi.setSystemTime(Date.now() + 1);
     startedEvent = { ...started, occurredAt: new Date().toISOString() };
@@ -99,46 +101,53 @@ describe("unbound exact-run duration source snapshots", () => {
     expect((await report(command, id)).status).toBe(403);
     expect([...harness.state.entries()]).toEqual(before);
   };
-  const pauseWorkspaceRead = () => {
-    let release!: () => void;
-    let reached!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const reading = new Promise<void>((resolve) => { reached = resolve; });
-    const original = harness.ctx.executionWorkspaces.get;
-    harness.ctx.executionWorkspaces.get = async (id) => { reached(); await gate; return original(id); };
-    return { release, reading };
-  };
+
+  it.each(commands)("refuses $tool drift before first start delivery despite a fresh trusted timestamp", async (command) => {
+    // A started after worker initialization, but its event waits while the issue
+    // moves to B. Both mutable issue reads would now agree on the wrong source.
+    const at = Date.parse(startedEvent.occurredAt);
+    expect(at).toBeGreaterThan(workerStartedAt);
+    moveIssue(sources[1]!.id);
+    vi.setSystemTime(at + 1);
+    expect(at).toBeLessThan(Date.now());
+    await start();
+    await expectRefusal(command);
+    await expectRefusal(command, sources[0]!.id);
+    await expectRefusal(command, sources[1]!.id);
+    expect(await history(command, 0)).toBeNull();
+    expect(await history(command, 1)).toBeNull();
+  });
 
   it.each(commands.flatMap((command) => ["alias", "primary"].map((idKind) => ({ ...command, idKind }))))(
-    "pins $tool $idKind completion to A after the issue moves to B with the same alias", async (command) => {
+    "refuses unproven $tool $idKind sources after the issue moves to B with the same alias", async (command) => {
       await start();
       moveIssue(sources[1]!.id);
       // Duplicate host delivery must not capture B under the same run key.
       await start();
-      expect((await report(command, command.idKind === "alias" ? aliasId : sources[0]!.id)).status).toBe(200);
-      expect(await history(command, 0)).toEqual([{ seconds: 120, at: expect.any(Number) }]);
+      await expectRefusal(command, command.idKind === "alias" ? aliasId : sources[0]!.id);
+      expect(await history(command, 0)).toBeNull();
       expect(await history(command, 1)).toBeNull();
       await expectRefusal(command, sources[1]!.id);
     },
   );
 
-  it.each(commands)("keeps $tool attribution to A when both the issue workspace and current run drift", async (command) => {
+  it.each(commands)("refuses $tool when both the issue workspace and current run drift", async (command) => {
     await start();
     moveIssue(sources[1]!.id, randomUUID());
-    expect((await report(command)).status).toBe(200);
-    expect(await history(command, 0)).toHaveLength(1);
+    await expectRefusal(command);
+    expect(await history(command, 0)).toBeNull();
     expect(await history(command, 1)).toBeNull();
   });
 
-  it.each(commands)("supports the stable project-only $tool source and pins it across primary drift", async (command) => {
+  it.each(commands)("refuses unproven project-only $tool sources both stable and after primary drift", async (command) => {
     moveIssue(null);
     projectSource(0);
     await start();
-    expect((await report(command)).status).toBe(200);
+    await expectRefusal(command);
     projectSource(1);
     moveIssue(sources[1]!.id, randomUUID());
-    expect((await report(command)).status).toBe(200);
-    expect(await history(command, 0)).toHaveLength(2);
+    await expectRefusal(command);
+    expect(await history(command, 0)).toBeNull();
     expect(await history(command, 1)).toBeNull();
   });
 
@@ -198,22 +207,19 @@ describe("unbound exact-run duration source snapshots", () => {
     for (const command of commands) await expectRefusal(command);
   });
 
-  it.each(["workspace", "run"])("refuses a snapshot if the issue's %s changes during capture", async (changed) => {
-    const gate = pauseWorkspaceRead();
+  it.each(["workspace", "run"])("never reads mutable source facts when the issue's %s changes during start", async (changed) => {
+    const lookups = [vi.spyOn(harness.ctx.issues, "get"), vi.spyOn(harness.ctx.executionWorkspaces, "get"),
+      vi.spyOn(harness.ctx.projects, "getWorkspaceForIssue")];
     const pending = start();
-    await gate.reading;
     moveIssue(changed === "workspace" ? sources[1]!.id : sources[0]!.id, changed === "run" ? randomUUID() : runId);
-    gate.release();
     await pending;
     for (const command of commands) await expectRefusal(command);
+    for (const lookup of lookups) expect(lookup).not.toHaveBeenCalled();
   });
 
-  it.each(["agent.run.finished", "agent.run.failed", "agent.run.cancelled"])("does not revive a source when %s arrives during capture", async (terminal) => {
-    const gate = pauseWorkspaceRead();
+  it.each(["agent.run.finished", "agent.run.failed", "agent.run.cancelled"])("does not revive a source when %s arrives during start", async (terminal) => {
     const pending = start();
-    await gate.reading;
     await harness.emit(terminal, { companyId, payload: { runId } });
-    gate.release();
     await pending;
     moveIssue(sources[1]!.id);
     await start();
