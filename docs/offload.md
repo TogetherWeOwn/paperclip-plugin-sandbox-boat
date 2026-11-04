@@ -82,7 +82,17 @@ host-measured wall time only: a completed remote run records the host-side
 elapsed interval (the guest-reported value can only shorten it, never
 lengthen it), and every sample is clamped to one day. Recordings come from
 completed remote runs (server-side) and from shim-reported local runs
-(`POST /offload/report`, agent-authed, bounded samples). Reports for
+(`POST /offload/report`, agent-authed, bounded samples). For an otherwise-local
+run with no prior offload binding, reporting resolves source metadata on demand
+from the host's run → issue → workspace lookup. This requires
+`offloadLocalRunsEnabled` and a source under `offloadLocalSourceRoots` whose
+on-disk origin matches the workspace repository. It does not require an
+environment, credential, admission grant, executor flag or guest-transport flag.
+The metadata serves only that report: it is never registered for dispatch,
+resolves no secret, and does not enroll the company for VM upkeep. Fresh real
+submits and dry-runs still need their existing exact-run admission; retained
+receipt handling is unchanged. With local runs disabled, an unbound local run
+cannot report. Reports for
 local-mode signatures (watch mode, single-file filters, inline code,
 unrecognized scripts) are refused before any state write, and each run is
 rate-limited (a short burst, then one report per second, 200 per run); excess

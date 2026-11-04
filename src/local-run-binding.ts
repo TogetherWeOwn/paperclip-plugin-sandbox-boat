@@ -11,8 +11,9 @@
 // inside an `offloadLocalSourceRoots` entry, and the checkout's own on-disk
 // `remote.origin.url` canonicalizes to the same repo id as the row's repoUrl
 // (the payload then carries the on-disk URL). Both facts are re-checked on
-// every executor resolve (offload-ssh-runtime). The Boat secret is resolved
-// last, after every check, so refused binds never spend secret resolutions.
+// every executor resolve (offload-ssh-runtime). Reports use only the source
+// facts. For an admitted bind, the Boat secret is resolved last, after every
+// check, so reports and refused binds never spend secret resolutions.
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -79,16 +80,22 @@ export function localRunSettings(raw: unknown): LocalRunSettings {
   };
 }
 
-/** Returns the realization payload for a started local run, or null when any host fact is missing.
- * Every refusal reports its reason through `options.onRefuse` so the caller can log it. */
-export async function localRunRealization(
+/** Source facts only: never an executor binding, credential or realization payload. */
+export interface LocalRunWorkspace {
+  workspaceId: string;
+  source: { localPath: string; repoUrl: string; projectId: string; projectWorkspaceId: string | null };
+}
+
+/** Resolve the run's host-owned source for telemetry or a later admitted bind.
+ * This seam cannot resolve a credential and does not require an environment. */
+export async function localRunWorkspace(
   event: { companyId: string; payload: unknown },
-  settings: LocalRunSettings,
-  host: LocalRunHost,
+  settings: Pick<LocalRunSettings, "enabled" | "sourceRoots">,
+  host: Omit<LocalRunHost, "apiKey">,
   options: { expectedWorkspaceId?: string; onRefuse?: (reason: string) => void } = {},
-): Promise<PluginEnvironmentRealizeWorkspaceParams | null> {
+): Promise<LocalRunWorkspace | null> {
   const refuse = (reason: string): null => { options.onRefuse?.(reason); return null; };
-  if (!settings.enabled || !settings.environmentId || !settings.apiKeySecretRef) return refuse("local-run offload is not enabled or not fully configured");
+  if (!settings.enabled) return refuse("local-run offload is not enabled");
   const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
   const { companyId } = event;
   if (!id(companyId) || !id(payload.runId) || !id(payload.issueId)) return refuse("run event is missing a run or issue id");
@@ -137,6 +144,24 @@ export async function localRunRealization(
   if (!onDiskRepoUrl) return refuse("checkout has no on-disk origin");
   const repoId = canonicalRepoId({ repoUrl: source.repoUrl, projectId: source.projectId });
   if (!repoId.startsWith("repo:") || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: source.projectId }) !== repoId) return refuse("on-disk origin does not match the workspace repoUrl");
+  return { workspaceId, source: { ...source, localPath: canonical, repoUrl: onDiskRepoUrl } };
+}
+
+/** Returns the realization payload only for a fully configured, admitted bind.
+ * Every refusal reports its reason through `options.onRefuse` so the caller can log it. */
+export async function localRunRealization(
+  event: { companyId: string; payload: unknown },
+  settings: LocalRunSettings,
+  host: LocalRunHost,
+  options: { expectedWorkspaceId?: string; onRefuse?: (reason: string) => void } = {},
+): Promise<PluginEnvironmentRealizeWorkspaceParams | null> {
+  const refuse = (reason: string): null => { options.onRefuse?.(reason); return null; };
+  if (!settings.enabled || !settings.environmentId || !settings.apiKeySecretRef) return refuse("local-run offload is not enabled or not fully configured");
+  const workspace = await localRunWorkspace(event, settings, host, options);
+  if (!workspace) return null;
+  const { companyId } = event;
+  const { runId } = event.payload as { runId: string };
+  const { workspaceId, source } = workspace;
   const apiKey = await host.apiKey(settings.apiKeySecretRef, companyId);
   if (!apiKey) return refuse("secret did not resolve");
   return {
@@ -146,12 +171,12 @@ export async function localRunRealization(
     config: { ...settings.driverConfig, apiKey },
     lease: { providerLeaseId: null },
     workspace: {
-      localPath: canonical,
+      localPath: source.localPath,
       metadata: {
         workspaceRealizationRequest: {
           version: 1, companyId, environmentId: settings.environmentId,
-          heartbeatRunId: payload.runId, executionWorkspaceId: workspaceId, localRun: true,
-          source: { localPath: canonical, repoUrl: onDiskRepoUrl, projectId: source.projectId, projectWorkspaceId: source.projectWorkspaceId },
+          heartbeatRunId: runId, executionWorkspaceId: workspaceId, localRun: true,
+          source,
         },
       },
     },

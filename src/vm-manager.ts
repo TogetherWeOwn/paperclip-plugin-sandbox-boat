@@ -73,7 +73,7 @@ import { OffloadAdmission, type AdmissionState } from "./offload/admission.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
-import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, handleVerify, normalizeOffloadSettings, type RouteActor } from "./offload/routes.js";
+import { NODE_PROFILE, PYTHON_PROFILE, V1_PROFILE, handleCancel, handleExec, handleHeartbeat, handleRead, handleReport, handleVerify, normalizeOffloadSettings, type OffloadRouteHost, type RouteActor } from "./offload/routes.js";
 import { NativeOffloadWorkspaces } from "./offload/workspaces.js";
 
 // "init" .. "running" are up (or coming up) and may bill; see docs.boat.dev/readiness.
@@ -780,8 +780,15 @@ export class BoatVmManager {
     return response;
   }
 
-  async offloadReport(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
-    return handleReport({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
+  async offloadReport(companyId: string, actor: RouteActor, body: unknown, resolveWorkspace?: OffloadRouteHost["workspaces"]["get"]): Promise<{ status: number; body: unknown }> {
+    const host = this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId));
+    return handleReport({ actor, companyId, body }, {
+      ...host,
+      // This resolver serves reports only: metadata obtained here never grants
+      // exec/dry-run access or enters the executor's workspace registry.
+      workspaces: { get: async (workspaceId, company, run) =>
+        await host.workspaces.get(workspaceId, company, run) ?? await resolveWorkspace?.(workspaceId, company, run) ?? null },
+    });
   }
 
   async offloadRead(
