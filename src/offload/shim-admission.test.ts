@@ -12,7 +12,8 @@ function setup(env: Record<string, string | undefined> = {}) {
   const err: Buffer[] = [];
   const randomId = vi.fn(() => "99999999-9999-4999-8999-999999999999");
   const post = vi.fn(async (_p: string, _b?: unknown): Promise<HttpResult> => ({ ok: true, status: 500, json: {} }));
-  const get = vi.fn(async (_p: string): Promise<HttpResult> => ({ ok: true, status: 500, json: {} }));
+  const get = vi.fn(async (_p: string): Promise<HttpResult> => ({ ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST", detail: "unknown commandId", commandId: PIN } }));
+  let now = 1_000_000;
   const spawn = vi.fn(async () => ({ code: 0 as number | null, signal: null as string | null }));
   const deps: ShimDeps = {
     env: {
@@ -24,8 +25,8 @@ function setup(env: Record<string, string | undefined> = {}) {
       ...env,
     },
     http: { post, get },
-    now: () => 1_000_000,
-    sleep: async () => {},
+    now: () => now,
+    sleep: async (ms) => { now += ms; },
     stdout: (b) => out.push(Buffer.from(b)),
     stderr: (b) => err.push(Buffer.from(b)),
     onSignal: () => {},
@@ -94,10 +95,53 @@ describe("pinned command mode", () => {
     expect(t.spawn).not.toHaveBeenCalled();
   });
 
-  it("refuses client-side local classification (service env, RUSTFLAGS) with exit 75 and no network", async () => {
+  it("recovers the original receipt with newly present local-only env and no second submit", async () => {
+    for (const script of [AS_CARGO, DIAG]) {
+      const t = setup();
+      const args = script === DIAG ? ["--", "test"] : ["test"];
+      let submitted = false;
+      t.post.mockImplementation(async () => {
+        submitted = true;
+        return { ok: true, status: 202, json: {} };
+      });
+      t.get.mockImplementation(async () => submitted
+        ? { ok: true, status: 200, json: completed }
+        : { ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST", detail: "unknown commandId", commandId: PIN } });
+      expect(await shimMain(script, args, t.deps)).toBe(0);
+      expect(t.post).toHaveBeenCalledTimes(1);
+      t.deps.env.DATABASE_URL = "postgres://local-only";
+      expect(await shimMain(script, args, t.deps)).toBe(0);
+      expect(t.get).toHaveBeenLastCalledWith(`/offload/commands/${PIN}?after=0`);
+      expect(t.post).toHaveBeenCalledTimes(1);
+      expect(t.spawn).not.toHaveBeenCalled();
+      expect(t.randomId).not.toHaveBeenCalled();
+    }
+  });
+
+  it("resumes polling an existing pinned receipt before classifying local-only env", async () => {
+    const t = setup({ DATABASE_URL: "postgres://local-only" });
+    t.get.mockResolvedValueOnce({ ok: true, status: 200, json: view("running", { remoteStarted: true }) })
+      .mockResolvedValue({ ok: true, status: 200, json: completed });
+    expect(await shimMain(AS_CARGO, ["test"], t.deps)).toBe(0);
+    expect(t.get).toHaveBeenCalledTimes(2);
+    expect(t.post).not.toHaveBeenCalled();
+    expect(t.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403, 410, 500, 400, 200])("never submits or runs locally after an inconclusive/auth/expired receipt read (%i)", async (status) => {
+    const t = setup();
+    t.get.mockResolvedValue({ ok: true, status, json: {} });
+    expect(await shimMain(AS_CARGO, ["test"], t.deps)).toBe(status === 401 || status === 403 ? 77 : 75);
+    expect(t.post).not.toHaveBeenCalled();
+    expect(t.spawn).not.toHaveBeenCalled();
+    expect(t.randomId).not.toHaveBeenCalled();
+  });
+
+  it("refuses fresh client-side local classification after an authenticated missing-receipt read", async () => {
     for (const env of [{ DATABASE_URL: "postgres://x" }, { RUSTFLAGS: "-C opt-level=3" }]) {
       const t = setup(env);
       expect(await shimMain(AS_CARGO, ["test"], t.deps)).toBe(75);
+      expect(t.get).toHaveBeenCalledExactlyOnceWith(`/offload/commands/${PIN}?after=0`);
       expect(t.spawn).not.toHaveBeenCalled();
       expect(t.post).not.toHaveBeenCalled();
       expect(t.stderr()).toContain("refused");

@@ -365,18 +365,46 @@ function isLive(state: OffloadCommandState | string): boolean {
 
 export async function runOffload(request: ShimRequest, deps: ClientDeps): Promise<number> {
   const tool = request.tool ?? "cargo";
-  const env = buildEnv(request.processEnv, tool);
-  if (env.local) {
-    if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);
-    deps.reportFallback?.({ reason: env.reason });
-    return deps.runLocal(request.argv);
-  }
   const commandId = deps.randomId();
   let pending: "SIGINT" | "SIGTERM" | null = null;
   deps.onSignal((signal) => {
     pending ??= signal;
   });
   const ctx: PollContext = { request, deps, commandId, pendingSignal: () => pending };
+
+  if (request.allowLocalFallback === false) {
+    // A pinned ID may already name remote work. Read it before classifying the
+    // current environment; recovery must not submit a changed payload or run it.
+    let receipt: HttpResult;
+    try {
+      receipt = await deps.http.get(`/offload/commands/${commandId}?after=0`);
+    } catch {
+      receipt = { ok: false, error: "read failed" };
+    }
+    if (receipt.ok && receipt.status === 200) {
+      const view = asReadView(receipt.json, commandId);
+      if (!view) return recover(ctx);
+      render(ctx, view);
+      const done = await finishIfTerminal(ctx, view);
+      if (done !== null) return done;
+      return poll(ctx, view.nextCursor);
+    }
+    if (receipt.ok && (receipt.status === 401 || receipt.status === 403)) return OFFLOAD_EXIT.auth;
+    if (receipt.ok && receipt.status === 410) return OFFLOAD_EXIT.executionUnknown;
+    const error = receipt.ok ? asError(receipt.json) : null;
+    // Only an explicit unknown-ID response permits fresh validation/submission.
+    // An unavailable, malformed or ambiguous read is never permission to launch.
+    if (!receipt.ok || receipt.status !== 400 || error?.code !== "OFFLOAD_INVALID_REQUEST"
+      || error.detail !== "unknown commandId" || error.commandId !== commandId) return recover(ctx);
+    if (pending) return signalExit(pending);
+  }
+
+  const env = buildEnv(request.processEnv, tool);
+  if (env.local) {
+    if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);
+    deps.reportFallback?.({ reason: env.reason });
+    return deps.runLocal(request.argv);
+  }
 
   let submit: HttpResult;
   try {

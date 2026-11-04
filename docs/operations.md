@@ -142,9 +142,22 @@ and treat any such hazard as a reason to keep admission closed.
 
 Shim. `BOAT_OFFLOAD_COMMAND_ID` is a selector only: it must be the exact
 pinned UUID of the grant, with no local fallback and no remint. A real retry
-of a pinned command is receipt-only and skips discovery. An old shim, or one
-without a pin, still meets the server gate and is refused without a matching
-grant.
+of a pinned command is receipt-only and skips discovery. The shim first reads
+that ID under existing receipt authorization, even if the current environment
+now contains local-only settings such as `DATABASE_URL` or `RUSTFLAGS`. It
+returns or polls the original receipt without another exec submission. Only an
+explicit unknown-ID response allows fresh workload validation and submission;
+an ambiguous read never permits launch. Local-only settings still refuse fresh
+work without submitting or running locally. An old shim, or one without a pin,
+still meets the server gate and is refused without a matching grant.
+
+Direct submit retries retain the journal's payload-digest check. New digests
+canonicalize environment key order; legacy rows retain their original
+order-sensitive contract, so submit retries must preserve their environment
+insertion order. An authorized receipt read by ID does not resubmit a payload.
+A deterministic never-started refusal also fixes that command ID's payload,
+without consuming a dispatch slot: it is not permission to reuse the ID for a
+different workload.
 
 Future enable window, each step separately authorized by the operator and none
 performed now:

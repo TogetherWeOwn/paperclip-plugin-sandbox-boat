@@ -139,6 +139,25 @@ describe("new admission before binding", () => {
     expect(t.create).not.toHaveBeenCalled();
     expect(t.start).not.toHaveBeenCalled();
   });
+  it("only the exact admitted actor can journal a local refusal under the pinned ID", async () => {
+    const t = setup();
+    const local = request({ argv: ["fmt"] });
+    for (const who of [
+      { ...actor(), runId: OTHER, authenticatedRunId: OTHER },
+      { ...actor(), agentId: OTHER, actorId: OTHER },
+      { ...actor(), authenticatedRunId: undefined },
+    ]) expect((await t.exec(local, who)).status).toBe(403);
+    expect(t.h.state.size).toBe(0);
+    expect(t.bind).not.toHaveBeenCalled();
+
+    expect((await t.exec(local)).status).toBe(503);
+    expect(await t.h.ctx.state.get(t.claimScope)).toBeNull();
+    // A deterministic never-started receipt fixes this ID's payload even
+    // without consuming a dispatch slot. It is not a reusable grant selector.
+    expect((await t.exec(local)).status).toBe(200);
+    expect((await t.exec()).status).toBe(409);
+    expect(t.start).not.toHaveBeenCalled();
+  });
   it("config/state read failure fails closed", async () => {
     const t = setup();
     vi.spyOn(t.h.ctx.state, "get").mockRejectedValue(new Error("storage offline"));

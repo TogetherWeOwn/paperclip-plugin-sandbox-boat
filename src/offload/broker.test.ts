@@ -152,6 +152,71 @@ describe("submit", () => {
     expect(otherArgv.status).toBe(409);
   });
 
+  describe("pre-canonical env digest with non-sorted insertion order", () => {
+    // Compatibility decision: rows written before env canonicalisation digest
+    // env in insertion order. We keep that exact order-sensitive contract: the
+    // same-order retry is accepted, a reordered retry is not (no broadened
+    // authority), and changed env values or execution payload still conflict.
+    const legacyEnv = { ZED: "1", ALPHA: "2" };
+
+    async function seedLegacy() {
+      const ctx = setup();
+      const legacy = { ...submitFor(), env: legacyEnv };
+      expect((await ctx.broker.submit(legacy, PRINCIPAL)).status).toBe(202);
+      const row = persisted(ctx.store) as { digest: string };
+      // The new-row digest sorts env keys; rewrite to the pre-canonical spelling.
+      const legacyDigest = JSON.stringify({
+        ws: legacy.executionWorkspaceId,
+        cwd: legacy.cwdRelative,
+        tool: "cargo",
+        runner: "cargo",
+        argv: legacy.argv,
+        env: legacy.env,
+        q: legacy.queueTimeoutMs,
+        t: legacy.timeoutMs,
+      });
+      expect(row.digest).not.toBe(legacyDigest);
+      ctx.store.data.set(`offload.cmd.${CMD}`, { ...row, digest: legacyDigest });
+      return { ...ctx, legacy };
+    }
+
+    it("accepts a same-order identical retry via submit and existingSubmission", async () => {
+      const { broker, backend, legacy } = await seedLegacy();
+      const retry = await broker.submit({ ...legacy, env: { ZED: "1", ALPHA: "2" } }, PRINCIPAL);
+      expect(retry.status).toBe(200);
+      expect((retry.body as OffloadReadResponse).commandId).toBe(CMD);
+      expect(backend.starts.length).toBe(1);
+      const known = await broker.existingSubmission({ ...legacy, env: { ZED: "1", ALPHA: "2" } }, PRINCIPAL);
+      expect(known?.status).toBe(200);
+    });
+
+    it("rejects a reordered legacy retry (order-dependent contract)", async () => {
+      const { broker, backend, legacy } = await seedLegacy();
+      const reordered = { ...legacy, env: { ALPHA: "2", ZED: "1" } };
+      const retry = await broker.submit(reordered, PRINCIPAL);
+      expect(retry.status).toBe(409);
+      expect(retry.body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+      const known = await broker.existingSubmission(reordered, PRINCIPAL);
+      expect(known?.status).toBe(409);
+      expect(backend.starts.length).toBe(1);
+    });
+
+    it("rejects changed env values and changed execution payload", async () => {
+      const { broker, legacy } = await seedLegacy();
+      const changes: OffloadSubmitRequest[] = [
+        { ...legacy, env: { ZED: "9", ALPHA: "2" } },
+        { ...legacy, env: { ZED: "1" } },
+        { ...legacy, argv: ["build"] },
+        { ...legacy, cwdRelative: "sub" },
+        { ...legacy, timeoutMs: 1000 },
+      ];
+      for (const changed of changes) {
+        expect((await broker.submit(changed, PRINCIPAL)).status).toBe(409);
+        expect((await broker.existingSubmission(changed, PRINCIPAL))?.status).toBe(409);
+      }
+    });
+  });
+
   it("refuses new admissions past 512 commands per run without dispatching", async () => {
     const { broker, backend } = setup();
     for (let i = 0; i < 512; i += 1) {
