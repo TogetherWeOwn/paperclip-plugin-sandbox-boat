@@ -61,6 +61,9 @@ function setup(backend: OffloadBackend = new NeverDispatchBackend(), now: () => 
   workspaces.set(WS, { repoUrl: "https://github.com/TogetherWeOwn/two-bot-next", projectId: "proj-1", projectWorkspaceId: "pws-1", path: "/work/two-bot-next", cwd: "/work/two-bot-next" });
   const host: OffloadRouteHost = {
     broker,
+    // Test-only: this fixture exercises classifier/receipt/preflight behavior, not exact-run admission.
+    // The real security gate is covered by admission.test.ts.
+    admission: { check: async () => null, consume: async () => null },
     workspaces: { get: async (id: string) => workspaces.get(id) ?? null },
     profile: { id: "rust-public-1", toolchains: ["stable", "1.88.0"], allowRustflags: false },
   };

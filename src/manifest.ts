@@ -103,6 +103,21 @@ const manifest: PaperclipPluginManifestV1 = {
         default: false,
         description: "Opt in to command-level offload through a lifecycle executor. The stock SSH executor also requires the guest transport opt-in and native workspace params. Does not enable the Cargo shim or change whole-run leases.",
       },
+      offloadAdmission: {
+        type: ["object", "null"], default: null, additionalProperties: false,
+        required: ["version", "companyId", "agentId", "runId", "executionWorkspaceId", "commandId", "issuedAt", "expiresAt"],
+        properties: {
+          version: { const: 1 },
+          companyId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          agentId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          runId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          executionWorkspaceId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          commandId: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          issuedAt: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+          expiresAt: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+        },
+        description: "Operator-issued default-deny grant for exactly one command of one authenticated run. Null or unset disables new admission. All ids are lowercase UUIDs; issuedAt and expiresAt are canonical UTC ISO timestamps with milliseconds, expiresAt after issuedAt and at most 75 minutes later. No lists or extra fields. The runtime parser is the authority; anything it rejects denies. Needs a host that supplies verified authenticatedRunId and an atomic state.create; otherwise it admits nothing.",
+      },
       offloadGuestTransportEnabled: {
         type: "boolean", default: false,
         description: "Enable the stock Linux SSH guest transport for explicitly approved public, secret-free workspaces. Requires offloadExecutorEnabled, native realization metadata and verified delegated cgroup v2. Never send production data.",

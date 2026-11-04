@@ -108,6 +108,110 @@ request body. This binding does not replace the executor resolver's source
 confinement or enable dispatch. Failed optional binding persistence does not
 break whole-run workspace realization.
 
+## Exact-run admission (future operator procedure)
+
+This section describes a future, separately authorized procedure. All offload
+flags remain off, and nothing here authorizes enabling them or issuing a grant.
+
+New remote admission is default-deny and needs the company `offloadAdmission`
+policy ([Configuration](configuration.md#company-plugin-settings-offload)) in
+addition to the gates above. The runtime parser (`src/offload/admission.ts`) is
+the authority on its shape; the policy names exactly one company, agent, run,
+execution workspace and command, for at most 75 minutes. It is not an
+allowlist, and a policy the parser rejects admits nothing.
+
+Required host capabilities. Missing either refuses the request, including a
+dry run, and the plugin never creates state speculatively to probe:
+
+- a verified `actor.authenticatedRunId`, supplied by the host from the agent's
+  run JWT and equal to the effective run. A request body or environment value
+  never substitutes for it;
+- the optional `state.create(input, value): Promise<boolean>`, negotiated as a
+  capability by the installed host. It must be a database-committed
+  insert-if-absent. A newer SDK wrapper in this repository does not make it an
+  installed capability, and `get`/`set` emulation is not accepted.
+
+Consumption. Admission writes one permanent company-and-run tombstone in the
+`boat-offload-admission-v1` namespace before the command is journaled. It
+survives config expiry or replacement, completion, cancellation, worker
+restart and journal retention. A spent run answers `OFFLOAD_EXECUTION_UNKNOWN`
+unless receipts exist; use those receipts, never remint or run it locally.
+Resetting or deleting state, uninstalling, replacing the plugin identity, and
+resetting or restoring the database are not renewals. Preserve the tombstones,
+and treat any such hazard as a reason to keep admission closed.
+
+Shim. `BOAT_OFFLOAD_COMMAND_ID` is a selector only: it must be the exact
+pinned UUID of the grant, with no local fallback and no remint. A real retry
+of a pinned command is receipt-only and skips discovery. An old shim, or one
+without a pin, still meets the server gate and is refused without a matching
+grant.
+
+Future enable window, each step separately authorized by the operator and none
+performed now:
+
+1. Pin the exact authenticated run, agent, company, execution workspace and a
+   preselected command UUID.
+2. Issue a narrow, expiring `offloadAdmission` for those values.
+3. Read back the canonical config and the installed `state.create` capability
+   through approved gates.
+4. Collect isolated negative evidence (wrong run, agent, workspace, command,
+   expired window, missing capability) before enabling anything.
+5. In an explicit flags step, turn on the required flags.
+6. Submit once, with the pinned command id.
+7. Collect the receipts.
+8. Expire or clear the policy, then turn the flags off.
+
+The window covers one command, never a whole run and never several days.
+Use the approved operator settings surface, not an agent request body or
+project-wide environment, to set this company policy. For example, the shape
+below is illustrative only: replace **all five IDs and both timestamps** with
+the independently verified tuple and the approved window, never paste it as
+a live grant:
+
+```json
+{
+  "offloadAdmission": {
+    "version": 1,
+    "companyId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "agentId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "runId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    "executionWorkspaceId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "commandId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    "issuedAt": "2026-01-02T03:00:00.000Z",
+    "expiresAt": "2026-01-02T04:00:00.000Z"
+  }
+}
+```
+
+Read back that company's stored policy and compare every field byte-for-byte
+with the approved values; also record the three flags as OFF before the
+separate flags step. Confirm the installed host's verified JWT actor field and
+negotiated atomic-state capability, not merely a source revision or SDK method
+name. Do not log JWTs or bearer credentials. If any readback, capability or
+permanent-claim continuity check is unavailable, stop with the flags OFF.
+Clearing means setting `offloadAdmission` to `null` in that same company and
+reading back null, then verifying the flags OFF; it never means deleting state.
+
+Negative evidence must distinguish admission refusal from an unrelated disabled
+executor gate. First use isolated fake-host fixtures with otherwise eligible
+settings, as in `src/offload/admission.test.ts` and
+`src/local-run-binding.test.ts`. Independently change the authenticated run,
+agent, company, workspace and command; omit provenance or atomic capability;
+use an absent, malformed, future or expired policy. Exercise real and dry-run
+requests and assert no binding, secret resolution, command creation or dispatch
+occurs. A matching dry-run must write nothing. A matching real request may
+consume once; same-ID/same-payload retries reconcile receipts, conflicting
+payloads fail, and a different ID remains denied after config replacement,
+restart and retention. Retained receipts/read/heartbeat/cancel must remain
+available under their existing authorization with admission cleared. Actual
+installed-host or live negative testing requires its own explicit authorization;
+these fake tests do not prove installed readiness or database atomicity.
+
+A dry run is read-only: it does not bind a workspace, resolve secrets or
+consume the grant. A workspace that is not yet bound cannot promise a remote
+run; the later real request may still be refused. A pinned real shim never
+falls back locally, even for a durable never-started receipt.
+
 ## Rollback
 
 Set company `offloadExecutorEnabled` to `false` for new admissions,

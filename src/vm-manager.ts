@@ -69,6 +69,7 @@ import { runOutsideInvocation } from "./proactive.js";
 import { syncFiles } from "./file-sync.js";
 import { VmStateStore, findBySandboxId, mergeRemoteRoot } from "./state.js";
 import type { RunSession, StartKind, StateClientLike, StateDoc, SweepDescriptor, UsageReading, VmKeyKind, VmRecord } from "./state.js";
+import { OffloadAdmission, type AdmissionState } from "./offload/admission.js";
 import { OffloadBroker, type BackendCommand, type OffloadJournalStore } from "./offload/broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./offload/executor-backend.js";
 import { SshOffloadRuntime, type SshOffloadRuntimeDeps } from "./offload-ssh-runtime.js";
@@ -434,7 +435,7 @@ export class BoatVmManager {
   private readonly logger: ManagerLogger;
   private readonly issues: IssueReader | null;
   private readonly offloadWorkspaces: NativeOffloadWorkspaces;
-  private readonly offloadState: StateClientLike;
+  private readonly offloadState: AdmissionState;
   private readonly offloadBrokers = new Map<string, OffloadBroker>();
   private readonly offloadBackend: ExecutorBackend;
   private readonly nativeOffload: SshOffloadRuntime;
@@ -512,6 +513,7 @@ export class BoatVmManager {
     const state = this.offloadState;
     const scope = (stateKey: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey });
     return {
+      ...(typeof state.create === "function" ? { create: (key: string, value: unknown) => state.create!(scope(key), value) } : {}),
       get: async (key) => state.get(scope(key)),
       set: async (key, value) => {
         await state.set(scope(key), value);
@@ -725,6 +727,7 @@ export class BoatVmManager {
   private offloadRouteHost(companyId: string, settings?: Record<string, unknown>) {
     return {
       broker: this.offloadBroker(companyId),
+      admission: new OffloadAdmission(this.offloadState, this.now, (company) => this.offloadCompanyConfig(company)),
       workspaces: this.offloadWorkspaces,
       profile: V1_PROFILE,
       extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],
@@ -767,11 +770,14 @@ export class BoatVmManager {
     }
   }
 
-  async offloadExec(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {
-    // Remember the company so an unscoped sweep after a restart still covers
-    // its pools even when no whole-run hook ever cached a config for it.
-    void this.store.rememberCompany(companyId).catch(() => undefined);
-    return handleExec({ actor, companyId, body }, this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)));
+  async offloadExec(companyId: string, actor: RouteActor, body: unknown, bindWorkspace?: () => Promise<void>): Promise<{ status: number; body: unknown }> {
+    const response = await handleExec({ actor, companyId, body }, {
+      ...this.offloadRouteHost(companyId, await this.offloadCompanyConfig(companyId)), bindWorkspace,
+    });
+    // Dry-runs and denied requests are read-only. An admitted real command
+    // enrolls its company for the unscoped upkeep sweep, never before admission.
+    if (response.status === 202) await this.store.rememberCompany(companyId).catch(() => undefined);
+    return response;
   }
 
   async offloadReport(companyId: string, actor: RouteActor, body: unknown): Promise<{ status: number; body: unknown }> {

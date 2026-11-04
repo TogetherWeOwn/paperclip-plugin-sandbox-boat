@@ -279,6 +279,9 @@ function routeHost(preflight: OffloadRouteHost["preflight"], realized = true): O
   });
   return {
     broker,
+    // Test-only: this fixture exercises classifier/receipt/preflight behavior, not exact-run admission.
+    // The real security gate is covered by admission.test.ts.
+    admission: { check: async () => null, consume: async () => null },
     workspaces: {
       get: async () => ({
         repoUrl: "https://github.com/example/public", projectId: "proj-1", projectWorkspaceId: "pws-1",

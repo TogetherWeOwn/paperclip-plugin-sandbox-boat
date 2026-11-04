@@ -188,7 +188,11 @@ describe("plugin wiring", () => {
   });
 
   const gitOrigin = (url: string) => `[remote "origin"]\n\turl = ${url}\n`;
+  // Live company config. Each request grants its own exact, short-lived
+  // operator policy by mutating this object; the host-owned claim is never cleared.
+  let current: Record<string, unknown> = {};
   async function setup(config: Record<string, unknown>, configGet?: () => Promise<Record<string, unknown>>) {
+    current = { offloadExecutorEnabled: true, ...config };
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-run-"));
     await mkdir(path.join(dir, ".git"));
     await writeFile(path.join(dir, ".git", "config"), gitOrigin("https://github.com/example/public"));
@@ -197,13 +201,40 @@ describe("plugin wiring", () => {
       workspaces: new Map([[workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: dir, cwd: dir }]]),
     });
     harness.secrets.set(secretId, "scoped-key");
-    await plugin.definition.setup({ ...harness.ctx, config: { get: configGet ?? (async () => config) } } as never);
+    await plugin.definition.setup({ ...harness.ctx, config: { get: configGet ?? (async () => current) } } as never);
     return harness;
   }
-  const exec = (actorRunId: string, execWorkspaceId: string = workspaceId) => plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
-    actor: { actorType: "agent", actorId: agentId, agentId, runId: actorRunId }, params: {}, query: {},
-    body: { version: 1, commandId: randomUUID(), executionWorkspaceId: execWorkspaceId, argv: ["test", "--locked"], cwdRelative: ".", env: {},
-      queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true } } as never);
+  const grant = (commandId: string, who: { run?: string; ws?: string; agent?: string } = {}) => {
+    const issued = Date.now() - 1000;
+    current.offloadAdmission = { version: 1, companyId, agentId: who.agent ?? agentId, runId: who.run ?? runId,
+      executionWorkspaceId: who.ws ?? workspaceId, commandId,
+      issuedAt: new Date(issued).toISOString(), expiresAt: new Date(issued + 60 * 60_000).toISOString() };
+  };
+  // Host-owned identity: authenticatedRunId is supplied by the host, never derived from the generic run id.
+  const call = (o: { run?: string; auth?: string | null; agent?: string; ws?: string; cmd?: string; argv?: string[]; dryRun?: boolean } = {}) =>
+    plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
+      actor: { actorType: "agent", actorId: o.agent ?? agentId, agentId: o.agent ?? agentId, runId: o.run ?? runId,
+        authenticatedRunId: o.auth === undefined ? (o.run ?? runId) : o.auth }, params: {}, query: {},
+      body: { version: 1, commandId: o.cmd ?? randomUUID(), executionWorkspaceId: o.ws ?? workspaceId, argv: o.argv ?? ["fmt"], cwdRelative: ".", env: {},
+        queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: o.dryRun ?? false } } as never);
+  // The real, admitted bind trigger: argv ["fmt"] is a deterministic never-started
+  // refusal after the bind and before any consume or dispatch, so it can repeat.
+  const admittedBind = (run: string = runId, ws: string = workspaceId, cmd: string = randomUUID()) => {
+    grant(cmd, { run, ws });
+    return call({ run, ws, cmd });
+  };
+  const refusedAfterBind = (response: Awaited<ReturnType<typeof call>>) =>
+    response.status === 503 && JSON.stringify(response.body).includes("incompatible workload");
+  // Pre-bind through the real admitted path, then classify with a read-only dry run. An unsuccessful
+  // bind (403, or 503 for an unbound workspace) is returned as is, never masked as success.
+  const exec = async (actorRunId: string, execWorkspaceId: string = workspaceId) => {
+    const cmd = randomUUID();
+    const bound = await admittedBind(actorRunId, execWorkspaceId, cmd);
+    if (!refusedAfterBind(bound)) return bound;
+    return call({ run: actorRunId, ws: execWorkspaceId, cmd, argv: ["test", "--locked"], dryRun: true });
+  };
+  const noClaims = (harness: Awaited<ReturnType<typeof setup>>) =>
+    [...harness.state.keys()].filter((key) => key.includes("boat-offload-admission"));
 
   it("admits the started run's own workspace after agent.run.started, and only that run", async () => {
     const harness = await setup(enabled);
@@ -212,6 +243,62 @@ describe("plugin wiring", () => {
     expect((await exec(runId)).status).toBe(200);
     expect((await exec(randomUUID())).status).toBe(403);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
+    // Binding and dry-run classification never consumed a grant.
+    expect(noClaims(harness)).toEqual([]);
+  });
+
+  it("agent.run.started alone resolves no secret and binds nothing", async () => {
+    const harness = await setup(enabled);
+    let resolutions = 0;
+    const originalResolve = harness.ctx.secrets.resolve;
+    harness.ctx.secrets.resolve = async (ref: { secretId?: string } | null) => { resolutions += 1; return originalResolve(ref); };
+    try {
+      await harness.emit("agent.run.started", started);
+      expect(resolutions).toBe(0);
+      expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    } finally {
+      harness.ctx.secrets.resolve = originalResolve;
+    }
+  });
+
+  it("a generic header run without authenticatedRunId, a wrong pinned tuple or a dry run resolves no secret and binds nothing", async () => {
+    const harness = await setup(enabled);
+    await harness.emit("agent.run.started", started);
+    let resolutions = 0;
+    const originalResolve = harness.ctx.secrets.resolve;
+    harness.ctx.secrets.resolve = async (ref: { secretId?: string } | null) => { resolutions += 1; return originalResolve(ref); };
+    const manager = (await import("./plugin.js")).currentManager();
+    try {
+      const cmd = randomUUID();
+      grant(cmd);
+      // Exact grant, but only the unsigned generic run id: no verified run.
+      expect((await call({ cmd, auth: null })).status).toBe(403);
+      expect((await call({ cmd, auth: randomUUID() })).status).toBe(403);
+      // Verified run, but each element of the pinned tuple is wrong in turn.
+      expect((await call({ cmd: randomUUID() })).status).toBe(403);
+      expect((await call({ cmd, ws: projectWorkspaceId })).status).toBe(403);
+      grant(cmd, { agent: randomUUID() });
+      expect((await call({ cmd })).status).toBe(403);
+      grant(cmd, { run: randomUUID() });
+      expect((await call({ cmd })).status).toBe(403);
+      grant(cmd, { ws: randomUUID() });
+      expect((await call({ cmd })).status).toBe(403);
+      // An exact grant on a dry run is read-only: it does not bind or resolve a secret.
+      grant(cmd);
+      expect((await call({ cmd, argv: ["test", "--locked"], dryRun: true })).status).toBe(503);
+      expect(resolutions).toBe(0);
+      expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+      expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      expect(noClaims(harness)).toEqual([]);
+      // Control: the same exact grant on a real request does bind.
+      grant(cmd);
+      expect(refusedAfterBind(await call({ cmd }))).toBe(true);
+      expect(resolutions).toBe(1);
+      expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
+    } finally {
+      harness.ctx.secrets.resolve = originalResolve;
+    }
   });
 
   it("answers under the project workspace id the shim reports for an execution-branch bind", async () => {
@@ -219,15 +306,15 @@ describe("plugin wiring", () => {
     harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
       projectWorkspaceId, path: dir, cwd: dir });
     await harness.emit("agent.run.started", started);
+    const response = await exec(runId, projectWorkspaceId);
     const bound = harness.logs.find((entry) => entry.message === "boat: bound local run for offload");
     // Both ids are logged: binds key on the execution workspace id, but the
     // shim (and later executor refusal logs) report the project workspace id.
     expect(bound?.meta).toMatchObject({ runId, workspaceId, projectWorkspaceId });
-    const response = await exec(runId, projectWorkspaceId);
     expect(response.status).toBe(200);
     // Remote classification under the alias, then the executor gate answers:
-    // this config enables local-run binding, not the executor.
-    expect(response.body).toMatchObject({ mode: "local", reason: "offload executor is not enabled" });
+    // exact-run admission needs the executor flag, so the next gate (guest transport) refuses.
+    expect(response.body).toMatchObject({ mode: "local" });
     expect((await exec(runId, workspaceId)).status).toBe(200);
     const manager = (await import("./plugin.js")).currentManager();
     expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
@@ -238,9 +325,11 @@ describe("plugin wiring", () => {
 
   it("completes the bind on request when the started bind registered only the execution id", async () => {
     const harness = await setup(enabled);
-    // The started bind sees no project workspace link yet: primary id only.
+    // The first admitted bind sees no project workspace link yet: primary id only.
     await harness.emit("agent.run.started", started);
+    expect(refusedAfterBind(await admittedBind())).toBe(true);
     const manager = (await import("./plugin.js")).currentManager();
+    expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
     expect(manager.hasOffloadBinding(companyId, runId, projectWorkspaceId)).toBe(false);
     harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
       projectWorkspaceId, path: dir, cwd: dir });
@@ -279,13 +368,14 @@ describe("plugin wiring", () => {
     expect((await exec(runId)).status).toBe(403);
   });
 
-  it("a terminal event during a slow start handler leaves no binding", async () => {
+  it("a terminal event during a slow admitted bind leaves no binding", async () => {
     const harness = await setup(enabled);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const original = harness.ctx.issues.get;
     harness.ctx.issues.get = async (id: string) => { await gate; return original(id); };
-    const pending = harness.emit("agent.run.started", started);
+    await harness.emit("agent.run.started", started);
+    const pending = admittedBind();
     await new Promise((resolve) => setTimeout(resolve, 10));
     await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
     release();
@@ -306,7 +396,8 @@ describe("plugin wiring", () => {
       if (input.namespace === "boat-offload-workspaces") { reached(); await gate; }
       return originalSet(input, value);
     };
-    const pending = harness.emit("agent.run.started", started);
+    await harness.emit("agent.run.started", started);
+    const pending = admittedBind();
     await writing;
     // The terminal event queues behind the in-flight write (same per-run lock), then removes it.
     const ending = harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
@@ -322,7 +413,9 @@ describe("plugin wiring", () => {
     const harness = await setup(enabled);
     const otherRun = "abababab-abab-4bab-abab-abababababab";
     await harness.emit("agent.run.started", started);
-    await harness.emit("agent.run.started", { companyId, payload: { runId: otherRun, issueId } });
+    await harness.emit("agent.run.started", { companyId, payload: { runId: otherRun, issueId, agentId } });
+    expect(refusedAfterBind(await admittedBind())).toBe(true);
+    expect(refusedAfterBind(await admittedBind(otherRun))).toBe(true);
     const manager = (await import("./plugin.js")).currentManager();
     expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
     expect(manager.hasOffloadBinding(companyId, otherRun, workspaceId)).toBe(true);
@@ -346,7 +439,8 @@ describe("plugin wiring", () => {
       return originalSet(input, value);
     };
     try {
-      const pending = harness.emit("agent.run.started", started);
+      await harness.emit("agent.run.started", started);
+      const pending = admittedBind();
       await writing;
       const realizing = plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
         config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
@@ -386,7 +480,8 @@ describe("plugin wiring", () => {
       return originalSet(input, value);
     };
     try {
-      const pending = harness.emit("agent.run.started", started);
+      await harness.emit("agent.run.started", started);
+      const pending = admittedBind();
       await writing;
       const realizing = plugin.definition.onEnvironmentRealizeWorkspace!({ driverKey: "boat", companyId, environmentId: nativeEnv,
         config: { apiKey: "native-key" }, lease: { providerLeaseId: null },
@@ -452,7 +547,8 @@ describe("plugin wiring", () => {
     const nativeSource = await mkdtemp(path.join(tmpdir(), "boat-native-restore-terminal-"));
     const gates = gateRestorationWrites(harness);
     try {
-      const pending = harness.emit("agent.run.started", started);
+      await harness.emit("agent.run.started", started);
+      const pending = admittedBind();
       await gates.firstWriting;
       const realizing = realizeWholeRun(nativeSource, "native-project");
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -481,7 +577,8 @@ describe("plugin wiring", () => {
     const sourceB = await mkdtemp(path.join(tmpdir(), "boat-native-restore-b-"));
     const gates = gateRestorationWrites(harness);
     try {
-      const pending = harness.emit("agent.run.started", started);
+      await harness.emit("agent.run.started", started);
+      const pending = admittedBind();
       await gates.firstWriting;
       const realizingA = realizeWholeRun(sourceA, "native-project-a");
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -560,21 +657,25 @@ describe("plugin wiring", () => {
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",
       path: harness.workspaces.get(workspaceId)!.path, repoUrl: "https://github.com/example/public" });
-    const body = { version: 1, commandId: randomUUID(), executionWorkspaceId: projectWorkspaceId,
-      argv: ["test", "--locked"], cwdRelative: ".", env: {}, queueTimeoutMs: 0, timeoutMs: 10_000, dryRun: true };
-    const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId,
-      actor: { actorType: "agent", actorId: agentId, agentId, runId }, params: {}, query: {}, body } as never);
+    const response = await exec(runId, projectWorkspaceId);
     expect(response.status).toBe(200);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
     // The started run's sibling still has no authority.
     expect((await exec(randomUUID())).status).toBe(403);
   });
 
-  it("a config read failure at run start is recovered on the first offload request", async () => {
-    let calls = 0;
-    const harness = await setup(enabled, async () => { calls += 1; if (calls === 1) throw new Error("config unavailable"); return enabled; });
+  it("a config read failure fails the first offload request closed and the retry recovers", async () => {
+    let failing = true;
+    let reads = 0;
+    const harness = await setup(enabled, async () => { reads += 1; if (failing) throw new Error("config unavailable"); return current; });
+    // The start event reads no config and binds nothing.
     await harness.emit("agent.run.started", started);
+    expect(reads).toBe(0);
+    const closed = await exec(runId);
+    expect(closed.status).toBe(403);
+    expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    failing = false;
     expect((await exec(runId)).status).toBe(200);
   });
 
@@ -591,7 +692,12 @@ describe("plugin wiring", () => {
       const manager = (await import("./plugin.js")).currentManager();
       expect(manager.hasOffloadBinding(companyId, runId, workspaceId)).toBe(true);
       await harness.emit("agent.run.started", started);
+      expect(await manager.rememberLocalRun((await localRunRealization(started, localRunSettings(enabled), host()))!)).toBe(false);
+      expect(refusedAfterBind(await admittedBind())).toBe(true);
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+      const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
+        .map(([, value]) => value as { workspace?: { path?: string } });
+      expect(saved.map((record) => record.workspace?.path)).toEqual([nativeSource]);
     } finally {
       await rm(nativeSource, { recursive: true, force: true });
     }
@@ -613,6 +719,13 @@ describe("plugin wiring", () => {
       harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",
         path: harness.workspaces.get(workspaceId)!.path, repoUrl: "https://github.com/example/public" });
       await harness.emit("agent.run.started", started);
+      // The request-time bind would skip an already-bound id, so also drive the project-branch bind directly.
+      const manager = (await import("./plugin.js")).currentManager();
+      expect(await manager.rememberLocalRun((await localRunRealization(started, localRunSettings(enabled), host({
+        issueWorkspaceId: async () => null,
+        issueProjectWorkspace: async () => ({ id: projectWorkspaceId, projectId: "project", path: dir, repoUrl: "https://github.com/example/public" }),
+      })))!)).toBe(false);
+      expect(refusedAfterBind(await admittedBind(runId, projectWorkspaceId))).toBe(true);
       expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
       const saved = [...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces"))
         .map(([, value]) => value as { workspaceId?: string; workspace?: { path?: string } });
@@ -627,7 +740,7 @@ describe("plugin wiring", () => {
     [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
   const restart = async (harness: Awaited<ReturnType<typeof setup>>) => {
     await plugin.definition.onShutdown?.();
-    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => enabled } } as never);
+    await plugin.definition.setup({ ...harness.ctx, config: { get: async () => current } } as never);
   };
 
   it("refuses a run whose owner is unknown: a started event without an agent", async () => {
@@ -670,6 +783,8 @@ describe("plugin wiring", () => {
   it("a terminal event forgets the run's persisted workspace bindings and owner after a worker restart", async () => {
     const harness = await setup(enabled);
     await harness.emit("agent.run.started", started);
+    expect(workspaceBindings(harness)).toEqual([]);
+    expect(refusedAfterBind(await admittedBind())).toBe(true);
     expect(workspaceBindings(harness)).toHaveLength(1);
     await restart(harness); // nothing about the run in memory
     await harness.emit("agent.run.finished", { companyId, payload: { runId, issueId } });
@@ -734,6 +849,7 @@ describe("plugin wiring", () => {
     harness.workspaces.set(workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project",
       projectWorkspaceId: null, path: "/etc", cwd: "/etc" });
     await harness.emit("agent.run.started", started);
+    expect(refusedAfterBind(await admittedBind())).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
     expect([403, 503]).toContain((await exec(runId)).status);
@@ -743,6 +859,7 @@ describe("plugin wiring", () => {
     const harness = await setup(enabled);
     await writeFile(path.join(dir!, ".git", "config"), gitOrigin("https://github.com/example/private"));
     await harness.emit("agent.run.started", started);
+    expect(refusedAfterBind(await admittedBind())).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
     expect([403, 503]).toContain((await exec(runId)).status);
@@ -769,5 +886,6 @@ describe("plugin wiring", () => {
     const harness = await setup({});
     await harness.emit("agent.run.started", started);
     expect((await exec(runId)).status).toBe(503);
+    expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
   });
 });

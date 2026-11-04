@@ -62,6 +62,8 @@ export class NeverDispatchBackend implements OffloadBackend {
 }
 
 export interface OffloadJournalStore {
+  /** Host atomic insertion prevents a racing refusal overwriting an admission. */
+  create?(key: string, value: unknown): Promise<boolean>;
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<void>;
@@ -174,14 +176,14 @@ const INDEX_KEY = "offload.retention";
 /** An expired commandId refuses reuse this long; a run's count outlives its last command by as much. */
 export const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60_000;
 
-function digestOf(request: OffloadSubmitRequest): string {
+function digestOf(request: OffloadSubmitRequest, canonicalEnv = true): string {
   return JSON.stringify({
     ws: request.executionWorkspaceId,
     cwd: request.cwdRelative,
     tool: request.tool ?? "cargo",
     runner: request.runner ?? "cargo",
     argv: request.argv,
-    env: request.env,
+    env: canonicalEnv ? Object.fromEntries(Object.entries(request.env).sort(([a], [b]) => a.localeCompare(b))) : request.env,
     q: request.queueTimeoutMs,
     t: request.timeoutMs,
   });
@@ -199,14 +201,14 @@ const DEFAULT_RUNNER: Readonly<Record<string, string>> = { node: "npm", python: 
  * digest; the legacy spelling is accepted only when matching an existing row.
  */
 function acceptedDigests(request: OffloadSubmitRequest): string[] {
-  const primary = digestOf(request);
+  const variants = [request];
   const fallback = DEFAULT_RUNNER[request.tool ?? "cargo"];
-  if (!fallback) return [primary];
   const runner = request.runner ?? "cargo";
-  if (runner !== fallback && runner !== "cargo") return [primary];
-  const legacy = digestOf({ ...request, runner: "cargo" });
-  const normalised = digestOf({ ...request, runner: fallback });
-  return primary === legacy ? [primary, normalised] : [primary, legacy];
+  if (fallback && (runner === fallback || runner === "cargo")) {
+    variants.push({ ...request, runner: runner === fallback ? "cargo" : fallback });
+  }
+  // New rows sort env keys; preserve matching pre-canonicalisation receipts.
+  return [...new Set(variants.flatMap((variant) => [digestOf(variant), digestOf(variant, false)]))];
 }
 
 export interface OffloadBrokerDeps {
@@ -255,6 +257,19 @@ export class OffloadBroker {
 
   private async save(record: JournalRecord): Promise<void> {
     await this.store.set(cmdKey(record.commandId), record);
+  }
+
+  private async insert(record: JournalRecord, digests: string[]): Promise<BrokerResponse | null> {
+    // Production new-admission routes require this negotiated host capability.
+    // Legacy standalone broker fixtures retain their single-worker store port.
+    if (!this.store.create) { await this.save(record); return null; }
+    if (await this.store.create(cmdKey(record.commandId), record) === true) return null;
+    const raced = await this.load(record.commandId);
+    return raced ? this.existingResponse(raced, digests, record) : {
+      status: 409, body: offloadError("OFFLOAD_EXECUTION_UNKNOWN", "command journal insertion was not confirmed; never replay", {
+        commandId: record.commandId, remoteStarted: null, fallbackSafe: false,
+      }),
+    };
   }
 
   private view(record: JournalRecord, after: number, limitBytes: number): OffloadReadResponse {
@@ -325,7 +340,7 @@ export class OffloadBroker {
       // Index first: a failed index write leaves no record, and an indexed
       // command without a record is simply pruned by the sweep.
       await this.track(request.commandId, principal.runId, now);
-      await this.save({
+      const raced = await this.insert({
         version: 1,
         commandId: request.commandId,
         companyId: principal.companyId,
@@ -349,7 +364,8 @@ export class OffloadBroker {
         commandDeadline: now + request.timeoutMs,
         createdAt: now,
         terminalAt: now,
-      });
+      }, digests);
+      if (raced) return raced;
       await this.store.set(countKey(principal.runId), count + 1);
       return null;
     });
@@ -498,7 +514,7 @@ export class OffloadBroker {
     });
   }
 
-  async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<BrokerResponse> {
+  async submit(request: OffloadSubmitRequest, principal: BrokerPrincipal, consume?: () => Promise<BrokerResponse | null>): Promise<BrokerResponse> {
     // Serialized per run so the 512-command admission bound cannot race.
     return this.chain(`run:${principal.runId}`, async () => {
       const digests = acceptedDigests(request);
@@ -515,6 +531,16 @@ export class OffloadBroker {
           status: 503,
           body: offloadError("OFFLOAD_UNAVAILABLE", "per-run command journal is full", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
         };
+      }
+      // The route's durable company+run claim is the cross-worker boundary.
+      // Existing receipts above never consume or re-dispatch. Losing a claim
+      // race permits only an existing receipt, not fresh journal intent.
+      if (consume) {
+        const refused = await consume();
+        if (refused) {
+          const raced = await this.load(request.commandId);
+          return raced ? this.existingResponse(raced, digests, principal) : refused;
+        }
       }
       // now() is read inside the chain: submit is always awaited, so no caller
       // observes time between the call and the admission.
@@ -544,7 +570,8 @@ export class OffloadBroker {
       // Persist intent before any external effect. Index first, as in
       // recordRefusal: an index failure must not strand an undispatched record.
       await this.track(request.commandId, principal.runId, now);
-      await this.save(record);
+      const raced = await this.insert(record, digests);
+      if (raced) return raced;
       await this.store.set(countKey(principal.runId), count + 1);
       this.known.add(request.commandId);
 

@@ -35,7 +35,11 @@ function requireManager(): BoatVmManager {
 }
 
 function toRouteActor(actor: PluginApiRequestInput["actor"]): RouteActor {
-  return { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId ?? null };
+  // Additive host/SDK field. Absent on older hosts; never reconstruct it from
+  // headers, body, environment, generic runId or the ownership lookup.
+  const trusted = actor as PluginApiRequestInput["actor"] & { readonly authenticatedRunId?: string | null };
+  return { actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId ?? null,
+    runId: actor.runId ?? null, authenticatedRunId: trusted.authenticatedRunId ?? null };
 }
 
 let bindLocalRun: ((companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => Promise<boolean>) | null = null;
@@ -92,9 +96,8 @@ const plugin = definePlugin({
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }
     });
-    // Local runs: bind heavy-command offload from host-owned run, issue and workspace data.
-    // The started event usually precedes workspace preparation, so the bind is retried
-    // when the run's first offload request arrives (onApiRequest below).
+    // Local runs bind only after exact-run admission on a real submit. Start
+    // events record ownership, never resolve credentials or bind offload.
     bindLocalRun = async (companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => {
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
       if (!settings.enabled) return false;
@@ -147,8 +150,7 @@ const plugin = definePlugin({
       // stays recoverable on the run's first offload request. Only a run on an issue binds locally.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
       const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
-      if (!(await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId)) || !issueId) return;
-      await bindLocalRun!(event.companyId, payload.runId, issueId);
+      await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId);
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
       ctx.events.on(done, async (event) => {
@@ -187,8 +189,8 @@ const plugin = definePlugin({
       return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "run is not known to belong to this agent", { commandId: null }) };
     }
     if (input.routeKey === "offload_exec") {
-      await bindOnFirstRequest(boat, input);
-      const response = await boat.offloadExec(input.companyId, toRouteActor(input.actor), input.body);
+      const response = await boat.offloadExec(input.companyId, toRouteActor(input.actor), input.body,
+        () => bindOnFirstRequest(boat, input));
       return { status: response.status, body: response.body };
     }
     if (input.routeKey === "offload_read") {

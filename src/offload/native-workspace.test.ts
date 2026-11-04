@@ -7,7 +7,19 @@ const companyId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const runId = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
 const workspaceId = "b9d0e6ac-a14e-4440-a324-7dcdd758be08";
 const commandId = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
-const actor = { actorType: "agent" as const, actorId: "agent-a", agentId: "agent-a", runId };
+const agentId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+// authenticatedRunId models the verified host identity; only a fake host supplies it.
+const actor = { actorType: "agent" as const, actorId: agentId, agentId, runId, authenticatedRunId: runId };
+const GUEST_OFF = "offload guest transport is not enabled";
+
+/** Operator-issued exact-run grant for one workspace/command; nothing here is a permissive stub. */
+function grantFor(executionWorkspaceId = workspaceId, grantCommandId = commandId) {
+  const now = Date.now();
+  return { offloadExecutorEnabled: true, offloadAdmission: { version: 1, companyId, agentId, runId,
+    executionWorkspaceId, commandId: grantCommandId, issuedAt: new Date(now - 60_000).toISOString(),
+    expiresAt: new Date(now + 60 * 60_000).toISOString() } };
+}
+let grant: Record<string, unknown> = {};
 const body = { version: 1, commandId, executionWorkspaceId: workspaceId, cwdRelative: ".",
   argv: ["test", "--locked"], env: {}, queueTimeoutMs: 0, timeoutMs: 120_000, dryRun: true };
 
@@ -29,13 +41,14 @@ export function nativeWorkspace(overrides: Record<string, unknown> = {}) {
 
 /** The host starts every run with agent.run.started; pass start=false to rely on the persisted owner (a restarted worker). */
 async function setup(state?: ReturnType<typeof createFakeContext>["ctx"]["state"], start = true) {
+  grant = grantFor();
   // The host shows the run executing on its issue, which a restarted worker confirms.
   const harness = createFakeContext({ issues: new Map([["issue-a", { status: "in_progress", executionRunId: runId }]]) });
   // Any attempt to use the SDK workspace client would require a new capability.
-  const ctx = { ...harness.ctx, ...(state ? { state } : {}) };
+  const ctx = { ...harness.ctx, config: { get: async () => grant }, ...(state ? { state } : {}) };
   Object.defineProperty(ctx, "executionWorkspaces", { get() { throw new Error("capability unavailable"); } });
   await plugin.definition.setup(ctx as never);
-  if (start) await currentManager().startLocalRun(companyId, runId, "issue-a", "agent-a");
+  if (start) await currentManager().startLocalRun(companyId, runId, "issue-a", agentId);
   return harness;
 }
 async function submit(extra: Record<string, unknown> = {}) {
@@ -57,10 +70,11 @@ describe("native workspace binding", () => {
   it("classifies from native realization metadata without the SDK workspace client", async () => {
     await setup();
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
-    // Classification is remote, but the dry-run now also answers the executor
-    // gates: this fake config never enables the executor, so the predictive
-    // answer is local with that reason (a binding miss would 503 instead).
-    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
+    // Classification is remote, but the dry-run also answers the executor
+    // gates: the exact grant enables the executor but not the guest transport,
+    // so the predictive answer is local with that reason (a binding miss would
+    // 503 instead). The dry-run never binds: the workspace was preseeded.
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: GUEST_OFF } });
   });
 
   it("answers under the host payload's project workspace id as well", async () => {
@@ -68,13 +82,14 @@ describe("native workspace binding", () => {
     // workspace id, while the realization keys on the execution workspace id.
     const projectWorkspaceId = "11111111-1111-4111-8111-111111111111";
     await setup();
+    grant = grantFor(projectWorkspaceId);
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace({
       source: { localPath: "/work/public-rust", projectId: "project-a", projectWorkspaceId,
         repoUrl: "https://github.com/example/public-rust" },
     }));
     const response = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
-    expect(response).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
+    expect(response).toMatchObject({ status: 200, body: { mode: "local", reason: GUEST_OFF } });
   });
 
   it("refuses a project alias two execution workspaces of one run claim with different sources", async () => {
@@ -92,13 +107,16 @@ describe("native workspace binding", () => {
         repoUrl: "https://github.com/example/public-rust" } });
     second.workspace.localPath = "/work/other-checkout";
     await plugin.definition.onEnvironmentRealizeWorkspace!(second);
+    grant = grantFor(projectWorkspaceId);
     const byAlias = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: projectWorkspaceId }, params: {}, query: {} } as never);
     expect(byAlias).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
-    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
+    grant = grantFor();
+    expect(await submit()).toMatchObject({ status: 200, body: { mode: "local", reason: GUEST_OFF } });
+    grant = grantFor(otherWorkspaceId);
     const byOther = await plugin.definition.onApiRequest!({ routeKey: "offload_exec", companyId, actor,
       body: { ...body, executionWorkspaceId: otherWorkspaceId }, params: {}, query: {} } as never);
-    expect(byOther).toMatchObject({ status: 200, body: { mode: "local", reason: "offload executor is not enabled" } });
+    expect(byOther).toMatchObject({ status: 200, body: { mode: "local", reason: GUEST_OFF } });
   });
 
   it("logs the run, workspace and reason when the exec route refuses with 503", async () => {
@@ -141,7 +159,7 @@ describe("native workspace binding", () => {
 
   it("admits the owner of a whole-run realization whose run started without an issue", async () => {
     const t = await setup(undefined, false);
-    await t.emit("agent.run.started", { companyId, payload: { runId, agentId: "agent-a", issueId: null } });
+    await t.emit("agent.run.started", { companyId, payload: { runId, agentId, issueId: null } });
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
     expect(await submit()).toMatchObject({ status: 200 });
   });
@@ -201,11 +219,60 @@ describe("native workspace binding", () => {
     expect(await submit()).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
 
-  it("keeps normal submits default-off with a durable safe-fallback receipt", async () => {
+  it("admits a granted submit but the guest transport stays off with a durable safe-fallback receipt", async () => {
     await setup();
     await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
     expect(await submit({ body: { ...body, dryRun: false } })).toMatchObject({ status: 202 });
     expect(await currentManager().offloadRead(companyId, actor, { commandId }, {}))
-      .toMatchObject({ status: 200, body: { state: "not_started", remoteStarted: false, fallbackSafe: true } });
+      .toMatchObject({ status: 200, body: { state: "not_started", remoteStarted: false, fallbackSafe: true, fallbackReason: GUEST_OFF } });
+  });
+
+  describe("fails closed for new work without operator grant, host identity or atomic state", () => {
+    const denied = (response: { status?: number; body?: unknown }) =>
+      expect(response).toMatchObject({ status: 403, body: { code: "OFFLOAD_FORBIDDEN" } });
+    const noReceipt = async () => expect((await currentManager().offloadRead(companyId, actor, { commandId }, {})).status).not.toBe(200);
+
+    it("denies dry-run and submit with no operator policy, leaving no receipt or binding", async () => {
+      const t = await setup();
+      grant = {};
+      await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+      denied(await submit());
+      denied(await submit({ body: { ...body, dryRun: false } }));
+      await noReceipt();
+      expect([...t.state.keys()].filter((key) => key.includes("boat-offload-admission"))).toEqual([]);
+    });
+
+    it("denies a stock host that supplies no authenticated run identity", async () => {
+      await setup();
+      await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+      const { authenticatedRunId: _omitted, ...stockActor } = actor;
+      denied(await submit({ actor: stockActor }));
+      denied(await submit({ actor: stockActor, body: { ...body, dryRun: false } }));
+      await noReceipt();
+    });
+
+    it("denies when the authenticated run differs from the claimed run", async () => {
+      await setup();
+      await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+      denied(await submit({ actor: { ...actor, authenticatedRunId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" } }));
+    });
+
+    it("denies a grant for another command or workspace", async () => {
+      await setup();
+      await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+      grant = grantFor(workspaceId, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+      denied(await submit());
+      grant = grantFor("22222222-2222-4222-8222-222222222222");
+      denied(await submit());
+    });
+
+    it("denies new work when the host state has no atomic create", async () => {
+      const t = await setup();
+      await setup({ ...t.ctx.state, create: undefined } as never);
+      await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
+      denied(await submit());
+      denied(await submit({ body: { ...body, dryRun: false } }));
+      await noReceipt();
+    });
   });
 });

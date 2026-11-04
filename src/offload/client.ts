@@ -35,6 +35,11 @@ export interface ShimRequest {
   queueTimeoutMs: number;
   timeoutMs: number;
   processEnv: Record<string, string | undefined>;
+  /**
+   * Default true. False (operator-pinned command ID) means this request must
+   * never run locally: every would-be fallback stops with exit 75 instead.
+   */
+  allowLocalFallback?: boolean;
 }
 
 export interface ClientDeps {
@@ -226,11 +231,20 @@ function render(ctx: PollContext, view: OffloadReadResponse): void {
  * Every size-limited page carries state/result, even with more output unread.
  * Local fallback happens only on a durable never-started receipt.
  */
+function refuseLocal(request: ShimRequest, deps: ClientDeps, reason: string): number {
+  const text = reason.replace(/[\r\n]+/g, " ").slice(0, 256);
+  deps.stderr(Buffer.from(`offload: pinned command ID; local fallback refused (${text}); exit 75, no local run.\n`, "utf8"));
+  return OFFLOAD_EXIT.executionUnknown;
+}
+
 async function finishIfTerminal(ctx: PollContext, view: OffloadReadResponse): Promise<number | null> {
   if (!TERMINAL.has(view.state) || view.events.length > 0) return null;
   if (view.terminalError === "OFFLOAD_OUTPUT_LIMIT") return OFFLOAD_EXIT.syncStaged;
   if (!view.result) {
     if (view.state === "not_started" && view.remoteStarted === false && view.fallbackSafe === true) {
+      if (ctx.request.allowLocalFallback === false) {
+        return refuseLocal(ctx.request, ctx.deps, view.fallbackReason || "executor refused before start");
+      }
       ctx.deps.reportFallback?.({ reason: view.fallbackReason || "executor refused before start" });
       return ctx.deps.runLocal(ctx.request.argv);
     }
@@ -353,6 +367,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
   const tool = request.tool ?? "cargo";
   const env = buildEnv(request.processEnv, tool);
   if (env.local) {
+    if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);
     deps.reportFallback?.({ reason: env.reason });
     return deps.runLocal(request.argv);
   }
@@ -404,6 +419,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
   }
   const decision = exitForError(envelope);
   if (decision.action === "fallback") {
+    if (request.allowLocalFallback === false) return refuseLocal(request, deps, envelope.detail);
     deps.reportFallback?.({ reason: envelope.detail });
     return deps.runLocal(request.argv);
   }

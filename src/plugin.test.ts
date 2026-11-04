@@ -2147,12 +2147,25 @@ describe("Probe", () => {
 });
 
 describe("offload API routes", () => {
-  const RUN_ID = "run-offload-1";
+  const RUN_ID = "44444444-4444-4444-8444-444444444444";
+  const AGENT_ID = "55555555-5555-4555-8555-555555555555";
   const CMD_ID = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
+
+  /** Operator-issued exact-run grant (executor enabled, guest transport still off). */
+  function grantFor(over: Record<string, unknown> = {}) {
+    const now = clock.t; // the manager runs on this fake clock
+    return { offloadExecutorEnabled: true, offloadAdmission: { version: 1, companyId: COMPANY, agentId: AGENT_ID, runId: RUN_ID,
+      executionWorkspaceId: WORKSPACE, commandId: CMD_ID, issuedAt: new Date(now - 60_000).toISOString(),
+      expiresAt: new Date(now + 60 * 60_000).toISOString(), ...over } };
+  }
+  const setGrant = (config: Record<string, unknown>) => {
+    (harness.ctx.config as { get: unknown }).get = async () => config;
+  };
+  beforeEach(() => setGrant(grantFor()));
 
   async function seedWorkspace(): Promise<void> {
     await currentManager().rememberOffloadWorkspace(nativeWorkspaceParams(COMPANY, RUN_ID, WORKSPACE));
-    await currentManager().startLocalRun(COMPANY, RUN_ID, "issue-offload-1", "agent-1");
+    await currentManager().startLocalRun(COMPANY, RUN_ID, "issue-offload-1", AGENT_ID);
   }
 
   const workspaceBindings = () => [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces"));
@@ -2176,7 +2189,8 @@ describe("offload API routes", () => {
       params: {},
       query: {},
       body: null,
-      actor: { actorType: "agent", actorId: "agent-1", agentId: "agent-1", runId: RUN_ID },
+      // authenticatedRunId models the verified identity only a (fake) new host supplies.
+      actor: { actorType: "agent", actorId: AGENT_ID, agentId: AGENT_ID, runId: RUN_ID, authenticatedRunId: RUN_ID },
       companyId: COMPANY,
       headers: {},
       ...extra,
@@ -2214,11 +2228,11 @@ describe("offload API routes", () => {
     await seedWorkspace();
     const submit = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody() }) as never);
     expect(submit.status).toBe(202);
-    // Until the executor wires in, every submit journals not_started and the
-    // shim falls back locally: safe by construction.
+    // The grant enables the executor but not the guest transport, so the
+    // admitted submit journals not_started and the shim falls back locally.
     const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never);
     expect(read.status).toBe(200);
-    expect(read.body).toMatchObject({ state: "not_started", remoteStarted: false, fallbackSafe: true });
+    expect(read.body).toMatchObject({ state: "not_started", remoteStarted: false, fallbackSafe: true, fallbackReason: "offload guest transport is not enabled" });
     const beat = await plugin.definition.onApiRequest!(apiInput("offload_heartbeat", { params: { commandId: CMD_ID } }) as never);
     expect(beat.status).toBe(200);
     const cancel = await plugin.definition.onApiRequest!(apiInput("offload_cancel", { params: { commandId: CMD_ID }, body: { reason: "client_signal" } }) as never);
@@ -2232,8 +2246,10 @@ describe("offload API routes", () => {
       apiInput("offload_exec", { body: submitBody(), actor: { actorType: "user", actorId: "u1" } }) as never,
     );
     expect(userActor.status).toBe(401);
+    const unknownId = "00000000-0000-4000-8000-000000000099";
+    setGrant(grantFor({ executionWorkspaceId: unknownId }));
     const unknownWs = await plugin.definition.onApiRequest!(
-      apiInput("offload_exec", { body: submitBody({ executionWorkspaceId: "00000000-0000-4000-8000-000000000099" }) }) as never,
+      apiInput("offload_exec", { body: submitBody({ executionWorkspaceId: unknownId }) }) as never,
     );
     expect(unknownWs.status).toBe(503);
     expect(unknownWs.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
@@ -2243,10 +2259,51 @@ describe("offload API routes", () => {
     await seedWorkspace();
     const dry = await plugin.definition.onApiRequest!(apiInput("offload_exec", { body: submitBody({ dryRun: true }) }) as never);
     expect(dry.status).toBe(200);
-    // The dry-run answers the executor gates too; this harness config leaves
-    // the executor disabled, so remote classification reads back as local.
-    expect(dry.body).toMatchObject({ mode: "local", reason: "offload executor is not enabled", profileId: "rust-public-1" });
+    // The dry-run answers the executor gates too; the grant enables the
+    // executor but not the guest transport, so remote reads back as local.
+    expect(dry.body).toMatchObject({ mode: "local", reason: "offload guest transport is not enabled", profileId: "rust-public-1" });
     const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never);
     expect(read.status).toBe(400);
+  });
+
+  describe("fails closed for new work on an old host or without an operator grant", () => {
+    const denied = (response: { status?: number; body?: unknown }) =>
+      expect(response).toMatchObject({ status: 403, body: { code: "OFFLOAD_FORBIDDEN" } });
+    const submitAs = (extra: Record<string, unknown>) => plugin.definition.onApiRequest!(apiInput("offload_exec", extra) as never);
+    const noReceipt = async () => expect((await plugin.definition.onApiRequest!(
+      apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never)).status).not.toBe(200);
+
+    it("denies dry-run and submit with no policy and leaves no receipt or admission claim", async () => {
+      await seedWorkspace();
+      setGrant({});
+      denied(await submitAs({ body: submitBody({ dryRun: true }) }));
+      denied(await submitAs({ body: submitBody() }));
+      await noReceipt();
+      expect([...harness.state.keys()].filter((key) => key.includes("boat-offload-admission"))).toEqual([]);
+    });
+
+    it("denies an old host that supplies no authenticated run identity", async () => {
+      await seedWorkspace();
+      const stock = { actorType: "agent", actorId: AGENT_ID, agentId: AGENT_ID, runId: RUN_ID };
+      denied(await submitAs({ actor: stock, body: submitBody({ dryRun: true }) }));
+      denied(await submitAs({ actor: stock, body: submitBody() }));
+      await noReceipt();
+    });
+
+    it("denies a command the grant does not name and a grant outside its window", async () => {
+      await seedWorkspace();
+      denied(await submitAs({ body: submitBody({ commandId: "99999999-9999-4999-8999-999999999999" }) }));
+      setGrant(grantFor({ issuedAt: new Date(clock.t - 3 * 60 * 60_000).toISOString(), expiresAt: new Date(clock.t - 2 * 60 * 60_000).toISOString() }));
+      denied(await submitAs({ body: submitBody() }));
+      await noReceipt();
+    });
+
+    it("a denied first request does not bind the workspace eagerly, and run start only records ownership", async () => {
+      await currentManager().startLocalRun(COMPANY, RUN_ID, "issue-offload-1", AGENT_ID);
+      expect(workspaceBindings()).toEqual([]);
+      setGrant({});
+      denied(await submitAs({ body: submitBody() }));
+      expect(workspaceBindings()).toEqual([]);
+    });
   });
 });

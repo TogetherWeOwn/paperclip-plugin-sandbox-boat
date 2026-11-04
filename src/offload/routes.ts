@@ -6,6 +6,7 @@
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
 import path from "node:path";
+import type { OffloadAdmission } from "./admission.js";
 import type { OffloadBroker, BrokerPrincipal, BackendCommand } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
@@ -39,6 +40,9 @@ export interface RouteActor {
   actorType: "user" | "agent";
   actorId: string;
   runId: string | null;
+  agentId?: string | null;
+  /** Host-owned verified JWT identity; absent on older hosts. */
+  authenticatedRunId?: string | null;
 }
 
 export interface OffloadWorkspaceMeta {
@@ -83,6 +87,9 @@ export interface OffloadSettings {
 
 export interface OffloadRouteHost {
   broker: OffloadBroker;
+  admission?: Pick<OffloadAdmission, "check" | "consume">;
+  /** May resolve secrets/persist a binding: only after new-admission check. */
+  bindWorkspace?: () => Promise<void>;
   workspaces: {
     get(workspaceId: string, companyId: string, runId: string): Promise<OffloadWorkspaceMeta | null>;
   };
@@ -343,6 +350,7 @@ export async function handleExec(
   input: { actor: RouteActor; companyId: string; body: unknown },
   host: OffloadRouteHost,
 ): Promise<RouteResponse> {
+  input = { ...input, actor: { ...input.actor } };
   const runId = authed(input.actor);
   if (!runId) return { status: 401, body: offloadError("OFFLOAD_UNAUTHORIZED", "agent run authentication required", {}) };
   // The host delivers a parsed body; bound its re-encoded size (host ingress
@@ -372,13 +380,24 @@ export async function handleExec(
   // real submit (and its idempotency digest) judged cargo.
   const tool = validated.value.tool ?? profileTool(profile);
   const runner = validated.value.runner ?? defaultRunnerFor(tool);
-  const request = { ...validated.value, tool, runner };
+  const request = { ...validated.value, tool, runner, argv: [...validated.value.argv], env: { ...validated.value.env } };
   if (!request.dryRun) {
     // A lost workspace binding is not proof that this ID never started. Consult
     // the journal before any unjournaled 503 below; an unknown ID still returns
     // null here and journals nothing.
     const known = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
     if (known) return known;
+  }
+  if (!host.admission) return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "exact-run admission is unavailable", { commandId: request.commandId }) };
+  const refused = await host.admission.check(input.companyId, input.actor, request);
+  if (refused) {
+    // An admission check may have raced another accepted submit. Only the
+    // journal may replace this refusal with an existing receipt, never launch.
+    if (!request.dryRun) {
+      const raced = await host.broker.existingSubmission(request, { companyId: input.companyId, runId });
+      if (raced) return raced;
+    }
+    return refused;
   }
   const settings: OffloadSettings = { ...DEFAULT_SETTINGS, ...host.settings };
   if (!settings.offloadProfiles.includes(profile.id)) {
@@ -390,6 +409,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
+  if (!request.dryRun) await host.bindWorkspace?.();
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
     if (!request.dryRun) {
@@ -480,7 +500,8 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", `incompatible workload: ${classification.reason}`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  return host.broker.submit(request, principal);
+  const admission = host.admission;
+  return host.broker.submit(request, principal, () => admission.consume(input.companyId, input.actor, request, principal));
 }
 
 /** Read the requested tool off the raw body before profile validation. Null when invalid. */
