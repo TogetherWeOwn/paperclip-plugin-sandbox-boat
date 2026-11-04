@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { runDryRun, runOffload, type BrokerHttp, type ClientDeps, type HttpResult, type ShimRequest } from "./client.js";
+import { offloadError } from "./errors.js";
+import { OFFLOAD_BOUNDS } from "./protocol.js";
+import { validateSubmit } from "./validate.js";
 
 const CMD = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
 const WS = "b9d0e6ac-a14e-4440-a324-7dcdd758be08";
@@ -416,6 +419,94 @@ describe("ambiguous-submit recovery", () => {
     const slept = t.sleeps.reduce((a, b) => a + b, 0);
     expect(slept).toBeGreaterThanOrEqual(10_000);
     expect(slept).toBeLessThan(12_000);
+  });
+});
+
+describe("pinned receipt validation", () => {
+  const verifyPath = `/offload/commands/${CMD}/verify`;
+  const unknown = offloadError("OFFLOAD_INVALID_REQUEST", "unknown commandId", { commandId: CMD });
+
+  it.each([
+    { name: "empty argv", argv: [] },
+    { name: "empty argument", argv: [""] },
+    { name: "control byte", argv: ["test\u0000"] },
+    { name: "lone surrogate", argv: ["test\ud800"] },
+    { name: "too many arguments", argv: Array(OFFLOAD_BOUNDS.maxArgs + 1).fill("test") as string[] },
+    { name: "oversized argv", argv: ["x".repeat(OFFLOAD_BOUNDS.maxArgvBytes)] },
+  ])("exits 64 immediately for $name on initial verification and recovery", async ({ argv }) => {
+    for (const first of [null, { ok: false, error: "read lost" }, { ok: true, status: 503, json: {} }] as const) {
+      const t = setup();
+      t.request.argv = argv;
+      t.request.allowLocalFallback = false;
+      t.deps.randomId = vi.fn(() => CMD);
+      t.http.post.mockImplementation(async (path: string, body: unknown) => {
+        expect(path).toBe(verifyPath);
+        const validated = validateSubmit(body);
+        expect(validated.ok).toBe(false);
+        if (validated.ok) throw new Error("expected invalid execution payload");
+        return { ok: true, status: 400, json: offloadError("OFFLOAD_INVALID_REQUEST", validated.detail) };
+      });
+      if (first) t.http.post.mockResolvedValueOnce(first);
+      expect(await runOffload(t.request, t.deps)).toBe(64);
+      expect(t.http.post).toHaveBeenCalledTimes(first ? 2 : 1);
+      expect(t.http.post.mock.calls.every(([path]) => path === verifyPath)).toBe(true);
+      expect(t.sleeps).toEqual([]);
+      expect(t.http.get).not.toHaveBeenCalled();
+      expect(t.deps.randomId).toHaveBeenCalledTimes(1);
+      expect(t.deps.runLocal).not.toHaveBeenCalled();
+      expect(t.deps.reportUnknown).not.toHaveBeenCalled();
+      expect(t.out).toEqual([]);
+      expect(t.err).toEqual([]);
+    }
+  });
+
+  it.each([
+    { ok: false, error: "read lost" },
+    { ok: true, status: 500, json: {} },
+    { ok: true, status: 503, json: offloadError("OFFLOAD_INVALID_REQUEST", "invalid argv") },
+    { ok: true, status: 200, json: {} },
+    { ok: true, status: 400, json: {} },
+    { ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST" } },
+    { ok: true, status: 400, json: { code: "OFFLOAD_INVALID_REQUEST", detail: "" } },
+    { ok: true, status: 400, json: { ...unknown, commandId: "another-command" } },
+    { ok: true, status: 400, json: { ...unknown, commandId: null } },
+  ] satisfies HttpResult[])("keeps ambiguous verification bounded without submitting: %j", async (response) => {
+    const t = setup();
+    t.request.allowLocalFallback = false;
+    t.http.post.mockResolvedValue(response);
+    expect(await runOffload(t.request, t.deps)).toBe(75);
+    expect(t.http.post.mock.calls.every(([path]) => path === verifyPath)).toBe(true);
+    expect(t.sleeps.reduce((a, b) => a + b, 0)).toBe(OFFLOAD_BOUNDS.recoveryBudgetMs);
+    expect(t.http.get).not.toHaveBeenCalled();
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+    expect(t.deps.reportUnknown).toHaveBeenCalledWith({ commandId: CMD });
+    expect(t.out).toEqual([]);
+  });
+
+  it("does not submit when an ambiguous verification later reports the exact unknown ID", async () => {
+    const t = setup();
+    t.request.allowLocalFallback = false;
+    t.http.post.mockResolvedValueOnce({ ok: false, error: "read lost" })
+      .mockResolvedValue({ ok: true, status: 400, json: unknown });
+    expect(await runOffload(t.request, t.deps)).toBe(75);
+    expect(t.http.post.mock.calls.every(([path]) => path === verifyPath)).toBe(true);
+    expect(t.http.get).not.toHaveBeenCalled();
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+  });
+
+  it("permits fresh submission only on the exact initial unknown-ID envelope", async () => {
+    const t = setup();
+    t.request.allowLocalFallback = false;
+    t.http.post.mockResolvedValueOnce({ ok: true, status: 400, json: unknown })
+      .mockResolvedValue({ ok: true, status: 202, json: {} });
+    t.http.get.mockResolvedValue({ ok: true, status: 200, json: readView({
+      state: "completed", result: { exitCode: 0, signal: null, timedOut: false, cancelled: false,
+        syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null },
+    }) });
+    expect(await runOffload(t.request, t.deps)).toBe(0);
+    expect(t.http.post.mock.calls.map(([path]) => path)).toEqual([verifyPath, "/offload/exec"]);
+    expect(t.http.post.mock.calls[0]![1]).toEqual(t.http.post.mock.calls[1]![1]);
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
   });
 });
 

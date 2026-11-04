@@ -196,6 +196,13 @@ function asError(json: unknown): OffloadErrorEnvelope | null {
   return json as OffloadErrorEnvelope;
 }
 
+/** An explicit validation rejection is not an ambiguous or unknown-ID read. */
+function isVerificationInvalid(response: HttpResult): boolean {
+  const error = response.ok && response.status === 400 ? asError(response.json) : null;
+  return error?.code === "OFFLOAD_INVALID_REQUEST" && typeof error.detail === "string"
+    && error.detail.length > 0 && error.detail !== "unknown commandId";
+}
+
 export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise<DryRunResult> {
   const tool = request.tool ?? "cargo";
   const env = buildEnv(request.processEnv, tool);
@@ -385,7 +392,8 @@ async function recover(ctx: PollContext): Promise<number> {
       return OFFLOAD_EXIT.auth;
     }
     if (response.ok && response.status === 409 && asError(response.json)?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT") return OFFLOAD_EXIT.invalidRequest;
-    // 400 unknown-command and transport failures: the submit may still land.
+    if (ctx.verifyRequest && !ctx.verified && isVerificationInvalid(response)) return OFFLOAD_EXIT.invalidRequest;
+    // Unknown-command and ambiguous reads: the submit may still land.
     if (deps.now() >= deadline) {
       deps.reportUnknown({ commandId });
       return OFFLOAD_EXIT.executionUnknown;
@@ -429,6 +437,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     if (receipt.ok && receipt.status === 410) return OFFLOAD_EXIT.executionUnknown;
     const error = receipt.ok ? asError(receipt.json) : null;
     if (receipt.ok && receipt.status === 409 && error?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT") return OFFLOAD_EXIT.invalidRequest;
+    if (isVerificationInvalid(receipt)) return OFFLOAD_EXIT.invalidRequest;
     // Only an explicit unknown-ID response permits fresh validation/submission.
     // An unavailable, malformed or ambiguous read is never permission to launch.
     if (!receipt.ok || receipt.status !== 400 || error?.code !== "OFFLOAD_INVALID_REQUEST"
