@@ -786,8 +786,11 @@ export class BoatVmManager {
       ...host,
       // This resolver serves reports only: metadata obtained here never grants
       // exec/dry-run access or enters the executor's workspace registry.
-      workspaces: { get: async (workspaceId, company, run) =>
-        await host.workspaces.get(workspaceId, company, run) ?? await resolveWorkspace?.(workspaceId, company, run) ?? null },
+      workspaces: { get: async (workspaceId, company, run) => {
+        const registered = await this.offloadWorkspaces.lookup(workspaceId, company, run);
+        // A withdrawn alias or invalid binding is a refusal, not missing metadata.
+        return registered === undefined ? await resolveWorkspace?.(workspaceId, company, run) ?? null : registered;
+      } },
     });
   }
 

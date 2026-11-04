@@ -182,3 +182,88 @@ describe("local-run duration learning through plugin dispatch", () => {
     expect(historyEntries()[0]?.[1]).toHaveLength(5);
   });
 });
+
+describe("local duration reports with registered workspace refusals", () => {
+  let dir: string;
+
+  afterEach(async () => {
+    await plugin.definition.onShutdown?.();
+    setManagerOverridesForTests({});
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it.each(commands)("rejects a withdrawn alias without training either repository for $tool, but accepts primary IDs", async (command) => {
+    resetReportBudgets();
+    dir = await mkdtemp(path.join(tmpdir(), "boat-duration-alias-"));
+    const otherWorkspaceId = randomUUID();
+    const sources = [
+      { id: workspaceId, root: path.join(dir, "a"), repo: repoUrl },
+      { id: otherWorkspaceId, root: path.join(dir, "b"), repo: "https://github.com/example/other" },
+    ];
+    for (const source of sources) {
+      await mkdir(path.join(source.root, ".git"), { recursive: true });
+      await writeFile(path.join(source.root, ".git", "config"), `[remote "origin"]\nurl = ${source.repo}\n`);
+    }
+    // A completed while the issue now points at B; both used the same project alias.
+    const harness = createFakeContext({
+      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: otherWorkspaceId, executionRunId: runId }]]),
+      workspaces: new Map(sources.map((source) => [source.id, {
+        projectId: "project", projectWorkspaceId, path: source.root, cwd: source.root, repoUrl: source.repo,
+      }])),
+    });
+    harness.ctx.config.get = async () => ({ offloadLocalRunsEnabled: true, offloadLocalSourceRoots: [dir],
+      offloadExecutorEnabled: false, offloadGuestTransportEnabled: false });
+    const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
+    setManagerOverridesForTests({ offloadExecutor: executor });
+    await plugin.definition.setup(harness.ctx as never);
+    await harness.emit("agent.run.started", started);
+    const registry = new NativeOffloadWorkspaces(harness.ctx.state);
+    for (const source of sources) {
+      await registry.remember({ companyId, environmentId: "environment", workspace: {
+        localPath: source.root, metadata: { workspaceRealizationRequest: {
+          version: 1, companyId, environmentId: "environment", heartbeatRunId: runId,
+          executionWorkspaceId: source.id, localRun: true,
+          source: { localPath: source.root, projectId: "project", projectWorkspaceId, repoUrl: source.repo },
+        } },
+      } } as never);
+    }
+    expect(await registry.get(projectWorkspaceId, companyId, runId)).toBeNull();
+    expect([...harness.state.values()]).toContainEqual(expect.objectContaining({ workspaceId: projectWorkspaceId, ambiguous: true }));
+    const lookup = vi.spyOn(harness.ctx.executionWorkspaces, "get");
+    const secret = vi.spyOn(harness.ctx.secrets, "resolve");
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("unexpected network request"); }));
+    const report = (id: string) => plugin.definition.onApiRequest!({ routeKey: "offload_report", companyId,
+      actor: { actorType: "agent", actorId: agentId, agentId, runId }, params: {}, query: {},
+      body: { executionWorkspaceId: id, tool: command.tool, runner: command.runner, argv: command.argv, durationSeconds: 120 },
+    } as never);
+    const before = structuredClone([...harness.state.entries()]);
+    expect(await report(projectWorkspaceId)).toMatchObject({ status: 403 });
+    expect([...harness.state.entries()]).toEqual(before);
+    expect(lookup).not.toHaveBeenCalled();
+    const [primaryKey, primary] = before.find(([, value]) => (value as { workspaceId?: string }).workspaceId === otherWorkspaceId)!;
+    // Invalid registered metadata is also a refusal, even though B is resolvable from the host.
+    for (const invalid of [{}, { ...(primary as object), version: 2 }, { ...(primary as object), companyId: randomUUID() }]) {
+      harness.state.set(primaryKey, invalid);
+      const invalidState = structuredClone([...harness.state.entries()]);
+      expect(await report(otherWorkspaceId)).toMatchObject({ status: 403 });
+      expect([...harness.state.entries()]).toEqual(invalidState);
+      expect(lookup).not.toHaveBeenCalled();
+    }
+    harness.state.set(primaryKey, primary);
+    resetReportBudgets(); // Primary-ID behavior is independent of the rejection burst above.
+    for (const source of sources) {
+      expect(await report(source.id)).toMatchObject({ status: 200, body: { recorded: true } });
+      const key = durationKey(`repo:${source.repo}`, command.profile, normalizeSignature(command.tool, command.runner, command.argv));
+      expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: key }))
+        .toEqual([{ seconds: 120, at: expect.any(Number) }]);
+    }
+    expect(await report(projectWorkspaceId)).toMatchObject({ status: 403 });
+    expect([...harness.state.entries()].filter(([key]) => key.includes("boat-offload-workspaces")))
+      .toEqual(before.filter(([key]) => key.includes("boat-offload-workspaces")));
+    expect(secret).not.toHaveBeenCalled();
+    expect(executor).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});

@@ -89,8 +89,13 @@ from the host's run → issue → workspace lookup. This requires
 on-disk origin matches the workspace repository. It does not require an
 environment, credential, admission grant, executor flag or guest-transport flag.
 The metadata serves only that report: it is never registered for dispatch,
-resolves no secret, and does not enroll the company for VM upkeep. Fresh real
-submits and dry-runs still need their existing exact-run admission; retained
+resolves no secret, and adds no persistent company-upkeep enrollment. Existing
+report-host construction still caches a company broker; unscoped sweeps include
+cached-broker companies for upkeep. Report-only metadata resolution does not
+isolate requests from that preexisting behavior. Explicitly withdrawn workspace
+aliases and invalid registered bindings remain refused, without falling back to
+current issue metadata. Fresh real submits and dry-runs still need their existing
+exact-run admission; retained
 receipt handling is unchanged. With local runs disabled, an unbound local run
 cannot report. Reports for
 local-mode signatures (watch mode, single-file filters, inline code,
