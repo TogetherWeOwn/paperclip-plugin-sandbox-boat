@@ -228,6 +228,8 @@ const DEFAULTS = {
   minComputeHoursLeft: 1,
 };
 
+type FinishRecovery = { finishedAt: number; accounted: boolean; reported: boolean };
+
 export class OffloadExecutor {
   private readonly boat: BoatApiLike;
   private readonly ledger: AccountLedger;
@@ -252,6 +254,7 @@ export class OffloadExecutor {
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
   private readonly stopFailures = new Set<string>();
+  private readonly pendingFinishes = new Map<string, FinishRecovery & { vm: PoolVm; warm: OffloadWarm; queueWaitMs: number }>();
   private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
@@ -288,6 +291,14 @@ export class OffloadExecutor {
       release: (identity) => this.releaseHold(identity),
       bind: (identity) => this.bindIdentity(identity),
       cancel: (command, result) => this.cancelQueued(command, result),
+      settled: async (command, result) => {
+        const key = this.cacheKey(command);
+        const pending = this.pendingFinishes.get(key);
+        if (!pending) return;
+        await this.finishOnVm(pending.vm, command, result, pending.warm, pending.queueWaitMs, pending);
+        this.pendingFinishes.delete(key);
+        this.knownCommands.delete(command.commandId);
+      },
     }, this.lifecycle ?? undefined) : null;
     const transport: OffloadDeps["runCommand"] = deps.guest
       ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand,
@@ -323,6 +334,13 @@ export class OffloadExecutor {
    */
   private async reconcileQuarantined(vm: PoolVm): Promise<void> {
     if (!vm.sandboxId || vm.deletePending) return;
+    // A healed journal receipt alone cannot release a VM whose post-finish
+    // accounting is still retrying. The recovered completion owns it until
+    // both accounting and disposition succeed.
+    if ([...this.pendingFinishes.values()].some((pending) => pending.vm === vm)) {
+      await this.stopVm(vm, true, true).catch(() => undefined);
+      return;
+    }
     let state: string | null = null;
     try {
       state = sandboxStateOf(await this.boat.get({ sandboxId: vm.sandboxId }), vm.sandboxId);
@@ -505,6 +523,9 @@ export class OffloadExecutor {
     return await this.requireDurable().readCommand(companyId, runId, commandId);
   }
   async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number) {
+    // Pool recovery may settle the journal while it holds admission. Finish
+    // it before journal startup can take the reverse journal -> admission path.
+    await this.recoverPool();
     return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason, generation);
   }
   // ID-only convenience calls are restricted to commands admitted by this
@@ -944,7 +965,8 @@ export class OffloadExecutor {
       const [entry] = this.queue.splice(at, 1);
       if (entry!.timerHandle != null) this.timers.clear(entry!.timerHandle);
       entry!.timerHandle = null;
-      entry!.resolve(this.finish(this.cacheKey(command), result));
+      const key = this.cacheKey(command);
+      entry!.resolve(this.journal.has(key) ? this.finish(key, result) : result);
     });
   }
 
@@ -1294,34 +1316,49 @@ export class OffloadExecutor {
       }
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: preStart?.reason ?? "command transport failed; reconcile the guest receipt before replay or VM reuse" };
     }
+    const finishedAt = this.now();
     try {
       if (this.durable) result = await this.durable.finish(command, result);
     } catch (error) {
+      this.pendingFinishes.set(this.cacheKey(command), { vm, warm, queueWaitMs, finishedAt, accounted: false, reported: false });
       await this.quarantineVm(vm, command);
       throw error;
     }
-    this.finish(this.cacheKey(command), result);
+    return await this.finishOnVm(vm, command, result, warm, queueWaitMs);
+  }
+
+  private async finishOnVm(vm: PoolVm, command: OffloadCommand, result: OffloadResult,
+    warm: OffloadWarm, queueWaitMs: number, recovery?: FinishRecovery): Promise<OffloadResult> {
+    if (!recovery) this.finish(this.cacheKey(command), result);
     if (result.status === "unavailable") {
       // A durable cancellation won the race after admission: no command ran.
       // Close the funded reservation with a zero-length command interval.
-      await this.ledger.finished(vm.accountReservation!, false, {
-        warm, queueWaitMs, exitCode: 0, outcome: "completed", expectedSeconds: 0, expectedDollars: 0,
-      }).catch(() => {
-        this.logger.error("boat offload usage persistence failed; account reservation retained");
-      });
+      if (!recovery?.accounted) {
+        await this.ledger.finished(vm.accountReservation!, false, {
+          warm, queueWaitMs, exitCode: 0, outcome: "completed", expectedSeconds: 0, expectedDollars: 0,
+        }, recovery?.finishedAt).catch((error) => {
+          this.logger.error("boat offload usage persistence failed; account reservation retained");
+          if (recovery) throw error;
+        });
+        if (recovery) recovery.accounted = true;
+      }
       // Sync-in may already have pushed source before the cancellation won.
       if (this.isEphemeral(command)) await this.deleteVm(vm);
       else await this.releaseVm(vm);
       return result;
     }
     let accountingFailed = false;
-    await this.ledger.finished(vm.accountReservation!, result.status === "unknown", {
-      warm, queueWaitMs, exitCode: result.exitCode, outcome: result.status, expectedSeconds: result.seconds, expectedDollars: result.dollars,
-    }).catch(() => {
-      accountingFailed = true;
-      this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
-    });
-    if (result.status === "completed") {
+    if (!recovery?.accounted) {
+      await this.ledger.finished(vm.accountReservation!, result.status === "unknown", {
+        warm, queueWaitMs, exitCode: result.exitCode, outcome: result.status, expectedSeconds: result.seconds, expectedDollars: result.dollars,
+      }, recovery?.finishedAt).catch((error) => {
+        accountingFailed = true;
+        this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
+        if (recovery) throw error;
+      });
+      if (recovery) recovery.accounted = true;
+    }
+    if (result.status === "completed" && !recovery?.reported) {
       // Feed the duration gate: completed remote runs teach the next decision.
       // A learning write never fails the command it just measured.
       try {
@@ -1331,6 +1368,7 @@ export class OffloadExecutor {
         void error;
       }
     }
+    if (recovery) recovery.reported = true;
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
       commandId: command.commandId,

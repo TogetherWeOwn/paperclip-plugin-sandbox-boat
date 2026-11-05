@@ -273,6 +273,7 @@ interface JournalPool {
   hold(identity: OffloadIdentity, command?: OffloadCommand): Promise<void>;
   release(identity: OffloadIdentity): Promise<void>;
   cancel(command: OffloadCommand, result: OffloadResult): Promise<void>;
+  settled?(command: OffloadCommand, result: OffloadResult): Promise<void>;
 }
 
 // One authoritative worker only. Exclusive create fences duplicate IDs, not
@@ -294,6 +295,8 @@ export class OffloadJournal {
   // accepts them; the pump settles uncertain in the meantime (see the
   // executor backend's task-settled signal) instead of polling forever.
   private readonly pendingSettle = new Map<string, { command: OffloadCommand; result: OffloadResult; attempts: number }>();
+  private readonly pendingCleanup = new Map<string, OffloadRecord>();
+  private cleanupChain: Promise<unknown> = Promise.resolve();
 
   // Cancellation and starting arbitrate on one record, never on a global lock
   // held across queue-refusal I/O or guest sync/transport.
@@ -406,15 +409,17 @@ export class OffloadJournal {
         const raw = await this.deps.journalStore.get(key);
         if (raw === null) { await this.prune(key); continue; }
         const record = parseRecord(raw, key);
-        if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state)) continue;
-        if (record.state === "unknown" && record.resultAt !== null) continue; // already settled
-        const result = record.result?.status === "unknown" ? record.result : this.unknown(record);
-        await this.deps.journalStore.set(key, { ...record, state: "unknown", result,
-          resultAt: this.now(), remoteStarted: null, fallbackSafe: false, updatedAt: this.now() });
-        // Only this command's hold is dropped: a hold for another command on
-        // the same sandbox (a reused slot) is never ours to release here.
-        this.held.delete(key);
-        settled += 1;
+        await this.transition(record, async () => {
+          await this.refresh(record);
+          if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state) || this.settled(record)) return;
+          const result = record.result?.status === "unknown" ? record.result : this.unknown(record);
+          await this.commit(record, { state: "unknown", result,
+            resultAt: this.now(), remoteStarted: null, fallbackSafe: false });
+          // Only this command's hold is dropped, never another command's hold
+          // on a reused sandbox. Delayed finish retries share this fence.
+          this.held.delete(key);
+          settled += 1;
+        });
       }
       return settled;
     });
@@ -694,6 +699,27 @@ export class OffloadJournal {
   // hold semantics so cancel and heartbeat stop hanging on it.
   async settlePending(): Promise<void> {
     await this.serialize(() => this.settlePendingLocked());
+    await this.cleanupPending();
+  }
+
+  // Pool admission can itself call journal reconciliation. Never await a pool
+  // action under the journal chain or a record fence. Failed cleanup stays
+  // retryable even though its receipt is already durable.
+  private async cleanupPending(): Promise<void> {
+    const task = this.cleanupChain.then(async () => {
+      for (const [key, record] of [...this.pendingCleanup]) {
+        try {
+          if (record.state === "unknown" && !this.settled(record)) await this.hold(record);
+          if (record.command && record.result) {
+            if (record.state === "not_started") await this.pool.cancel(record.command, record.result);
+            await this.pool.settled?.(record.command, record.result);
+          }
+          this.pendingCleanup.delete(key);
+        } catch { /* Keep cleanup for the next sweep. */ }
+      }
+    });
+    this.cleanupChain = task.catch(() => undefined);
+    await task;
   }
 
   private async settlePendingLocked(): Promise<void> {
@@ -713,36 +739,32 @@ export class OffloadJournal {
         this.pendingSettle.delete(key);
         continue;
       }
-      if (TERMINAL.has(record.state) || this.settled(record)) { this.pendingSettle.delete(key); continue; }
-      const at = this.now();
-      const terminal: Partial<OffloadRecord> = pending.result.status === "unavailable"
-        ? { state: "not_started", result: pending.result, resultAt: at, remoteStarted: false, fallbackSafe: true }
-        : pending.result.status === "unknown"
-          ? { state: "unknown", result: pending.result, resultAt: null, remoteStarted: null, fallbackSafe: false }
-          : { state: pending.result.cancelled ? "cancelled" : "completed", result: pending.result,
-            resultAt: at, remoteStarted: true, fallbackSafe: false };
-      // An unavailable refusal is only valid before durable starting intent;
-      // the record moved on while the store was down, so hold as unknown.
-      const patch: Partial<OffloadRecord> = pending.result.status === "unavailable" && !PRE_START.has(record.state)
-        ? { state: "unknown", result: this.unknown(record), resultAt: null,
-          remoteStarted: null, fallbackSafe: false }
-        : terminal;
       try {
-        await this.deps.journalStore.set(key, { ...record, ...patch, updatedAt: at });
-        this.pendingSettle.delete(key);
-        if (patch.state === "unknown") await this.hold({ ...record, ...patch } as OffloadRecord);
+        await this.transition(record, async () => {
+          await this.refresh(record);
+          if (!TERMINAL.has(record.state) && !this.settled(record)) {
+            let result = pending.result;
+            // Use the same cancellation mapping as finish(), at the same
+            // record fence. A late cancel cannot clobber the recovered exit.
+            if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
+              result = { ...result, cancelled: true, exitCode: 130 };
+            }
+            if (pending.attempts >= 10 || result.status === "unavailable" && !PRE_START.has(record.state)) {
+              result = this.unknown(record);
+            }
+            const patch: Partial<OffloadRecord> = result.status === "unavailable"
+              ? { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true }
+              : result.status === "unknown"
+                ? { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false }
+                : { state: result.cancelled ? "cancelled" : "completed", result,
+                  resultAt: this.now(), remoteStarted: true, fallbackSafe: false };
+            await this.commit(record, patch);
+          }
+          this.pendingCleanup.set(key, record);
+          this.pendingSettle.delete(key);
+        });
       } catch {
         pending.attempts += 1;
-        if (pending.attempts >= 10) {
-          try {
-            await this.deps.journalStore.set(key, { ...record, state: "unknown", result: this.unknown(record),
-              resultAt: null, remoteStarted: null, fallbackSafe: false, updatedAt: at });
-            await this.hold({ ...record, state: "unknown" } as OffloadRecord);
-          } catch {
-            continue;
-          }
-          this.pendingSettle.delete(key);
-        }
       }
     }
   }
@@ -1002,5 +1024,6 @@ export class OffloadJournal {
         }
       }
     });
+    await this.cleanupPending();
   }
 }
