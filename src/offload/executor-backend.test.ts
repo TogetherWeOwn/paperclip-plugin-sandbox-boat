@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OffloadBroker, type BackendCommand, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
+import { OffloadBroker, type BackendCommand, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./executor-backend.js";
 import { fixture, command, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
 import type { OffloadReadView } from "../offload-journal.js";
@@ -210,6 +210,35 @@ describe("executor backend", () => {
     f.guest.observable = true;
     // Fixture disposal releases the held runner, never a real VM.
   });
+
+  it("settles the output pump with uncertainty when the finish commit is lost, then heals on sweep", async () => {
+    f = await fixture();
+    const releaseExec = f.hold(`exec:${cmd.commandId}`);
+    const releaseStage = f.hold(`stage:${cmd.commandId}`);
+    const output = sink();
+    const handle = backend(f.executor).start(cmd, output);
+    await until(() => f!.guest.alive(cmd.commandId));
+    // Let the guest exit and the run reach sync-out, so the durable record is
+    // past starting intent; only then break the store, so the lost write is
+    // the terminal finish commit rather than an earlier transport commit.
+    releaseExec.resolve();
+    await until(() => f!.trace.includes(`stage:${cmd.commandId}`));
+    f!.state.failWrites = true;
+    releaseStage.resolve();
+    // The pump reports uncertainty instead of polling the non-terminal view forever.
+    await expect(Promise.race([handle.done,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("output pump did not settle")), 2_000)),
+    ])).resolves.toBeUndefined();
+    expect(output.fail).toHaveBeenCalledTimes(1);
+    expect(output.fail).toHaveBeenCalledWith(expect.objectContaining({ code: "OFFLOAD_EXECUTION_UNKNOWN" }));
+    expect(output.complete).not.toHaveBeenCalled();
+    expect(output.failToStart).not.toHaveBeenCalled();
+    // Once the store recovers, one sweep commits the stashed terminal result.
+    f!.state.failWrites = false;
+    await f!.executor.sweep();
+    await expect.poll(async () => (await f!.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).state)
+      .toBe("completed");
+  });
 });
 
 class Store implements OffloadJournalStore {
@@ -276,5 +305,38 @@ describe("broker with real executor adapter", () => {
     const cancelled = await broker.cancel(cmd.commandId, cmd, "client");
     expect(cancelled.body).toMatchObject({ state: "cancelled", remoteStarted: true, fallbackSafe: false,
       result: { exitCode: 23, cancelled: true, syncBack: { state: "staged", artifactId: "staged-1" } } });
+  });
+
+  it("keeps broker heartbeat and cancel responsive when a poisoned sink detaches a hanging backend cancel", async () => {
+    let failSaves = false;
+    class FailStore extends Store {
+      override async set(key: string, value: unknown) {
+        if (failSaves) throw new Error("injected broker journal failure");
+        return super.set(key, value);
+      }
+    }
+    let capturedSink: OffloadOutputSink | null = null;
+    // A backend whose cancel joins remote cleanup that never settles.
+    const hanging: OffloadBackend = {
+      start: (_input, sink) => {
+        capturedSink = sink;
+        return { done: new Promise<void>(() => {}), cancel: () => new Promise<never>(() => {}) };
+      },
+    };
+    const broker = new OffloadBroker({ store: new FailStore(), backend: hanging, now: Date.now });
+    const wedged = (ms: number) =>
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("broker call wedged")), ms));
+    await broker.submit(request, cmd);
+    // A lost sink write poisons the command and stops it; the stop must not
+    // join the hanging backend cancel on the command's journal chain.
+    failSaves = true;
+    capturedSink!.started();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    failSaves = false;
+    // Both ride the same chain the poison path just released.
+    await expect(Promise.race([broker.heartbeat(cmd.commandId, cmd), wedged(2_000)]))
+      .resolves.toMatchObject({ body: expect.objectContaining({ state: "unknown" }) });
+    await expect(Promise.race([broker.cancel(cmd.commandId, cmd, "client"), wedged(2_000)]))
+      .resolves.toMatchObject({ body: expect.objectContaining({ state: "unknown" }) });
   });
 });

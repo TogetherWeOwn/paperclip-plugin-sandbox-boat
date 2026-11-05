@@ -10,6 +10,10 @@ export interface OffloadStore {
   create(key: string, value: unknown): Promise<boolean>;
   delete(key: string): Promise<void>;
   list(prefix: string): Promise<string[]>;
+  // Drop an index entry whose record read back null. Implemented by stores
+  // whose index and record writes are not atomic; journals fall back to
+  // delete() when it is absent.
+  pruneDangling?(id: string): Promise<void>;
 }
 
 export interface OffloadIdentity extends Partial<GuestIdentity> {
@@ -285,6 +289,11 @@ export class OffloadJournal {
   private readonly preStartFailures = new Map<string, PreStartFailure>();
   private readonly held = new Map<string, OffloadIdentity>();
   private readonly transitions = new Map<string, Promise<unknown>>();
+  // Terminal results whose commit failed (a store blip after the guest ran).
+  // Retried by settlePending from retention and the pool sweep until the store
+  // accepts them; the pump settles uncertain in the meantime (see the
+  // executor backend's task-settled signal) instead of polling forever.
+  private readonly pendingSettle = new Map<string, { command: OffloadCommand; result: OffloadResult; attempts: number }>();
 
   // Cancellation and starting arbitrate on one record, never on a global lock
   // held across queue-refusal I/O or guest sync/transport.
@@ -340,6 +349,24 @@ export class OffloadJournal {
 
   pending(): Promise<OffloadResult>[] { return [...this.inFlight.values()].map((entry) => entry.task); }
 
+  // Resolves when the in-process task for a command key settles, either way.
+  // Never rejects: callers (the executor backend pump) use it only to stop
+  // polling a durable view that a lost finish commit left non-terminal.
+  taskSettled(key: string): Promise<void> {
+    const entry = this.inFlight.get(key);
+    return entry ? entry.task.then(() => undefined, () => undefined) : Promise.resolve();
+  }
+
+  // Drop an indexed key whose record is gone. With the index-before-record
+  // write order a missing record means no remote effect is durable on create
+  // (pre-spawn "accepted"), and delete targets only terminal tombstones — so
+  // pruning is safe. Records that exist but are malformed still throw
+  // OFFLOAD_EXECUTION_UNKNOWN via parseRecord.
+  private async prune(key: string): Promise<void> {
+    if (this.deps.journalStore.pruneDangling) await this.deps.journalStore.pruneDangling(key);
+    else await this.deps.journalStore.delete(key);
+  }
+
   private async checkRun(companyId: string, runId: string): Promise<void> {
     const run = await this.deps.resolveRunState(companyId, runId);
     if (run.permanentlyTerminal) throw offloadError("OFFLOAD_FORBIDDEN");
@@ -361,7 +388,9 @@ export class OffloadJournal {
   async hasUnsettled(sandboxId: string): Promise<boolean> {
     return this.serialize(async () => {
       for (const key of await this.deps.journalStore.list("command/")) {
-        const record = parseRecord(await this.deps.journalStore.get(key), key);
+        const raw = await this.deps.journalStore.get(key);
+        if (raw === null) { await this.prune(key); continue; }
+        const record = parseRecord(raw, key);
         if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state)) continue;
         if (record.state === "unknown" && record.resultAt !== null) continue; // already settled
         return true;
@@ -374,7 +403,9 @@ export class OffloadJournal {
     return this.serialize(async () => {
       let settled = 0;
       for (const key of await this.deps.journalStore.list("command/")) {
-        const record = parseRecord(await this.deps.journalStore.get(key), key);
+        const raw = await this.deps.journalStore.get(key);
+        if (raw === null) { await this.prune(key); continue; }
+        const record = parseRecord(raw, key);
         if (record.identity?.sandboxId !== sandboxId || TERMINAL.has(record.state)) continue;
         if (record.state === "unknown" && record.resultAt !== null) continue; // already settled
         const result = record.result?.status === "unknown" ? record.result : this.unknown(record);
@@ -393,7 +424,12 @@ export class OffloadJournal {
     if (!this.startup) {
       this.startup = this.serialize(async () => {
         for (const key of await this.deps.journalStore.list("command/")) {
-          const record = parseRecord(await this.deps.journalStore.get(key), key);
+          const raw = await this.deps.journalStore.get(key);
+          // A crash between the store's index and record writes leaves an
+          // index entry with no record. Prune it and continue: without this
+          // every submit, cancel and sweep throws after restart.
+          if (raw === null) { await this.prune(key); continue; }
+          const record = parseRecord(raw, key);
           if (record.identity) this.lifecycle?.remember?.(record.identity);
           if (this.settled(record)) continue; // settled unknown: terminal-read, never re-held
           if (!TERMINAL.has(record.state) && record.identity) await this.hold(record);
@@ -596,45 +632,119 @@ export class OffloadJournal {
 
   async finish(command: OffloadCommand, result: OffloadResult): Promise<OffloadResult> {
     const record = this.active.get(commandKey(command))!;
-    const committed = await this.transition(record, async () => {
-      if (TERMINAL.has(record.state)) return record.result!;
-      // Cancellation after guest exit still cancels the command lifecycle, but
-      // cannot erase execution or drop staged changes. A timeout keeps exit 124.
-      if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
-        result = { ...result, cancelled: true, exitCode: 130 };
+    const key = commandKey(command);
+    // The exact terminal result handed to the commit, captured inside the
+    // fence. Non-null only when a commit was attempted, so a fence logic
+    // refusal (never a store failure) never stashes a settlement.
+    let computed: OffloadResult | null = null;
+    try {
+      const committed = await this.transition(record, async () => {
+        if (TERMINAL.has(record.state)) return record.result!;
+        // Cancellation after guest exit still cancels the command lifecycle, but
+        // cannot erase execution or drop staged changes. A timeout keeps exit 124.
+        if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
+          result = { ...result, cancelled: true, exitCode: 130 };
+        }
+        // No transport is invoked before the starting commit. A sync/boot-ID
+        // failure is therefore a known non-start, not identity-less uncertainty.
+        if (PRE_START.has(record.state) && result.status === "unknown") {
+          result = this.unavailable(command,
+            this.preStartFailures.get(key)?.reason ?? "command failed before durable starting intent");
+        }
+        // Guest-controlled facts never commit unvalidated: a malformed exit
+        // commits unknown (holding the reservation) instead of throwing past
+        // it. The no-lifecycle journal path runs runCommand with no upstream
+        // validator, so this is the fence for that reachable path.
+        if (result.status !== "unavailable") {
+          const exit = (result as { exitCode?: unknown }).exitCode;
+          const secs = (result as { seconds?: unknown }).seconds;
+          if (!Number.isInteger(exit) || !Number.isFinite(secs) || (secs as number) < 0) {
+            result = this.unknown(record);
+          }
+        }
+        if (result.status === "unavailable") {
+          if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
+          computed = result;
+          await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
+        } else if (result.status === "unknown") {
+          computed = result;
+          await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
+        } else {
+          computed = result;
+          await this.commit(record, { state: result.cancelled ? "cancelled" : "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
+        }
+        return result;
+      });
+      this.pendingSettle.delete(key);
+      if (committed.status === "unknown") await this.hold(record);
+      return committed;
+    } catch (error) {
+      // A failed terminal commit leaves the durable record non-terminal while
+      // the guest already ran. Keep the computed result so retention and the
+      // pool sweep can commit it once the store recovers; the pump reports
+      // uncertainty in the meantime rather than polling forever.
+      if (computed) this.pendingSettle.set(key, { command: structuredClone(command), result: computed, attempts: 0 });
+      throw error;
+    }
+  }
+
+  // Commit stashed terminal results. Runs from retention and the pool sweep,
+  // which are already rate-bounded; each pass makes one attempt per command.
+  // After bounded retries an uncommittable result falls back to unknown with
+  // hold semantics so cancel and heartbeat stop hanging on it.
+  async settlePending(): Promise<void> {
+    await this.serialize(() => this.settlePendingLocked());
+  }
+
+  private async settlePendingLocked(): Promise<void> {
+    for (const [key, pending] of [...this.pendingSettle]) {
+      if (this.inFlight.has(key)) continue;
+      let raw: unknown;
+      try {
+        raw = await this.deps.journalStore.get(key);
+      } catch {
+        continue; // The store is still down; a later sweep retries.
       }
-      // No transport is invoked before the starting commit. A sync/boot-ID
-      // failure is therefore a known non-start, not identity-less uncertainty.
-      // Name the step that failed (recorded by run()); the generic string
-      // remains only for a pre-start unknown no step claimed.
-      if (PRE_START.has(record.state) && result.status === "unknown") {
-        result = this.unavailable(command,
-          this.preStartFailures.get(commandKey(command))?.reason ?? "command failed before durable starting intent");
+      if (raw === null) { this.pendingSettle.delete(key); continue; }
+      let record: OffloadRecord;
+      try {
+        record = parseRecord(raw, key);
+      } catch {
+        this.pendingSettle.delete(key);
+        continue;
       }
-      // Guest-controlled facts never commit unvalidated: a malformed exit
-      // commits unknown (holding the reservation) instead of throwing past
-      // it. The no-lifecycle journal path runs runCommand with no upstream
-      // validator, so this is the fence for that reachable path.
-      if (result.status !== "unavailable") {
-        const exit = (result as { exitCode?: unknown }).exitCode;
-        const secs = (result as { seconds?: unknown }).seconds;
-        if (!Number.isInteger(exit) || !Number.isFinite(secs) || (secs as number) < 0) {
-          result = this.unknown(record);
+      if (TERMINAL.has(record.state) || this.settled(record)) { this.pendingSettle.delete(key); continue; }
+      const at = this.now();
+      const terminal: Partial<OffloadRecord> = pending.result.status === "unavailable"
+        ? { state: "not_started", result: pending.result, resultAt: at, remoteStarted: false, fallbackSafe: true }
+        : pending.result.status === "unknown"
+          ? { state: "unknown", result: pending.result, resultAt: null, remoteStarted: null, fallbackSafe: false }
+          : { state: pending.result.cancelled ? "cancelled" : "completed", result: pending.result,
+            resultAt: at, remoteStarted: true, fallbackSafe: false };
+      // An unavailable refusal is only valid before durable starting intent;
+      // the record moved on while the store was down, so hold as unknown.
+      const patch: Partial<OffloadRecord> = pending.result.status === "unavailable" && !PRE_START.has(record.state)
+        ? { state: "unknown", result: this.unknown(record), resultAt: null,
+          remoteStarted: null, fallbackSafe: false }
+        : terminal;
+      try {
+        await this.deps.journalStore.set(key, { ...record, ...patch, updatedAt: at });
+        this.pendingSettle.delete(key);
+        if (patch.state === "unknown") await this.hold({ ...record, ...patch } as OffloadRecord);
+      } catch {
+        pending.attempts += 1;
+        if (pending.attempts >= 10) {
+          try {
+            await this.deps.journalStore.set(key, { ...record, state: "unknown", result: this.unknown(record),
+              resultAt: null, remoteStarted: null, fallbackSafe: false, updatedAt: at });
+            await this.hold({ ...record, state: "unknown" } as OffloadRecord);
+          } catch {
+            continue;
+          }
+          this.pendingSettle.delete(key);
         }
       }
-      if (result.status === "unavailable") {
-        if (!PRE_START.has(record.state)) throw offloadError("OFFLOAD_EXECUTION_UNKNOWN");
-        await this.commit(record, { state: "not_started", result, resultAt: this.now(), remoteStarted: false, fallbackSafe: true });
-        this.preStartFailures.delete(commandKey(command));
-      } else if (result.status === "unknown") {
-        await this.commit(record, { state: "unknown", result, resultAt: null, remoteStarted: null, fallbackSafe: false });
-      } else {
-        await this.commit(record, { state: result.cancelled ? "cancelled" : "completed", result, resultAt: this.now(), remoteStarted: true, fallbackSafe: false });
-      }
-      return result;
-    });
-    if (committed.status === "unknown") await this.hold(record);
-    return committed;
+    }
   }
 
   private unavailable(command: Pick<OffloadCommand, "commandId">, reason: string): OffloadResult {
@@ -862,9 +972,16 @@ export class OffloadJournal {
 
   async collectGarbage(): Promise<void> {
     await this.serialize(async () => {
+      // Commit terminal results lost to a store blip before pruning and
+      // retention, so one sweep heals a failed finish commit.
+      await this.settlePendingLocked();
       for (const key of await this.deps.journalStore.list("command/")) {
         if (this.inFlight.has(key)) continue;
-        const record = parseRecord(await this.deps.journalStore.get(key), key);
+        const raw = await this.deps.journalStore.get(key);
+        // See recover(): an index entry with no record is a torn write, not a
+        // command. Prune it so retention converges instead of throwing.
+        if (raw === null) { await this.prune(key); continue; }
+        const record = parseRecord(raw, key);
         if (!TERMINAL.has(record.state)) continue;
         const run = await this.deps.resolveRunState(record.companyId, record.runId);
         if (record.tombstone) {

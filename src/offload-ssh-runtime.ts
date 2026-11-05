@@ -312,9 +312,11 @@ const key = (company: string, run: string, workspace: string) => JSON.stringify(
 const plain = (value: unknown): value is string => typeof value === "string" && value.length > 0 && !value.includes("\0");
 
 /** The SDK has no CAS/list port. Serialize this worker's writes and maintain a
- * credential-free key index; index-before-record makes a partial write fail
- * closed on recovery. The plugin runs one worker, like its existing pool store. */
-function journalStore(state: StateClientLike, companyId: string, poolId: string): OffloadStore {
+ * credential-free key index. The index is written before the record in both
+ * put and delete: a crash then leaves either a dangling index entry (pruned
+ * by journal recovery) or an orphan record (never listed, never wedging),
+ * never the reverse. The plugin runs one worker, like its existing pool store. */
+export function journalStore(state: StateClientLike, companyId: string, poolId: string): OffloadStore {
   const scope = (stateKey: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: `boat-executor-${poolId}`, stateKey });
   let tail: Promise<unknown> = Promise.resolve();
   const serialized = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -341,7 +343,13 @@ function journalStore(state: StateClientLike, companyId: string, poolId: string)
       await put(id, value); return true;
     }),
     delete: (id) => serialized(async () => {
+      await state.set(scope("index"), (await keys()).filter((item) => item !== id));
       await state.delete(scope(id));
+    }),
+    pruneDangling: (id) => serialized(async () => {
+      // Re-read inside the tail: a concurrent put may have healed the entry
+      // after the caller saw null. Only rewrite the index when still dangling.
+      if (await state.get(scope(id)) !== null) return;
       await state.set(scope("index"), (await keys()).filter((item) => item !== id));
     }),
     list: (prefix) => serialized(async () => (await keys()).filter((id) => id.startsWith(prefix))),
