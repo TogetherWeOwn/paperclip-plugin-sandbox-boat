@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OffloadBroker, type BackendCommand, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./executor-backend.js";
-import { fixture, command, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
+import { fixture, command, deferred, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
 import type { OffloadReadView } from "../offload-journal.js";
 
 const cmd: BackendCommand = {
@@ -211,7 +211,26 @@ describe("executor backend", () => {
     // Fixture disposal releases the held runner, never a real VM.
   });
 
-  it("does not fabricate cancellation after only the terminal journal write fails", async () => {
+  it("reads again when the task settles during delivery of an older non-terminal snapshot", async () => {
+    const task = deferred<void>();
+    const deliver = deferred<void>();
+    const executor = { ...port(), waitSettled: () => task.promise };
+    executor.readOutput.mockImplementationOnce(async () => { await deliver.promise; return queued; });
+    const output = sink();
+    const handle = backend(executor).start(cmd, output);
+    await until(() => executor.readOutput.mock.calls.length === 1);
+    task.resolve();
+    // Deliver the older snapshot only after the settlement continuation ran.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    deliver.resolve();
+    await handle.done;
+    expect(executor.readOutput).toHaveBeenCalledTimes(2);
+    expect(output.complete).toHaveBeenCalledWith(completed.result);
+    expect(output.fail).not.toHaveBeenCalled();
+    expect(executor.cancelCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("does not fabricate cancellation after a lost terminal write (post-settlement read failure: %s)", async (failRead) => {
     f = await fixture();
     const set = f.state.set.bind(f.state);
     let failures = 0;
@@ -223,10 +242,26 @@ describe("executor backend", () => {
       }
       await set(key, value);
     };
+    let settled = false;
+    let readFailures = 0;
+    const executor: ExecutorPort = {
+      start: (input) => f!.executor.start(input),
+      waitSettled: async (...args) => { await f!.executor.waitSettled(...args); settled = true; },
+      readOutput: async (...args) => {
+        if (failRead && settled && readFailures === 0) {
+          readFailures += 1;
+          throw new Error("one post-settlement output read lost");
+        }
+        return f!.executor.readOutput(...args);
+      },
+      heartbeatCommand: (...args) => f!.executor.heartbeatCommand(...args),
+      cancelCommand: (...args) => f!.executor.cancelCommand(...args),
+    };
     const output = sink();
-    const handle = backend(f.executor).start(cmd, output);
+    const handle = backend(executor).start(cmd, output);
     await handle.done;
     expect(failures).toBe(1);
+    expect(readFailures).toBe(failRead ? 1 : 0);
     expect(output.fail).toHaveBeenCalledWith(expect.objectContaining({ code: "OFFLOAD_EXECUTION_UNKNOWN" }));
     await f.executor.sweep();
     expect(await f.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({
