@@ -211,7 +211,7 @@ describe("executor backend", () => {
     // Fixture disposal releases the held runner, never a real VM.
   });
 
-  it("does not fabricate cancellation after only the terminal journal write fails", async () => {
+  it.each([false, true])("does not fabricate cancellation after a lost terminal write (post-settlement read failure: %s)", async (failRead) => {
     f = await fixture();
     const set = f.state.set.bind(f.state);
     let failures = 0;
@@ -223,10 +223,26 @@ describe("executor backend", () => {
       }
       await set(key, value);
     };
+    let settled = false;
+    let readFailures = 0;
+    const executor: ExecutorPort = {
+      start: (input) => f!.executor.start(input),
+      waitSettled: async (...args) => { await f!.executor.waitSettled(...args); settled = true; },
+      readOutput: async (...args) => {
+        if (failRead && settled && readFailures === 0) {
+          readFailures += 1;
+          throw new Error("one post-settlement output read lost");
+        }
+        return f!.executor.readOutput(...args);
+      },
+      heartbeatCommand: (...args) => f!.executor.heartbeatCommand(...args),
+      cancelCommand: (...args) => f!.executor.cancelCommand(...args),
+    };
     const output = sink();
-    const handle = backend(f.executor).start(cmd, output);
+    const handle = backend(executor).start(cmd, output);
     await handle.done;
     expect(failures).toBe(1);
+    expect(readFailures).toBe(failRead ? 1 : 0);
     expect(output.fail).toHaveBeenCalledWith(expect.objectContaining({ code: "OFFLOAD_EXECUTION_UNKNOWN" }));
     await f.executor.sweep();
     expect(await f.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({

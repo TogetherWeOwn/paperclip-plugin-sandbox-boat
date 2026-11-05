@@ -59,7 +59,7 @@ export class ExecutorBackend implements OffloadBackend {
     let sawStart = false;
     let outcome: BackendCancellation | null = null;
     let cancellation: Promise<void> | null = null;
-    let finishUncertain = false;
+    let taskSettled = false;
     const cancelGuest = (): Promise<void> => {
       if (!cancellation) cancellation = (async () => {
         if (executor && dispatched) await executor.cancelCommand(command.companyId, command.runId, command.commandId, "broker_cancel");
@@ -103,11 +103,11 @@ export class ExecutorBackend implements OffloadBackend {
         // Task-settled signal: when the in-process task has settled but the
         // durable view is still non-terminal (a lost finish commit), one more
         // read decides — terminal settles normally, otherwise uncertainty.
-        let taskSettled = false;
         let settled: Promise<boolean> | null = null;
+        const markSettled = () => { taskSettled = true; return true; };
         try {
           settled = active.executor.waitSettled
-            ? active.executor.waitSettled(command.companyId, command.runId, command.commandId).then(() => true, () => true)
+            ? active.executor.waitSettled(command.companyId, command.runId, command.commandId).then(markSettled, markSettled)
             : null;
         } catch {
           settled = null;
@@ -145,10 +145,7 @@ export class ExecutorBackend implements OffloadBackend {
           // The task settled but the durable view is still non-terminal: the
           // finish commit was lost and the sweep owns retrying it. Report
           // uncertainty now instead of polling until the run ends.
-          if (taskSettled) {
-            finishUncertain = true;
-            throw uncertain();
-          }
+          if (taskSettled) throw uncertain();
           if (settled) {
             const wait = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.pollIntervalMs));
             if (await Promise.race([wait, settled])) taskSettled = true;
@@ -166,7 +163,7 @@ export class ExecutorBackend implements OffloadBackend {
           // A settled task has already finished guest cleanup. Its missing
           // terminal commit is not a client cancellation: let settlement retry
           // the original result without persisting a fabricated broker_cancel.
-          if (!finishUncertain) await cancelGuest().catch(() => undefined);
+          if (!taskSettled) await cancelGuest().catch(() => undefined);
           sink.fail(uncertain());
         }
       }
