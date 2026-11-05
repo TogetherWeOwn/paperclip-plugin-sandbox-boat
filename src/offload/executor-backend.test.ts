@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OffloadBroker, type BackendCommand, type OffloadBackend, type OffloadJournalStore, type OffloadOutputSink } from "./broker.js";
 import { ExecutorBackend, type ExecutorPort } from "./executor-backend.js";
-import { fixture, command, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
+import { fixture, command, deferred, until, type Fixture } from "../test-support/offload-lifecycle-contract.js";
 import type { OffloadReadView } from "../offload-journal.js";
 
 const cmd: BackendCommand = {
@@ -209,6 +209,25 @@ describe("executor backend", () => {
     expect(output.failToStart).not.toHaveBeenCalled();
     f.guest.observable = true;
     // Fixture disposal releases the held runner, never a real VM.
+  });
+
+  it("reads again when the task settles during delivery of an older non-terminal snapshot", async () => {
+    const task = deferred<void>();
+    const deliver = deferred<void>();
+    const executor = { ...port(), waitSettled: () => task.promise };
+    executor.readOutput.mockImplementationOnce(async () => { await deliver.promise; return queued; });
+    const output = sink();
+    const handle = backend(executor).start(cmd, output);
+    await until(() => executor.readOutput.mock.calls.length === 1);
+    task.resolve();
+    // Deliver the older snapshot only after the settlement continuation ran.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    deliver.resolve();
+    await handle.done;
+    expect(executor.readOutput).toHaveBeenCalledTimes(2);
+    expect(output.complete).toHaveBeenCalledWith(completed.result);
+    expect(output.fail).not.toHaveBeenCalled();
+    expect(executor.cancelCommand).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("does not fabricate cancellation after a lost terminal write (post-settlement read failure: %s)", async (failRead) => {

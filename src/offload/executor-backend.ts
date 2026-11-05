@@ -114,6 +114,7 @@ export class ExecutorBackend implements OffloadBackend {
         }
         let cursor = 0;
         for (;;) {
+          const readAfterSettlement = taskSettled;
           const view = await active.executor.readOutput(command.companyId, command.runId, command.commandId, cursor);
           // `starting` is already a durable may-have-spawned intent, not a
           // never-started receipt. Output is also positive execution evidence.
@@ -142,10 +143,10 @@ export class ExecutorBackend implements OffloadBackend {
             } else sink.complete(result.result);
             return;
           }
-          // The task settled but the durable view is still non-terminal: the
-          // finish commit was lost and the sweep owns retrying it. Report
-          // uncertainty now instead of polling until the run ends.
-          if (taskSettled) throw uncertain();
+          // Only a read begun after settlement can prove a lost finish commit;
+          // a delayed older snapshot must get one fresh verification read.
+          // The sweep owns retrying a missing commit, so report uncertainty.
+          if (readAfterSettlement) throw uncertain();
           if (settled) {
             const wait = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.pollIntervalMs));
             if (await Promise.race([wait, settled])) taskSettled = true;
