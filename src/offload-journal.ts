@@ -749,7 +749,7 @@ export class OffloadJournal {
             if (result.status === "completed" && record.cancelRequested && !result.timedOut) {
               result = { ...result, cancelled: true, exitCode: 130 };
             }
-            if (pending.attempts >= 10 || result.status === "unavailable" && !PRE_START.has(record.state)) {
+            if (result.status === "unavailable" ? !PRE_START.has(record.state) : pending.attempts >= 10) {
               result = this.unknown(record);
             }
             const patch: Partial<OffloadRecord> = result.status === "unavailable"

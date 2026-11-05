@@ -211,6 +211,32 @@ describe("executor backend", () => {
     // Fixture disposal releases the held runner, never a real VM.
   });
 
+  it("does not fabricate cancellation after only the terminal journal write fails", async () => {
+    f = await fixture();
+    const set = f.state.set.bind(f.state);
+    let failures = 0;
+    f.state.set = async (key, value) => {
+      const row = value as { state?: string; commandId?: string };
+      if (key.namespace === "guest-test-journal" && row.commandId === cmd.commandId && row.state === "completed" && failures === 0) {
+        failures += 1;
+        throw new Error("one terminal write lost");
+      }
+      await set(key, value);
+    };
+    const output = sink();
+    const handle = backend(f.executor).start(cmd, output);
+    await handle.done;
+    expect(failures).toBe(1);
+    expect(output.fail).toHaveBeenCalledWith(expect.objectContaining({ code: "OFFLOAD_EXECUTION_UNKNOWN" }));
+    await f.executor.sweep();
+    expect(await f.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({
+      state: "completed", result: { exitCode: 0, cancelled: false },
+    });
+    const records = Object.values(await f.state.all()) as Array<{ commandId?: string; cancelRequested?: unknown }>;
+    expect(records.find((row) => row.commandId === cmd.commandId)?.cancelRequested ?? null).toBeNull();
+    expect(f.starts).toHaveLength(1);
+  });
+
   it("settles the output pump with uncertainty when the finish commit is lost, then heals on sweep", async () => {
     f = await fixture();
     const releaseExec = f.hold(`exec:${cmd.commandId}`);

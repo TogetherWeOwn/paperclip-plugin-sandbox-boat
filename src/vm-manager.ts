@@ -916,7 +916,10 @@ export class BoatVmManager {
    * account's live VMs from a host-account listing.
    */
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
-    this.configs.set(environmentId, { companyId, environmentId, config, seenAt: this.now() });
+    try {
+      const bound = { ...config, apiKey: resolveApiKey(config), costApiKey: resolveCostApiKey(config) };
+      this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: this.now() });
+    } catch { return; } // No credential provenance to enroll for provider upkeep.
     void this.persistSweepDescriptor(companyId, environmentId, config).catch((error) =>
       this.logger.warn("boat: could not persist the sweep config", { environmentId, error: errorText(error) }),
     );
@@ -940,14 +943,12 @@ export class BoatVmManager {
    */
   private readonly sweepDescriptorWrites = new Map<string, Promise<void>>();
 
-  private persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
+  private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
     const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
     // A non-secret same-account marker: the ops listing runs under the inline
     // key's account, so rehydration through the host key is only safe when the
     // host key resolves to that same account. A digest, never the key itself.
-    const accountDigest = config.apiKey != null
-      ? sweepAccountDigest(config.apiBase, config.apiKey)
-      : null;
+    const accountDigest = sweepAccountDigest(config.apiBase, resolveApiKey(config));
     // Dedupe on the persisted content, not the write time: seenAt changes on
     // every hook, so including it would defeat the cache with a write per call.
     // The marker and digest are part of the identity: a key-only rotation must
@@ -997,12 +998,15 @@ export class BoatVmManager {
       }
       for (const [environmentId, descriptor] of Object.entries(saved)) {
         if (this.configs.has(environmentId)) continue;
-        // Legacy descriptors predate the marker: rehydrate as before; the next
-        // hook rewrites them with the marker.
-        if (descriptor.hadInlineKey === true && !this.sameAccountAsHost(descriptor)) continue;
+        // Missing provenance is not keyless provenance. Both inline and host
+        // keys may rotate; only a verified current account may rehydrate.
+        if (typeof descriptor.hadInlineKey !== "boolean" || !this.sameAccountAsHost(descriptor)) continue;
         try {
           const config = parseDriverConfig({ ...descriptor.config, apiKey: null, costApiKey: null });
-          this.configs.set(environmentId, { companyId, environmentId, config, seenAt: descriptor.seenAt });
+          // Keep the verified key in memory only; later host rotation cannot
+          // retarget an already rehydrated environment's provider operations.
+          const bound = { ...config, apiKey: resolveApiKey(config), costApiKey: resolveCostApiKey(config) };
+          this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: descriptor.seenAt });
         } catch {
           // An invalid descriptor is only a cache: the next hook re-caches it.
         }
@@ -1025,18 +1029,10 @@ export class BoatVmManager {
     return sweepAccountDigest(apiBase, hostKey) === descriptor.accountDigest;
   }
 
-  /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */
-  private sweepBoatFor(companyId: string): BoatApiLike | null {
-    const cached = [...this.configs.values()].filter((entry) => entry.companyId === companyId)
-      .sort((a, b) => Number(b.config.apiKey != null) - Number(a.config.apiKey != null));
-    for (const entry of cached) {
-      try {
-        return this.opsApi(entry.config);
-      } catch {
-        // No usable key on this environment; try the next.
-      }
-    }
-    return null;
+  /** Candidate configs only: the runtime must match each pool's credential provenance. */
+  private sweepConfigsFor(companyId: string): BoatDriverConfig[] {
+    return [...this.configs.values()].filter((entry) => entry.companyId === companyId)
+      .sort((a, b) => a.environmentId.localeCompare(b.environmentId)).map((entry) => entry.config);
   }
 
   private ttlSeconds(config: BoatDriverConfig, hardDeadlineMs: number | null): number {
@@ -3445,7 +3441,7 @@ export class BoatVmManager {
       // Unloaded pools get a company client (a rehydrated config through the
       // host key) so past-due VMs stop without a new command resolving them.
       await Promise.all([
-        withDeadline(this.nativeOffload.sweep(offloadCompanies, { boatFor: (companyId) => this.sweepBoatFor(companyId) }),
+        withDeadline(this.nativeOffload.sweep(offloadCompanies, { configsFor: (companyId) => this.sweepConfigsFor(companyId) }),
           this.offloadUpkeepTimeoutMs, "offload pool sweep")
           .catch(() => report.errors.push(tag(null, "offload pool sweep unverified"))),
         ...[...offloadCompanies].map((companyId) =>

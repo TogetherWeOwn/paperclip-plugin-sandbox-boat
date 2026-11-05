@@ -21,6 +21,100 @@ function failFinish(commandId: string, state = "completed", scope: { runId?: str
 }
 
 describe("lost finish integration recovery", () => {
+  it("preserves never-started evidence after more than ten failed refusal settlements", async () => {
+    const executor = s.make({ queueLimit: 1 });
+    const gate = s.hold("exec:occupant");
+    const occupant = s.execute(command("occupant"), executor);
+    await until(() => s.starts.length === 1);
+    const set = s.state.set.bind(s.state);
+    let failures = 12;
+    s.state.set = async (key, value) => {
+      const row = value as { commandId?: string; state?: string };
+      if (key.namespace === "guest-test-journal" && row.commandId === "refused" && row.state === "not_started" && failures-- > 0) {
+        throw new Error("refusal persistence outage");
+      }
+      await set(key, value);
+    };
+    const cmd = command("refused", { executionWorkspaceId: "workspace-b", queueTimeoutMs: 1_000 });
+    const refused = s.execute(cmd, executor);
+    const rejection = expect(refused).rejects.toThrow("refusal persistence outage");
+    await until(() => [...s.clock.timers.values()].some((timer) => timer.at === s.clock.t + 1_000));
+    await s.clock.advance(1_000);
+    await rejection;
+    for (let n = 0; n < 12; n += 1) await executor.collectGarbage();
+    expect(await executor.readCommand(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({
+      state: "not_started", remoteStarted: false, fallbackSafe: true,
+    });
+    const next = s.execute(command("after-refusal-outage", { executionWorkspaceId: "workspace-c", queueTimeoutMs: 10_000 }), executor);
+    await until(() => [...s.clock.timers.values()].some((timer) => timer.at === s.clock.t + 10_000));
+    gate.resolve();
+    await occupant;
+    expect(await next).toMatchObject({ status: "completed" });
+    const restarted = s.make({ queueLimit: 1 }, new DiskState(s.state.path));
+    await expect(restarted.recover()).resolves.toBeUndefined();
+    expect(s.starts.map((start) => start.commandId)).toEqual(["occupant", "after-refusal-outage"]);
+  });
+
+  it("retries a ledger-only finish outage at the original finish boundary before VM reuse", async () => {
+    const cmd = command("ledger-only");
+    const gate = s.hold("exec:ledger-only");
+    const set = s.state.set.bind(s.state);
+    let outage = true;
+    s.state.set = async (key, value) => {
+      const doc = value as { usage?: Array<{ outcome?: string }> };
+      if (outage && key.namespace === "boat-account" && doc.usage?.some((row) => row.outcome === "completed")) {
+        throw new Error("ledger-only outage");
+      }
+      await set(key, value);
+    };
+    const running = s.execute(cmd);
+    await until(() => s.starts.length === 1);
+    await s.clock.advance(1_000);
+    gate.resolve();
+    expect(await running).toMatchObject({ status: "completed", exitCode: 0 });
+    expect(await s.executor.readCommand(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({ state: "completed" });
+    expect(s.executor.getUsage().find((row) => row.commandId === cmd.commandId)?.outcome).not.toBe("completed");
+    await s.clock.advance(4_000);
+    await s.executor.sweep();
+    expect(s.boat.boxes.get(s.starts[0]!.sandboxId)?.state).toBe("archived");
+    await s.clock.advance(10_000);
+    outage = false;
+    await s.executor.sweep();
+    const row = s.executor.getUsage().find((usage) => usage.commandId === cmd.commandId)!;
+    expect(row).toMatchObject({ outcome: "completed", expectedSeconds: 1, tailSince: null });
+    expect(row.intervals).toEqual([
+      { since: new Date(EPOCH).toISOString(), until: new Date(EPOCH + 1_000).toISOString(), phase: "command" },
+      { since: new Date(EPOCH + 1_000).toISOString(), until: new Date(EPOCH + 5_000).toISOString(), phase: "idle_tail" },
+    ]);
+    expect(await s.execute(command("after-ledger-only"))).toMatchObject({ status: "completed" });
+    expect(s.starts.filter((start) => start.commandId === cmd.commandId)).toHaveLength(1);
+  });
+
+  it("stops a proven never-started VM while ledger-only finish accounting remains unavailable", async () => {
+    const cmd = command("prestart-ledger-only");
+    s.fail.add(`push:${cmd.commandId}`);
+    const set = s.state.set.bind(s.state);
+    let outage = true;
+    s.state.set = async (key, value) => {
+      const doc = value as { usage?: Array<{ outcome?: string }> };
+      if (outage && key.namespace === "boat-account" && doc.usage?.some((row) => row.outcome === "completed")) {
+        throw new Error("never-started accounting outage");
+      }
+      await set(key, value);
+    };
+    expect(await s.execute(cmd)).toMatchObject({ status: "unavailable", fallbackSafe: true });
+    expect(s.starts).toHaveLength(0);
+    const vm = [...s.boat.boxes.values()][0]!;
+    expect(vm.state).toBe("ready");
+    await s.executor.sweep();
+    expect(vm.state).toBe("archived");
+    expect(s.boat.callsOf("stop")).toHaveLength(1);
+    outage = false;
+    await s.executor.sweep();
+    expect(await s.execute(command("after-prestart-ledger"))).toMatchObject({ status: "completed" });
+    expect(s.starts.map((start) => start.commandId)).toEqual(["after-prestart-ledger"]);
+  });
+
   it("finishes accounting and recovers capacity without replaying the guest", async () => {
     const cmd = command("lost-finish");
     const gate = s.hold("exec:lost-finish");

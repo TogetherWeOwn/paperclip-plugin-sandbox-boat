@@ -12,7 +12,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import { commandDigest } from "./offload-journal.js";
 import { scryptSync } from "node:crypto";
-import { DEFAULT_API_BASE } from "./config.js";
+import { DEFAULT_API_BASE, parseDriverConfig } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
 import { sweepDigestCacheSizeForTests } from "./vm-manager.js";
@@ -39,6 +39,10 @@ function overrides() {
     sweepVmTimeoutMs: 500,
   };
 }
+
+/** The existing pool credential digest (same scrypt KDF as the runtime; no pool rekey). */
+const poolDigestOf = (key: string) =>
+  scryptSync(key, `boat-offload-pool\u0000${DEFAULT_API_BASE}`, 32).toString("hex");
 
 const workspaceId = "33333333-3333-4333-8333-333333333333";
 const issue = "issue-sweep-restart";
@@ -126,13 +130,13 @@ describe("sweep after a worker restart", () => {
     );
     await harness.ctx.state.set(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
-      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts", seenAt: clock - 60_000 } },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts", seenAt: clock - 60_000, credentialDigest: poolDigestOf(fakeKey) } },
     );
 
     // A restarted runtime: no bindings, no loaded pools, no new command.
     const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
-      ssh: {} as never, accountId });
-    await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+      ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+    await runtime.sweep([companyId], { configsFor: () => [parseDriverConfig(baseConfig)] });
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([box.id]);
     await runtime.shutdown();
   });
@@ -272,7 +276,7 @@ describe("sweep after a worker restart", () => {
     );
     await harness.ctx.state.set(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
-      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-race", seenAt: clock - 60_000 } },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-race", seenAt: clock - 60_000, credentialDigest: poolDigestOf(fakeKey) } },
     );
     // A command resolves the pool after the sweep's snapshot: the first
     // provider call persists a busy reservation, which the sweep must leave
@@ -293,8 +297,8 @@ describe("sweep after a worker restart", () => {
     };
     try {
       const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
-        ssh: {} as never, accountId });
-      await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+        ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+      await runtime.sweep([companyId], { configsFor: () => [parseDriverConfig(baseConfig)] });
       await runtime.shutdown();
     } finally {
       fake.get = realGet;
@@ -318,7 +322,7 @@ describe("sweep after a worker restart", () => {
     );
     await harness.ctx.state.set(
       { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
-      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-settle", seenAt: clock - 60_000 } },
+      { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-settle", seenAt: clock - 60_000, credentialDigest: poolDigestOf(fakeKey) } },
     );
     // Seed a live journal receipt bound to the VM, then fail its write: the
     // settlement reads fine but cannot persist, so settleSandboxUnknown throws
@@ -343,8 +347,8 @@ describe("sweep after a worker restart", () => {
     }) as typeof harness.ctx.state.set;
     try {
       const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
-        ssh: {} as never, accountId });
-      await runtime.sweep([companyId], { boatFor: () => fake as unknown as BoatApiLike });
+        ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+      await runtime.sweep([companyId], { configsFor: () => [parseDriverConfig(baseConfig)] });
       await runtime.shutdown();
     } finally {
       harness.ctx.state.set = realSet;
@@ -487,5 +491,195 @@ describe("sweep after a worker restart", () => {
     expect(fake.callsOf("stop")).toEqual([]);
     expect(fake.callsOf("deleteSandbox")).toEqual([]);
     expect(report.errors.join("\n")).toMatch(/unreadable/);
+  });
+
+  describe("host-key rehydration of sweep descriptors", () => {
+    const keylessConfig = { cliproxyTunnel: false };
+    const vmDoc = async () => await harness.ctx.state.get(
+      { scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "vms" }) as {
+      vms?: Record<string, { sandboxId?: string; status?: string }>;
+    } | null;
+    const liveRecord = async (sandboxId: string) =>
+      Object.values((await vmDoc())?.vms ?? {}).some((record) => record.sandboxId === sandboxId && record.status !== "deleted");
+    /** Acquire and release with a stop that never takes effect: the record stays stopping. */
+    async function leaveStopping(config: Record<string, unknown>, runId: string) {
+      const lease = await plugin.definition.onEnvironmentAcquireLease!({
+        companyId, environmentId, driverKey: "boat", config, runId,
+        issueId: issue, executionWorkspaceId: workspaceId, agentId: "agent-1",
+      });
+      fake.stopMode = "stays_up";
+      await expect(plugin.definition.onEnvironmentReleaseLease!({
+        companyId, environmentId, driverKey: "boat", config, issueId: issue,
+        providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata,
+      })).resolves.toBeUndefined();
+      const saved = await untilSweepDescriptor();
+      await currentManager().sweepInFlight()?.catch(() => undefined);
+      return { sandboxId: lease.providerLeaseId!, saved };
+    }
+
+    it.each([
+      ["an inline-key origin", { ...baseConfig, apiKey: "boat_legacy_inline_origin_not_real" }],
+      ["a keyless origin", keylessConfig],
+    ])("never rehydrates a markerless legacy descriptor of %s under a new account host key", async (_name, config) => {
+      const { sandboxId, saved } = await leaveStopping(config, "run-legacy-markerless");
+      const persisted = saved.envs?.[environmentId] as { config?: Record<string, unknown> };
+      process.env.BOAT_API_KEY = "boat_new_account_host_key_not_real";
+      await restart();
+      // Legacy shape: no hadInlineKey, no account digest. Its origin cannot be
+      // told apart, so the new host key must not be trusted to be its account.
+      // Written after the restart so no hook can rewrite it under the test.
+      const legacy = { version: 1 as const, companyId, environmentId, seenAt: clock, config: { ...(persisted.config ?? {}) } };
+      await new VmStateStore(harness.ctx.state).saveSweepDescriptor(companyId, environmentId, legacy);
+
+      // The foreign account's listing succeeds and still shows the VM: it must
+      // not be stopped through an unproven config.
+      fake.stopMode = "immediate";
+      clock += 10 * 60_000;
+      const stopsBefore = fake.callsOf("stop").length;
+      const deletesBefore = fake.callsOf("deleteSandbox").length;
+      const first = await currentManager().sweep("schedule", { force: true });
+      expect(first.stopped ?? []).not.toContain(sandboxId);
+      expect(fake.callsOf("stop").length).toBe(stopsBefore);
+      expect(fake.callsOf("deleteSandbox").length).toBe(deletesBefore);
+
+      // The foreign account's successful listing lacks the VM: absence proves
+      // nothing about this account, so neither VM nor plugin record is dropped.
+      fake.boxes.delete(sandboxId);
+      clock += 60_000;
+      const second = await currentManager().sweep("schedule", { force: true });
+      expect(JSON.stringify(second.forgotten ?? [])).not.toContain(sandboxId);
+      expect(JSON.stringify(second.deleted ?? [])).not.toContain(sandboxId);
+      expect(await liveRecord(sandboxId)).toBe(true);
+      // Nothing was enrolled: a later sweep still does not act on the config.
+      expect(fake.callsOf("stop").length).toBe(stopsBefore);
+      expect(fake.callsOf("deleteSandbox").length).toBe(deletesBefore);
+    });
+
+    it("rehydrates a host-sourced descriptor under the same host key and stops the stopping VM", async () => {
+      const { sandboxId } = await leaveStopping(keylessConfig, "run-host-same");
+      await restart();
+      fake.stopMode = "immediate";
+      clock += 10 * 60_000;
+      const stopsBefore = fake.callsOf("stop").length;
+      const report = await currentManager().sweep("schedule", { force: true });
+      expect(report.stopped).toContain(sandboxId);
+      expect(fake.callsOf("stop").slice(stopsBefore).map((call) => call.args.sandboxId)).toContain(sandboxId);
+    });
+
+    it("fails closed when the host key rotates to another account after a host-sourced descriptor was written", async () => {
+      const { sandboxId } = await leaveStopping(keylessConfig, "run-host-rotated");
+      process.env.BOAT_API_KEY = "boat_rotated_host_key_other_account_not_real";
+      await restart();
+      fake.stopMode = "immediate";
+      clock += 10 * 60_000;
+      const stopsBefore = fake.callsOf("stop").length;
+      const deletesBefore = fake.callsOf("deleteSandbox").length;
+      const first = await currentManager().sweep("schedule", { force: true });
+      expect(first.stopped ?? []).not.toContain(sandboxId);
+      expect(fake.callsOf("stop").length).toBe(stopsBefore);
+      // The rotated account's listing is successful and lacks the VM.
+      fake.boxes.delete(sandboxId);
+      clock += 60_000;
+      const second = await currentManager().sweep("schedule", { force: true });
+      expect(JSON.stringify(second.forgotten ?? [])).not.toContain(sandboxId);
+      expect(await liveRecord(sandboxId)).toBe(true);
+      expect(fake.callsOf("deleteSandbox").length).toBe(deletesBefore);
+    });
+  });
+
+  describe("unloaded pool account matching", () => {
+    const keyA = "boat_pool_account_a_not_real";
+    const keyB = "boat_pool_account_b_not_real";
+    const poolId = "pool-account-match";
+    const accountId = "account-restart";
+    const sandboxId = "bx_accountmatch001";
+    const configFor = (apiKey: string) => parseDriverConfig({ ...baseConfig, apiKey });
+    const journalScope = (stateKey: string) =>
+      ({ scopeKind: "company" as const, scopeId: companyId, namespace: `boat-executor-${poolId}`, stateKey });
+    const runId = "run-account-match";
+    const recordKey = `command/${companyId}/${runId}/cmd-account-1`;
+
+    async function seed(credentialDigest: string | undefined) {
+      const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+      await store.save(
+        { maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+        [{ sandboxId, busy: false, stopped: false, stopping: false, quarantined: false,
+          lastActiveAt: clock - 60_000, generation: 1, idleHandle: null,
+          stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null }],
+      );
+      await harness.ctx.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+        { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-account", seenAt: clock - 60_000,
+          ...(credentialDigest !== undefined ? { credentialDigest } : {}) } },
+      );
+      const command = { companyId, runId, commandId: "cmd-account-1" };
+      const digest = commandDigest(command as never);
+      await harness.ctx.state.set(journalScope("index"), [recordKey]);
+      await harness.ctx.state.set(journalScope(recordKey), {
+        version: 1, companyId, runId, commandId: "cmd-account-1", command, digest, state: "running",
+        identity: { companyId, runId, commandId: "cmd-account-1", digest, sandboxId, guestBootId: "boot-1", journalGeneration: 1 },
+        acceptedAt: clock, updatedAt: clock, resultAt: null, result: null, remoteStarted: null, fallbackSafe: false,
+      });
+      return store;
+    }
+    const journalState = async () =>
+      (await harness.ctx.state.get(journalScope(recordKey)) as { state?: string; resultAt?: number | null } | null);
+
+    it("does not settle, delete or query anything for pool A when only account B is available, then converges with A", async () => {
+      // A's VM is provider-gone (absent from A's fake): real terminal evidence,
+      // but only A's client may read it. B's client answers 404 for every VM.
+      const fakeA = fake;
+      const fakeB = new FakeBoat({ now: () => clock });
+      const built: string[] = [];
+      const store = await seed(poolDigestOf(keyA));
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId,
+        boat: (config) => {
+          built.push(config.apiKey ?? "");
+          return (config.apiKey === keyA ? fakeA : fakeB) as unknown as BoatApiLike;
+        } });
+      try {
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyB)] }).catch(() => undefined);
+        // No provider call of any kind under B, none under A, and no client for A built.
+        expect(fakeB.calls).toEqual([]);
+        expect(fakeA.calls).toEqual([]);
+        expect(built).not.toContain(keyA);
+        // The slot, the journal receipt and the registry entry are untouched.
+        expect((await store.load()).find((vm) => vm.sandboxId === sandboxId))
+          .toMatchObject({ quarantined: false, stopped: false, stopping: false });
+        expect(await journalState()).toMatchObject({ state: "running", resultAt: null });
+        const registry = await harness.ctx.state.get(
+          { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" }) as Record<string, unknown>;
+        expect(Object.keys(registry)).toContain(poolId);
+
+        // The matching account's config is offered: it proves the VM gone and converges.
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyB), configFor(keyA)] }).catch(() => undefined);
+        expect(fakeB.calls).toEqual([]);
+        expect(fakeA.callsOf("get").map((call) => call.args.sandboxId)).toContain(sandboxId);
+        expect((await store.load()).find((vm) => vm.sandboxId === sandboxId)).toBeUndefined();
+        expect(await journalState()).toMatchObject({ state: "unknown" });
+        expect((await journalState())?.resultAt).not.toBeNull();
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it("never queries any account for a legacy registry entry that has no credential digest", async () => {
+      const built: string[] = [];
+      const store = await seed(undefined);
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId,
+        boat: (config) => { built.push(config.apiKey ?? ""); return fake as unknown as BoatApiLike; } });
+      try {
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyA), configFor(keyB)] }).catch(() => undefined);
+        expect(fake.calls).toEqual([]);
+        expect(built).toEqual([]);
+        expect((await store.load()).find((vm) => vm.sandboxId === sandboxId))
+          .toMatchObject({ quarantined: false, stopped: false });
+        expect(await journalState()).toMatchObject({ state: "running", resultAt: null });
+      } finally {
+        await runtime.shutdown();
+      }
+    });
   });
 });

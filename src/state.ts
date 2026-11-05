@@ -221,9 +221,8 @@ export class VmStateStore {
         || typeof descriptor.seenAt !== "number" || !descriptor.config || typeof descriptor.config !== "object"
         || Array.isArray(descriptor.config)) continue;
       envs[environmentId] = { version: 1, companyId, environmentId, seenAt: descriptor.seenAt, config: { ...(descriptor.config as Record<string, unknown>) },
-        // Legacy descriptors predate the same-account marker: absent reads as
-        // keyless, and the sweep treats them as before until a hook rewrites them.
-        ...(descriptor.hadInlineKey === true ? { hadInlineKey: true as const } : {}),
+        // Preserve explicit false separately from missing legacy provenance.
+        ...(typeof descriptor.hadInlineKey === "boolean" ? { hadInlineKey: descriptor.hadInlineKey } : {}),
         ...(typeof descriptor.accountDigest === "string" ? { accountDigest: descriptor.accountDigest } : {}) };
     }
     return envs;

@@ -357,7 +357,7 @@ export function journalStore(state: StateClientLike, companyId: string, poolId: 
 }
 
 /** Every pool a company ever ran, so retention reaches pools no live command resolves again (e.g. after a restart). */
-type PoolRegistry = Record<string, { artifactRoot: string; seenAt: number }>;
+type PoolRegistry = Record<string, { artifactRoot: string; seenAt: number; credentialDigest?: string }>;
 const poolRegistryScope = (companyId: string) =>
   ({ scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" });
 
@@ -367,7 +367,7 @@ export class SshOffloadRuntime {
    * claimed them with different sources; kept until the run is forgotten so a
    * re-realization cannot resurrect an ambiguous alias. */
   private readonly ambiguousAliases = new Set<string>();
-  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync; sessions: Map<string, SshSession> }>();
+  private readonly pools = new Map<string, { companyId: string; artifactRoot: string; credentialDigest: string; executor: OffloadExecutor; guest: SshOffloadGuest; sync: SshOffloadSync; sessions: Map<string, SshSession> }>();
   /** Credential-free pool identity (the poolId fields minus the credential
    * digest) to the live poolId, so a rotated or re-pointed API key presented
    * by a new binding retires the pool bound to the old credential instead of
@@ -627,6 +627,7 @@ export class SshOffloadRuntime {
     // key (the next run or realization, or the first bind after a worker
     // restart), never by switching a live binding's credential mid-run. That
     // resolve retires the old credential's pool below instead of reusing it.
+    binding.config = { ...binding.config, apiKey: resolveApiKey(binding.config) };
     binding.credentialDigest ??= poolCredentialDigest(binding.config)
       .catch((error: unknown) => { binding.credentialDigest = undefined; throw error; });
     const credentialDigest = await binding.credentialDigest;
@@ -799,12 +800,12 @@ export class SshOffloadRuntime {
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
-    this.pools.set(poolId, { companyId: command.companyId, artifactRoot, executor, guest, sync, sessions });
+    this.pools.set(poolId, { companyId: command.companyId, artifactRoot, credentialDigest, executor, guest, sync, sessions });
     this.poolByBaseIdentity.set(baseIdentity, poolId);
     // Bookkeeping only, never awaited (the queue can sit behind a sweep): a
     // lost write is retried by every sweep while the pool is loaded.
     void this.updateRegistry(command.companyId, (registry) => {
-      registry[poolId] = { artifactRoot: settings.offloadArtifactRoot as string, seenAt: Date.now() };
+      registry[poolId] = { artifactRoot: settings.offloadArtifactRoot as string, seenAt: Date.now(), credentialDigest };
     }).catch(() => undefined);
     return executor;
   }
@@ -870,24 +871,24 @@ export class SshOffloadRuntime {
     return true;
   }
 
-  /** Provider client for an unloaded pool: the sweep caller's company client
-   * first, else a cached binding in sorted (environment, run, workspace) order.
-   * Caller-first keeps multi-account selection deterministic across restarts:
-   * binding-map order follows hook timing, while the caller's client is
-   * keyed-first sorted. Null when neither resolves, and the pool waits. */
-  private poolBoatFor(companyId: string, boatFor?: (companyId: string) => BoatApiLike | null): BoatApiLike | null {
-    try {
-      const caller = boatFor?.(companyId);
-      if (caller) return caller;
-    } catch { /* fall through to bindings */ }
-    const bindings = [...this.bindings.values()].filter((binding) => binding.companyId === companyId)
-      .sort((a, b) => a.environmentId < b.environmentId ? -1 : a.environmentId > b.environmentId ? 1
-        : a.runId < b.runId ? -1 : a.runId > b.runId ? 1
-        : a.workspaceId < b.workspaceId ? -1 : a.workspaceId > b.workspaceId ? 1 : 0);
-    for (const binding of bindings) {
+  /** Only the recorded credential + endpoint may operate an unloaded pool.
+   * A company-level client or a foreign account's 404 is never deletion proof.
+   * Legacy unmarked pools wait until a verified resolve registers provenance. */
+  private async poolBoatFor(companyId: string, digest: unknown,
+    configsFor?: (companyId: string) => BoatDriverConfig[]): Promise<BoatApiLike | null> {
+    if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return null;
+    let configs: BoatDriverConfig[] = [];
+    try { configs = configsFor?.(companyId) ?? []; } catch { /* try live bindings and the host */ }
+    configs = [...configs, ...[...this.bindings.values()].filter((binding) => binding.companyId === companyId).map((binding) => binding.config),
+      parseDriverConfig({})];
+    for (const config of configs) {
       try {
-        return this.deps.boat?.(binding.config) ?? boatApi({ apiKey: resolveApiKey(binding.config), apiBase: binding.config.apiBase });
-      } catch { /* no usable key on this binding; try the next */ }
+        // Capture a host-resolved key before the KDF await, so rotation cannot
+        // switch the provider client after the matching digest was computed.
+        const bound = { ...config, apiKey: resolveApiKey(config) };
+        if (await poolCredentialDigest(bound) !== digest) continue;
+        return this.deps.boat?.(bound) ?? boatApi({ apiKey: bound.apiKey, apiBase: bound.apiBase });
+      } catch { /* unavailable matching credentials leave the pool unknown */ }
     }
     return null;
   }
@@ -1011,7 +1012,7 @@ export class SshOffloadRuntime {
   }
 
   /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */
-  async sweep(companyIds: Iterable<string> = [], opts: { boatFor?: (companyId: string) => BoatApiLike | null } = {}): Promise<void> {
+  async sweep(companyIds: Iterable<string> = [], opts: { configsFor?: (companyId: string) => BoatDriverConfig[] } = {}): Promise<void> {
     const outcomes = await Promise.allSettled([...this.pools.values()].map(async ({ executor, sync }) => {
       await executor.sweep();
       await executor.collectGarbage();
@@ -1034,10 +1035,9 @@ export class SshOffloadRuntime {
     const retired = await Promise.allSettled([...companies].map((companyId) => this.updateRegistry(companyId, async (registry) => {
       // (Re-)register loaded pools first: this retries a lost write from resolve.
       for (const [poolId, loaded] of this.pools) {
-        if (loaded.companyId === companyId) registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now() };
+        if (loaded.companyId === companyId) registry[poolId] = { artifactRoot: loaded.artifactRoot, seenAt: Date.now(), credentialDigest: loaded.credentialDigest };
       }
       const roots = new Set<string>();
-      const unloadedBoat = this.poolBoatFor(companyId, opts.boatFor);
       for (const [poolId, entry] of Object.entries(registry)) {
         if (this.pools.has(poolId)) continue;
         if (!entry || typeof entry.artifactRoot !== "string" || !Number.isFinite(entry.seenAt)) { delete registry[poolId]; continue; }
@@ -1045,6 +1045,8 @@ export class SshOffloadRuntime {
         // settles provider-gone slots without waiting for a new command to
         // resolve this poolId. Without a client the pool waits, still covered
         // by retention below.
+        const unloadedBoat = await this.poolBoatFor(companyId, entry.credentialDigest, opts.configsFor);
+        if (this.pools.has(poolId)) continue; // resolve may have completed during the KDF
         if (unloadedBoat) {
           // Fence resolutions before upkeep starts and hold the fence through
           // provider calls and the save: resolve waits on retiredSweeps, so a
@@ -1067,8 +1069,16 @@ export class SshOffloadRuntime {
         try {
           const empty = await task;
           roots.add(entry.artifactRoot);
-          // Forget the pool once nothing of it is left to expire.
-          if (empty && Date.now() - entry.seenAt >= ARTIFACT_RETENTION_MS) delete registry[poolId];
+          // An empty journal says nothing about provider liveness. Keep the
+          // registry retry anchor for any still-billing or uncertain VM.
+          if (empty && Date.now() - entry.seenAt >= ARTIFACT_RETENTION_MS) {
+            const store = new OffloadPoolStore(this.deps.state, this.deps.accountId, poolId);
+            const vms = await store.load().catch((error) => {
+              if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return [];
+              throw error;
+            });
+            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) delete registry[poolId];
+          }
         } catch {
           // One unreadable pool must not starve the company's other pools.
           failed = true;
