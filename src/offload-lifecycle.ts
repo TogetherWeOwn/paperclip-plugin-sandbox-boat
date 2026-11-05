@@ -141,6 +141,19 @@ export class OffloadLifecycle {
     this.active.delete(key);
   }
 
+  /** Forget every watchdog path of a VM that stopped or was released: its boot
+   * id changes on resume, so those paths can never match a new prepare. */
+  releaseSandbox(sandboxId: string): void {
+    for (const path of this.watchdogPaths) {
+      try {
+        const [sandbox] = JSON.parse(path) as [string];
+        if (sandbox === sandboxId) this.watchdogPaths.delete(path);
+      } catch {
+        this.watchdogPaths.delete(path);
+      }
+    }
+  }
+
   private expire(entry: ActiveGuest): void {
     if (this.now() >= entry.identity.guestDeadline) entry.reason ??= "execution_timeout";
     else if (this.now() >= entry.identity.heartbeatDeadline) entry.reason ??= "interest_expired";

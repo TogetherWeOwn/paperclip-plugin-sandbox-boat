@@ -56,7 +56,7 @@ describe("sync reservations across cancellation and recovery", () => {
     gate.resolve();
     const result = await first;
     expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true });
-    expect(await s.executor.read(cmd.commandId)).toMatchObject({ state: "not_started", fallbackSafe: true });
+    expect(await s.executor.readCommand(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({ state: "not_started", fallbackSafe: true });
     expect(await s.execute(cmd)).toEqual(result);
     expect(s.starts).toEqual([]);
   });
@@ -77,7 +77,7 @@ describe("sync reservations across cancellation and recovery", () => {
     } else {
       expect(result).toMatchObject({ remoteStarted: true, fallbackSafe: false, exitCode: 130, cancelled: true,
         syncBack: { state: "staged", artifactId: "artifact-cancelled" } });
-      expect(await ex.read("cancelled")).toMatchObject({ state: "cancelled", result: { cancelled: true } });
+      expect(await ex.readCommand("company-a", "run-a", "cancelled")).toMatchObject({ state: "cancelled", result: { cancelled: true } });
     }
     expect(await s.execute(command("cancelled"), ex)).toEqual(result);
   });
@@ -105,7 +105,7 @@ describe("sync reservations across cancellation and recovery", () => {
     expect.soft(await s.state.store().get(commandKey(command("commit-race")))).toMatchObject({ cancelRequested: "client_signal" });
     stage.resolve();
     expect(await first).toMatchObject({ remoteStarted: true, fallbackSafe: false, cancelled: true, exitCode: 130 });
-    expect(await s.executor.read("commit-race")).toMatchObject({ state: "cancelled" });
+    expect(await s.executor.readCommand("company-a", "run-a", "commit-race")).toMatchObject({ state: "cancelled" });
   });
 
   it.each(["push", "collect", "stage"])("recovers the workspace hold from an interrupted %s before using a spare VM", async (phase) => {
