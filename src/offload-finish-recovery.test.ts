@@ -210,6 +210,30 @@ describe("lost finish integration recovery", () => {
     expect(s.starts.map((start) => start.commandId)).toEqual(["after-prestart-ledger"]);
   });
 
+  it("keeps two live scopes ambiguous when a third scope arrives after one completes", async () => {
+    const ex = s.make({ maxOffloadVms: 3, maxActive: 3 });
+    const a = command("three-scopes");
+    const b = command("three-scopes", { runId: "run-b", executionWorkspaceId: "workspace-b" });
+    const c = command("three-scopes", { runId: "run-c", executionWorkspaceId: "workspace-c" });
+    const gate = s.hold("exec:three-scopes");
+    const first = s.execute(a, ex);
+    await until(() => s.starts.length === 1);
+    // B and C remain in sync-in while A finishes; neither guest has spawned.
+    const thirdGate = s.hold("push:three-scopes");
+    const second = s.execute(b, ex);
+    await until(() => s.trace.filter((entry) => entry === "push:three-scopes").length === 2);
+    gate.resolve();
+    await first;
+    const third = s.execute(c, ex);
+    await until(() => s.trace.filter((entry) => entry === "push:three-scopes").length === 3);
+    await expect(ex.read(c.commandId)).rejects.toThrow("OFFLOAD_COMMAND_SCOPE_REQUIRED");
+    await expect(ex.heartbeat(c.commandId)).rejects.toThrow("OFFLOAD_COMMAND_SCOPE_REQUIRED");
+    await expect(ex.cancel(c.commandId, "client_signal")).rejects.toThrow("OFFLOAD_COMMAND_SCOPE_REQUIRED");
+    thirdGate.resolve();
+    await second;
+    await third;
+  });
+
   it("finishes accounting and recovers capacity without replaying the guest", async () => {
     const cmd = command("lost-finish");
     const gate = s.hold("exec:lost-finish");

@@ -897,17 +897,22 @@ export class SshOffloadRuntime {
    * Upkeep for a registered pool that is not loaded: stop past-due VMs,
    * confirm stopping VMs, settle provider-gone VMs (journal to terminal-read
    * unknown, never replayed), then reconcile the ledger for that poolId.
-   * Never creates a VM. Throws on an unreadable pool document (absent is
-   * nothing to do) so the sweep reports unverified, never silent.
+   * Never creates a VM. An absent pool still needs ledger reconciliation;
+   * an unreadable document throws so the sweep reports unverified.
    */
   private async sweepUnloadedPool(companyId: string, poolId: string, seenAt: number, boat: BoatApiLike): Promise<void> {
     const poolStore = new OffloadPoolStore(this.deps.state, this.deps.accountId, poolId);
+    const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     let doc;
     try {
       doc = await poolStore.loadDoc();
     } catch (error) {
-      if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return;
-      throw error;
+      if (!(error instanceof Error) || error.message !== "OFFLOAD_POOL_ABSENT") throw error;
+      // Reserve can commit before either pool save succeeds. This caller has
+      // verified credential provenance; reconcile durable intents (including
+      // id-less TTL holds), never infer provider deletion from pool absence.
+      await ledger.reconcile(boat, undefined, false, false, poolId);
+      return;
     }
     const pool = doc.vms;
     const inert = async (): Promise<never> => { throw new Error("Unloaded offload pool is not executable"); };
@@ -916,7 +921,6 @@ export class SshOffloadRuntime {
       resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
         tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
       sync: { push: inert, collect: inert, stage: inert, markSuspect: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
-    const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     const now = Date.now();
     // Fields a concurrent claim changes; compared against a reload before
     // saving so the sweep never overwrites a reservation made from a snapshot
@@ -928,6 +932,7 @@ export class SshOffloadRuntime {
     const original = new Map(pool.map((vm) => [vmKey(vm), fingerprint(vm)]));
     const deletedIds = new Set<string>();
     let changed = false;
+    let accountingFailed = false;
     for (const vm of [...pool]) {
       if (!vm.sandboxId) continue; // a lost create reply: no provider handle until a command resolves this pool
       let state: string | null = null;
@@ -945,8 +950,15 @@ export class SshOffloadRuntime {
       const live = (await poolStore.loadDoc().catch(() => null))?.vms.find((entry) => vmKey(entry) === vmKey(vm));
       if (!live || fingerprint(live) !== original.get(vmKey(vm))) continue;
       if (["archived", "cancelled", "deleted"].includes(state)) {
-        vm.stopObservedAt ??= now;
-        await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id).catch(() => undefined);
+        if (vm.stopObservedAt == null) { vm.stopObservedAt = now; changed = true; }
+        try {
+          await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id);
+        } catch {
+          // Retain this slot's accounting retry anchor, but do not let its
+          // write outage prevent other VMs from stopping or saving progress.
+          accountingFailed = true;
+          continue;
+        }
         // Same rule as the loaded executor: a failed settlement keeps the
         // slot fenced for retry, never freed on an unsettled receipt.
         if (!await journal.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
@@ -1008,7 +1020,8 @@ export class SshOffloadRuntime {
       }
       await poolStore.save(fresh.config, merged);
     }
-    await ledger.reconcile(boat, undefined, false, false, poolId).catch(() => undefined);
+    await ledger.reconcile(boat, undefined, false, false, poolId);
+    if (accountingFailed) throw new Error("Offload pool accounting incomplete");
   }
 
   /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */
@@ -1058,7 +1071,10 @@ export class SshOffloadRuntime {
           try {
             await this.sweepUnloadedPool(companyId, poolId, entry.seenAt, unloadedBoat);
           } catch {
+            // Upkeep may have saved terminal VM flags before reconciliation
+            // failed. Do not let retention erase its only durable retry anchor.
             failed = true;
+            continue;
           } finally {
             releaseFence();
             this.retiredSweeps.delete(poolId);
@@ -1077,7 +1093,11 @@ export class SshOffloadRuntime {
               if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return [];
               throw error;
             });
-            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) delete registry[poolId];
+            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) {
+              const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
+              if (await ledger.poolAccountingSettled(poolId)) delete registry[poolId];
+              else failed = true;
+            }
           }
         } catch {
           // One unreadable pool must not starve the company's other pools.

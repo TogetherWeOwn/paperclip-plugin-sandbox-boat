@@ -138,7 +138,8 @@ describe("sync workspace fail-closed review guards", () => {
       expect(await next).toEqual(settled);
     } finally {
       // Also drain the queued mutant without advancing its timeout clock.
-      await ex.cancel("same-workspace", "client_signal", 1);
+      // Scoped: the refusal already settled, leaving the ID-only lookup.
+      await ex.cancelCommand("company-a", "run-a", "same-workspace", "client_signal", 1);
       await next;
     }
   });

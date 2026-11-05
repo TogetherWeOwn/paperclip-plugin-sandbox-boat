@@ -85,16 +85,34 @@ the bind stops dispatch (commands fall back locally). The offload request body
 supplies nothing, and the secret in step 4 is resolved last, after every
 check: a bind retried from an offload request runs only for a run with no
 existing binding and only for the workspace that request named, so probing
-with random workspace ids never spends secret resolutions. The started event usually
-arrives before Paperclip prepares the run's workspace, so the bind is retried when
-that run's first offload request arrives. A binding never replaces a whole-run
+with random workspace ids never spends secret resolutions. The started event
+records ownership only, never a workspace binding or credential resolution.
+Binding runs only after the exact-run admission gate on a real submit; a dry-run
+or telemetry report never triggers it. A binding never replaces a whole-run
 realization for the same run and workspace. `agent.run.finished`, `failed` and
 `cancelled` drop the executor binding and the persisted workspace record, and fence
 the run: a late or slow start handler cannot bind it again. A missing or refused
 host fact (no execution workspace, no local path, no source root, an origin that
 does not match, no secret) leaves the run unbound, and its
 own commands fall back locally (503) before dispatch; other-agent runs keep the
-403. This adds five capabilities to the 0.2.2
+403. The persisted per-run owner row is written only when the company uses Boat
+at all (local-run offload enabled or a seen whole-run config), so idle
+companies add no per-run state; the in-memory owner gate is always recorded.
+Scoped sweeps age out owner records older than 24 hours and ended tombstones
+via the persisted per-company owner index. Scheduled sweeps cover companies
+known in memory or already enrolled by an admitted real submit or whole-run
+realization. Start/telemetry-only events do not enroll a company for provider
+upkeep: after restart, an owner-only company needs a scoped sweep or later
+rediscovery. Unindexed rows cannot be enumerated by this collector. Age alone never retires a
+live issue run: the sweep deletes a stale issue owner only on positive
+disproof (its issue exists and names a different run, or a successful lookup
+finds no issue at all). A thrown host lookup error or a missing issues
+provider keeps the owner for the next sweep; the ownership gate stays
+fail-closed (refuses) on the same uncertainty. A terminal forget whose row
+delete fails leaves the ended tombstone indexed, so the next sweep retries
+the delete instead of orphaning the row. A run that started while the company did not use
+Boat has no persisted owner, so a worker restart before Boat is enabled leaves
+that run unable to offload; runs started afterwards are unaffected. This adds five capabilities to the 0.2.2
 set: `events.subscribe`, `execution.workspaces.read`, `secrets.read-ref`,
 `projects.read` and `project.workspaces.read`; the
 upgrade needs board approval of that capability change.

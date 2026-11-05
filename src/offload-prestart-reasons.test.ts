@@ -255,7 +255,7 @@ describe("executor logs and releases on a pre-start failure", () => {
     expect((warn?.meta?.sandboxId as string).length).toBeGreaterThan(0);
     expect(s.logs.some((entry) => entry.message.includes("quarantined"))).toBe(false);
     // The read view carries the same reason the shim announces.
-    expect(await s.executor.read(cmd.commandId)).toMatchObject({ state: "not_started",
+    expect(await s.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({ state: "not_started",
       fallbackReason: "sync push failed before the command could start" });
     // Released, not quarantined: the next command reuses the same VM.
     const second = await s.execute(lifecycleCommand("exec-after-fail"));

@@ -282,6 +282,16 @@ export class AccountLedger {
   }
   usage(poolId: string): AccountUsageRow[] { return structuredClone(this.rows.filter((r) => r.poolId === poolId)); }
 
+  /** Durable retention gate, independent of the pool's VM flags or cached rows. */
+  async poolAccountingSettled(poolId: string): Promise<boolean> {
+    return this.locked(async () => {
+      const doc = await this.read();
+      return doc.intents.filter((intent) => intent.poolId === poolId && this.owns(intent))
+        .every((intent) => !intent.active && (intent.status === "stopped" || intent.status === "rejected"))
+        && doc.usage.filter((row) => row.poolId === poolId && this.owns(row)).every((row) => row.tailSince === null);
+    });
+  }
+
   /**
    * Tracked VM seconds in the UTC calendar month containing nowMs, for one
    * company. Sums paid intervals clamped to the month plus the elapsed part

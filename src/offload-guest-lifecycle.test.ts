@@ -89,7 +89,7 @@ describe("offload guest lifecycle: cancellation and descendant fencing", () => {
     if (!s.guest.alive("active")) {
       const result = await pending;
       expect(result).toMatchObject({ remoteStarted: true, fallbackSafe: false });
-      expect(await s.api().read?.("active", 0, 65536)).toMatchObject({
+      expect(await s.executor.readOutput("company-a", "run-a", "active", 0, 65536)).toMatchObject({
         state: "cancelled", remoteStarted: true, fallbackSafe: false, result: { cancelled: true },
       });
       await cancellation();
@@ -197,10 +197,10 @@ describe("offload guest lifecycle: interest and absolute deadlines", () => {
   it("a late heartbeat does not resurrect expired or cancelled work", async () => {
     await running();
     await s.clock.advance(30_000);
-    await s.api().heartbeat?.("active", 1);
+    await s.executor.heartbeatCommand("company-a", "run-a", "active", 1);
     await s.clock.advance(5_000);
     expect.soft(s.guest.alive("active")).toBe(false);
-    await s.api().heartbeat?.("active", 1);
+    await s.executor.heartbeatCommand("company-a", "run-a", "active", 1);
     await s.clock.advance(30_000);
     expect.soft(s.guest.alive("active")).toBe(false);
     expect(s.starts).toHaveLength(1);
@@ -242,8 +242,8 @@ describe("offload guest lifecycle: incremental output", () => {
     const stderr = Uint8Array.from([254, 0, 13, 10]);
     s.output([["stdout", stdout], ["stderr", stderr]]);
     await s.execute(command("binary"));
-    const first = await s.api().read?.("binary", 0, 65536);
-    const replay = await s.api().read?.("binary", 0, 65536);
+    const first = await s.executor.readOutput("company-a", "run-a", "binary", 0, 65536);
+    const replay = await s.executor.readOutput("company-a", "run-a", "binary", 0, 65536);
     expect.soft(first?.events).toEqual([
       { seq: 1, stream: "stdout", dataBase64: "AP/DKAo=" },
       { seq: 2, stream: "stderr", dataBase64: "/gANCg==" },
@@ -256,8 +256,8 @@ describe("offload guest lifecycle: incremental output", () => {
   it("bounds each read to sixty-four KiB without losing the remainder", async () => {
     s.output(Array.from({ length: 70 }, () => ["stdout", new Uint8Array(1024).fill(255)]));
     await s.execute(command("bounded-output"));
-    const first = await s.api().read?.("bounded-output", 0, 65536);
-    const second = first ? await s.api().read?.("bounded-output", first.nextCursor, 65536) : undefined;
+    const first = await s.executor.readOutput("company-a", "run-a", "bounded-output", 0, 65536);
+    const second = await s.executor.readOutput("company-a", "run-a", "bounded-output", first.nextCursor, 65536);
     const bytes = (events: typeof first) => Buffer.concat((events?.events ?? []).map((v) => Buffer.from(v.dataBase64, "base64")));
     expect.soft(bytes(first).length).toBe(65_536);
     expect.soft(bytes(second).length).toBe(6_144);
@@ -267,9 +267,9 @@ describe("offload guest lifecycle: incremental output", () => {
   it("a cursor excludes already consumed events without changing retained output", async () => {
     s.output([["stdout", Buffer.from("first")], ["stderr", Buffer.from("second")]]);
     await s.execute(command("cursor"));
-    const tail = await s.api().read?.("cursor", 1, 65536);
+    const tail = await s.executor.readOutput("company-a", "run-a", "cursor", 1, 65536);
     expect.soft(tail?.events).toEqual([{ seq: 2, stream: "stderr", dataBase64: "c2Vjb25k" }]);
-    const full = await s.api().read?.("cursor", 0, 65536);
+    const full = await s.executor.readOutput("company-a", "run-a", "cursor", 0, 65536);
     expect.soft(full?.events).toHaveLength(2);
     expect(s.starts).toHaveLength(1);
   });
