@@ -928,6 +928,7 @@ export class SshOffloadRuntime {
     const original = new Map(pool.map((vm) => [vmKey(vm), fingerprint(vm)]));
     const deletedIds = new Set<string>();
     let changed = false;
+    let accountingFailed = false;
     for (const vm of [...pool]) {
       if (!vm.sandboxId) continue; // a lost create reply: no provider handle until a command resolves this pool
       let state: string | null = null;
@@ -945,8 +946,15 @@ export class SshOffloadRuntime {
       const live = (await poolStore.loadDoc().catch(() => null))?.vms.find((entry) => vmKey(entry) === vmKey(vm));
       if (!live || fingerprint(live) !== original.get(vmKey(vm))) continue;
       if (["archived", "cancelled", "deleted"].includes(state)) {
-        vm.stopObservedAt ??= now;
-        await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id);
+        if (vm.stopObservedAt == null) { vm.stopObservedAt = now; changed = true; }
+        try {
+          await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id);
+        } catch {
+          // Retain this slot's accounting retry anchor, but do not let its
+          // write outage prevent other VMs from stopping or saving progress.
+          accountingFailed = true;
+          continue;
+        }
         // Same rule as the loaded executor: a failed settlement keeps the
         // slot fenced for retry, never freed on an unsettled receipt.
         if (!await journal.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
@@ -1009,6 +1017,7 @@ export class SshOffloadRuntime {
       await poolStore.save(fresh.config, merged);
     }
     await ledger.reconcile(boat, undefined, false, false, poolId);
+    if (accountingFailed) throw new Error("Offload pool accounting incomplete");
   }
 
   /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */

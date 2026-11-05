@@ -392,6 +392,78 @@ describe("sweep after a worker restart", () => {
     }
   });
 
+  it.each([
+    ["archived", "persistent"], ["deleted", "persistent"],
+    ["archived", "transient"], ["deleted", "transient"],
+  ] as const)("keeps stopping other overdue VMs when %s accounting fails (%s)", async (providerState, failure) => {
+    const poolId = "pool-accounting-stop-progress";
+    const accountId = "account-stop-progress";
+    const sandboxId = "bx_terminalprogress";
+    const api = fake as unknown as BoatApiLike;
+    const ledger = new AccountLedger(harness.ctx.state, accountId, () => clock);
+    const reservation = await ledger.reserve(api, { operation: "create", poolId, size: "default",
+      jobSeconds: 60, tailSeconds: 15, maxActive: 3, maxStartsPerDay: 75, minComputeHoursLeft: 0,
+      command: { commandId: "progress-command", runId: "progress-run", cardId: "card", repoId: "repo", companyId } });
+    await ledger.started(api, reservation, sandboxId);
+    await ledger.finished(reservation, false, { outcome: "completed", exitCode: 0 });
+    await ledger.stopRequested(sandboxId, clock + 15_000, clock, reservation.id);
+    if (providerState === "archived") fake.addSandbox({ id: sandboxId, state: "archived" });
+    const before = fake.addSandbox({ id: "bx_progressbefore", state: "ready" });
+    const after = fake.addSandbox({ id: "bx_progressafter", state: "ready" });
+    const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+    await store.save({ maxOffloadVms: 3, offloadIdleStopSeconds: 15 }, [before.id, sandboxId, after.id].map((id) => ({
+      sandboxId: id, busy: false, stopped: false, stopping: false, quarantined: false,
+      lastActiveAt: clock - 60_000, generation: 1, idleHandle: null,
+      ...(id === sandboxId ? { accountReservation: reservation } : {}),
+      stopDueAt: clock - 1_000, stopRequestedAt: null, stopAttempts: 0, identity: null,
+    })));
+    const registryScope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" };
+    await harness.ctx.state.set(registryScope, { [poolId]: {
+      artifactRoot: "/tmp/paperclip-accounting-stop-progress", seenAt: clock,
+      credentialDigest: poolDigestOf(fakeKey),
+    } });
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let outage = true;
+    harness.ctx.state.set = async (input, value) => {
+      if (outage && input.namespace === "boat-account") {
+        if (failure === "transient") outage = false;
+        throw new Error("account-write-only outage");
+      }
+      return realSet(input, value);
+    };
+    const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+      ssh: {} as never, accountId, boat: () => api });
+    vi.useFakeTimers({ toFake: ["Date"], now: clock + 33 * 86_400_000 });
+    try {
+      await expect(runtime.sweep([companyId])).rejects.toThrow("Offload pool sweep unverified");
+      expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([before.id, after.id]);
+      const persisted = await store.load();
+      for (const id of [before.id, after.id]) {
+        expect(persisted.find((vm) => vm.sandboxId === id)).toMatchObject({ stopping: true, stopRequestedAt: expect.any(Number) });
+      }
+      expect(persisted.find((vm) => vm.sandboxId === sandboxId)).toMatchObject({
+        stopped: false, stopObservedAt: clock + 33 * 86_400_000,
+      });
+      expect(Object.keys(await harness.ctx.state.get(registryScope) as object)).toContain(poolId);
+      outage = false;
+      await runtime.shutdown();
+      const restarted = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId, boat: () => api });
+      try {
+        await restarted.sweep([companyId]);
+        await ledger.load();
+        expect(ledger.usage(poolId)[0]).toMatchObject({ tailSince: null, stoppedAt: expect.any(Number) });
+        expect(await harness.ctx.state.get(registryScope)).toEqual({});
+        expect(fake.callsOf("create")).toEqual([]);
+        expect(fake.callsOf("resume")).toEqual([]);
+      } finally { await restarted.shutdown(); }
+    } finally {
+      harness.ctx.state.set = realSet;
+      vi.useRealTimers();
+      await runtime.shutdown();
+    }
+  });
+
   it("keeps an unloaded terminal slot fenced when the journal settlement fails", async () => {
     const poolId = "pool-restart-settle-fail";
     const accountId = "account-restart";
