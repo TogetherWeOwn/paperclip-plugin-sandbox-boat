@@ -946,7 +946,7 @@ export class SshOffloadRuntime {
       if (!live || fingerprint(live) !== original.get(vmKey(vm))) continue;
       if (["archived", "cancelled", "deleted"].includes(state)) {
         vm.stopObservedAt ??= now;
-        await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id).catch(() => undefined);
+        await ledger.stopped(vm.sandboxId, vm.stopObservedAt, vm.accountReservation?.id);
         // Same rule as the loaded executor: a failed settlement keeps the
         // slot fenced for retry, never freed on an unsettled receipt.
         if (!await journal.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
@@ -1008,7 +1008,7 @@ export class SshOffloadRuntime {
       }
       await poolStore.save(fresh.config, merged);
     }
-    await ledger.reconcile(boat, undefined, false, false, poolId).catch(() => undefined);
+    await ledger.reconcile(boat, undefined, false, false, poolId);
   }
 
   /** Sweep loaded pools, then run retention for every registered pool of these companies that is not loaded. */
@@ -1058,7 +1058,10 @@ export class SshOffloadRuntime {
           try {
             await this.sweepUnloadedPool(companyId, poolId, entry.seenAt, unloadedBoat);
           } catch {
+            // Upkeep may have saved terminal VM flags before reconciliation
+            // failed. Do not let retention erase its only durable retry anchor.
             failed = true;
+            continue;
           } finally {
             releaseFence();
             this.retiredSweeps.delete(poolId);
@@ -1077,7 +1080,11 @@ export class SshOffloadRuntime {
               if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return [];
               throw error;
             });
-            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) delete registry[poolId];
+            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) {
+              const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
+              if (await ledger.poolAccountingSettled(poolId)) delete registry[poolId];
+              else failed = true;
+            }
           }
         } catch {
           // One unreadable pool must not starve the company's other pools.

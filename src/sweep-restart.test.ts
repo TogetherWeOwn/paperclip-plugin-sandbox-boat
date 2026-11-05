@@ -14,6 +14,7 @@ import { commandDigest } from "./offload-journal.js";
 import { scryptSync } from "node:crypto";
 import { DEFAULT_API_BASE, parseDriverConfig } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
+import { AccountLedger } from "./account-ledger.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
 import { sweepDigestCacheSizeForTests } from "./vm-manager.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
@@ -306,6 +307,89 @@ describe("sweep after a worker restart", () => {
     expect((await store.load()).find((vm) => vm.sandboxId === box.id))
       .toMatchObject({ busy: true, stopping: false });
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).not.toContain(box.id);
+  });
+
+  it.each([
+    ["archived", "stopped"], ["deleted", "stopped"],
+    ["archived", "reconcile"], ["deleted", "reconcile"],
+    ["archived", "prior-loss"], ["deleted", "prior-loss"],
+  ] as const)("retains expired pool accounting through %s provider state and a %s write outage", async (providerState, phase) => {
+    const poolId = "pool-expired-accounting";
+    const accountId = "account-expired-accounting";
+    const sandboxId = "bx_expiredaccount1";
+    const api = fake as unknown as BoatApiLike;
+    const ledger = new AccountLedger(harness.ctx.state, accountId, () => clock);
+    const reservation = await ledger.reserve(api, { operation: "create", poolId, size: "default",
+      jobSeconds: 60, tailSeconds: 15, maxActive: 2, maxStartsPerDay: 75, minComputeHoursLeft: 0,
+      command: { commandId: "expired-command", runId: "expired-run", cardId: "card", repoId: "repo", companyId } });
+    await ledger.started(api, reservation, sandboxId);
+    clock += 1_000;
+    await ledger.finished(reservation, false, { outcome: "completed", exitCode: 0 });
+    await ledger.stopRequested(sandboxId, clock + 15_000, clock, reservation.id);
+    if (providerState === "archived") fake.addSandbox({ id: sandboxId, state: "archived" });
+    // The empty command journal is already past retention. No whole-run
+    // descriptor or command resolution may supply another retry path.
+    const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+    await store.save({ maxOffloadVms: 1, offloadIdleStopSeconds: 15 }, phase === "prior-loss" && providerState === "deleted" ? [] : [{ sandboxId,
+      busy: false, stopped: phase === "prior-loss", stopping: phase !== "prior-loss", quarantined: false,
+      lastActiveAt: clock, generation: 1, idleHandle: null, accountReservation: reservation,
+      stopDueAt: clock + 15_000, stopRequestedAt: clock, stopAttempts: 1, identity: null }]);
+    // Simulate flags/removal saved by an older worker, with its credential
+    // temporarily unavailable: only durable accounting can prevent forgetting.
+    if (phase === "prior-loss") process.env.BOAT_API_KEY = "boat_other_account_not_real";
+    const registryScope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" };
+    await harness.ctx.state.set(registryScope, { [poolId]: {
+      artifactRoot: "/tmp/paperclip-expired-accounting-artifacts", seenAt: clock,
+      credentialDigest: poolDigestOf(fakeKey),
+    } });
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let accountWrites = 0;
+    let outage = true;
+    harness.ctx.state.set = async (input, value) => {
+      if (input.namespace === "boat-account") {
+        accountWrites += 1;
+        if (outage && (phase === "stopped" || accountWrites > 1)) throw new Error("account-write-only outage");
+      }
+      return realSet(input, value);
+    };
+    const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+      ssh: {} as never, accountId, boat: () => api });
+    vi.useFakeTimers({ toFake: ["Date"], now: clock + 33 * 86_400_000 });
+    try {
+      await expect(runtime.sweep([companyId])).rejects.toThrow("Offload pool sweep unverified");
+      expect(Object.keys(await harness.ctx.state.get(registryScope) as object)).toContain(poolId);
+      if (phase === "prior-loss") expect(accountWrites).toBe(0);
+      else expect(accountWrites).toBeGreaterThan(0);
+      if (phase === "stopped") {
+        await ledger.load();
+        expect(ledger.usage(poolId)[0]?.tailSince).not.toBeNull();
+        expect((await store.load()).find((vm) => vm.sandboxId === sandboxId)).toMatchObject({ stopped: false });
+      }
+      outage = false;
+      process.env.BOAT_API_KEY = fakeKey;
+      // A second worker must recover from durable state alone.
+      await runtime.shutdown();
+      const restarted = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId, boat: () => api });
+      try {
+        await restarted.sweep([companyId]);
+        await ledger.load();
+        expect(ledger.usage(poolId)[0]).toMatchObject({ tailSince: null, stoppedAt: expect.any(Number) });
+        const account = [...harness.state.entries()].find(([key]) => key.includes("|boat-account|"))?.[1] as {
+          intents: Array<{ id: string; active: boolean; status: string }>;
+        };
+        expect(account.intents.find((intent) => intent.id === reservation.id)).toMatchObject({ active: false, status: "stopped" });
+        expect(await harness.ctx.state.get(registryScope)).toEqual({});
+        if (providerState === "deleted") expect(await store.load()).toEqual([]);
+        else expect((await store.load())[0]).toMatchObject({ stopped: true, stopping: false });
+        expect(fake.callsOf("create")).toEqual([]);
+        expect(fake.callsOf("resume")).toEqual([]);
+      } finally { await restarted.shutdown(); }
+    } finally {
+      harness.ctx.state.set = realSet;
+      vi.useRealTimers();
+      await runtime.shutdown();
+    }
   });
 
   it("keeps an unloaded terminal slot fenced when the journal settlement fails", async () => {
