@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { OffloadCommand, OffloadResult } from "./offload.js";
 import { OffloadJournal, commandKey, type OffloadDurableDeps } from "./offload-journal.js";
 import { journalStore } from "./offload-ssh-runtime.js";
+import { deferred, flush, until } from "./test-support/offload-lifecycle-contract.js";
 import type { StateClientLike } from "./state.js";
 
 type Scope = { scopeKind: "company" | "instance"; scopeId?: string; namespace?: string; stateKey: string };
@@ -44,7 +45,9 @@ const completed = (commandId: string): OffloadResult => ({
   queueWaitMs: 0, exitCode: 0, seconds: 1, dollars: 0, remoteStarted: true, fallbackSafe: false,
 });
 
-function journalFor(store: ReturnType<typeof journalStore>, now: () => number): OffloadJournal {
+function journalFor(store: ReturnType<typeof journalStore>, now: () => number,
+  pool: ConstructorParameters<typeof OffloadJournal>[2] = { hold: async () => {}, release: async () => {}, cancel: async () => {} },
+  lifecycle = false): OffloadJournal {
   const deps: OffloadDurableDeps = {
     journalStore: store,
     guestReceipts: { read: async () => null },
@@ -57,7 +60,9 @@ function journalFor(store: ReturnType<typeof journalStore>, now: () => number): 
       markSuspect: async () => {},
     },
   };
-  return new OffloadJournal(deps, now, { hold: async () => {}, release: async () => {}, cancel: async () => {} });
+  return new OffloadJournal(deps, now, pool, lifecycle ? {
+    prepare: async (_sandbox, _command, base) => base, discard: () => {}, cancel: async () => {}, heartbeat: () => {},
+  } : undefined);
 }
 
 describe("offload journal recovery", () => {
@@ -143,6 +148,66 @@ describe("offload journal recovery", () => {
     await journal.settlePending();
     expect(await journal.readOutput(companyId, runId, cmd.commandId)).toEqual(settled);
     expect(settled.state).toBe("unknown");
+  });
+
+  it.each([false, true])("fences a lost finish against cancellation (overlap=%s)", async (overlap) => {
+    const backing = memState();
+    const store = journalStore(backing.state, companyId, `pool-cancel-settle-${overlap}`);
+    const journal = journalFor(store, () => 1_000, undefined, true);
+    const cmd = command("cmd-cancel-settle");
+    await expect(journal.execute(cmd, async () => {
+      await journal.run("sandbox-1", cmd, async () => ({ exitCode: 0, seconds: 1 }));
+      backing.failNextSet((input) => input.stateKey !== "index");
+      return await journal.finish(cmd, completed(cmd.commandId));
+    })).rejects.toThrow("injected store failure");
+    const get = store.get.bind(store);
+    const gate = deferred<void>();
+    let reads = 0;
+    let paused = false;
+    if (overlap) store.get = async (key) => {
+      const raw = await get(key);
+      if (key === commandKey(cmd) && ++reads === 2) {
+        paused = true;
+        await gate.promise; // cancel's refresh has read a non-terminal snapshot
+      }
+      return raw;
+    };
+    const cancel = journal.cancelCommand(companyId, runId, cmd.commandId, "client_signal");
+    if (overlap) await until(() => paused);
+    else await cancel;
+    const settle = journal.settlePending();
+    // Let the retry reach its commit/fence while cancel still owns the fence.
+    for (let i = 0; i < 10; i += 1) await flush();
+    gate.resolve();
+    await Promise.all([cancel, settle]);
+    expect(await journal.readOutput(companyId, runId, cmd.commandId)).toMatchObject({
+      state: "cancelled", result: { cancelled: true, exitCode: 130 },
+    });
+  });
+
+  it("retries a failed refusal's queue cleanup outside the journal lock", async () => {
+    const backing = memState();
+    const store = journalStore(backing.state, companyId, "pool-refusal-cleanup");
+    let cleanupAttempts = 0;
+    const journal = journalFor(store, () => 1_000, {
+      hold: async () => {}, release: async () => {}, cancel: async () => {
+        cleanupAttempts += 1;
+        // Pool cleanup may ask the journal whether a sandbox still owns work.
+        await journal.hasUnsettled("sandbox-1");
+        if (cleanupAttempts === 1) throw new Error("cleanup outage");
+      },
+    });
+    const cmd = command("cmd-refused");
+    await expect(journal.execute(cmd, async () => {
+      backing.failNextSet((input) => input.stateKey !== "index");
+      return await journal.finish(cmd, { status: "unavailable", commandId: cmd.commandId,
+        code: "OFFLOAD_UNAVAILABLE", reason: "queue timeout", remoteStarted: false, fallbackSafe: true });
+    })).rejects.toThrow("injected store failure");
+    await journal.settlePending();
+    expect(cleanupAttempts).toBe(1);
+    expect(await journal.readCommand(companyId, runId, cmd.commandId)).toMatchObject({ state: "not_started" });
+    await journal.collectGarbage();
+    expect(cleanupAttempts).toBe(2);
   });
 
   it("heals a failed finish commit through settlePending", async () => {
