@@ -11,6 +11,9 @@ import {
 
 export interface ExecutorPort extends Pick<OffloadExecutor, "readOutput" | "heartbeatCommand" | "cancelCommand"> {
   start(command: OffloadCommand): Promise<OffloadReadView>;
+  // Resolves when the executor's in-process task for the command settles.
+  // Optional for backward compatibility; never rejects when implemented.
+  waitSettled?(companyId: string, runId: string, commandId: string): Promise<void>;
 }
 export interface ExecutorBackendDeps {
   /** Trusted host binding only. Resolution must not dispatch a command itself.
@@ -56,6 +59,7 @@ export class ExecutorBackend implements OffloadBackend {
     let sawStart = false;
     let outcome: BackendCancellation | null = null;
     let cancellation: Promise<void> | null = null;
+    let taskSettled = false;
     const cancelGuest = (): Promise<void> => {
       if (!cancellation) cancellation = (async () => {
         if (executor && dispatched) await executor.cancelCommand(command.companyId, command.runId, command.commandId, "broker_cancel");
@@ -96,8 +100,21 @@ export class ExecutorBackend implements OffloadBackend {
         sawStart = active.initial.remoteStarted === true || active.initial.state === "starting"
           || active.initial.state === "syncing_out" || active.initial.events.length > 0;
         if (sawStart) sink.started();
+        // Task-settled signal: when the in-process task has settled but the
+        // durable view is still non-terminal (a lost finish commit), one more
+        // read decides — terminal settles normally, otherwise uncertainty.
+        let settled: Promise<boolean> | null = null;
+        const markSettled = () => { taskSettled = true; return true; };
+        try {
+          settled = active.executor.waitSettled
+            ? active.executor.waitSettled(command.companyId, command.runId, command.commandId).then(markSettled, markSettled)
+            : null;
+        } catch {
+          settled = null;
+        }
         let cursor = 0;
         for (;;) {
+          const readAfterSettlement = taskSettled;
           const view = await active.executor.readOutput(command.companyId, command.runId, command.commandId, cursor);
           // `starting` is already a durable may-have-spawned intent, not a
           // never-started receipt. Output is also positive execution evidence.
@@ -126,7 +143,16 @@ export class ExecutorBackend implements OffloadBackend {
             } else sink.complete(result.result);
             return;
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, this.pollIntervalMs));
+          // Only a read begun after settlement can prove a lost finish commit;
+          // a delayed older snapshot must get one fresh verification read.
+          // The sweep owns retrying a missing commit, so report uncertainty.
+          if (readAfterSettlement) throw uncertain();
+          if (settled) {
+            const wait = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.pollIntervalMs));
+            if (await Promise.race([wait, settled])) taskSettled = true;
+          } else {
+            await new Promise<void>((resolve) => setTimeout(resolve, this.pollIntervalMs));
+          }
         }
       } catch {
         if (!dispatched) {
@@ -135,7 +161,10 @@ export class ExecutorBackend implements OffloadBackend {
           this.deps.logRefusal?.({ runId: command.runId, workspaceId: command.executionWorkspaceId, reason: "offload executor binding unavailable" });
           sink.failToStart("offload executor binding unavailable");
         } else {
-          await cancelGuest().catch(() => undefined);
+          // A settled task has already finished guest cleanup. Its missing
+          // terminal commit is not a client cancellation: let settlement retry
+          // the original result without persisting a fabricated broker_cancel.
+          if (!taskSettled) await cancelGuest().catch(() => undefined);
           sink.fail(uncertain());
         }
       }
@@ -146,9 +175,12 @@ export class ExecutorBackend implements OffloadBackend {
         await ready;
         if (executor && !outcome) await executor.heartbeatCommand(command.companyId, command.runId, command.commandId);
       },
-      cancel: async () => {
+      cancel: async (reason) => {
         await ready;
-        if (!outcome) await cancelGuest();
+        // A delayed broker save can fail after the task settled and queue
+        // poison cleanup behind it. Only real cancellation may change that
+        // task's original result; active work still needs cleanup below.
+        if (!outcome && (reason !== "cleanup" || !taskSettled)) await cancelGuest();
         // A cancel acknowledgement alone is not a settled workspace: sync-in
         // may still read it, or sync-out may still stage returned changes.
         await done;

@@ -11,7 +11,8 @@ import type { BudgetLimitName } from "./budget.js";
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 } as const;
 type Window = keyof typeof WINDOWS;
 // @boatdev/sdk 1.10 SandboxUsageResponse.billingMultiplier: seconds already
-// include this multiplier. Never infer it from wall time or apply it twice.
+// include this multiplier. Historical audit version, not re-audited for the
+// pinned 1.13.0. Never infer it from wall time or apply it twice.
 const WEIGHT: Record<BoatSize, number> = { small: 0.5, default: 1, large: 2, xlarge: 50 / 9 };
 /**
  * Stale-hold margin: a start whose provider TTL plus this margin has passed
@@ -391,8 +392,8 @@ export class AccountLedger {
     const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
     const tailBudget = intent != null && Number.isFinite(intent.tailSeconds)
       ? row.tailSince + (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000 : null;
-    const cap = row.stopDueAt != null ? row.stopDueAt + STOP_OBSERVE_GRACE_S * 1000 : (tailBudget ?? at);
-    return Math.min(at, cap);
+    const requestedCap = row.stopDueAt != null ? row.stopDueAt + STOP_OBSERVE_GRACE_S * 1000 : Infinity;
+    return Math.min(at, requestedCap, tailBudget ?? Infinity);
   }
   private closeTail(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
     for (const row of doc.usage) {
@@ -596,7 +597,8 @@ export class AccountLedger {
   }
 
   async finished(reservation: AccountReservation, unknown: boolean,
-    metadata: Pick<AccountUsageRow, "warm" | "queueWaitMs" | "exitCode" | "outcome" | "expectedSeconds" | "expectedDollars"> = {}): Promise<void> {
+    metadata: Pick<AccountUsageRow, "warm" | "queueWaitMs" | "exitCode" | "outcome" | "expectedSeconds" | "expectedDollars"> = {},
+    finishedAt = this.now()): Promise<void> {
     // Defense in depth: copy only typed scalar fields, never a guest-shaped
     // object wholesale, so a compromised upstream cannot plant unbounded
     // bytes or unexpected keys in the shared account document.
@@ -612,16 +614,32 @@ export class AccountLedger {
     };
     await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
-      const at = this.now(), row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
+      // A lost journal finish may complete accounting on a later sweep. Keep
+      // the original host-measured boundary, and never reopen an observed stop.
+      // An unknown transport result is not a verified end. Once stopped, its
+      // terminal boundary remains billable even if finish recovery runs later.
+      const boundary = unknown && intent.status === "stopped" ? intent.endedAt ?? finishedAt : finishedAt;
+      const at = Math.max(intent.at, Math.min(boundary, this.now(), intent.endedAt ?? Infinity));
+      const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
       if (row) {
         Object.assign(row, safe);
-        if (at > intent.at) row.intervals = [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }];
+        row.intervals = at > intent.at
+          ? [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }] : [];
         row.tailSince = unknown ? null : at;
+        if (intent.status === "stopped" && row.tailSince !== null) {
+          // Terminal reconciliation can precede a recovered finish write.
+          // Rebuild its bounded billed tail without reopening a stopped VM.
+          const end = this.tailEnd(doc, row, intent.endedAt ?? at);
+          if (end > at) row.intervals.push({ since: new Date(at).toISOString(), until: new Date(end).toISOString(), phase: "idle_tail" });
+          row.tailSince = null;
+        }
         row.seconds = Math.max(0, (at - intent.at) / 1000) * WEIGHT[intent.size];
         row.meterProvenance = "pending";
       }
-      if (unknown) intent.status = "ambiguous";
-      else intent.compute = Math.max(0, (at - intent.at) / 1000 + intent.tailSeconds) * WEIGHT[intent.size];
+      if (intent.status !== "stopped") {
+        if (unknown) intent.status = "ambiguous";
+        else intent.compute = Math.max(0, (at - intent.at) / 1000 + intent.tailSeconds) * WEIGHT[intent.size];
+      }
       await this.write(doc);
     });
   }

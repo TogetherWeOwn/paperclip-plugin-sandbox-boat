@@ -45,7 +45,7 @@ const execFileAsync = promisify(execFile);
 function pidRunning(pid: number): boolean {
   try {
     const text = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return text.slice(text.lastIndexOf(")") + 2).split(" ")[1] !== "Z";
+    return text.slice(text.lastIndexOf(")") + 2).split(" ")[0] !== "Z";
   } catch {
     return false;
   }

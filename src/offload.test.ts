@@ -2,6 +2,10 @@ import { describe, expect, it, beforeEach } from "vitest";
 import { FakeBoat, trialLimits } from "./test-support/fake-boat.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { JsonState, usage } from "./test-support/account-admission.fixture.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { command as durableCommand, harness as durableHarness, MemAccountState } from "./test-support/durable-offload.js";
 
 // RED: this module does not exist yet. These tests define the v1 offload
 // executor contract from TOG-38024: shared pool, warm pick, resume/create,
@@ -465,5 +469,45 @@ describe("offload driver config", () => {
     const props = (manifest.environmentDrivers?.[0] as { configSchema?: { properties?: Record<string, unknown> } }).configSchema?.properties ?? {};
     expect(props.maxOffloadVms).toMatchObject({ default: 4 });
     expect(props.offloadIdleStopSeconds).toMatchObject({ default: 15 });
+  });
+});
+
+describe("offload ledger-only finish recovery without guest lifecycle", () => {
+  it("reuses the same-workspace VM right after collectGarbage heals a lost ledger finish", async () => {
+    const root = await mkdtemp(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "offload-ledger-heal-"));
+    const h = durableHarness(root);
+    try {
+      const state = new MemAccountState();
+      const set = state.set.bind(state);
+      let outage = true;
+      state.set = async (key, value) => {
+        const doc = value as { usage?: Array<{ outcome?: string }> };
+        if (outage && key.namespace === "boat-account" && doc.usage?.some((row) => row.outcome === "completed")) {
+          throw new Error("ledger-only outage");
+        }
+        await set(key, value);
+      };
+      const { executor } = h.openExecutor({ state, accountId: "ledger-heal-account" });
+      const first = durableCommand("ledger-heal-1");
+      const firstResult = await executor.execute(first);
+      expect(firstResult).toMatchObject({ status: "completed", exitCode: 23 });
+      if (firstResult.status !== "completed") throw new Error("expected completed");
+      expect(executor.getUsage().find((row) => row.commandId === first.commandId)?.outcome).not.toBe("completed");
+
+      // Heal the ledger and run only garbage collection: no sweep may stop the VM.
+      outage = false;
+      await executor.collectGarbage();
+      expect(executor.getUsage().find((row) => row.commandId === first.commandId)?.outcome).toBe("completed");
+
+      const second = await executor.execute(durableCommand("ledger-heal-2"));
+      expect(second).toMatchObject({ status: "completed", sandboxId: firstResult.sandboxId, warm: "warm" });
+      expect(h.boat.callsOf("create")).toHaveLength(1);
+      expect(h.boat.callsOf("resume")).toHaveLength(0);
+      expect(h.boat.callsOf("stop")).toHaveLength(0);
+      expect(h.boat.callsOf("delete")).toHaveLength(0);
+    } finally {
+      h.crash();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -228,6 +228,10 @@ const DEFAULTS = {
   minComputeHoursLeft: 1,
 };
 
+type FinishRecovery = { finishedAt: number; accounted: boolean; reported: boolean };
+type PendingFinish = FinishRecovery & { vm: PoolVm; warm: OffloadWarm; queueWaitMs: number; guestVerifiedEmpty: boolean;
+  command: OffloadCommand; result: OffloadResult | null; journalPending: boolean; retrying?: Promise<void> };
+
 export class OffloadExecutor {
   private readonly boat: BoatApiLike;
   private readonly ledger: AccountLedger;
@@ -252,6 +256,7 @@ export class OffloadExecutor {
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
   private readonly stopFailures = new Set<string>();
+  private readonly pendingFinishes = new Map<string, PendingFinish>();
   private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
@@ -288,6 +293,14 @@ export class OffloadExecutor {
       release: (identity) => this.releaseHold(identity),
       bind: (identity) => this.bindIdentity(identity),
       cancel: (command, result) => this.cancelQueued(command, result),
+      settled: async (command, result) => {
+        const key = this.cacheKey(command);
+        const pending = this.pendingFinishes.get(key);
+        if (!pending) return;
+        pending.result = result;
+        pending.guestVerifiedEmpty ||= result.status === "unavailable";
+        await this.settleFinish(key, pending);
+      },
     }, this.lifecycle ?? undefined) : null;
     const transport: OffloadDeps["runCommand"] = deps.guest
       ? (_vm, command, identity) => this.lifecycle!.run(identity as ExecutionIdentity, command, deps.runCommand,
@@ -323,6 +336,14 @@ export class OffloadExecutor {
    */
   private async reconcileQuarantined(vm: PoolVm): Promise<void> {
     if (!vm.sandboxId || vm.deletePending) return;
+    // A healed receipt cannot release a VM while accounting is retrying.
+    // Only a verified command end permits stopping without guest observation:
+    // an unknown transport result can still have live descendants.
+    const pending = [...this.pendingFinishes.values()].filter((finish) => finish.vm === vm);
+    if (pending.length > 0 && pending.every((finish) => finish.guestVerifiedEmpty)) {
+      await this.stopVm(vm, true, true).catch(() => undefined);
+      return;
+    }
     let state: string | null = null;
     try {
       state = sandboxStateOf(await this.boat.get({ sandboxId: vm.sandboxId }), vm.sandboxId);
@@ -335,6 +356,7 @@ export class OffloadExecutor {
       await this.persistStopTelemetry(vm).catch(() => {
         this.logger.error("boat offload terminal receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
       });
+      if (pending.length > 0) return; // post-finish accounting still owns the fence
       // The slot stays fenced until the journal receipt settles: a transient
       // journal failure must not free capacity that restart recovery re-holds
       // and re-fences, and a freed slot must never outlive its unsettled bill.
@@ -369,7 +391,7 @@ export class OffloadExecutor {
           // The fence does not pause billing, so halt it with a forced stop
           // while staying fenced; the terminal branch settles the receipt and
           // frees the slot once Boat archives the VM.
-          if (this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
+          if (pending.length > 0 || this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
             await this.stopVm(vm, true, true).catch(() => undefined);
             return;
           }
@@ -471,6 +493,10 @@ export class OffloadExecutor {
   // deadline, or treats a receipt/leader exit as proof of descendant cleanup.
   async sweep(): Promise<void> {
     await this.recover();
+    // Best effort: a failed finish commit is retried here (and in retention)
+    // until the store accepts it. Never throws; the next sweep retries.
+    await this.durable?.settlePending().catch(() => undefined);
+    await this.retryFinishAccounting();
     await this.withAdmission(async () => {
       for (const vm of [...this.pool]) {
         // A pending ephemeral delete is quarantined against reuse, but sweep
@@ -497,11 +523,39 @@ export class OffloadExecutor {
     });
     await this.reconcile();
   }
-  async collectGarbage(): Promise<void> { await this.requireDurable().collectGarbage(); }
+  async collectGarbage(): Promise<void> {
+    await this.requireDurable().collectGarbage();
+    await this.retryFinishAccounting();
+  }
+
+  private async retryFinishAccounting(): Promise<void> {
+    for (const [key, pending] of [...this.pendingFinishes]) {
+      // Lost journal commits retry through its settled callback. Ledger-only
+      // failures have no journal cleanup obligation, so enroll them here too.
+      if (!pending.journalPending) await this.settleFinish(key, pending).catch(() => undefined);
+    }
+  }
+
+  private async settleFinish(key: string, pending: PendingFinish): Promise<void> {
+    // A sweep snapshot can outlive normal settlement and VM reassignment.
+    if (this.pendingFinishes.get(key) !== pending || !pending.result) return;
+    if (pending.retrying) return await pending.retrying;
+    const result = pending.result;
+    const task = (async () => {
+      await this.finishOnVm(pending.vm, pending.command, result, pending.warm, pending.queueWaitMs, pending);
+      this.pendingFinishes.delete(key);
+    })();
+    pending.retrying = task;
+    try { await task; }
+    finally { pending.retrying = undefined; }
+  }
   async readCommand(companyId: string, runId: string, commandId: string) {
     return await this.requireDurable().readCommand(companyId, runId, commandId);
   }
   async cancelCommand(companyId: string, runId: string, commandId: string, reason: string, generation?: number) {
+    // Pool recovery may settle the journal while it holds admission. Finish
+    // it before journal startup can take the reverse journal -> admission path.
+    await this.recoverPool();
     return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason, generation);
   }
   // ID-only convenience calls are restricted to commands admitted by this
@@ -534,6 +588,19 @@ export class OffloadExecutor {
     await this.recoverPool();
     const view = await this.requireDurable().start(snapshot, () => this.executeVolatile(snapshot));
     return { ...view, events: [], nextCursor: 0 };
+  }
+  // Task-settled signal for the executor backend pump: resolves when the
+  // in-process task for this command settles, either way. Never rejects, so
+  // a settled task over a still-non-terminal durable view (a lost finish
+  // commit) ends the pump with uncertainty instead of polling forever.
+  async waitSettled(companyId: string, runId: string, commandId: string): Promise<void> {
+    try {
+      await this.durable?.taskSettled(`command/${companyId}/${runId}/${commandId}`).catch(() => undefined);
+      const key = this.durable ? `command/${companyId}/${runId}/${commandId}` : commandId;
+      await this.inFlight.get(key)?.then(() => undefined, () => undefined);
+    } catch {
+      // A settle signal must never fail the pump itself.
+    }
   }
   private requireDurable(): OffloadJournal {
     if (!this.durable) throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
@@ -928,7 +995,8 @@ export class OffloadExecutor {
       const [entry] = this.queue.splice(at, 1);
       if (entry!.timerHandle != null) this.timers.clear(entry!.timerHandle);
       entry!.timerHandle = null;
-      entry!.resolve(this.finish(this.cacheKey(command), result));
+      const key = this.cacheKey(command);
+      entry!.resolve(this.journal.has(key) ? this.finish(key, result) : result);
     });
   }
 
@@ -1278,34 +1346,63 @@ export class OffloadExecutor {
       }
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: preStart?.reason ?? "command transport failed; reconcile the guest receipt before replay or VM reuse" };
     }
+    const key = this.cacheKey(command);
+    const pending: PendingFinish = { vm, warm, queueWaitMs, finishedAt: this.now(), accounted: false, reported: false,
+      guestVerifiedEmpty: result.status !== "unknown", command, result: null, journalPending: true };
+    this.pendingFinishes.set(key, pending);
     try {
       if (this.durable) result = await this.durable.finish(command, result);
     } catch (error) {
       await this.quarantineVm(vm, command);
       throw error;
     }
-    this.finish(this.cacheKey(command), result);
+    pending.result = result;
+    pending.guestVerifiedEmpty ||= result.status === "unavailable";
+    pending.journalPending = false;
+    this.finish(key, result);
+    try {
+      await this.settleFinish(key, pending);
+    } catch (error) {
+      await this.quarantineVm(vm, command);
+      // The journal's success is still authoritative during a ledger outage.
+      // Keep its accounting retry fenced, without rewriting the command exit.
+      if (pending.accounted) throw error;
+    }
+    return result;
+  }
+
+  private async finishOnVm(vm: PoolVm, command: OffloadCommand, result: OffloadResult,
+    warm: OffloadWarm, queueWaitMs: number, recovery?: FinishRecovery): Promise<OffloadResult> {
+    if (!recovery) this.finish(this.cacheKey(command), result);
     if (result.status === "unavailable") {
       // A durable cancellation won the race after admission: no command ran.
       // Close the funded reservation with a zero-length command interval.
-      await this.ledger.finished(vm.accountReservation!, false, {
-        warm, queueWaitMs, exitCode: 0, outcome: "completed", expectedSeconds: 0, expectedDollars: 0,
-      }).catch(() => {
-        this.logger.error("boat offload usage persistence failed; account reservation retained");
-      });
+      if (!recovery?.accounted) {
+        await this.ledger.finished(vm.accountReservation!, false, {
+          warm, queueWaitMs, exitCode: 0, outcome: "completed", expectedSeconds: 0, expectedDollars: 0,
+        }, recovery?.finishedAt).catch((error) => {
+          this.logger.error("boat offload usage persistence failed; account reservation retained");
+          if (recovery) throw error;
+        });
+        if (recovery) recovery.accounted = true;
+      }
       // Sync-in may already have pushed source before the cancellation won.
       if (this.isEphemeral(command)) await this.deleteVm(vm);
       else await this.releaseVm(vm);
       return result;
     }
     let accountingFailed = false;
-    await this.ledger.finished(vm.accountReservation!, result.status === "unknown", {
-      warm, queueWaitMs, exitCode: result.exitCode, outcome: result.status, expectedSeconds: result.seconds, expectedDollars: result.dollars,
-    }).catch(() => {
-      accountingFailed = true;
-      this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
-    });
-    if (result.status === "completed") {
+    if (!recovery?.accounted) {
+      await this.ledger.finished(vm.accountReservation!, result.status === "unknown", {
+        warm, queueWaitMs, exitCode: result.exitCode, outcome: result.status, expectedSeconds: result.seconds, expectedDollars: result.dollars,
+      }, recovery?.finishedAt).catch((error) => {
+        accountingFailed = true;
+        this.logger.error("boat offload usage persistence failed; VM quarantined and account reservation retained");
+        if (recovery) throw error;
+      });
+      if (recovery) recovery.accounted = true;
+    }
+    if (result.status === "completed" && !recovery?.reported) {
       // Feed the duration gate: completed remote runs teach the next decision.
       // A learning write never fails the command it just measured.
       try {
@@ -1315,6 +1412,7 @@ export class OffloadExecutor {
         void error;
       }
     }
+    if (recovery) recovery.reported = true;
     // Identity + accounting only, never argv/env or raw transport errors.
     this.logger.info(`boat offload expected-cost ${JSON.stringify({ commandId: command.commandId, repoId: command.repoId, size: this.config.size, warm, queueWaitMs, seconds: result.seconds, dollars: Number(result.dollars.toFixed(6)), outcome: result.status, estimated: result.status === "unknown" })}`, {
       commandId: command.commandId,
@@ -1378,13 +1476,24 @@ export class OffloadExecutor {
 
   private async releaseVm(vm: PoolVm): Promise<void> {
     await this.withAdmission(async () => {
+      const workspaceKey = vm.workspaceKey;
       vm.lastActiveAt = this.now();
       vm.busy = false;
+      // Only completed/never-started paths release, after terminal accounting.
+      // Clear the ledger-outage fence before dispatch; unknown stays quarantined.
+      vm.quarantined = false;
       vm.workspaceKey = null;
       vm.generation += 1;
       vm.stopAttempts = 0;
       vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
-      await this.persistPool();
+      try { await this.persistPool(); }
+      catch (error) {
+        // Settlement remains retryable. Keep its workspace fenced before
+        // admission can assign a VM that this old finish would release again.
+        vm.quarantined = true;
+        vm.workspaceKey = workspaceKey;
+        throw error;
+      }
       if (!this.closed) await this.dispatchQueued();
       // Dispatch may reserve this VM, retire it for an incompatible waiter,
       // or leave a stop retry installed. Never resurrect its old idle timer.
