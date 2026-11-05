@@ -115,7 +115,8 @@ export type BackendCancellation =
 
 export interface OffloadBackendHandle {
   readonly done: Promise<void>;
-  cancel(): Promise<void | BackendCancellation>;
+  /** Poison cleanup stops active work, but must not cancel an already settled task. */
+  cancel(reason?: "cleanup"): Promise<void | BackendCancellation>;
   heartbeat?(): Promise<void>;
 }
 
@@ -776,7 +777,7 @@ export class OffloadBroker {
           // Detached from this cmd chain: cancellation joins remote cleanup
           // whose sink callbacks re-enter the same chain, so awaiting it here
           // would wedge every later heartbeat, cancel and sweep on this key.
-          if (handle) void runOutsideInvocation(() => handle.cancel()).catch(() => undefined);
+          if (handle) void runOutsideInvocation(() => handle.cancel("cleanup")).catch(() => undefined);
           try {
             const raw = (await this.store.get(cmdKey(commandId))) as JournalRecord | null;
             if (raw && !TERMINAL.has(raw.state)) {

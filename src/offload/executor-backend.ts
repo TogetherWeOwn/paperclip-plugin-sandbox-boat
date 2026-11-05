@@ -175,9 +175,12 @@ export class ExecutorBackend implements OffloadBackend {
         await ready;
         if (executor && !outcome) await executor.heartbeatCommand(command.companyId, command.runId, command.commandId);
       },
-      cancel: async () => {
+      cancel: async (reason) => {
         await ready;
-        if (!outcome) await cancelGuest();
+        // A delayed broker save can fail after the task settled and queue
+        // poison cleanup behind it. Only real cancellation may change that
+        // task's original result; active work still needs cleanup below.
+        if (!outcome && (reason !== "cleanup" || !taskSettled)) await cancelGuest();
         // A cancel acknowledgement alone is not a settled workspace: sync-in
         // may still read it, or sync-out may still stage returned changes.
         await done;
