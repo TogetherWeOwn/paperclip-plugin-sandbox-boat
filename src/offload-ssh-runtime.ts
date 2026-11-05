@@ -897,17 +897,22 @@ export class SshOffloadRuntime {
    * Upkeep for a registered pool that is not loaded: stop past-due VMs,
    * confirm stopping VMs, settle provider-gone VMs (journal to terminal-read
    * unknown, never replayed), then reconcile the ledger for that poolId.
-   * Never creates a VM. Throws on an unreadable pool document (absent is
-   * nothing to do) so the sweep reports unverified, never silent.
+   * Never creates a VM. An absent pool still needs ledger reconciliation;
+   * an unreadable document throws so the sweep reports unverified.
    */
   private async sweepUnloadedPool(companyId: string, poolId: string, seenAt: number, boat: BoatApiLike): Promise<void> {
     const poolStore = new OffloadPoolStore(this.deps.state, this.deps.accountId, poolId);
+    const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     let doc;
     try {
       doc = await poolStore.loadDoc();
     } catch (error) {
-      if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return;
-      throw error;
+      if (!(error instanceof Error) || error.message !== "OFFLOAD_POOL_ABSENT") throw error;
+      // Reserve can commit before either pool save succeeds. This caller has
+      // verified credential provenance; reconcile durable intents (including
+      // id-less TTL holds), never infer provider deletion from pool absence.
+      await ledger.reconcile(boat, undefined, false, false, poolId);
+      return;
     }
     const pool = doc.vms;
     const inert = async (): Promise<never> => { throw new Error("Unloaded offload pool is not executable"); };
@@ -916,7 +921,6 @@ export class SshOffloadRuntime {
       resolveRunState: async (company, runId) => ({ permanentlyTerminal: this.runEnded(company, runId), terminatedAt: null,
         tokenExpiresAt: seenAt + 24 * 60 * 60_000 }),
       sync: { push: inert, collect: inert, stage: inert, markSuspect: inert } }, Date.now, { hold: inert, release: inert, cancel: inert });
-    const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
     const now = Date.now();
     // Fields a concurrent claim changes; compared against a reload before
     // saving so the sweep never overwrites a reservation made from a snapshot

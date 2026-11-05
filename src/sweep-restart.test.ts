@@ -12,6 +12,10 @@ import type { BoatApiLike } from "./boat-client.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import { commandDigest } from "./offload-journal.js";
 import { scryptSync } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { isExecutorRefusal, type BackendCommand } from "./offload/broker.js";
 import { DEFAULT_API_BASE, parseDriverConfig } from "./config.js";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { AccountLedger } from "./account-ledger.js";
@@ -307,6 +311,92 @@ describe("sweep after a worker restart", () => {
     expect((await store.load()).find((vm) => vm.sandboxId === box.id))
       .toMatchObject({ busy: true, stopping: false });
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).not.toContain(box.id);
+  });
+
+  it("expires a durable reservation after failed pool saves without a new command or pool document", async () => {
+    const root = await mkdtemp(join(tmpdir(), "absent-offload-pool-"));
+    const api = fake as unknown as BoatApiLike;
+    const accountId = "account-absent-pool";
+    const registryScope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" };
+    const input: BackendCommand = { companyId, runId: "absent-pool-run", executionWorkspaceId: workspaceId,
+      commandId: "absent-pool-command", cardId: issue, repoId: "repo:https://github.com/example/public",
+      profileId: "rust-public-1", argv: ["test", "--locked"], cwdRelative: ".", env: {}, timeoutMs: 60_000, queueTimeoutMs: 0 };
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let poolFailures = 0;
+    let failPool = true;
+    harness.ctx.state.set = async (key, value) => {
+      if (failPool && key.namespace === "boat-offload-pool") {
+        poolFailures += 1;
+        throw new Error("pool-only write outage");
+      }
+      await realSet(key, value);
+    };
+    const deps = { state: harness.ctx.state, logger: harness.ctx.logger, ssh: {} as never, accountId, boat: () => api,
+      trackedFiles: async () => new Set(["Cargo.toml", "Cargo.lock"]) };
+    const runtime = new SshOffloadRuntime(deps);
+    let restarted: SshOffloadRuntime | undefined;
+    vi.useFakeTimers({ toFake: ["Date"], now: clock });
+    try {
+      await writeFile(join(root, "Cargo.toml"), "[package]\nname = 'test'\nversion = '0.1.0'\n");
+      await writeFile(join(root, "Cargo.lock"), "version = 3\n");
+      runtime.remember({ driverKey: "boat", companyId, environmentId, config: baseConfig, lease: { providerLeaseId: null },
+        workspace: { localPath: root, metadata: { workspaceRealizationRequest: {
+          version: 1, companyId, environmentId, heartbeatRunId: input.runId, executionWorkspaceId: workspaceId,
+          source: { localPath: root, repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null },
+        } } } });
+      const executor = await runtime.resolve(input, { offloadExecutorEnabled: true, offloadGuestTransportEnabled: true,
+        offloadCgroupParent: "/sys/fs/cgroup/test", offloadArtifactRoot: join(root, "artifacts"), offloadAllowedRepos: [input.repoId] });
+      if (isExecutorRefusal(executor)) throw new Error(executor.refusalReason);
+      expect(await executor.execute(input)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("reservation retained") });
+      expect(poolFailures).toBeGreaterThanOrEqual(2);
+      expect(fake.callsOf("create")).toEqual([]);
+      // The dying worker cannot flush its quarantined placeholder either.
+      await expect(runtime.shutdown()).rejects.toThrow("pool-only write outage");
+      const registry = await harness.ctx.state.get(registryScope) as Record<string, unknown>;
+      const [poolId] = Object.keys(registry);
+      expect(poolId).toBeDefined();
+      const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId!);
+      await expect(store.loadDoc()).rejects.toThrow("OFFLOAD_POOL_ABSENT");
+      const account = () => [...harness.state.entries()].find(([key]) => key.includes("|boat-account|"))?.[1] as {
+        intents: Array<{ active: boolean; status: string; sandboxId: string | null; compute: number; computeReflected: number; ttlSeconds: number }>;
+      };
+      expect(account().intents).toEqual([expect.objectContaining({ active: true, status: "ambiguous", sandboxId: null })]);
+      expect(account().intents[0]!.compute).toBeGreaterThan(0);
+      expect(account().intents[0]!.ttlSeconds).toBeGreaterThanOrEqual(60);
+      // No whole-run config, new admission or loaded-pool recovery can help.
+      expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" })).toBeNull();
+      failPool = false;
+      restarted = new SshOffloadRuntime(deps);
+      delete process.env.BOAT_API_KEY;
+      clock += 2 * 86_400_000;
+      vi.setSystemTime(clock);
+      await restarted.sweep([companyId]); // compact the ended command to a tombstone
+      clock += 31 * 86_400_000; // funded TTL + margin, token and tombstone retention
+      vi.setSystemTime(clock);
+      // A missing or foreign credential/endpoint still cannot settle the hold.
+      for (const config of [{}, { apiKey: "wrong-account" }, { apiKey: fakeKey, apiBase: "https://other-provider.invalid" }]) {
+        delete process.env.BOAT_API_KEY;
+        await expect(restarted.sweep([companyId], { configsFor: () => [parseDriverConfig(config)] }))
+          .rejects.toThrow("Offload pool sweep unverified");
+        expect(account().intents[0]).toMatchObject({ active: true, status: "ambiguous" });
+        expect(await harness.ctx.state.get(registryScope)).toEqual(registry);
+      }
+      process.env.BOAT_API_KEY = fakeKey;
+      await restarted.sweep([companyId]);
+      expect(account().intents[0]).toMatchObject({ active: false, status: "stopped", compute: 0 });
+      expect(await harness.ctx.state.get(registryScope)).toEqual({});
+      await restarted.sweep([companyId]);
+      await expect(store.loadDoc()).rejects.toThrow("OFFLOAD_POOL_ABSENT");
+      for (const method of ["create", "fork", "resume", "update", "stop"] as const) expect(fake.callsOf(method)).toEqual([]);
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      failPool = false;
+      harness.ctx.state.set = realSet;
+      await runtime.shutdown();
+      await restarted?.shutdown();
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it.each([

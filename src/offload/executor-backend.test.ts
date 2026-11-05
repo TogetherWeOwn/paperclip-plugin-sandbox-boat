@@ -316,6 +316,69 @@ const request = { version: 1 as const, commandId: cmd.commandId, executionWorksp
   queueTimeoutMs: cmd.queueTimeoutMs, timeoutMs: cmd.timeoutMs, dryRun: false };
 
 describe("broker with real executor adapter", () => {
+  it.each(["started", "output"])("does not cancel a settled task when a delayed %s save poisons the broker", async (event) => {
+    f = await fixture();
+    const exec = f.hold(`exec:${cmd.commandId}`);
+    f.output([["stdout", Buffer.from("original output\n")]]);
+    const save = f.state.set.bind(f.state);
+    let terminalFailures = 0;
+    f.state.set = async (key, value) => {
+      const row = value as { commandId?: string; state?: string };
+      if (key.namespace === "guest-test-journal" && row.commandId === cmd.commandId
+        && row.state === "completed" && terminalFailures === 0) {
+        terminalFailures += 1;
+        throw new Error("one terminal write lost");
+      }
+      await save(key, value);
+    };
+    const delayed = deferred<void>();
+    let pendingSave = false;
+    class DelayedStore extends Store {
+      override async set(key: string, value: unknown) {
+        const row = value as { state?: string; outputBytes?: number };
+        if (!pendingSave && key === `offload.cmd.${cmd.commandId}` && row.state === "running"
+          && (event === "started" || row.outputBytes! > 0)) {
+          pendingSave = true;
+          await delayed.promise;
+          throw new Error("delayed broker event save lost");
+        }
+        await super.set(key, value);
+      }
+    }
+    const cancel = vi.spyOn(f.executor, "cancelCommand");
+    const adapter = backend(f.executor);
+    let pump!: Promise<void>;
+    let cleanup!: Promise<unknown>;
+    const broker = new OffloadBroker({ store: new DelayedStore(), now: Date.now, backend: {
+      start: (input, output) => {
+        const handle = adapter.start(input, output);
+        pump = handle.done;
+        return { ...handle, cancel: (...args) => {
+          cleanup = handle.cancel(...args);
+          return cleanup as ReturnType<typeof handle.cancel>;
+        } };
+      },
+    } });
+    await broker.submit(request, cmd);
+    await until(() => pendingSave && f!.guest.alive(cmd.commandId));
+    exec.resolve();
+    await pump; // task settled; uncertainty is queued behind the broker save
+    expect(terminalFailures).toBe(1);
+    delayed.resolve(); // broker persistence heals after losing that older save
+    expect((await broker.read(cmd.commandId, cmd, 0)).body).toMatchObject({ state: "unknown", fallbackSafe: false });
+    await expect(cleanup).rejects.toThrow("OFFLOAD_EXECUTION_UNKNOWN");
+    expect(cancel).not.toHaveBeenCalled();
+    await f.executor.sweep();
+    expect(await f.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({
+      state: "completed", remoteStarted: true, fallbackSafe: false, result: { exitCode: 0, cancelled: false },
+    });
+    const records = Object.values(await f.state.all()) as Array<{ commandId?: string; cancelRequested?: unknown }>;
+    expect(records.find((row) => row.commandId === cmd.commandId)?.cancelRequested ?? null).toBeNull();
+    expect(f.starts).toHaveLength(1);
+    expect((await broker.submit(request, cmd)).body).toMatchObject({ state: "unknown", fallbackSafe: false });
+    expect(f.starts).toHaveLength(1);
+  });
+
   it("forwards broker heartbeats to guest interest without the output pump renewing it", async () => {
     const executor = port();
     let view = queued;
