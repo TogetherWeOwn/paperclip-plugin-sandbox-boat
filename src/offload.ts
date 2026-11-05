@@ -254,7 +254,7 @@ export class OffloadExecutor {
   private readonly journal = new Map<string, { digest: string; result: OffloadResult | null }>();
   private readonly inFlight = new Map<string, Promise<OffloadResult>>();
   private readonly stopFailures = new Set<string>();
-  private readonly pendingFinishes = new Map<string, FinishRecovery & { vm: PoolVm; warm: OffloadWarm; queueWaitMs: number }>();
+  private readonly pendingFinishes = new Map<string, FinishRecovery & { vm: PoolVm; warm: OffloadWarm; queueWaitMs: number; guestVerifiedEmpty: boolean }>();
   private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
@@ -297,7 +297,6 @@ export class OffloadExecutor {
         if (!pending) return;
         await this.finishOnVm(pending.vm, command, result, pending.warm, pending.queueWaitMs, pending);
         this.pendingFinishes.delete(key);
-        this.knownCommands.delete(command.commandId);
       },
     }, this.lifecycle ?? undefined) : null;
     const transport: OffloadDeps["runCommand"] = deps.guest
@@ -334,10 +333,11 @@ export class OffloadExecutor {
    */
   private async reconcileQuarantined(vm: PoolVm): Promise<void> {
     if (!vm.sandboxId || vm.deletePending) return;
-    // A healed journal receipt alone cannot release a VM whose post-finish
-    // accounting is still retrying. The recovered completion owns it until
-    // both accounting and disposition succeed.
-    if ([...this.pendingFinishes.values()].some((pending) => pending.vm === vm)) {
+    // A healed receipt cannot release a VM while accounting is retrying.
+    // Only a verified command end permits stopping without guest observation:
+    // an unknown transport result can still have live descendants.
+    const pending = [...this.pendingFinishes.values()].filter((finish) => finish.vm === vm);
+    if (pending.length > 0 && pending.every((finish) => finish.guestVerifiedEmpty)) {
       await this.stopVm(vm, true, true).catch(() => undefined);
       return;
     }
@@ -353,6 +353,7 @@ export class OffloadExecutor {
       await this.persistStopTelemetry(vm).catch(() => {
         this.logger.error("boat offload terminal receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
       });
+      if (pending.length > 0) return; // post-finish accounting still owns the fence
       // The slot stays fenced until the journal receipt settles: a transient
       // journal failure must not free capacity that restart recovery re-holds
       // and re-fences, and a freed slot must never outlive its unsettled bill.
@@ -387,7 +388,7 @@ export class OffloadExecutor {
           // The fence does not pause billing, so halt it with a forced stop
           // while staying fenced; the terminal branch settles the receipt and
           // frees the slot once Boat archives the VM.
-          if (this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
+          if (pending.length > 0 || this.durable && await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
             await this.stopVm(vm, true, true).catch(() => undefined);
             return;
           }
@@ -1320,7 +1321,8 @@ export class OffloadExecutor {
     try {
       if (this.durable) result = await this.durable.finish(command, result);
     } catch (error) {
-      this.pendingFinishes.set(this.cacheKey(command), { vm, warm, queueWaitMs, finishedAt, accounted: false, reported: false });
+      this.pendingFinishes.set(this.cacheKey(command), { vm, warm, queueWaitMs, finishedAt, accounted: false, reported: false,
+        guestVerifiedEmpty: result.status !== "unknown" });
       await this.quarantineVm(vm, command);
       throw error;
     }
