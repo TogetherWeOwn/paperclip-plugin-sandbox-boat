@@ -45,7 +45,9 @@ describe("guest lifecycle boundary regressions", () => {
     await until(() => s.trace.includes("exec:deadline"));
     await s.clock.advance(10_000);
     expect(await pending).toMatchObject({ exitCode: 124, timedOut: true, fallbackSafe: false });
-    expect(await s.executor.read("deadline")).toMatchObject({ result: { timedOut: true, exitCode: 124 } });
+    // Terminal commands leave the ID-only lookup (an in-memory convenience):
+    // the scoped durable read still serves the receipt.
+    expect(await s.executor.readOutput("company-a", "run-a", "deadline")).toMatchObject({ result: { timedOut: true, exitCode: 124 } });
   });
 
   it.each([
@@ -117,7 +119,7 @@ describe("start and output API regressions", () => {
     const patch = field === "output" ? { output: [{ seq: 1, stream: "stdout", dataBase64: 12 }] }
       : { identity: { ...record.identity, cgroupPath: "/" } };
     await store.set(commandKey(cmd), { ...record, ...patch });
-    await expect(s.executor.read("corrupt")).rejects.toMatchObject({ code: "OFFLOAD_EXECUTION_UNKNOWN" });
+    await expect(s.executor.readOutput("company-a", "run-a", "corrupt")).rejects.toMatchObject({ code: "OFFLOAD_EXECUTION_UNKNOWN" });
   });
   it("joins duplicate starts and byte-chunks a single oversized transport write", async () => {
     const gate = s.hold("exec:streaming");
@@ -140,8 +142,8 @@ describe("start and output API regressions", () => {
   it("a read below the next event's size fails without advancing or losing bytes", async () => {
     s.output([["stderr", new Uint8Array(1024).fill(7)]]);
     await s.execute(command("small-read"));
-    await expect(s.executor.read("small-read", 0, 1)).rejects.toMatchObject({ code: "OFFLOAD_OUTPUT_READ_TOO_SMALL" });
-    const full = await s.executor.read("small-read");
+    await expect(s.executor.readOutput("company-a", "run-a", "small-read", 0, 1)).rejects.toMatchObject({ code: "OFFLOAD_OUTPUT_READ_TOO_SMALL" });
+    const full = await s.executor.readOutput("company-a", "run-a", "small-read");
     expect(full.nextCursor).toBe(1);
     expect(Buffer.from(full.events[0]!.dataBase64, "base64")).toEqual(Buffer.alloc(1024, 7));
   });

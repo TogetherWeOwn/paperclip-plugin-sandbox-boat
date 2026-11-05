@@ -64,15 +64,20 @@ and override `ManagerDeps.offloadExecutor`; the stock worker uses
   accept an optional journal generation; stale generations cannot signal or renew
   current work.
 * ID-only `read`, `cancel` and `heartbeat` helpers apply only to commands this
-  executor admitted and reject ambiguous IDs. External routes must use the
-  run/company-scoped methods and supply authenticated bindings.
+  executor admitted and reject ambiguous IDs. Terminal commands leave that
+  in-memory lookup (which stays bounded); the scoped reads still serve their
+  durable receipts. External routes must use the run/company-scoped methods
+  and supply authenticated bindings. Watchdog paths stay pinned while their
+  VM boot is alive and release when the VM stops or retires, so the per-run
+  maps drain instead of growing with every command.
 * The journal store writes its index before the record, so a crash between the
   two leaves either an index entry with no record or a record no index lists.
   Recovery and retention prune dangling index entries instead of throwing, so a
-  torn write never wedges later submits; orphan records stay invisible until
-  retention ages them out. A terminal finish commit lost to a store blip keeps
-  its computed result in memory, and retention and the pool sweep retry the
-  commit (bounded, then unknown with hold), so one sweep heals a failed finish.
+  torn write never wedges later submits; orphan records stay invisible, not
+  discoverable by indexed retention. A terminal finish commit lost to a store
+  blip keeps its computed result in memory, and retention and the pool sweep
+  retry the commit (bounded, then unknown with hold). A sandbox's already
+  settled unknown is never overwritten by that retry.
 
 Lifecycle-enabled executors persist pool ownership, funded idle tails, absolute
 stop deadlines, stop requests and guest identities in instance-scoped plugin
@@ -175,10 +180,15 @@ follows durable host intent. The watchdog kills the subtree on execution deadlin
 expired client interest or supervisor loss. Heartbeats renew the guest watchdog
 and host timer; reads renew neither. Losing a result/output channel is uncertain,
 not permission to replay. Output is capped at 1 MiB; overflow fails closed rather
-than returning truncated success. New pool VMs follow the environment's
+than returning truncated success. Guest read pages carry at most 64 events and about
+96 KiB of encoded JSON, so a page stays inside the control RPC's 128 KiB envelope;
+a page that still outgrows the envelope fails closed as output overflow. The host
+output poll backs off while the guest is quiet (100 ms,
+doubling to one poll per second) with a 10 ms floor when pages carry events, so
+a silent command costs about one SSH round trip per second instead of ten. New
+pool VMs follow the environment's
 monitoring setting (default on), and the pool compatibility key carries the
 opt-out so a VM is never reused across monitoring policies. The existing
-native sweep job owns stop retry/reconciliation; no host pacer is added.
 
 **Fallback:** without functional cgroup-v2 delegation and a verified outside
 watchdog, the command never starts and the existing bounded local path remains

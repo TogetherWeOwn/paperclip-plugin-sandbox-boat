@@ -227,6 +227,10 @@ const DEFAULTS = {
   maxStartsPerDay: 70,
   minComputeHoursLeft: 1,
 };
+/** Volatile-only dedup cache bound (live waiters stay far below it: queue 32 + in-flight). */
+const MAX_VOLATILE_JOURNAL = 512;
+/** ID-only convenience lookups bound; terminal commands are deleted outright in execute(). */
+const MAX_KNOWN_COMMANDS = 1024;
 
 export class OffloadExecutor {
   private readonly boat: BoatApiLike;
@@ -452,7 +456,9 @@ export class OffloadExecutor {
     } else {
       vm.stopping = false;
       vm.stopped = true;
-      // A confirmed terminal observation ends the VM's SSH session.
+      // A confirmed terminal observation ends both the SSH session and the
+      // old boot's watchdog paths, just like direct stop and retirement.
+      this.lifecycle?.releaseSandbox(vm.sandboxId);
       await this.notifyReleased(vm);
     }
     return false;
@@ -508,7 +514,9 @@ export class OffloadExecutor {
     return await this.requireDurable().cancelCommand(companyId, runId, commandId, reason, generation);
   }
   // ID-only convenience calls are restricted to commands admitted by this
-  // executor. Ambiguous IDs fail closed; external routes must use scoped calls.
+  // executor and not yet terminal (settlement drops the lookup so the map
+  // cannot grow with every command). Ambiguous IDs fail closed; terminal
+  // commands and external routes must use the scoped calls.
   private knownCommand(commandId: string): OffloadCommand {
     const command = this.knownCommands.get(commandId);
     if (!command) throw new Error("OFFLOAD_COMMAND_SCOPE_REQUIRED");
@@ -659,13 +667,25 @@ export class OffloadExecutor {
     const known = this.knownCommands.get(snapshot.commandId);
     if (!this.knownCommands.has(snapshot.commandId)) this.knownCommands.set(snapshot.commandId, snapshot);
     else if (known && commandKey(known) !== commandKey(snapshot)) this.knownCommands.set(snapshot.commandId, null);
+    // Bound the start()-path leftovers (execute() deletes on terminal below).
+    while (this.knownCommands.size > MAX_KNOWN_COMMANDS) {
+      const oldest = this.knownCommands.keys().next();
+      if (oldest.done) break;
+      this.knownCommands.delete(oldest.value);
+    }
     return snapshot;
   }
 
   async execute(command: OffloadCommand): Promise<OffloadResult> {
     const snapshot = this.trackCommand(command);
     await this.recoverPool();
-    return this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
+    const result = this.durable ? await this.durable.execute(snapshot, () => this.executeVolatile(snapshot)) : await this.executeVolatile(snapshot);
+    if (result.status === "completed" || result.status === "unavailable") {
+      // The terminal receipt lives in the durable journal (or the volatile
+      // journal below); ID-only lookups must use the scoped calls from here on.
+      this.knownCommands.delete(snapshot.commandId);
+    }
+    return result;
   }
 
   private cacheKey(command: OffloadCommand): string {
@@ -694,6 +714,22 @@ export class OffloadExecutor {
       return await pending;
     } finally {
       this.inFlight.delete(key);
+      if (this.durable) {
+        // Duplicates replay from the durable journal from here on.
+        this.journal.delete(key);
+      } else {
+        for (const [oldKey, entry] of this.journal) {
+          if (this.journal.size <= MAX_VOLATILE_JOURNAL) break;
+          // Live entries back in-flight work: finish() and duplicate joins
+          // need them, and they stay bounded by queue plus admission. An entry
+          // whose promise has not settled stays even with a result: finish()
+          // runs before accounting, duration recording and VM release, so
+          // evicting it would let a duplicate re-execute while the first call
+          // is still pending, and the settling call would then delete the
+          // duplicate's inFlight join.
+          if (entry.result !== null && !this.inFlight.has(oldKey)) this.journal.delete(oldKey);
+        }
+      }
     }
   }
 
@@ -1423,6 +1459,8 @@ export class OffloadExecutor {
     // Retirement ends the VM's stop obligation; a leftover failure entry
     // could never be retried and would poison every later shutdown.
     this.stopFailures.delete(vm.sandboxId);
+    // The boot id changes on any later resume, so drop its watchdog paths.
+    this.lifecycle?.releaseSandbox(vm.sandboxId);
     vm.generation += 1;
     const at = this.pool.indexOf(vm);
     if (at >= 0) this.pool.splice(at, 1);
@@ -1568,6 +1606,8 @@ export class OffloadExecutor {
     vm.stopped = state === "archived" || state === "cancelled";
     vm.stopping = !vm.stopped;
     vm.stopObservedAt = vm.stopped ? this.now() : null;
+    // A stopped VM resumes under a new boot id: its old watchdog paths are dead.
+    if (vm.stopped) this.lifecycle?.releaseSandbox(vm.sandboxId);
     await this.persistStopTelemetry(vm).catch(() => {
       this.logger.error("boat offload stop receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
     });
