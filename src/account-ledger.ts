@@ -392,8 +392,8 @@ export class AccountLedger {
     const intent = doc.intents.find((i) => i.usageId != null && i.usageId === row.usageRecordId);
     const tailBudget = intent != null && Number.isFinite(intent.tailSeconds)
       ? row.tailSince + (intent.tailSeconds + STOP_OBSERVE_GRACE_S) * 1000 : null;
-    const cap = row.stopDueAt != null ? row.stopDueAt + STOP_OBSERVE_GRACE_S * 1000 : (tailBudget ?? at);
-    return Math.min(at, cap);
+    const requestedCap = row.stopDueAt != null ? row.stopDueAt + STOP_OBSERVE_GRACE_S * 1000 : Infinity;
+    return Math.min(at, requestedCap, tailBudget ?? Infinity);
   }
   private closeTail(doc: AccountDoc, sandboxId: string, at: number, includeUnscoped = false): void {
     for (const row of doc.usage) {
@@ -616,12 +616,23 @@ export class AccountLedger {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
       // A lost journal finish may complete accounting on a later sweep. Keep
       // the original host-measured boundary, and never reopen an observed stop.
-      const at = Math.max(intent.at, Math.min(finishedAt, this.now(), intent.endedAt ?? Infinity));
+      // An unknown transport result is not a verified end. Once stopped, its
+      // terminal boundary remains billable even if finish recovery runs later.
+      const boundary = unknown && intent.status === "stopped" ? intent.endedAt ?? finishedAt : finishedAt;
+      const at = Math.max(intent.at, Math.min(boundary, this.now(), intent.endedAt ?? Infinity));
       const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
       if (row) {
         Object.assign(row, safe);
-        if (at > intent.at) row.intervals = [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }];
-        row.tailSince = unknown || intent.status === "stopped" ? null : at;
+        row.intervals = at > intent.at
+          ? [{ since: new Date(intent.at).toISOString(), until: new Date(at).toISOString(), phase: "command" }] : [];
+        row.tailSince = unknown ? null : at;
+        if (intent.status === "stopped" && row.tailSince !== null) {
+          // Terminal reconciliation can precede a recovered finish write.
+          // Rebuild its bounded billed tail without reopening a stopped VM.
+          const end = this.tailEnd(doc, row, intent.endedAt ?? at);
+          if (end > at) row.intervals.push({ since: new Date(at).toISOString(), until: new Date(end).toISOString(), phase: "idle_tail" });
+          row.tailSince = null;
+        }
         row.seconds = Math.max(0, (at - intent.at) / 1000) * WEIGHT[intent.size];
         row.meterProvenance = "pending";
       }
