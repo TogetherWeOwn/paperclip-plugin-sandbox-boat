@@ -626,7 +626,7 @@ export class BoatVmManager {
         const deleted = await this.offloadState.delete(this.runOwnerScope(companyId, runId)).then(() => true, () => false);
         // A racing terminal event may have left a tombstone after its own
         // failed delete. Keep it discoverable until a sweep confirms deletion.
-        if (deleted) await this.untrackRunOwner(companyId, runId);
+        if (deleted && await this.forgetRunOffload(companyId, runId)) await this.untrackRunOwner(companyId, runId);
         return false;
       }
     }
@@ -789,12 +789,10 @@ export class BoatVmManager {
       }
     }
     // From the persisted index, so bindings are forgotten even when this worker never saw the run start.
-    await this.forgetRunOffload(companyId, runId);
-    // The index is the sweep's only enumeration source: a surviving row (a
-    // failed delete, even with a tombstone write) stays indexed, so a later
-    // sweep retries the delete instead of orphaning the row where no sweep
-    // finds it.
-    if (rowDeleted) await this.untrackRunOwner(companyId, runId);
+    const workspacesDeleted = await this.forgetRunOffload(companyId, runId);
+    // The owner index is also the retry anchor for surviving workspace rows.
+    // Retain it until both the owner and all bindings are durably removed.
+    if (rowDeleted && workspacesDeleted) await this.untrackRunOwner(companyId, runId);
   }
 
   /** True once this worker has seen a whole-run config for the company (cached on acquire/realize). */
@@ -839,6 +837,13 @@ export class BoatVmManager {
           const stale = !tombstone && saved !== null && typeof saved === "object"
             && typeof saved.startedAt === "number" && this.now() - saved.startedAt > LOCAL_RUN_STATE_MAX_AGE_MS;
           if (record === null || tombstone || stale) {
+            // A lost owner-row write does not end a locally owned live run.
+            // Keep its bindings and retry anchor until a terminal event arrives.
+            const localId = this.localRunKey(companyId, runId);
+            if (!tombstone && this.localRuns.has(localId) && !this.endedLocalRuns.has(localId)) {
+              live.add(runId);
+              continue;
+            }
             // Age alone never ends an issue run: the ownership gate rehydrates
             // live issue runs from the host (savedRunLive), so the sweep
             // applies the same liveness bound instead of stranding active runs.
@@ -853,10 +858,9 @@ export class BoatVmManager {
               }
             }
             const deleted = await this.offloadState.delete(this.runOwnerScope(companyId, runId)).then(() => true, () => false);
-            await this.forgetRunOffload(companyId, runId);
-            // The index is the only enumeration source: a failed row delete
-            // stays indexed so the next sweep retries instead of orphaning it.
-            if (!deleted) live.add(runId);
+            const workspacesDeleted = await this.forgetRunOffload(companyId, runId);
+            // Keep the enumeration anchor for either kind of failed cleanup.
+            if (!deleted || !workspacesDeleted) live.add(runId);
             continue;
           }
           live.add(runId);
@@ -870,14 +874,15 @@ export class BoatVmManager {
   }
 
   /** Drop a run's whole-run realizations, executor bindings and persisted workspace bindings. */
-  private async forgetRunOffload(companyId: string, runId: string): Promise<void> {
+  private async forgetRunOffload(companyId: string, runId: string): Promise<boolean> {
     for (const key of this.wholeRunRealizations.keys()) {
       const [company, run] = JSON.parse(key) as [string, string, string];
       if (company === companyId && run === runId) this.wholeRunRealizations.delete(key);
     }
     this.nativeOffload.forgetRun(companyId, runId);
-    await this.offloadWorkspaces.forgetRun(companyId, runId).catch((error) => {
+    return await this.offloadWorkspaces.forgetRun(companyId, runId).then(() => true, (error) => {
       this.logger.warn("boat: could not forget the run's offload workspace bindings", { runId, error: errorText(error) });
+      return false;
     });
   }
 
@@ -1073,7 +1078,10 @@ export class BoatVmManager {
    * account's live VMs from a host-account listing.
    */
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
-    this.configs.set(environmentId, { companyId, environmentId, config, seenAt: this.now() });
+    try {
+      const bound = { ...config, apiKey: resolveApiKey(config), costApiKey: resolveCostApiKey(config) };
+      this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: this.now() });
+    } catch { return; } // No credential provenance to enroll for provider upkeep.
     void this.persistSweepDescriptor(companyId, environmentId, config).catch((error) =>
       this.logger.warn("boat: could not persist the sweep config", { environmentId, error: errorText(error) }),
     );
@@ -1097,14 +1105,12 @@ export class BoatVmManager {
    */
   private readonly sweepDescriptorWrites = new Map<string, Promise<void>>();
 
-  private persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
+  private async persistSweepDescriptor(companyId: string, environmentId: string, config: BoatDriverConfig): Promise<void> {
     const { apiKey: _apiKey, costApiKey: _costApiKey, ...publicFields } = { ...config } as Record<string, unknown>;
     // A non-secret same-account marker: the ops listing runs under the inline
     // key's account, so rehydration through the host key is only safe when the
     // host key resolves to that same account. A digest, never the key itself.
-    const accountDigest = config.apiKey != null
-      ? sweepAccountDigest(config.apiBase, config.apiKey)
-      : null;
+    const accountDigest = sweepAccountDigest(config.apiBase, resolveApiKey(config));
     // Dedupe on the persisted content, not the write time: seenAt changes on
     // every hook, so including it would defeat the cache with a write per call.
     // The marker and digest are part of the identity: a key-only rotation must
@@ -1154,12 +1160,15 @@ export class BoatVmManager {
       }
       for (const [environmentId, descriptor] of Object.entries(saved)) {
         if (this.configs.has(environmentId)) continue;
-        // Legacy descriptors predate the marker: rehydrate as before; the next
-        // hook rewrites them with the marker.
-        if (descriptor.hadInlineKey === true && !this.sameAccountAsHost(descriptor)) continue;
+        // Missing provenance is not keyless provenance. Both inline and host
+        // keys may rotate; only a verified current account may rehydrate.
+        if (typeof descriptor.hadInlineKey !== "boolean" || !this.sameAccountAsHost(descriptor)) continue;
         try {
           const config = parseDriverConfig({ ...descriptor.config, apiKey: null, costApiKey: null });
-          this.configs.set(environmentId, { companyId, environmentId, config, seenAt: descriptor.seenAt });
+          // Keep the verified key in memory only; later host rotation cannot
+          // retarget an already rehydrated environment's provider operations.
+          const bound = { ...config, apiKey: resolveApiKey(config), costApiKey: resolveCostApiKey(config) };
+          this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: descriptor.seenAt });
         } catch {
           // An invalid descriptor is only a cache: the next hook re-caches it.
         }
@@ -1182,18 +1191,10 @@ export class BoatVmManager {
     return sweepAccountDigest(apiBase, hostKey) === descriptor.accountDigest;
   }
 
-  /** A provider client for sweep upkeep of a company: a live config first, else a rehydrated one through the host key. */
-  private sweepBoatFor(companyId: string): BoatApiLike | null {
-    const cached = [...this.configs.values()].filter((entry) => entry.companyId === companyId)
-      .sort((a, b) => Number(b.config.apiKey != null) - Number(a.config.apiKey != null));
-    for (const entry of cached) {
-      try {
-        return this.opsApi(entry.config);
-      } catch {
-        // No usable key on this environment; try the next.
-      }
-    }
-    return null;
+  /** Candidate configs only: the runtime must match each pool's credential provenance. */
+  private sweepConfigsFor(companyId: string): BoatDriverConfig[] {
+    return [...this.configs.values()].filter((entry) => entry.companyId === companyId)
+      .sort((a, b) => a.environmentId.localeCompare(b.environmentId)).map((entry) => entry.config);
   }
 
   private ttlSeconds(config: BoatDriverConfig, hardDeadlineMs: number | null): number {
@@ -3602,7 +3603,7 @@ export class BoatVmManager {
       // Unloaded pools get a company client (a rehydrated config through the
       // host key) so past-due VMs stop without a new command resolving them.
       await Promise.all([
-        withDeadline(this.nativeOffload.sweep(offloadCompanies, { boatFor: (companyId) => this.sweepBoatFor(companyId) }),
+        withDeadline(this.nativeOffload.sweep(offloadCompanies, { configsFor: (companyId) => this.sweepConfigsFor(companyId) }),
           this.offloadUpkeepTimeoutMs, "offload pool sweep")
           .catch(() => report.errors.push(tag(null, "offload pool sweep unverified"))),
         ...[...offloadCompanies].map((companyId) =>

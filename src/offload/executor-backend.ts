@@ -59,6 +59,7 @@ export class ExecutorBackend implements OffloadBackend {
     let sawStart = false;
     let outcome: BackendCancellation | null = null;
     let cancellation: Promise<void> | null = null;
+    let finishUncertain = false;
     const cancelGuest = (): Promise<void> => {
       if (!cancellation) cancellation = (async () => {
         if (executor && dispatched) await executor.cancelCommand(command.companyId, command.runId, command.commandId, "broker_cancel");
@@ -144,7 +145,10 @@ export class ExecutorBackend implements OffloadBackend {
           // The task settled but the durable view is still non-terminal: the
           // finish commit was lost and the sweep owns retrying it. Report
           // uncertainty now instead of polling until the run ends.
-          if (taskSettled) throw uncertain();
+          if (taskSettled) {
+            finishUncertain = true;
+            throw uncertain();
+          }
           if (settled) {
             const wait = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), this.pollIntervalMs));
             if (await Promise.race([wait, settled])) taskSettled = true;
@@ -159,7 +163,10 @@ export class ExecutorBackend implements OffloadBackend {
           this.deps.logRefusal?.({ runId: command.runId, workspaceId: command.executionWorkspaceId, reason: "offload executor binding unavailable" });
           sink.failToStart("offload executor binding unavailable");
         } else {
-          await cancelGuest().catch(() => undefined);
+          // A settled task has already finished guest cleanup. Its missing
+          // terminal commit is not a client cancellation: let settlement retry
+          // the original result without persisting a fabricated broker_cancel.
+          if (!finishUncertain) await cancelGuest().catch(() => undefined);
           sink.fail(uncertain());
         }
       }

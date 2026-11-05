@@ -243,6 +243,112 @@ describe("run-owner state retention", () => {
     expect(harness.state.get(indexKey)).toBeUndefined();
   });
 
+  it("a live run whose owner row never persisted keeps its owner, binding and index through collection", async () => {
+    // R4: the first owner-row write fails (the start only warns) while the
+    // index and workspace binding writes succeed. A null persisted row is not
+    // proof of death for a run this worker holds live: collecting it would
+    // forget the binding and strand a running run's control path.
+    const manager = currentManager();
+    const environmentId = "env-1";
+    const workspaceId = "exec-ws-1";
+    const recordKey = `company|${COMPANY}|boat-offload-runs|run-live`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    const realSet = harness.ctx.state.set.bind(harness.ctx.state);
+    let failOwnerRow = true;
+    harness.ctx.state.set = async (input, value) => {
+      if (failOwnerRow && input.namespace === "boat-offload-runs" && input.stateKey === "run-live") {
+        failOwnerRow = false;
+        throw new Error("state outage");
+      }
+      return realSet(input, value);
+    };
+    expect(await manager.startLocalRun(COMPANY, "run-live", null, "agent-1", true)).toBe(true);
+    expect(failOwnerRow).toBe(false);
+    expect(harness.state.has(recordKey)).toBe(false);
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["run-live"] });
+    expect(await manager.rememberLocalRun({ companyId: COMPANY, environmentId, config: { maxOffloadVms: 1, apiKey: "scoped-key" },
+      workspace: { localPath: "/srv/work/repo", metadata: { workspaceRealizationRequest: {
+        version: 1, companyId: COMPANY, environmentId, heartbeatRunId: "run-live",
+        executionWorkspaceId: workspaceId, localRun: true,
+        source: { localPath: "/srv/work/repo", repoUrl: null, projectId: "project", projectWorkspaceId: null },
+      } } } } as never)).toBe(true);
+    const bindings = () => [...harness.state.keys()].filter((key) => key.includes("boat-offload-workspaces")
+      || key.includes("boat-offload-run-workspaces"));
+    const before = bindings();
+    expect(before.length).toBeGreaterThan(0);
+
+    await manager.collectRunOwnerGarbage([COMPANY]);
+
+    expect(await manager.localRunOwnedBy(COMPANY, "run-live", "agent-1")).toBe(true);
+    expect(manager.hasOffloadBinding(COMPANY, "run-live", workspaceId)).toBe(true);
+    expect(bindings()).toEqual(before);
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["run-live"] });
+  });
+
+  it("a collector retains a dead run until its remaining workspace rows are deleted", async () => {
+    // R6: the owner row delete succeeds but one workspace row delete fails.
+    // The run must stay indexed (the index is the only enumeration source) so
+    // a later collection can finish the leftover rows and the per-run index.
+    const recordKey = `company|${COMPANY}|boat-offload-runs|dead-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    const runIndexKey = `company|${COMPANY}|boat-offload-run-workspaces|dead-run`;
+    const wsKey = (id: string) => `company|${COMPANY}|boat-offload-workspaces|${JSON.stringify(["dead-run", id])}`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "dead-run",
+      issueId: null, agentId: "agent-1", startedAt: clock - 25 * 60 * 60_000 });
+    harness.state.set(indexKey, { version: 1, runs: ["dead-run"] });
+    harness.state.set(runIndexKey, { version: 1, workspaces: ["ws-1", "ws-2"] });
+    harness.state.set(wsKey("ws-1"), { version: 1, companyId: COMPANY, runId: "dead-run", workspaceId: "ws-1" });
+    harness.state.set(wsKey("ws-2"), { version: 1, companyId: COMPANY, runId: "dead-run", workspaceId: "ws-2" });
+    const realDelete = harness.state.delete.bind(harness.state);
+    let failDeletes = true;
+    harness.state.delete = (key: string) => {
+      if (failDeletes && key === wsKey("ws-2")) throw new Error("state outage");
+      return realDelete(key);
+    };
+    await currentManager().collectRunOwnerGarbage([COMPANY]);
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.has(wsKey("ws-2"))).toBe(true);
+    expect(harness.state.has(runIndexKey)).toBe(true);
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["dead-run"] });
+    failDeletes = false;
+    await currentManager().collectRunOwnerGarbage([COMPANY]);
+    expect(harness.state.has(wsKey("ws-1"))).toBe(false);
+    expect(harness.state.has(wsKey("ws-2"))).toBe(false);
+    expect(harness.state.has(runIndexKey)).toBe(false);
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
+  it("forgetLocalRun keeps the run indexed when a workspace row delete fails after the owner row delete", async () => {
+    // R6 via the terminal event: same retention, then the collector finishes.
+    const recordKey = `company|${COMPANY}|boat-offload-runs|ended-ws-run`;
+    const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
+    const runIndexKey = `company|${COMPANY}|boat-offload-run-workspaces|ended-ws-run`;
+    const wsKey = (id: string) => `company|${COMPANY}|boat-offload-workspaces|${JSON.stringify(["ended-ws-run", id])}`;
+    harness.state.set(recordKey, { version: 1, companyId: COMPANY, runId: "ended-ws-run",
+      issueId: null, agentId: "agent-1", startedAt: clock });
+    harness.state.set(indexKey, { version: 1, runs: ["ended-ws-run"] });
+    harness.state.set(runIndexKey, { version: 1, workspaces: ["ws-1", "ws-2"] });
+    harness.state.set(wsKey("ws-1"), { version: 1, companyId: COMPANY, runId: "ended-ws-run", workspaceId: "ws-1" });
+    harness.state.set(wsKey("ws-2"), { version: 1, companyId: COMPANY, runId: "ended-ws-run", workspaceId: "ws-2" });
+    const realDelete = harness.state.delete.bind(harness.state);
+    let failDeletes = true;
+    harness.state.delete = (key: string) => {
+      if (failDeletes && key === wsKey("ws-2")) throw new Error("state outage");
+      return realDelete(key);
+    };
+    await currentManager().forgetLocalRun(COMPANY, "ended-ws-run");
+    expect(harness.state.get(recordKey)).toBeUndefined();
+    expect(harness.state.has(wsKey("ws-2"))).toBe(true);
+    expect(harness.state.has(runIndexKey)).toBe(true);
+    expect(harness.state.get(indexKey)).toEqual({ version: 1, runs: ["ended-ws-run"] });
+    failDeletes = false;
+    await currentManager().collectRunOwnerGarbage([COMPANY]);
+    expect(harness.state.has(wsKey("ws-1"))).toBe(false);
+    expect(harness.state.has(wsKey("ws-2"))).toBe(false);
+    expect(harness.state.has(runIndexKey)).toBe(false);
+    expect(harness.state.get(indexKey)).toBeUndefined();
+  });
+
   it("a 25 h old owner record is gone after the sweep", async () => {
     const recordKey = `company|${COMPANY}|boat-offload-runs|old-run`;
     const indexKey = `company|${COMPANY}|boat-offload-runs|owners`;
