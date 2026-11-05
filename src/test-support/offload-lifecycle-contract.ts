@@ -290,8 +290,9 @@ export async function fixture() {
   let output: Array<["stdout" | "stderr", Uint8Array]> = [];
   const executors: OffloadExecutor[] = [];
   const make = (config: Partial<OffloadDeps["config"]> = {}, disk = state,
-    runCommand: OffloadLifecycleDeps["runCommand"] | null = null) => {
+    runCommand: OffloadLifecycleDeps["runCommand"] | null = null, recordDuration?: OffloadDeps["recordDuration"]) => {
     const deps = {
+      recordDuration,
       boat: boat as unknown as BoatApiLike, logger: {
         info: (message: string, meta?: Record<string, unknown>) => { logs.push({ message, meta }); },
         warn: (message: string, meta?: Record<string, unknown>) => { logs.push({ message, meta }); },

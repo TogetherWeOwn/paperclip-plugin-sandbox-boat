@@ -544,7 +544,8 @@ export class OffloadExecutor {
   }
 
   private async settleFinish(key: string, pending: PendingFinish): Promise<void> {
-    if (!pending.result) return;
+    // A sweep snapshot can outlive normal settlement and VM reassignment.
+    if (this.pendingFinishes.get(key) !== pending || !pending.result) return;
     if (pending.retrying) return await pending.retrying;
     const result = pending.result;
     const task = (async () => {
@@ -1529,13 +1530,24 @@ export class OffloadExecutor {
 
   private async releaseVm(vm: PoolVm): Promise<void> {
     await this.withAdmission(async () => {
+      const workspaceKey = vm.workspaceKey;
       vm.lastActiveAt = this.now();
       vm.busy = false;
+      // Only completed/never-started paths release, after terminal accounting.
+      // Clear the ledger-outage fence before dispatch; unknown stays quarantined.
+      vm.quarantined = false;
       vm.workspaceKey = null;
       vm.generation += 1;
       vm.stopAttempts = 0;
       vm.stopDueAt = this.now() + (this.closed ? 0 : (vm.tailSeconds ?? this.config.offloadIdleStopSeconds) * 1000);
-      await this.persistPool();
+      try { await this.persistPool(); }
+      catch (error) {
+        // Settlement remains retryable. Keep its workspace fenced before
+        // admission can assign a VM that this old finish would release again.
+        vm.quarantined = true;
+        vm.workspaceKey = workspaceKey;
+        throw error;
+      }
       if (!this.closed) await this.dispatchQueued();
       // Dispatch may reserve this VM, retire it for an incompatible waiter,
       // or leave a stop retry installed. Never resurrect its old idle timer.

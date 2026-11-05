@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AccountLedger } from "./account-ledger.js";
-import { command, DiskState, EPOCH, fixture, until, type Fixture } from "./test-support/offload-lifecycle-contract.js";
+import { command, deferred, DiskState, EPOCH, fixture, until, type Fixture } from "./test-support/offload-lifecycle-contract.js";
 
 let s: Fixture;
 beforeEach(async () => { s = await fixture(); });
@@ -21,6 +21,101 @@ function failFinish(commandId: string, state = "completed", scope: { runId?: str
 }
 
 describe("lost finish integration recovery", () => {
+  it("does not replay a stale finish snapshot against a newer VM reservation", async () => {
+    const duration = deferred<void>();
+    const terminal = deferred<void>();
+    let recording = false;
+    let committing = false;
+    const ex = s.make({ maxOffloadVms: 2, maxActive: 2 }, s.state, null, async (cmd) => {
+      if (cmd.commandId === "snapshot-a") { recording = true; await duration.promise; }
+    });
+    const set = s.state.set.bind(s.state);
+    let outage = true;
+    s.state.set = async (key, value) => {
+      const doc = value as { commandId?: string; state?: string; usage?: Array<{ outcome?: string }> };
+      if (outage && key.namespace === "boat-account" && doc.usage?.some((row) => row.outcome === "completed")) {
+        throw new Error("finish accounting outage");
+      }
+      if (key.namespace === "guest-test-journal" && doc.commandId === "snapshot-b" && doc.state === "not_started") {
+        committing = true;
+        await terminal.promise;
+      }
+      await set(key, value);
+    };
+    try {
+      expect(await s.execute(command("snapshot-a"), ex)).toMatchObject({ status: "completed" });
+      s.fail.add("push:snapshot-b");
+      const b = s.execute(command("snapshot-b", { executionWorkspaceId: "workspace-b" }), ex);
+      await until(() => committing);
+      outage = false;
+      const sweep = ex.collectGarbage();
+      // A now owns no ledger lock, but holds the sweep's [A, B] snapshot in
+      // duration telemetry while B's normal finish releases the second VM.
+      await until(() => recording);
+      terminal.resolve();
+      expect(await b).toMatchObject({ status: "unavailable", fallbackSafe: true });
+      const gate = s.hold("exec:snapshot-c");
+      const c = s.execute(command("snapshot-c", { executionWorkspaceId: "workspace-c" }), ex);
+      await until(() => s.starts.some((start) => start.commandId === "snapshot-c"));
+      const sandboxId = s.starts.find((start) => start.commandId === "snapshot-c")!.sandboxId;
+      const poolVm = async () => {
+        const pool = Object.values(await s.state.all()).find((value) =>
+          (value as { vms?: unknown[] }).vms) as { vms: Array<{ sandboxId: string; busy: boolean; workspaceKey: string | null; generation: number; accountReservation: unknown }> };
+        return pool.vms.find((vm) => vm.sandboxId === sandboxId)!;
+      };
+      const reserved = await poolVm();
+      const d = s.execute(command("snapshot-d", { executionWorkspaceId: "workspace-c", queueTimeoutMs: 60_000 }), ex);
+      await until(() => [...s.clock.timers.values()].some((timer) => timer.at === s.clock.t + 60_000));
+      duration.resolve();
+      await sweep;
+      expect(await poolVm()).toEqual(reserved);
+      expect(s.starts.map((start) => start.commandId)).toEqual(["snapshot-a", "snapshot-c"]);
+      expect(s.boat.callsOf("stop")).toHaveLength(0);
+      expect(s.boat.callsOf("delete")).toHaveLength(0);
+      gate.resolve();
+      expect(await c).toMatchObject({ status: "completed", sandboxId });
+      expect(await d).toMatchObject({ status: "completed" });
+    } finally {
+      terminal.resolve();
+      duration.resolve();
+    }
+  });
+
+  it("keeps a recovered finish fenced when its release pool write fails", async () => {
+    const set = s.state.set.bind(s.state);
+    let ledgerOutage = true;
+    let poolOutage = false;
+    let poolFailed = false;
+    s.state.set = async (key, value) => {
+      const doc = value as { usage?: Array<{ outcome?: string }>; vms?: Array<{ workspaceKey?: string | null }> };
+      if (ledgerOutage && key.namespace === "boat-account" && doc.usage?.some((row) => row.outcome === "completed")) {
+        throw new Error("finish accounting outage");
+      }
+      if (poolOutage && key.namespace === "boat-offload-pool" && doc.vms?.some((vm) => vm.workspaceKey === null)) {
+        poolOutage = false;
+        poolFailed = true;
+        throw new Error("release pool write outage");
+      }
+      await set(key, value);
+    };
+    expect(await s.execute(command("release-write-a"))).toMatchObject({ status: "completed" });
+    const sandboxId = s.starts[0]!.sandboxId;
+    ledgerOutage = false;
+    poolOutage = true;
+    await s.executor.collectGarbage();
+    expect(poolFailed).toBe(true);
+    expect(s.executor.getUsage().find((row) => row.commandId === "release-write-a")).toMatchObject({ outcome: "completed" });
+    // Admission sees the fence even though the ledger has healed. Retrying A
+    // must never dispose a reservation acquired after a failed release write.
+    expect(await s.execute(command("release-write-b"))).toMatchObject({ status: "unavailable" });
+    expect(s.starts).toHaveLength(1);
+    await s.executor.collectGarbage();
+    expect(await s.execute(command("release-write-c"))).toMatchObject({ status: "completed", sandboxId, warm: "warm" });
+    expect(s.boat.callsOf("create")).toHaveLength(1);
+    expect(s.boat.callsOf("stop")).toHaveLength(0);
+    expect(s.boat.callsOf("delete")).toHaveLength(0);
+  });
+
   it("preserves never-started evidence after more than ten failed refusal settlements", async () => {
     const executor = s.make({ queueLimit: 1 });
     const gate = s.hold("exec:occupant");
