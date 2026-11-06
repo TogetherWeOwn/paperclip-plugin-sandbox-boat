@@ -131,14 +131,23 @@ export class OffloadAdmission {
    * A crash between this insert and the journal may spend without executing:
    * at-most-once is intentional; no code deletes or overwrites this claim. */
   async consume(companyId: string, actor: RouteActor, request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<RouteResponse | null> {
+    let decision: RouteResponse | typeof BROAD | null;
     try {
-      const decision = await this.policy(companyId, actor, request);
+      decision = await this.policy(companyId, actor, request);
       if (decision === BROAD) {
         // Broad admission writes no claim: v0.2.14 admitted every command of an
         // owned run. A run already spent under an exact grant stays spent.
         return await this.state.get(this.scope(companyId, actor.runId!)) === null ? null : this.spent(request);
       }
-      if (decision) return decision;
+    } catch {
+      // Nothing was claimed or started: these reads have no side effect and the
+      // broker found no journal record for this ID, so local fallback is safe.
+      return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "offload admission could not be read; running local", {
+        commandId: request.commandId, remoteStarted: false, fallbackSafe: true,
+      }) };
+    }
+    if (decision) return decision;
+    try {
       const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
         : object(value) ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
       const { dryRun: _dryRun, ...execution } = request;

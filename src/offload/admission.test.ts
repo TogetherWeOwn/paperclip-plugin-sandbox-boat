@@ -216,7 +216,28 @@ describe("broad path when no exact grant is configured", () => {
     const t = setup();
     const admission = new OffloadAdmission(t.h.ctx.state, () => NOW, async () => { throw new Error("config offline"); });
     expect(await admission.check(COMPANY, legacyActor(), request())).toMatchObject({ status: 403 });
-    expect(await admission.consume(COMPANY, legacyActor(), request(), { companyId: COMPANY, runId: RUN } as never)).toMatchObject({ status: 409 });
+    // Nothing was claimed or started, so submit refuses fallback-safe, never unknown.
+    expect(await admission.consume(COMPANY, legacyActor(), request(), { companyId: COMPANY, runId: RUN } as never))
+      .toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+  });
+  it("a read failure between dry-run and submit falls back locally with no claim or journal record", async () => {
+    const t = setup();
+    t.config.offloadAdmission = null;
+    const { create: _create, ...legacyState } = t.h.ctx.state;
+    const via = t.host(legacyState);
+    expect((await t.exec(request({ dryRun: true }), legacyActor(), COMPANY, via)).status).toBe(200);
+    const get = t.h.ctx.state.get.bind(t.h.ctx.state);
+    const failing = vi.spyOn(t.h.ctx.state, "get").mockImplementation(async (scope) => {
+      if (scope.namespace === "boat-offload-admission-v1") throw new Error("storage offline");
+      return get(scope);
+    });
+    const submitted = await t.exec(request(), legacyActor(), COMPANY, via);
+    expect(submitted).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+    expect(t.start).not.toHaveBeenCalled();
+    expect(t.create).not.toHaveBeenCalled();
+    expect(await t.store.get(`offload.cmd.${CMD}`)).toBeNull();
+    failing.mockRestore();
+    expect(await t.h.ctx.state.get(t.claimScope)).toBeNull();
   });
 });
 
