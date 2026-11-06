@@ -104,7 +104,9 @@ export class SshOffloadGuest implements GuestController {
   async bootId(sandboxId: string): Promise<string> { return this.rpc(sandboxId, "boot"); }
   async preflight(sandboxId: string, _command: OffloadCommand) {
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    const now = this.deps.now ?? Date.now;
+    // Elapsed time only, so a monotonic default: a host clock step cannot
+    // stretch the window.
+    const now = this.deps.now ?? (() => performance.now());
     const startedAt = now();
     let result = await this.probe(sandboxId);
     // A probe that ran OUTSIDE the delegated parent indicts this SSH
@@ -135,6 +137,8 @@ export class SshOffloadGuest implements GuestController {
       const delayMs = DELEGATION_WAIT_BASE_MS * 2 ** refreshes;
       if (now() - startedAt + delayMs > windowMs) break;
       await sleep(delayMs);
+      // A late timer must not start a refresh past the window either.
+      if (now() - startedAt > windowMs) break;
       refreshes++;
       let fresh: SshSession;
       // The listener restart itself can refuse a connection: a failed

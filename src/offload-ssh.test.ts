@@ -136,7 +136,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     const NOT_DELEGATED = "probe_admit_failed:EACCES:session_not_delegated";
     const refused = (ineligibleReason: string) => ({ cgroupV2Delegated: false, outsideWatchdogVerified: false, ineligibleReason });
     const attempt = async (name: string, answers: unknown[],
-      options: { delegationWait?: { maxRefreshes?: number; windowMs?: number }; failRefreshes?: number[] } = {}) => {
+      options: { delegationWait?: { maxRefreshes?: number; windowMs?: number }; failRefreshes?: number[]; oversleepMs?: number } = {}) => {
       const { counter, script } = counting(name, answers);
       let refreshes = 0;
       let sessionCalls = 0;
@@ -150,7 +150,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
           if (options.failRefreshes?.includes(refreshes)) throw new Error("listener restarting");
           return ssh.session;
         },
-        sleep: async (ms) => { delays.push(ms); clock += ms; },
+        sleep: async (ms) => { delays.push(ms); clock += ms + (options.oversleepMs ?? 0); },
         now: () => clock,
         ...(options.delegationWait ? { delegationWait: options.delegationWait } : {}),
         cgroupParent: parent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
@@ -185,6 +185,11 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       refreshes: 2, sessionCalls: 1, delays: [2_000, 4_000], probes: 3 });
     await expect(attempt("probe-over-cap", [NOT_DELEGATED], { delegationWait: { maxRefreshes: 99, windowMs: 3_600_000 } })).resolves.toMatchObject({
       capabilities: { delegationRefreshes: 4 }, refreshes: 4, probes: 5 });
+    // A timer that fires late cannot start a refresh past the window: the
+    // 16 s backoff fits on paper (26 s + 16 s) but resumes at 46 s.
+    await expect(attempt("probe-oversleep", [NOT_DELEGATED], { oversleepMs: 4_000 })).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 3 },
+      refreshes: 3, sessionCalls: 1, delays: [2_000, 4_000, 8_000, 16_000], probes: 4 });
     await expect(attempt("probe-disabled", [NOT_DELEGATED, true], { delegationWait: { maxRefreshes: 0 } })).resolves.toEqual({
       capabilities: refused(NOT_DELEGATED), refreshes: 0, sessionCalls: 1, delays: [], probes: 1 });
     // A reopen refused mid-restart spends one refresh and probes nothing; the
