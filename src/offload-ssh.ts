@@ -22,6 +22,9 @@ export interface SshOffloadGuestDeps {
   /** Bounded wait for guest sshd delegation (see `preflight`). Values can
    * only tighten the defaults, which are also the hard caps. */
   delegationWait?: { maxRefreshes?: number; windowMs?: number };
+  /** True once the owning runtime is shutting down; the delegation wait
+   * stops before any further refresh. */
+  closing?: () => boolean;
   /** Trusted operator delegation, never an agent-supplied path. */
   cgroupParent: string;
   workspace(sandboxId: string, command: OffloadCommand): Promise<string>;
@@ -130,25 +133,35 @@ export class SshOffloadGuest implements GuestController {
     // pre-start step.
     const maxRefreshes = clampWait(this.deps.delegationWait?.maxRefreshes, DELEGATION_WAIT_MAX_REFRESHES);
     const windowMs = clampWait(this.deps.delegationWait?.windowMs, DELEGATION_WAIT_WINDOW_MS);
+    const closing = this.deps.closing ?? (() => false);
     let refreshes = 0;
+    let reprobes = 0;
     while (result.cgroupV2Delegated !== true
       && result.ineligibleReason?.endsWith(":session_not_delegated")
-      && this.deps.refreshSession && refreshes < maxRefreshes) {
+      && this.deps.refreshSession && refreshes < maxRefreshes && !closing()) {
       const delayMs = DELEGATION_WAIT_BASE_MS * 2 ** refreshes;
       if (now() - startedAt + delayMs > windowMs) break;
       await sleep(delayMs);
-      // A late timer must not start a refresh past the window either.
-      if (now() - startedAt > windowMs) break;
+      // A late timer must not start a refresh past the window either, and
+      // shutdown can begin during the backoff: its drain is bounded, so a
+      // refresh started now could authorize a key and open a control master
+      // after the worker already closed every session.
+      if (now() - startedAt > windowMs || closing()) break;
       refreshes++;
       let fresh: SshSession;
       // The listener restart itself can refuse a connection: a failed
       // reopen keeps the last refusal and spends one refresh of the budget.
-      try { fresh = await this.deps.refreshSession(sandboxId); } catch { continue; }
+      // A reopen refused because shutdown began ends the wait instead.
+      try { fresh = await this.deps.refreshSession(sandboxId); } catch {
+        if (closing()) break;
+        continue;
+      }
       // Pin the re-probe to the refreshed session itself, so a concurrent
       // session change cannot silently substitute a different connection.
       result = await this.probe(sandboxId, fresh);
+      reprobes++;
     }
-    return refreshes > 0 ? { ...result, delegationRefreshes: refreshes } : result;
+    return refreshes > 0 ? { ...result, delegationRefreshes: refreshes, delegationReprobes: reprobes } : result;
   }
   private async probe(sandboxId: string, sessionOverride?: SshSession): Promise<Awaited<ReturnType<GuestController["preflight"]>>> {
     // Eligibility is still one guest probe exercising real admission, kill

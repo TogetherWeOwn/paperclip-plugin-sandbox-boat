@@ -307,19 +307,22 @@ describe("executor logs and releases on a pre-start failure", () => {
     expect(s.starts).toEqual([]);
   });
 
-  it("a timed-out delegation wait keeps its detail and logs only the refresh count", async () => {
+  it("a timed-out delegation wait keeps its detail and logs only the refresh and probe counts", async () => {
     s.guest.delegated = false;
     s.guest.watchdog = false;
     s.guest.preflightReason = "probe_admit_failed:EACCES:session_not_delegated";
     s.guest.preflightRefreshes = 4;
+    // Four refreshes, one of which never reconnected: three probes ran.
+    s.guest.preflightReprobes = 3;
     const cmd = lifecycleCommand("exec-prepare-delegation-wait");
     const result = await s.execute(cmd);
     expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
       reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
     expect(JSON.stringify(result)).not.toContain("refreshes");
+    expect(JSON.stringify(result)).not.toContain("reprobes");
     const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
     expect(warn?.meta).toMatchObject({ commandId: cmd.commandId, step: "guest lifecycle prepare",
-      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "probe_admit_failed:EACCES:session_not_delegated", refreshes: 4 });
+      code: "OFFLOAD_GUEST_INELIGIBLE", detail: "probe_admit_failed:EACCES:session_not_delegated", refreshes: 4, reprobes: 3 });
     expect(s.starts).toEqual([]);
   });
 
@@ -331,6 +334,7 @@ describe("executor logs and releases on a pre-start failure", () => {
     await s.execute(cmd);
     const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
     expect(warn?.meta).not.toHaveProperty("refreshes");
+    expect(warn?.meta).not.toHaveProperty("reprobes");
   });
 
   it("preflight RPC failure is a distinct warn detail from a guest-reported refusal", async () => {

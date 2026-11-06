@@ -411,7 +411,7 @@ describe("offload idle stop releases the SSH session", () => {
 // guest execution, no cgroup: resolve only admits, and the fake session seam
 // means no VM is ever reserved (boat.calls stays empty).
 describe("runtime release-hook wiring (no guest)", () => {
-  async function setupRuntime() {
+  async function setupRuntime(options: { realOpener?: boolean; ssh?: Record<string, unknown> } = {}) {
     const root = await mkdtemp(path.join(tmpdir(), "pcboat-rt-"));
     const source = path.join(root, "source");
     await mkdir(source);
@@ -419,12 +419,12 @@ describe("runtime release-hook wiring (no guest)", () => {
     await writeFile(path.join(source, "Cargo.lock"), "local-lock");
     const harness = createFakeContext();
     const closeSession = vi.fn(async (_sandboxId: string) => {});
-    const sshStub = { closeSession } as unknown as SshManager;
+    const sshStub = { closeSession, ...options.ssh } as unknown as SshManager;
     const boat = new FakeBoat({ now: Date.now });
     const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: sshStub,
       accountId: "test-only", trackedFiles: listAllFilesAsTracked,
       boat: () => boat as unknown as BoatApiLike,
-      session: async (sandboxId: string) => ({ sandboxId }) as SshSession,
+      ...(options.realOpener ? {} : { session: async (sandboxId: string) => ({ sandboxId }) as SshSession }),
       guestOptions: { stateRoot: root } });
     const companyId = randomUUID(), runId = randomUUID(), executionWorkspaceId = randomUUID();
     runtime.remember({ driverKey: "boat", companyId, environmentId: "env",
@@ -442,12 +442,76 @@ describe("runtime release-hook wiring (no guest)", () => {
       argv: ["test", "--locked"], cwdRelative: ".", env: {}, timeoutMs: 10_000, queueTimeoutMs: 0 });
     const executor = mustResolve(await runtime.resolve(cmd("cmd-1"), settings));
     expect(boat.calls).toHaveLength(0);
-    const pools = (runtime as unknown as { pools: Map<string, { sessions: Map<string, SshSession> }> }).pools;
+    const pools = (runtime as unknown as { pools: Map<string, { sessions: Map<string, SshSession>;
+      guest: { deps: { session(id: string): Promise<SshSession>; refreshSession(id: string): Promise<SshSession> } } }> }).pools;
     const entry = [...pools.values()][0]!;
     const hook = (executor as unknown as { onVmReleased: (sandboxId: string) => Promise<void> })
       .onVmReleased;
     return { runtime, root, boat, closeSession, entry, hook };
   }
+
+  // The worker's drain is bounded, then it closes every session and the key
+  // dir: an open still running past that point must not recreate the key,
+  // authorize it on the VM or keep a new control master.
+  it("shutdown fences the session opener after each step and refuses refreshes", async () => {
+    const markClosing = (runtime: SshOffloadRuntime) => { (runtime as unknown as { closing: boolean }).closing = true; };
+    const opened = (sandboxId: string) => ({ sandboxId }) as SshSession;
+    // Shutdown begins while the key is being ensured: no authorization, no open.
+    {
+      let runtime!: SshOffloadRuntime;
+      const openSession = vi.fn(async (input: { sandboxId: string }) => opened(input.sandboxId));
+      const s = await setupRuntime({ realOpener: true, ssh: {
+        ensureKey: vi.fn(async () => { markClosing(runtime); return { publicKey: "ssh-ed25519 AAAAKEY" }; }),
+        openSession, run: vi.fn(async () => ({ exitCode: 0 })) } });
+      runtime = s.runtime;
+      try {
+        const vm = String((await s.boat.create()).sandbox.id);
+        await expect(s.entry.guest.deps.session(vm)).rejects.toMatchObject({ code: "OFFLOAD_RUNTIME_CLOSING" });
+        expect(s.boat.calls.map((call) => call.method)).not.toContain("sshKey");
+        expect(openSession).not.toHaveBeenCalled();
+        expect(s.entry.sessions.has(vm)).toBe(false);
+      } finally {
+        await s.runtime.shutdown();
+        await rm(s.root, { recursive: true, force: true });
+      }
+    }
+    // Shutdown begins while the master opens: the new session is closed, not cached.
+    {
+      let runtime!: SshOffloadRuntime;
+      const s = await setupRuntime({ realOpener: true, ssh: {
+        ensureKey: vi.fn(async () => ({ publicKey: "ssh-ed25519 AAAAKEY" })),
+        openSession: vi.fn(async (input: { sandboxId: string }) => { markClosing(runtime); return opened(input.sandboxId); }),
+        run: vi.fn(async () => ({ exitCode: 0 })) } });
+      runtime = s.runtime;
+      try {
+        const vm = String((await s.boat.create()).sandbox.id);
+        await expect(s.entry.guest.deps.session(vm)).rejects.toMatchObject({ code: "OFFLOAD_RUNTIME_CLOSING" });
+        expect(s.closeSession).toHaveBeenCalledWith(vm);
+        expect(s.entry.sessions.has(vm)).toBe(false);
+      } finally {
+        await s.runtime.shutdown();
+        await rm(s.root, { recursive: true, force: true });
+      }
+    }
+    // After shutdown began, a refresh refuses before touching the key or the
+    // cache, while an already-cached session stays usable for the drain.
+    {
+      const ensureKey = vi.fn(async () => ({ publicKey: "ssh-ed25519 AAAAKEY" }));
+      const s = await setupRuntime({ realOpener: true, ssh: { ensureKey, openSession: vi.fn(), run: vi.fn() } });
+      try {
+        const cached = opened("vm-cached");
+        s.entry.sessions.set("vm-cached", cached);
+        markClosing(s.runtime);
+        await expect(s.entry.guest.deps.refreshSession("vm-cached")).rejects.toMatchObject({ code: "OFFLOAD_RUNTIME_CLOSING" });
+        await expect(s.entry.guest.deps.session("vm-new")).rejects.toMatchObject({ code: "OFFLOAD_RUNTIME_CLOSING" });
+        await expect(s.entry.guest.deps.session("vm-cached")).resolves.toBe(cached);
+        expect(ensureKey).not.toHaveBeenCalled();
+      } finally {
+        await s.runtime.shutdown();
+        await rm(s.root, { recursive: true, force: true });
+      }
+    }
+  }, 15_000);
 
   it("the installed hook closes and forgets the cached session", async () => {
     const s = await setupRuntime();

@@ -180,9 +180,12 @@ export class Guest {
   preflightReason: string | null = null;
   /** Refresh count a concrete guest's bounded delegation wait would report. */
   preflightRefreshes: number | null = null;
+  /** Of those refreshes, how many re-ran the probe. */
+  preflightReprobes: number | null = null;
   preflight = async () => ({ cgroupV2Delegated: this.delegated, outsideWatchdogVerified: this.watchdog,
     ...(this.preflightReason !== null ? { ineligibleReason: this.preflightReason } : {}),
-    ...(this.preflightRefreshes !== null ? { delegationRefreshes: this.preflightRefreshes } : {}) });
+    ...(this.preflightRefreshes !== null ? { delegationRefreshes: this.preflightRefreshes } : {}),
+    ...(this.preflightReprobes !== null ? { delegationReprobes: this.preflightReprobes } : {}) });
   prepare = async (_sandboxId: string, cmd: LifecycleCommand): Promise<GuestIdentity> => {
     const identity = {
       guestBootId: "boot-a", processGroupId: 4100 + this.prepared.size,

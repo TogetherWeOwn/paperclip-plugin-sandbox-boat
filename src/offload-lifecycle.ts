@@ -39,6 +39,9 @@ export interface GuestController {
     /** Session refreshes the bounded delegation wait attempted (server log
      * only, a count, never guest bytes). Absent when none ran. */
     delegationRefreshes?: number;
+    /** Of those refreshes, how many reopened and re-ran the probe; the rest
+     * failed to reconnect. Server log only. Absent when none ran. */
+    delegationReprobes?: number;
   }>;
   prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity>;
   armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }>;
@@ -83,8 +86,10 @@ export class OffloadLifecycle {
           ? "cgroup_and_watchdog_false"
           : capabilities.cgroupV2Delegated !== true ? "cgroup_not_delegated" : "watchdog_not_verified");
       const refreshes = capabilities.delegationRefreshes;
+      const reprobes = capabilities.delegationReprobes;
       throw Object.assign(offloadError("OFFLOAD_GUEST_INELIGIBLE", detail),
-        Number.isSafeInteger(refreshes) ? { refreshes } : {});
+        Number.isSafeInteger(refreshes) ? { refreshes } : {},
+        Number.isSafeInteger(reprobes) ? { reprobes } : {});
     }
     const sentAt = this.now();
     const identity = await this.guest.prepare(sandboxId, command);

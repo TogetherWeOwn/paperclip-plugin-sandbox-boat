@@ -347,9 +347,13 @@ default VM:
    on the command's reserved VM inside its timed window, so its seconds are
    billed to that command. If the window ends without delegation, the
    command falls back locally with the same `OFFLOAD_GUEST_INELIGIBLE` code
-   and `detail=`, plus `refreshes=` on the warn line counting the refreshes
-   attempted. A refusal with `refreshes=4` means sshd never settled into
-   the delegated scope: check the step-2 units on the template. Fix that sub-step on
+   and `detail=`, plus `refreshes=` and `reprobes=` on the warn line:
+   `refreshes` counts the reconnects attempted, `reprobes` how many of them
+   connected and re-ran the probe. `refreshes=4 reprobes=4` means sshd never
+   settled into the delegated scope: check the step-2 units on the template.
+   A `reprobes` well below `refreshes` means the reconnects themselves
+   failed (sshd down or restarting), not the delegation. Plugin shutdown
+   ends the wait early, with no reconnect after it begins. Fix that sub-step on
    the template and re-run until it prints `true` — a template that does
    not print `true` refuses every remote command, so never smoke against one.
 6. Save the VM as a named snapshot (not available during the boat free trial)
