@@ -1395,7 +1395,8 @@ export class OffloadExecutor {
       if (preStart) {
         this.logger.warn("boat offload command failed before transport", {
           commandId: command.commandId, sandboxId: vm.sandboxId,
-          step: preStart.step, code: preStart.code, detail: preStart.detail, reason: preStart.reason,
+          step: preStart.step, code: preStart.code, detail: preStart.detail,
+          ...(preStart.refreshes !== null ? { refreshes: preStart.refreshes } : {}), reason: preStart.reason,
         });
       }
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: preStart?.reason ?? "command transport failed; reconcile the guest receipt before replay or VM reuse" };

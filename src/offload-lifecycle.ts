@@ -36,6 +36,9 @@ export interface GuestController {
      * RPC transport failure, …). Server-log diagnosis only; the
      * client-facing code stays OFFLOAD_GUEST_INELIGIBLE. */
     ineligibleReason?: string;
+    /** Session refreshes the bounded delegation wait attempted (server log
+     * only, a count, never guest bytes). Absent when none ran. */
+    delegationRefreshes?: number;
   }>;
   prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity>;
   armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }>;
@@ -79,7 +82,9 @@ export class OffloadLifecycle {
         ?? (capabilities.cgroupV2Delegated !== true && capabilities.outsideWatchdogVerified !== true
           ? "cgroup_and_watchdog_false"
           : capabilities.cgroupV2Delegated !== true ? "cgroup_not_delegated" : "watchdog_not_verified");
-      throw offloadError("OFFLOAD_GUEST_INELIGIBLE", detail);
+      const refreshes = capabilities.delegationRefreshes;
+      throw Object.assign(offloadError("OFFLOAD_GUEST_INELIGIBLE", detail),
+        Number.isSafeInteger(refreshes) ? { refreshes } : {});
     }
     const sentAt = this.now();
     const identity = await this.guest.prepare(sandboxId, command);

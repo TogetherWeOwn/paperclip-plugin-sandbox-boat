@@ -14,11 +14,14 @@ export interface SshOffloadGuestDeps {
   /** Authorize the key and pin the API-provided host key after every resume. */
   session(sandboxId: string): Promise<SshSession>;
   /** Drop the cached session (and its control master) and open a fresh one.
-   * Used once when a preflight probe proves the current session runs outside
+   * Used when a preflight probe proves the current session runs outside
    * the delegated cgroup parent: a connection accepted by a pre-restart sshd
    * listener keeps that listener's config — no template ForceCommand scope —
    * for every multiplexed command, however long the master lives. */
   refreshSession?(sandboxId: string): Promise<SshSession>;
+  /** Bounded wait for guest sshd delegation (see `preflight`). Values can
+   * only tighten the defaults, which are also the hard caps. */
+  delegationWait?: { maxRefreshes?: number; windowMs?: number };
   /** Trusted operator delegation, never an agent-supplied path. */
   cgroupParent: string;
   workspace(sandboxId: string, command: OffloadCommand): Promise<string>;
@@ -48,6 +51,15 @@ const POLL_IDLE_BASE_MS = 100;
 const POLL_IDLE_MAX_MS = 1_000;
 /** Floor spacing even when a page carried events, so a trickling guest cannot spin RPCs. */
 const POLL_BUSY_FLOOR_MS = 10;
+
+/** Delegation wait, defaults and hard caps at once. A fresh fork or snapshot
+ * VM restarts sshd once ~15 s after boot (the template's settle unit), and
+ * every connection accepted before that restart stays outside the delegated
+ * parent. Refreshes back off 2, 4, 8, 16 s: the last one starts ~30 s plus
+ * probe time after the first refusal, inside a 45 s window. */
+export const DELEGATION_WAIT_MAX_REFRESHES = 4;
+export const DELEGATION_WAIT_WINDOW_MS = 45_000;
+const DELEGATION_WAIT_BASE_MS = 2_000;
 
 /** Concrete Linux cgroup-v2 lifecycle over Boat's existing pinned SSH path.
  * No process-group-only execution is advertised as equivalent containment. */
@@ -91,29 +103,48 @@ export class SshOffloadGuest implements GuestController {
 
   async bootId(sandboxId: string): Promise<string> { return this.rpc(sandboxId, "boot"); }
   async preflight(sandboxId: string, _command: OffloadCommand) {
-    const first = await this.probe(sandboxId);
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const now = this.deps.now ?? Date.now;
+    const startedAt = now();
+    let result = await this.probe(sandboxId);
     // A probe that ran OUTSIDE the delegated parent indicts this SSH
     // session, not the template: a control master accepted by a pre-restart
     // sshd listener keeps that listener's parsed config (no template
-    // ForceCommand scope) for every multiplexed command, and the guest's
-    // config-watch unit restarts the listener exactly while a resumed VM's
-    // first session opens. Drop the cached session once and re-run the
-    // identical probe over a fresh connection, which the current listener
-    // serves. Every other refusal (a delegated session whose admission or
-    // kill still failed, an unplaced or transport failure) refreshes
-    // nothing: a new connection would land in the same place. Eligibility
-    // still requires the probe's literal `true`. The placement suffix is
-    // guest-reported like the rest of the token, so it only ever steers
-    // this one reconnect — a forged suffix can waste or skip a refresh,
-    // never admit a command the identical re-probe would refuse.
-    if (first.cgroupV2Delegated === true
-      || !first.ineligibleReason?.endsWith(":session_not_delegated")
-      || !this.deps.refreshSession) return first;
-    let fresh: SshSession;
-    try { fresh = await this.deps.refreshSession(sandboxId); } catch { return first; }
-    // Pin the re-probe to the refreshed session itself, so a concurrent
-    // session change cannot silently substitute a different connection.
-    return this.probe(sandboxId, fresh);
+    // ForceCommand scope) for every multiplexed command. The guest's units
+    // restart the listener while a resumed VM's first session opens, and a
+    // fresh fork or snapshot VM restarts it once ~15 s after boot — so an
+    // immediate reconnect can still reach the pre-settle listener. Drop the
+    // cached session and re-run the identical probe over a fresh connection,
+    // backing off, until the probe stops reporting an undelegated session or
+    // the bounded wait ends. Every other refusal (a delegated session whose
+    // admission or kill still failed, an unplaced or transport failure)
+    // refreshes nothing: a new connection would land in the same place.
+    // Eligibility still requires the probe's literal `true`. The placement
+    // suffix is guest-reported like the rest of the token, so it only ever
+    // steers this bounded reconnect loop — a forged suffix can waste the
+    // window or skip it, never admit a command the identical re-probe would
+    // refuse. The wait runs inside the command's host-timed window on its
+    // reserved VM, so its seconds are billed to the command like any other
+    // pre-start step.
+    const maxRefreshes = clampWait(this.deps.delegationWait?.maxRefreshes, DELEGATION_WAIT_MAX_REFRESHES);
+    const windowMs = clampWait(this.deps.delegationWait?.windowMs, DELEGATION_WAIT_WINDOW_MS);
+    let refreshes = 0;
+    while (result.cgroupV2Delegated !== true
+      && result.ineligibleReason?.endsWith(":session_not_delegated")
+      && this.deps.refreshSession && refreshes < maxRefreshes) {
+      const delayMs = DELEGATION_WAIT_BASE_MS * 2 ** refreshes;
+      if (now() - startedAt + delayMs > windowMs) break;
+      await sleep(delayMs);
+      refreshes++;
+      let fresh: SshSession;
+      // The listener restart itself can refuse a connection: a failed
+      // reopen keeps the last refusal and spends one refresh of the budget.
+      try { fresh = await this.deps.refreshSession(sandboxId); } catch { continue; }
+      // Pin the re-probe to the refreshed session itself, so a concurrent
+      // session change cannot silently substitute a different connection.
+      result = await this.probe(sandboxId, fresh);
+    }
+    return refreshes > 0 ? { ...result, delegationRefreshes: refreshes } : result;
   }
   private async probe(sandboxId: string, sessionOverride?: SshSession): Promise<Awaited<ReturnType<GuestController["preflight"]>>> {
     // Eligibility is still one guest probe exercising real admission, kill
@@ -297,6 +328,11 @@ export class SshOffloadGuest implements GuestController {
     this.prepared.clear();
     this.sessions.clear();
   }
+}
+
+/** A configured wait value may only tighten its default, which is the cap. */
+function clampWait(value: number | undefined, cap: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, cap) : cap;
 }
 
 /** True for the control-plane byte-cap refusal (see runStreamProcess): the

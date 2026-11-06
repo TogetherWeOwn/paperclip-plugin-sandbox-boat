@@ -91,7 +91,7 @@ export interface SshOffloadRuntimeDeps {
   // Boundary test seams: real SSH is still used, not an injected guest mock.
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
-  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain">;
+  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain" | "delegationWait">;
   /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   trackedFiles?: TrackedFilesFn;
 }
@@ -716,10 +716,10 @@ export class SshOffloadRuntime {
     // Warm commands reuse the cached session and its control master. After a
     // resume (new machine, IP and host key) the first guest op fails on the
     // stale session, and push re-authorizes exactly once through this refresh.
-    // The guest preflight uses the same refresh once when its probe proves the
-    // cached session runs outside the delegated cgroup parent (a master
-    // accepted by a pre-restart sshd listener never enters the template's
-    // ForceCommand scope). Single-flight per VM, like the opener above:
+    // The guest preflight uses the same refresh, in a bounded backoff wait,
+    // when its probe proves the session runs outside the delegated cgroup
+    // parent (a master accepted by a pre-restart sshd listener never enters
+    // the template's ForceCommand scope). Single-flight per VM, like the opener above:
     // concurrent refreshers share one reopen instead of each reopening
     // closing the master the other just started.
     const refreshing = new Map<string, Promise<SshSession>>();
