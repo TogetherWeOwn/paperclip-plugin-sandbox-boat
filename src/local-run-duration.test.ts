@@ -210,8 +210,11 @@ describe("local duration reports with registered workspace refusals", () => {
           projectId: "project", projectWorkspaceId, path: source.root, cwd: source.root, repoUrl: source.repo,
         }])),
       });
+      // A null policy is the broad path; an exact grant naming another command applies here.
+      const admission = { version: 1, companyId, agentId, runId, executionWorkspaceId: workspaceId, commandId: randomUUID(),
+        issuedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
       harness.ctx.config.get = async () => ({ offloadLocalRunsEnabled: true, offloadLocalSourceRoots: [dir],
-        offloadExecutorEnabled: false, offloadGuestTransportEnabled: false });
+        offloadExecutorEnabled: false, offloadGuestTransportEnabled: false, offloadAdmission: admission });
       const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
       setManagerOverridesForTests({ offloadExecutor: executor });
       await plugin.definition.setup(harness.ctx as never);
