@@ -123,7 +123,7 @@ const manifest: PaperclipPluginManifestV1 = {
           issuedAt: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
           expiresAt: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
         },
-        description: "Operator-issued default-deny grant for exactly one command of one authenticated run. Null or unset disables new admission. All ids are lowercase UUIDs; issuedAt and expiresAt are canonical UTC ISO timestamps with milliseconds, expiresAt after issuedAt and at most 75 minutes later. No lists or extra fields. The runtime parser is the authority; anything it rejects denies. Needs a host that supplies verified authenticatedRunId and an atomic state.create; otherwise it admits nothing.",
+        description: "Operator-issued exact-run grant for exactly one command of one authenticated run. Null or unset keeps the broad opt-in path: the offload flags, allowlisted repos, source roots and per-workspace isolation decide, as in 0.2.14. Any other value replaces that path for the company and denies everything but the grant. All ids are lowercase UUIDs; issuedAt and expiresAt are canonical UTC ISO timestamps with milliseconds, expiresAt after issuedAt and at most 75 minutes later. No lists or extra fields. The runtime parser is the authority; anything it rejects denies. Needs a host that supplies verified authenticatedRunId and an atomic state.create; otherwise it admits nothing.",
       },
       offloadGuestTransportEnabled: {
         type: "boolean", default: false,

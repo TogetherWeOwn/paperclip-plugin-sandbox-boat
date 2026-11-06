@@ -103,7 +103,10 @@ describe("local-run duration learning through plugin dispatch", () => {
     expect(JSON.stringify([...harness.state.values()])).not.toContain("fake-scoped-key");
   });
 
-  it.each(commands)("an unbound $tool refusal leaves a fresh real submit or dry-run without admission", async (command) => {
+  it.each(commands)("an unbound $tool refusal leaves a fresh real submit or dry-run unadmitted under an exact grant", async (command) => {
+    // A null policy is the broad path; an exact grant naming another run applies here.
+    config.offloadAdmission = { version: 1, companyId, agentId, runId: randomUUID(), executionWorkspaceId: workspaceId,
+      commandId: randomUUID(), issuedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
     await unchanged(report(command));
     const before = structuredClone([...harness.state.entries()]);
     for (const dryRun of [false, true]) {

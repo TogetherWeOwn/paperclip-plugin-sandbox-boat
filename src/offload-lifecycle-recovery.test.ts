@@ -148,6 +148,30 @@ describe("offload lifecycle: quarantine reconciles after a restart", () => {
     const next = await s.execute(command("next", { cardId: "card-b", executionWorkspaceId: "workspace-b" }), restarted);
     expect(next).toMatchObject({ status: "completed" });
   });
+
+  // SDK 1.13.0 GET passes `state` through unchanged, and its SandboxStateEnum
+  // has no `stopped`: only stop.status=completed is defined ("the sandbox is
+  // archived"). A literal `stopped` therefore proves no process-tree end and
+  // stays indeterminate: fenced, unsettled, never reused or replayed.
+  it("a quarantined VM whose provider reads a literal stopped stays fenced", async () => {
+    s.fail.add("exec:doomed");
+    const cmd = command("doomed");
+    const original = await s.execute(cmd);
+    expect(original).toMatchObject({ status: "unknown", fallbackSafe: false });
+    const sandboxId = s.starts[0]!.sandboxId;
+    s.clock.crashWorker();
+    s.fail.clear();
+    s.boat.boxes.get(sandboxId)!.state = "stopped";
+    const disk = new DiskState(s.state.path);
+    const restarted = s.make({ queueLimit: 0 }, disk);
+    await s.api(restarted).recover?.();
+    await s.api(restarted).sweep?.();
+    expect(await new OffloadPoolStore(disk, `guest-test:${s.root}`, "guest-test-pool").load()).toMatchObject([{ sandboxId, quarantined: true }]);
+    expect(await s.execute(cmd, restarted)).toEqual(original);
+    const next = await s.execute(command("next", { cardId: "card-b", executionWorkspaceId: "workspace-b" }), restarted);
+    expect(next).toMatchObject({ status: "unavailable" });
+    expect(s.boat.callsOf("create")).toHaveLength(1);
+  });
 });
 
 // slice b: persisted stop-observation telemetry and worker-death sweep.

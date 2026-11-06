@@ -1,5 +1,8 @@
-// Operator-owned exact-run admission. The host, never the request body or
-// environment, supplies authenticatedRunId and an atomic durable state create.
+// Operator-owned admission. A null or unset `offloadAdmission` keeps the
+// v0.2.14 broad opt-in path: the offload flags, allowlisted repo, host-owned
+// source roots and per-workspace isolation stay the gates. Any other value is
+// an exact-run grant: the host, never the request body or environment,
+// supplies authenticatedRunId and an atomic durable state create.
 import { createHash } from "node:crypto";
 import type { StateClientLike } from "../state.js";
 import type { BrokerPrincipal } from "./broker.js";
@@ -31,7 +34,13 @@ const object = (value: unknown): value is Record<string, unknown> => value !== n
 const timestamp = (value: unknown): number => typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
   && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value ? Date.parse(value) : NaN;
 
-/** Missing, empty, broad, malformed and unknown-version policies all deny. */
+/** Only an explicit null or an absent key selects the broad path. A config
+ * that could not be read never reaches here: the reader throws and denies. */
+export function isBroadAdmission(config: Record<string, unknown> | undefined): boolean {
+  return config?.offloadAdmission === undefined || config.offloadAdmission === null;
+}
+
+/** As an exact grant, missing, empty, broad, malformed and unknown-version policies all deny. */
 export function parseAdmissionPolicy(value: unknown): OffloadAdmissionPolicy | null {
   if (!object(value) || value.version !== 1 || Object.keys(value).length !== FIELDS.length
     || Object.keys(value).some((key) => !FIELDS.includes(key))
@@ -41,6 +50,9 @@ export function parseAdmissionPolicy(value: unknown): OffloadAdmissionPolicy | n
   if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt) || expiresAt <= issuedAt || expiresAt - issuedAt > ADMISSION_MAX_WINDOW_MS) return null;
   return { ...value } as unknown as OffloadAdmissionPolicy;
 }
+
+/** Marker for the null-policy broad path; never a grant or a claim. */
+export const BROAD = "broad" as const;
 
 interface Claim {
   version: 1;
@@ -75,11 +87,18 @@ export class OffloadAdmission {
     }) };
   }
 
-  private async policy(companyId: string, actor: RouteActor, request: OffloadSubmitRequest): Promise<RouteResponse | null> {
+  private async policy(companyId: string, actor: RouteActor, request: OffloadSubmitRequest): Promise<RouteResponse | typeof BROAD | null> {
+    const config = await this.config(companyId);
+    // Broad: the route's run-ownership and the downstream flag, profile,
+    // workspace and executor gates decide, exactly as v0.2.14 did.
+    // A host that does supply a verified run must agree with the effective run.
+    if (isBroadAdmission(config)) {
+      return actor.actorType === "agent" && actor.runId && (actor.authenticatedRunId == null || actor.authenticatedRunId === actor.runId)
+        ? BROAD : this.refuse(request, "agent run authentication is required");
+    }
     if (actor.actorType !== "agent" || !actor.agentId || !actor.authenticatedRunId || actor.authenticatedRunId !== actor.runId) {
       return this.refuse(request, "verified exact-run authentication is required for new admission");
     }
-    const config = await this.config(companyId);
     const policy = parseAdmissionPolicy(config?.offloadAdmission);
     if (!policy || config?.offloadExecutorEnabled !== true) return this.refuse(request, "exact-run admission is disabled or malformed");
     const now = this.now();
@@ -92,13 +111,16 @@ export class OffloadAdmission {
     return null;
   }
 
-  /** Read-only, also before first-request binding. Does not reserve capacity. */
-  async check(companyId: string, actor: RouteActor, request: OffloadSubmitRequest): Promise<RouteResponse | null> {
+  /** Read-only, also before first-request binding. Does not reserve capacity.
+   * BROAD admits on the v0.2.14 path, where a dry-run may bind as it did then. */
+  async check(companyId: string, actor: RouteActor, request: OffloadSubmitRequest): Promise<RouteResponse | typeof BROAD | null> {
     try {
-      const refused = await this.policy(companyId, actor, request);
-      if (refused) return refused;
+      const decision = await this.policy(companyId, actor, request);
+      if (decision !== null && decision !== BROAD) return decision;
+      // A run spent under an exact grant stays spent after a switch to broad:
+      // its receipts are the answer, never a remint under a fresh command ID.
       if (await this.state.get(this.scope(companyId, actor.runId!)) !== null) return this.spent(request);
-      return null;
+      return decision;
     } catch {
       return this.refuse(request, "exact-run admission could not be verified");
     }
@@ -110,8 +132,13 @@ export class OffloadAdmission {
    * at-most-once is intentional; no code deletes or overwrites this claim. */
   async consume(companyId: string, actor: RouteActor, request: OffloadSubmitRequest, principal: BrokerPrincipal): Promise<RouteResponse | null> {
     try {
-      const refused = await this.policy(companyId, actor, request);
-      if (refused) return refused;
+      const decision = await this.policy(companyId, actor, request);
+      if (decision === BROAD) {
+        // Broad admission writes no claim: v0.2.14 admitted every command of an
+        // owned run. A run already spent under an exact grant stays spent.
+        return await this.state.get(this.scope(companyId, actor.runId!)) === null ? null : this.spent(request);
+      }
+      if (decision) return decision;
       const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
         : object(value) ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
       const { dryRun: _dryRun, ...execution } = request;

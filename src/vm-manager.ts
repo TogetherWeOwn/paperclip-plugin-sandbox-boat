@@ -889,7 +889,9 @@ export class BoatVmManager {
   private offloadRouteHost(companyId: string, settings?: Record<string, unknown>) {
     return {
       broker: this.offloadBroker(companyId),
-      admission: new OffloadAdmission(this.offloadState, this.now, (company) => this.offloadCompanyConfig(company)),
+      // Unlike offloadCompanyConfig, a failed read throws: an unreadable
+      // config must deny, never look like a null policy's broad path.
+      admission: new OffloadAdmission(this.offloadState, this.now, async (company) => this.offloadConfigFn ? await this.offloadConfigFn(company) : undefined),
       workspaces: this.offloadWorkspaces,
       profile: V1_PROFILE,
       extraProfiles: [NODE_PROFILE, PYTHON_PROFILE],

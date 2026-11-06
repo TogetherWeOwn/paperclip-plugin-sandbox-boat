@@ -282,6 +282,26 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
   }, TIMEOUT);
 
+  it("(6) with no exact grant configured, a stock host keeps the v0.2.14 path: an owned run binds and is admitted", async () => {
+    const saved = config.offloadAdmission;
+    (config as Record<string, unknown>).offloadAdmission = null;
+    try {
+      host = startHost(source);
+      await host.initialize();
+      const actor = { agentId, companyId, runId };
+      await host.call("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
+      // No authenticated run identity or atomic create is needed: the dry-run
+      // binds the run's own allowlisted workspace and is answered, not denied.
+      const reply = await untilOwned(actor);
+      expect(reply.status).toBe(200);
+      expect(host.logs).toContain("boat: bound local run for offload");
+      expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
+      expect([...host.state.keys()].filter((key) => key.includes("boat-offload-admission"))).toEqual([]);
+    } finally {
+      config.offloadAdmission = saved;
+    }
+  }, TIMEOUT);
+
   it.each([
     { tool: "node", runner: "npm", argv: ["test"], profile: "node-public-1" },
     { tool: "python", runner: "pytest", argv: ["tests"], profile: "python-public-1" },

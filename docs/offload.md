@@ -97,15 +97,15 @@ before any host workspace read or state write, whatever the workspace ID, and
 a later workspace move cannot train another repository. A registered report
 reuses the existing exact-run registry without resolving an environment,
 credential, admission grant or executor. Registering an otherwise-local source
-still requires an admitted real submit, `offloadLocalRunsEnabled`, and the
+still requires an admitted offload request, `offloadLocalRunsEnabled`, and the
 existing source-root/on-disk-origin checks; reporting cannot create that binding.
 Reporting itself resolves no secret and adds no persistent company-upkeep
 enrollment. Existing
 report-host construction still caches a company broker; unscoped sweeps include
 cached-broker companies for upkeep. Explicitly withdrawn workspace
 aliases and invalid registered bindings remain refused, without falling back to
-current issue metadata. Fresh real submits and dry-runs still need their existing
-exact-run admission; retained receipt handling is unchanged. Reports for
+current issue metadata. Fresh real submits and dry-runs still need admission
+(the broad path or an exact grant); retained receipt handling is unchanged. Reports for
 local-mode signatures (watch mode, single-file filters, inline code,
 unrecognized scripts) are refused before any state write, and each run is
 rate-limited (a short burst, then one report per second, 200 per run); excess
