@@ -24,7 +24,7 @@ describe("limits freshness at account admission", () => {
     const p = f.pool();
     await p.execute(command("seed"));
     await advance(6_000); // warm, but the limits snapshot has expired
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_674 });
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_764 });
     safeRefusal(await p.execute(command("warm-exhausted")));
     expect(f.executions).toEqual(["seed"]);
     expect(f.boat.callsOf("limits").length).toBeGreaterThanOrEqual(2);
@@ -92,7 +92,7 @@ describe("shared admission: effective caps and unreflected reservations", () => 
     { name: "daily start", overrides: { starts: starts(69) }, config: {} },
     { name: "minute start", overrides: { starts: { ...starts(4), hour: { limit: 25, used: 4, remaining: 21 }, minute: { limit: 5, used: 4, remaining: 1 } } }, config: {} },
     { name: "hour start", overrides: { starts: { ...starts(24), hour: { limit: 25, used: 24, remaining: 1 } } }, config: {} },
-    { name: "compute", overrides: { creditBalanceSeconds: 3_749 }, config: {} },
+    { name: "compute", overrides: { creditBalanceSeconds: 3_929 }, config: {} },
   ])("allows one winner across two pools racing the last $name budget", async ({ overrides, config }) => {
     f.boat.limitsResponse = limits(overrides);
     const gate = f.gate();
@@ -111,9 +111,10 @@ describe("shared admission: effective caps and unreflected reservations", () => 
   it.each([
     { name: "active", overrides: { activeSandboxes: 1 } },
     { name: "start", overrides: { starts: starts(69) } },
-    // Whole-run TTL is 60s; offload job+tail is 75s. 134s of
-    // headroom cannot fund any pair (60+75 or 75+75).
-    { name: "compute", overrides: { creditBalanceSeconds: 3_734 } },
+    // Whole-run TTL is 60s; offload job+tail is 165s (60s timeout + 90s
+    // pre-start allowance + 15s tail). 224s of headroom cannot fund any pair
+    // (60+165 or 165+165).
+    { name: "compute", overrides: { creditBalanceSeconds: 3_824 } },
   ])("coordinates a whole-run lease and two pools on the same last $name budget", async ({ overrides }) => {
     f.boat.limitsResponse = limits(overrides);
     const g = f.gate();
@@ -255,12 +256,12 @@ describe("provider window reset metadata", () => {
 
 describe("size-weighted job plus tail plus reserve", () => {
   it.each([
-    { size: "default" as const, available: 3_674, allowed: false },
-    { size: "default" as const, available: 3_675, allowed: true },
-    { size: "small" as const, available: 3_637, allowed: false },
-    { size: "small" as const, available: 3_637.5, allowed: true },
+    { size: "default" as const, available: 3_764, allowed: false },
+    { size: "default" as const, available: 3_765, allowed: true },
+    { size: "small" as const, available: 3_682, allowed: false },
+    { size: "small" as const, available: 3_682.5, allowed: true },
   ])("uses SDK machine seconds for $size: $available remaining => $allowed", async ({ size, available, allowed }) => {
-    // 60s command + 15s tail, at SDK multipliers 1 / 0.5; reserve = 3600 base seconds.
+    // 60s command + 90s pre-start allowance + 15s tail, at SDK multipliers 1 / 0.5; reserve = 3600 base seconds.
     f.boat.limitsResponse = limits({ creditBalanceSeconds: available });
     const result = await f.pool("weighted", { size }).execute(command("weighted"));
     if (allowed) expect(result).toMatchObject({ status: "completed" });
@@ -268,30 +269,30 @@ describe("size-weighted job plus tail plus reserve", () => {
   });
 
   it("uses the command timeout, not the optimistic observed duration, for admission", async () => {
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_690 });
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_800 });
     safeRefusal(await f.pool().execute(command("long-worst-case", { timeoutMs: 120_000 })));
     noDispatch(f);
   });
 
   it("preserves configured compute reserve instead of spending it on the job", async () => {
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 7_274 });
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 7_364 });
     safeRefusal(await f.pool("reserve", { minComputeHoursLeft: 2 }).execute(command("keep-reserve")));
     noDispatch(f);
   });
 
   it("uses the smaller trial allowance/balance after credit used, not the wallet alone", async () => {
-    f.boat.limitsResponse = limits({ trialComputeCapSeconds: 90_000, creditUsedSeconds: 86_326, creditBalanceSeconds: 2_000_000 });
+    f.boat.limitsResponse = limits({ trialComputeCapSeconds: 90_000, creditUsedSeconds: 86_236, creditBalanceSeconds: 2_000_000 });
     safeRefusal(await f.pool().execute(command("trial-bound")));
     noDispatch(f);
   });
 
   it("subtracts outstanding small and default compute in SDK units without mixing wall seconds", async () => {
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_712 });
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_847 });
     const g = f.gate();
     const small = f.pool("small", { size: "small" }, async () => { await g.promise; return { exitCode: 0, seconds: 0 }; });
     const first = small.execute(command("small-held")); await flush();
     const second = f.pool("default").execute(command("default-denied")); await advance(2);
-    // 37.5 + 75 + 3600 = 3712.5, just beyond the available 3712.
+    // 82.5 + 165 + 3600 = 3847.5, just beyond the available 3847.
     safeRefusal(await second); g.resolve(); await first;
     expect(f.executions).toEqual(["small-held"]);
   });
@@ -389,14 +390,14 @@ describe("durable intent and ambiguous external effects", () => {
   });
 
   it("persists outstanding size-weighted compute across a module/process-cache restart", async () => {
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_712 });
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3_847 });
     const gate = f.gate();
     const first = f.pool("held-small", { size: "small" }, async () => { await gate.promise; return { exitCode: 0, seconds: 0 }; }).execute(command("held-small"));
     await flush();
     expect(f.executions).toEqual(["held-small"]);
     const recovered = await restart(f);
     try {
-      // 37.5 reserved + 75 requested + 3600 reserve exceeds 3712.
+      // 82.5 reserved + 165 requested + 3600 reserve exceeds 3847.
       safeRefusal(await recovered.pool("restarted-default").execute(command("compute-after-restart")));
       expect(recovered.executions).toEqual([]);
       expect(f.boat.callsOf("create")).toHaveLength(1);
@@ -476,15 +477,15 @@ describe("adaptive tail accounting-change simulation", () => {
   });
 
   it("refuses adaptive C=300 when only the shorter job+tail+reserve would fit", async () => {
-    f.boat.limitsResponse = limits({ starts: starts(56), creditBalanceSeconds: 3_959 });
-    // 60 + 300 + 3600 = 3960, not 3675.
+    f.boat.limitsResponse = limits({ starts: starts(56), creditBalanceSeconds: 4_049 });
+    // 150 + 300 + 3600 = 4050, not 3765.
     safeRefusal(await f.pool().execute(command("adaptive-no-compute")));
     noDispatch(f);
   });
 
   it("keeps a running warm VM subject to the longer job+tail compute reservation", async () => {
     const p = f.pool(); await p.execute(command("seed")); await advance(6_000);
-    f.boat.limitsResponse = limits({ starts: starts(56), creditBalanceSeconds: 3_959 });
+    f.boat.limitsResponse = limits({ starts: starts(56), creditBalanceSeconds: 4_049 });
     safeRefusal(await p.execute(command("adaptive-warm-no-compute")));
     expect(f.executions).toEqual(["seed"]);
   });

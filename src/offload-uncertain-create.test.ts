@@ -218,7 +218,7 @@ describe("offload uncertain create", () => {
     const s = setup();
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 60_000 })).toMatchObject({ status: "unavailable" });
-    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(75);
+    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(165);
 
     const second = await s.executor.execute({ ...command("cmd-2"), timeoutMs: 600_000 });
     expect(second).toMatchObject({ status: "completed" });
@@ -228,8 +228,8 @@ describe("offload uncertain create", () => {
     expect(creates[1]!.args).toEqual(creates[0]!.args);
     const [id] = [...s.fake.boxes.keys()];
     expect(s.fake.callsOf("update")).toHaveLength(1);
-    expect(s.fake.callsOf("update")[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 615 });
-    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(615);
+    expect(s.fake.callsOf("update")[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 705 });
+    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(705);
     expect(second).toMatchObject({ sandboxId: id });
   });
 
@@ -284,10 +284,10 @@ describe("offload uncertain create", () => {
     const s = setup();
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute({ ...command("cmd-1"), timeoutMs: 600_000 })).toMatchObject({ status: "unavailable" });
-    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(615);
+    expect(s.fake.callsOf("create")[0]!.args.ttlSeconds).toBe(705);
 
-    // 600 s of the 615 s TTL elapsed before the next claim. The shorter
-    // adopter (135 s envelope) would otherwise lose its VM ~15 s into the
+    // 600 s of the 705 s TTL elapsed before the next claim. The shorter
+    // adopter (225 s envelope) would otherwise lose its VM ~105 s into the
     // run, so the adoption must renew the deadline from now.
     s.clock.t += 600_000;
     const second = await s.executor.execute(command("cmd-2"));
@@ -296,8 +296,8 @@ describe("offload uncertain create", () => {
     const [id] = [...s.fake.boxes.keys()];
     const updates = s.fake.callsOf("update");
     expect(updates).toHaveLength(1);
-    expect(updates[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 135 });
-    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(135);
+    expect(updates[0]!.args).toMatchObject({ sandboxId: id, ttlSeconds: 225 });
+    expect(s.fake.boxes.get(id!)?.ttlSeconds).toBe(225);
     expect(second).toMatchObject({ sandboxId: id });
   });
 
@@ -333,16 +333,16 @@ describe("offload uncertain create", () => {
     expect(await s.executor.execute({ ...command("cmd-2"), timeoutMs: 600_000 })).toMatchObject({ status: "unavailable" });
     s.account.state.set = innerSet;
 
-    // The extension landed (provider deadline now 615 s) and the adopter hold
+    // The extension landed (provider deadline now 705 s) and the adopter hold
     // failed; the original hold was renewed through the extended deadline.
     expect(s.fake.callsOf("update")).toHaveLength(1);
     expect(s.executor.getUsage().filter((row) => row.commandId === "cmd-2").map((row) => row.kind))
       .toEqual(["failed_start"]);
     const original = ledgerDoc(s).intents.find((i) => i.operation === "create");
     expect(original?.status).not.toBe("rejected");
-    expect(original?.ttlSeconds).toBe(615);
+    expect(original?.ttlSeconds).toBe(705);
 
-    // Past the original 75 s TTL plus the stale-hold margin, the renewed hold
+    // Past the original 165 s TTL plus the stale-hold margin, the renewed hold
     // still covers the VM: the next claim adopts it instead of leaking it.
     s.clock.t += 700_000;
     const third = await s.executor.execute({ ...command("cmd-3"), timeoutMs: 600_000 });

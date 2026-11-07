@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, type TestContext } from "vitest";
 import { access, mkdir, readdir, readFile, readlink, rmdir, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import path from "node:path";
 import { userInfo } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -9,7 +9,7 @@ import { CGROUP_GATED, CGROUP_SKIP_NOTE, markCgroupGated } from "./test-support/
 import { SshOffloadGuest } from "./offload-ssh.js";
 import { OFFLOAD_SSH_SCRIPT } from "./offload-ssh-script.js";
 import { OffloadLifecycle } from "./offload-lifecycle.js";
-import { commandDigest } from "./offload-journal.js";
+import { commandDigest, offloadError } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
 
 let ssh: LoopbackSsh;
@@ -320,6 +320,21 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
       try {
         await expect(priming.prepare(ssh.session.sandboxId, frozen)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
         expect(await readFile(path.join(stub, "argv"), "utf8")).toBe("fetch\n--locked\n--config\nregistry.global-credential-providers=[]\n");
+      } finally {
+        await priming.shutdown();
+      }
+    }
+    // The funded guest timeout is asked for only after the fetch ran, and a
+    // window the fetch used up refuses before the guest prepare RPC.
+    {
+      const { priming, stub } = await primingGuest(0, "funded");
+      let fetchedFirst: boolean | null = null;
+      try {
+        await expect(priming.prepare(ssh.session.sandboxId, offline, () => {
+          fetchedFirst = existsSync(path.join(stub, "argv"));
+          throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "funded_window_elapsed");
+        })).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE", detail: "funded_window_elapsed" });
+        expect(fetchedFirst).toBe(true);
       } finally {
         await priming.shutdown();
       }
