@@ -188,7 +188,7 @@ export class SshOffloadGuest implements GuestController {
     return { cgroupV2Delegated: false, outsideWatchdogVerified: false,
       ineligibleReason: probeToken ?? "guest_reported_ineligible" };
   }
-  async prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity> {
+  async prepare(sandboxId: string, command: OffloadCommand, timeoutMs?: number): Promise<GuestIdentity> {
     // Explicit nonsecret command env only; no inherited host/Boat credentials.
     // Node/Python commands travel with an empty env (validateSubmit enforces
     // it); cargo keeps its two validated keys.
@@ -250,7 +250,7 @@ export class SshOffloadGuest implements GuestController {
       program: this.script(), cgroupParent: this.deps.cgroupParent, stateRoot: this.deps.stateRoot ?? "/tmp",
       cwd,
       executable,
-      args: this.deps.args?.(command) ?? command.argv, env: preparedEnv, timeoutMs: command.timeoutMs ?? 120_000,
+      args: this.deps.args?.(command) ?? command.argv, env: preparedEnv, timeoutMs: timeoutMs ?? command.timeoutMs ?? 120_000,
       path: guestPath,
       base: { companyId: command.companyId, runId: command.runId, commandId: command.commandId,
         digest: commandDigest(command), sandboxId },

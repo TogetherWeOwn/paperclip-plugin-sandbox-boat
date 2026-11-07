@@ -76,11 +76,11 @@ describe("review safety mutation pins", () => {
     expect(serialized).not.toContain("--token=");
   });
 
-  it("updates the provider deadline from 75 to 360 seconds before a counted-resume command runs", async () => {
+  it("updates the provider deadline from 165 to 450 seconds before a counted-resume command runs", async () => {
     const p = f.pool("metered-tail", {}, async (id, cmd) => {
       if (cmd.commandId === "counted-resume") {
-        expect(f.boat.boxes.get(id)!.ttlSeconds).toBe(360);
-        expect(f.boat.boxes.get(id)!.archiveAfter!.getTime()).toBe(Date.now() + 360_000);
+        expect(f.boat.boxes.get(id)!.ttlSeconds).toBe(450);
+        expect(f.boat.boxes.get(id)!.archiveAfter!.getTime()).toBe(Date.now() + 450_000);
       }
       return { exitCode: 0, seconds: 0 };
     });
@@ -93,8 +93,8 @@ describe("review safety mutation pins", () => {
       return result;
     };
     expect(await p.execute(command("counted-resume"))).toMatchObject({ status: "completed", exitCode: 0 });
-    expect(f.boat.callsOf("resume")[0]!.args.ttlSeconds).toBe(75);
-    expect(f.boat.callsOf("update").at(-1)!.args).toMatchObject({ ttlSeconds: 360 });
+    expect(f.boat.callsOf("resume")[0]!.args.ttlSeconds).toBe(165);
+    expect(f.boat.callsOf("update").at(-1)!.args).toMatchObject({ ttlSeconds: 450 });
     expect(journal().usage.find((r) => r.commandId === "counted-resume")).toMatchObject({ observedStartsDelta: 1 });
   });
 

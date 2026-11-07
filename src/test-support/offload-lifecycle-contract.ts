@@ -186,11 +186,14 @@ export class Guest {
     ...(this.preflightReason !== null ? { ineligibleReason: this.preflightReason } : {}),
     ...(this.preflightRefreshes !== null ? { delegationRefreshes: this.preflightRefreshes } : {}),
     ...(this.preflightReprobes !== null ? { delegationReprobes: this.preflightReprobes } : {}) });
-  prepare = async (_sandboxId: string, cmd: LifecycleCommand): Promise<GuestIdentity> => {
+  /** Guest timeout each prepare was asked to arm, in call order. */
+  preparedTimeouts: Array<number | undefined> = [];
+  prepare = async (_sandboxId: string, cmd: LifecycleCommand, timeoutMs?: number): Promise<GuestIdentity> => {
+    this.preparedTimeouts.push(timeoutMs);
     const identity = {
       guestBootId: "boot-a", processGroupId: 4100 + this.prepared.size,
       cgroupPath: `/delegated/commands/${cmd.commandId}`, journalGeneration: 1,
-      heartbeatDeadline: this.clock.t + 30_000, guestDeadline: this.clock.t + (cmd.timeoutMs ?? 120_000),
+      heartbeatDeadline: this.clock.t + 30_000, guestDeadline: this.clock.t + (timeoutMs ?? cmd.timeoutMs ?? 120_000),
     };
     this.prepared.set(cmd.commandId, identity);
     return structuredClone(identity);

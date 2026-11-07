@@ -167,7 +167,9 @@ export interface OffloadLifecycleDeps extends Omit<OffloadDeps, "guest" | "runCo
   runCommand(sandboxId: string, command: OffloadCommand, context?: OffloadRunContext): Promise<CommandExit>;
 }
 
-type Reservation = { kind: "run"; vm: PoolVm; warm: OffloadWarm };
+// `fundedUntil` is the host time the claim's funded job window ends at: the
+// provider TTL it set, minus the funded tail.
+type Reservation = { kind: "run"; vm: PoolVm; warm: OffloadWarm; fundedUntil?: number };
 type Dispatch = Reservation | OffloadResult;
 type Slot = Reservation | { kind: "unavailable"; reason: string } | { kind: "blocked" };
 type Claim = Exclude<Slot, { kind: "blocked" }> | { kind: "queued"; wait: Promise<Dispatch> };
@@ -227,6 +229,18 @@ const DEFAULTS = {
   maxStartsPerDay: 70,
   minComputeHoursLeft: 1,
 };
+/**
+ * Pre-start seconds every offload claim funds on top of the command timeout.
+ * The provider TTL starts when the claim creates, resumes or updates the VM,
+ * but the guest only spawns after the journal's sync push, the boot-id RPC and
+ * the guest preflight, whose bounded delegation wait on a fresh VM ends inside
+ * offload-ssh's 45 s DELEGATION_WAIT_WINDOW_MS plus its last 15 s probe. The
+ * remaining 30 s cover the boot-id and prepare RPCs and an ordinary push.
+ * Slower pre-start work (a large push, a `cargo fetch` prime) is not funded:
+ * the lifecycle trims the guest deadline to the funded window instead, so the
+ * envelope and the guest deadline never disagree.
+ */
+export const OFFLOAD_PRE_START_ALLOWANCE_S = 90;
 /** Volatile-only dedup cache bound (live waiters stay far below it: queue 32 + in-flight). */
 const MAX_VOLATILE_JOURNAL = 512;
 /** ID-only convenience lookups bound; terminal commands are deleted outright in execute(). */
@@ -263,6 +277,8 @@ export class OffloadExecutor {
   private readonly pendingFinishes = new Map<string, PendingFinish>();
   private readonly knownCommands = new Map<string, OffloadCommand | null>();
   private readonly knownScopes = new Map<string, Map<string, OffloadCommand> | null>();
+  /** Funded job-window ends of commands between dispatch and transport exit. */
+  private readonly fundedWindows = new Map<string, number>();
   private admission: Promise<unknown> = Promise.resolve();
   private closed = false;
   private shutdownTask: Promise<void> | null = null;
@@ -292,7 +308,8 @@ export class OffloadExecutor {
     if (hasDurableDeps && !(deps.journalStore && deps.guestReceipts && deps.resolveRunState && deps.sync)) {
       throw new Error("OFFLOAD_DURABLE_CONFIGURATION_REQUIRED");
     }
-    this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers) : null;
+    this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers,
+      (command) => this.fundedWindows.get(commandKey(command)) ?? null) : null;
     this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDurableDeps, this.now, {
       hold: (identity, command) => this.restoreHold(identity, command),
       release: (identity) => this.releaseHold(identity),
@@ -825,7 +842,7 @@ export class OffloadExecutor {
       await this.releaseVm(dispatch.vm);
       return result;
     }
-    return await this.runOnVm(dispatch.vm, command, dispatch.warm, this.now() - enqueuedAt);
+    return await this.runOnVm(dispatch.vm, command, dispatch.warm, this.now() - enqueuedAt, dispatch.fundedUntil);
   }
 
   /**
@@ -1088,6 +1105,8 @@ export class OffloadExecutor {
     const idempotencyKey = `pcboatoff-${reservation.id}`;
     // Placeholders that predate the persisted body rebuild it from the
     // current command, as before; stored bodies always win above.
+    // The legacy body predates the funded pre-start allowance; keep it as it
+    // was so the replay resends the closest body to the lost create.
     const legacyJobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
     const legacyTtlSeconds = Math.max(60, Math.ceil(legacyJobSeconds + reservation.tailSeconds));
     let id: string;
@@ -1157,7 +1176,10 @@ export class OffloadExecutor {
       // next claim under the same key.
       const funded = await this.admitCommand(command, "warm", id);
       if ("kind" in funded) return null;
-      const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+      const jobSeconds = this.fundedJobSeconds(command);
+      // Taken before the remaining life is read or extended: the provider
+      // deadline is then at least fundedFrom + neededTtl either way.
+      const fundedFrom = this.now();
       // The provider deadline runs from the original create (≈ reservation.at),
       // not from the replay: a delayed replay can leave almost no life even
       // when the adopter envelope is shorter than the original TTL. Extend
@@ -1217,7 +1239,7 @@ export class OffloadExecutor {
       // original hold. A failing settlement write is logged, not fatal; the
       // double hold is conservative and converges on reconcile.
       await ledger.failed(reservation, true).catch(() => undefined);
-      return { kind: "run", vm, warm: "cold" };
+      return { kind: "run", vm, warm: "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
     }
     // Another trust domain must not adopt the replayed VM: settle the
     // reservation against it first (so stopped() can match it), then stop it.
@@ -1256,10 +1278,7 @@ export class OffloadExecutor {
     // admission inside the ledger lock: fail closed on telemetry errors and
     // count pending and running envelopes so concurrent claims cannot burst past the cap.
     const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
-    // Fund the provider-enforced TTL envelope, not the raw timeout: create,
-    // resume and warm update all clamp the deadline to whole seconds with a
-    // 60 s minimum. A 16 s reservation must not create a 60 s billing VM.
-    const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+    const jobSeconds = this.fundedJobSeconds(command);
     try {
       return await ledger.reserve(this.boat, { ...this.config, operation, sandboxId, poolId: this.poolId,
         jobSeconds, tailSeconds: this.config.offloadIdleStopSeconds,
@@ -1274,12 +1293,25 @@ export class OffloadExecutor {
     }
   }
 
+  /**
+   * The job part of a claim's envelope: the command timeout plus the funded
+   * pre-start allowance. Fund the provider-enforced TTL envelope, not the raw
+   * timeout: create, resume and warm update all clamp the deadline to whole
+   * seconds with a 60 s minimum. A 16 s reservation must not create a 60 s
+   * billing VM. Admission, the ledger's stale-hold bound and every TTL this
+   * executor sends derive from this one value.
+   */
+  private fundedJobSeconds(command: OffloadCommand): number {
+    return Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000) + OFFLOAD_PRE_START_ALLOWANCE_S,
+      60 - this.config.offloadIdleStopSeconds);
+  }
+
   private async accountClaim(command: OffloadCommand, existing: PoolVm | null, operation: "create" | "resume" | "warm"): Promise<Reservation | { kind: "unavailable"; reason: string }> {
     const ledger = this.ledger!;
     const admitted = await this.admitCommand(command, operation, existing?.sandboxId);
     if ("kind" in admitted) return admitted;
     const reservation = admitted;
-    const jobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
+    const jobSeconds = this.fundedJobSeconds(command);
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
       stopping: false, stopRequestedAt: null, identity: null, compatibilityKey: this.compatibilityKey(command) };
     this.reserveVm(vm, command);
@@ -1306,6 +1338,9 @@ export class OffloadExecutor {
     if (pending) vm.pendingCreate = pending;
     try {
       await this.persistPool();
+      // Taken before the provider call: the provider deadline it sets is no
+      // earlier than fundedFrom + ttlSeconds.
+      const fundedFrom = this.now();
       if (operation === "create") {
         // Same semantics as whole-run leases (vm-manager): a configured named
         // snapshot is the guest image; a missing one is a refused start, so the
@@ -1349,7 +1384,7 @@ export class OffloadExecutor {
       if (vm.tailSeconds > reservation.tailSeconds) await this.boat.update({ sandboxId: vm.sandboxId,
         ttlSeconds: Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds)) });
       await this.persistPool();
-      return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold" };
+      return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
     } catch (error) {
       const definitive = !effectConfirmed && await definitiveStartRejection(error);
       await ledger.failed(reservation, definitive).catch(() => {
@@ -1366,9 +1401,12 @@ export class OffloadExecutor {
     }
   }
 
-  private async runOnVm(vm: PoolVm, command: OffloadCommand, warm: OffloadWarm, queueWaitMs: number): Promise<OffloadResult> {
+  private async runOnVm(vm: PoolVm, command: OffloadCommand, warm: OffloadWarm, queueWaitMs: number,
+    fundedUntil?: number): Promise<OffloadResult> {
     const startedAt = this.now();
     let result: OffloadResult;
+    const key = this.cacheKey(command);
+    if (fundedUntil !== undefined) this.fundedWindows.set(key, fundedUntil);
     try {
       const raw = await this.runCommand(vm.sandboxId, command);
       // The duration gate learns from host-measured wall time, never from
@@ -1401,8 +1439,9 @@ export class OffloadExecutor {
         });
       }
       result = { status: "unknown", code: "OFFLOAD_UNKNOWN", commandId: command.commandId, sandboxId: vm.sandboxId, warm, queueWaitMs, remoteStarted: true, fallbackSafe: false, exitCode: 75, seconds, dollars, reason: preStart?.reason ?? "command transport failed; reconcile the guest receipt before replay or VM reuse" };
+    } finally {
+      this.fundedWindows.delete(key);
     }
-    const key = this.cacheKey(command);
     const pending: PendingFinish = { vm, warm, queueWaitMs, finishedAt: this.now(), accounted: false, reported: false,
       guestVerifiedEmpty: result.status !== "unknown", command, result: null, journalPending: true };
     this.pendingFinishes.set(key, pending);

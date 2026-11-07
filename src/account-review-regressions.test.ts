@@ -134,10 +134,11 @@ describe("reconciliation evidence", () => {
 });
 
 describe("funding and accounting", () => {
-  it("funds the enforced 60 s minimum TTL before creating", async () => {
-    // 16 s of job+tail plus the 1 h reserve fits 3650, but the enforced 60 s
-    // envelope does not: admission must refuse without dispatching.
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3650 });
+  it("funds the pre-start allowance and tail of a short command before creating", async () => {
+    // 16 s of timeout+tail plus the 1 h reserve fits 3705, but the enforced
+    // 106 s envelope (1 s + 90 s pre-start allowance + 15 s tail) does not:
+    // admission must refuse without dispatching.
+    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3705 });
     const p = f.pool();
     expect(await p.execute(command("tiny", { timeoutMs: 1_000 }))).toMatchObject({ status: "unavailable" });
     expect(f.boat.callsOf("create")).toHaveLength(0);
@@ -146,7 +147,7 @@ describe("funding and accounting", () => {
   it("creates short commands with a TTL equal to the funded envelope", async () => {
     const p = f.pool();
     expect(await p.execute(command("tiny-ok", { timeoutMs: 1_000 }))).toMatchObject({ status: "completed" });
-    expect(f.boat.callsOf("create")[0]!.args.ttlSeconds).toBe(60);
+    expect(f.boat.callsOf("create")[0]!.args.ttlSeconds).toBe(106);
   });
 
   it("closes the predecessor tail at a new resume, not at the later terminal receipt", async () => {

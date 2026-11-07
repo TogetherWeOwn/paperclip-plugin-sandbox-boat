@@ -345,7 +345,8 @@ default VM:
    first probe, and each probe keeps its 15 s RPC fence). Only a literal
    `true` admits; every other refusal is still a single probe. The wait runs
    on the command's reserved VM inside its timed window, so its seconds are
-   billed to that command. If the window ends without delegation, the
+   billed to that command, and the provider TTL funds it through the
+   pre-start allowance (see "Offload TTL funding" below). If the window ends without delegation, the
    command falls back locally with the same `OFFLOAD_GUEST_INELIGIBLE` code
    and `detail=`, plus `refreshes=` and `reprobes=` on the warn line:
    `refreshes` counts the reconnects attempted, `reprobes` how many of them
@@ -462,13 +463,34 @@ After exact-head CI/review, an authorized operator can run `node scripts/native-
 * **Retries never double-bill.** Creates send an `Idempotency-Key`. boat documents the key for create and fork only, and the SDK has no key for resume. A resume retry therefore checks the VM state first and treats `sandbox_resuming` as done. Pool creates carry the reservation id as the key, so a retry after a lost reply replays the same provider effect instead of billing a second VM: a compatible retry adopts the VM and runs on it, an incompatible one stops it, settles the reservation, and frees the slot for a fresh create.
 * **A failed delete stops.** If the provider delete fails on release of a per-run VM (or on destroy), the plugin stops the VM instead so billing stops, records the stop, and rethrows the delete error. No tombstone is written: the record keeps the VM tracked (stopped) so later sweep passes still see it.
 
+### Offload TTL funding
+
+Every offload claim sets the pool VM's provider TTL (on create, resume or the
+warm update) to `timeout + 90 s + offloadIdleStopSeconds`, at least 60 s, and
+the account ledger admits and holds exactly that envelope. The 90 s is the
+pre-start allowance: the TTL starts at the claim, but the guest only spawns
+after the sync push, the boot-id read and the guest preflight, whose bounded
+delegation wait on a fresh VM can take up to 45 s plus its last 15 s probe.
+The allowance counts toward `minComputeHoursLeft`, the compute check and the
+monthly cap like the rest of the envelope; it adds no start, so
+`maxStartsPerDay` is unchanged.
+
+The guest deadline never outlives the funded window (claim time plus timeout
+plus allowance; the idle tail stays free for sync-out). When pre-start fits
+the allowance, the command gets its full timeout. When pre-start is slower (a
+large push, a `cargo fetch` prime), the guest deadline is trimmed to what is
+left of the window, so the command reports a timeout instead of being cut off
+by the provider TTL with an unknown result. A pre-start that used up the whole
+window refuses before spawn and falls back locally with
+`OFFLOAD_GUEST_INELIGIBLE` and `detail=funded_window_elapsed`.
+
 ### Offload VM-hour cap
 
 `offloadMonthlyVmHourCap` (default 0, disabled) caps the month's tracked
 offload VM-hours per company against the existing account-ledger usage rows;
 once reached, new commands run local until next month. The check is strict:
 admission counts settled usage plus pending envelopes plus the new request's
-own command-plus-tail envelope, so a request that would cross the cap is
+own command-plus-allowance-plus-tail envelope, so a request that would cross the cap is
 refused instead of admitting one extra envelope past it. Stop lag does not
 inflate the month: a tail closed on late terminal evidence ends at the stop
 deadline plus a 5-minute grace (or the funded tail plus a 5-minute grace), and a still-open tail

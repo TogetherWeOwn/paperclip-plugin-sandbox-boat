@@ -43,7 +43,9 @@ export interface GuestController {
      * failed to reconnect. Server log only. Absent when none ran. */
     delegationReprobes?: number;
   }>;
-  prepare(sandboxId: string, command: OffloadCommand): Promise<GuestIdentity>;
+  /** `timeoutMs`, when given, is the guest deadline to arm instead of the
+   * command's own timeout: never longer, trimmed to the funded VM window. */
+  prepare(sandboxId: string, command: OffloadCommand, timeoutMs?: number): Promise<GuestIdentity>;
   armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }>;
   inspect(sandboxId: string, identity: GuestIdentity): Promise<{
     identity: GuestIdentity; populated: boolean; receipt: string;
@@ -72,7 +74,10 @@ export class OffloadLifecycle {
   // never recycle a prepared path in the same VM boot for this worker lifetime.
   private readonly watchdogPaths = new Set<string>();
   constructor(private readonly guest: GuestController, private readonly now: () => number,
-    private readonly timers: OffloadTimers) {}
+    private readonly timers: OffloadTimers,
+    /** Host time the command's funded job window ends at (its provider TTL
+     * minus the funded tail), or null when the caller funds no window. */
+    private readonly fundedUntil: (command: OffloadCommand) => number | null = () => null) {}
 
   async prepare(sandboxId: string, command: OffloadCommand, base: OffloadIdentity): Promise<ExecutionIdentity> {
     const capabilities = await this.guest.preflight(sandboxId, command);
@@ -91,8 +96,21 @@ export class OffloadLifecycle {
         Number.isSafeInteger(refreshes) ? { refreshes } : {},
         Number.isSafeInteger(reprobes) ? { reprobes } : {});
     }
+    // Pre-start work (sync push, boot id, the delegation wait above) ran
+    // inside the provider TTL the claim funded. The guest deadline must not
+    // outlive that window: the funded pre-start allowance normally leaves the
+    // full timeout, and a slower pre-start trims the deadline to what is left
+    // instead of letting the provider stop a still-running command.
+    const timeoutMs = command.timeoutMs ?? 120_000;
+    const fundedUntil = this.fundedUntil(command);
+    let guestTimeoutMs = timeoutMs;
+    if (fundedUntil !== null) {
+      const remainingMs = Math.floor(fundedUntil - this.now());
+      if (!(remainingMs > 0)) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "funded_window_elapsed");
+      guestTimeoutMs = Math.min(timeoutMs, remainingMs);
+    }
     const sentAt = this.now();
-    const identity = await this.guest.prepare(sandboxId, command);
+    const identity = await this.guest.prepare(sandboxId, command, guestTimeoutMs);
     // The guest reports absolutes on its own clock. Map them onto the host
     // clock with the pre-send host time: the supervisor stamps guestNow when
     // it creates the child, which can be no earlier than the send, so
@@ -102,11 +120,13 @@ export class OffloadLifecycle {
     const guestNow = Number.isSafeInteger(identity.guestNow) ? (identity.guestNow as number) : sentAt;
     const skew = guestNow - sentAt;
     const heartbeatDeadline = identity.heartbeatDeadline - skew;
-    const guestDeadline = identity.guestDeadline - skew;
+    // The guest stamps its deadline after the prepare RPC: clamp it on the
+    // host so the host watchdog fires at the funded window end regardless.
+    const guestDeadline = Math.min(identity.guestDeadline - skew, fundedUntil ?? Infinity);
     if (!validGuestIdentity(identity) || identity.guestBootId.startsWith("unverified:")
       || identity.guestBootId !== base.guestBootId || identity.journalGeneration !== base.journalGeneration
       || !(heartbeatDeadline > this.now()) || heartbeatDeadline > this.now() + 30_000
-      || !(guestDeadline > this.now()) || guestDeadline > this.now() + (command.timeoutMs ?? 120_000)) {
+      || !(guestDeadline > this.now()) || guestDeadline > this.now() + guestTimeoutMs) {
       throw offloadError("OFFLOAD_GUEST_IDENTITY_INVALID");
     }
     const path = JSON.stringify([sandboxId, identity.guestBootId, identity.cgroupPath]);
