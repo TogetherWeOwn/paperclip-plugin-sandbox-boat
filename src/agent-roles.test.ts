@@ -7,7 +7,8 @@ const role = (name: string) => readFileSync(new URL(`../.claude/agents/${name}.m
 
 it("keeps cross-review independent, concurrent and pinned without test execution", () => {
   const text = role("cross-reviewer");
-  expect(text).toContain("alongside the primary assessment on the same pinned head");
+  expect(text).toContain("alongside the primary assessment on the same pinned base and head");
+  expect(text).toContain("Before either assessment starts, record the shared base and head SHAs and require both reviewers to use that same recorded pair");
   expect(text).toContain("do not share or consume preliminary conclusions until independent findings are recorded");
   expect(text).toContain("Reconcile findings afterwards, before decisions");
   expect(text).toContain("a changed head requires applicable revalidation");
