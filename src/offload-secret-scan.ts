@@ -4,7 +4,9 @@
 // `git ls-files --cached` intersected with the filesystem walk, so untracked
 // or ignored workspace files (a stray .dev.vars, a local deploy key) never
 // reach a pool VM. A source that is not a git work tree, or whose tracked
-// files cannot be listed, stays local (fail closed).
+// files cannot be listed, stays local (fail closed). Because the guest only
+// ever sees tracked files, a source with untracked, non-ignored files also
+// stays local: the host build could read them and the guest build could not.
 //
 // Before admission the tracked, sync-eligible files also go through a bounded
 // content scan for known credential shapes (cloud keys, private-key headers,
@@ -12,7 +14,7 @@
 // command local. This is a heuristic net for well-known token formats, not a
 // proof that a workspace is secret-free; the tracked-only rule and the sync
 // excludes are the primary boundary.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { X509Certificate } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
@@ -25,8 +27,65 @@ const execFileAsync = promisify(execFile);
 /** Posix-style paths relative to the source root, as listed by git. */
 export type TrackedFilesFn = (sourceRoot: string) => Promise<ReadonlySet<string> | null>;
 
+/** True when the source has untracked, non-ignored files, or when that cannot be determined. */
+export type UntrackedFilesFn = (sourceRoot: string) => Promise<boolean>;
+
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
+
+/** Worker env with every GIT_* override removed, so git sees only the bound source. */
+function hardenedGitEnv(): NodeJS.ProcessEnv {
+  // No GIT_* variable from the worker env (GIT_DIR, GIT_INDEX_FILE, the
+  // GIT_CONFIG_COUNT override family, ...) may redirect the listing to a
+  // different repository, index or configuration than the bound source.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of Object.keys(env)) if (name.startsWith("GIT_")) delete env[name];
+  env.GIT_OPTIONAL_LOCKS = "0";
+  return env;
+}
+
+function hardenedGitArgs(sourceRoot: string, ...args: string[]): string[] {
+  return ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", sourceRoot, ...args];
+}
+
+/**
+ * True when sourceRoot holds at least one untracked file git does not ignore
+ * (`git ls-files --others --exclude-standard`). The mirror carries tracked
+ * files only, so a tracked file that references such a file (a new module
+ * before its first commit) builds on the host and fails on the guest: the
+ * command must stay local. Untracked directories collapse to one entry and
+ * the listing stops at the first entry, so the cost is bounded by the first
+ * hit, not the size of the untracked tree. Any git failure (not a work tree,
+ * timeout, oversized output, a signal) returns true: fail closed to local.
+ * Same hardened invocation as listTrackedFiles.
+ */
+export function hasUntrackedFiles(sourceRoot: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      resolve(value);
+    };
+    const child = spawn(
+      "git",
+      hardenedGitArgs(sourceRoot, "ls-files", "-z", "--others", "--exclude-standard", "--directory", "--no-empty-directory"),
+      { env: hardenedGitEnv(), stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const timer = setTimeout(() => finish(true), GIT_TIMEOUT_MS);
+    let bytes = 0;
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      // Any non-empty entry is a hit; a NUL-only chunk cannot occur, but a
+      // stream that keeps growing without an entry is refused on size.
+      if (chunk.some((byte) => byte !== 0) || bytes > GIT_MAX_BUFFER) finish(true);
+    });
+    child.on("error", () => finish(true));
+    child.on("close", (code, signal) => finish(code !== 0 || signal !== null));
+  });
+}
 
 /**
  * The tracked (index) files under sourceRoot, or null when the source is not
@@ -36,18 +95,12 @@ const GIT_MAX_BUFFER = 32 * 1024 * 1024;
  * `git -C <source> ls-files` semantics for a subdirectory checkout too.
  */
 export async function listTrackedFiles(sourceRoot: string): Promise<Set<string> | null> {
-  // No GIT_* variable from the worker env (GIT_DIR, GIT_INDEX_FILE, the
-  // GIT_CONFIG_COUNT override family, ...) may redirect the listing to a
-  // different repository, index or configuration than the bound source.
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const name of Object.keys(env)) if (name.startsWith("GIT_")) delete env[name];
-  env.GIT_OPTIONAL_LOCKS = "0";
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync(
       "git",
-      ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", sourceRoot, "ls-files", "-z", "--cached"],
-      { timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, encoding: "utf8", env },
+      hardenedGitArgs(sourceRoot, "ls-files", "-z", "--cached"),
+      { timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, encoding: "utf8", env: hardenedGitEnv() },
     ));
   } catch {
     return null;

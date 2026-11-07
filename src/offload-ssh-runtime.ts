@@ -24,7 +24,8 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
-import { hasSecretInFiles, listTrackedFiles, pemFilesAreCertificateOnly, type TrackedFilesFn } from "./offload-secret-scan.js";
+import { hasSecretInFiles, hasUntrackedFiles, listTrackedFiles, pemFilesAreCertificateOnly, type TrackedFilesFn,
+  type UntrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
@@ -94,7 +95,11 @@ export interface SshOffloadRuntimeDeps {
   guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain" | "delegationWait">;
   /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   trackedFiles?: TrackedFilesFn;
+  /** Untracked-file check for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  untrackedFiles?: UntrackedFilesFn;
 }
+/** Named stay-local reason when the source has untracked, non-ignored files. */
+export const UNTRACKED_FILES_REASON = "untracked files present; running local";
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
 
@@ -535,6 +540,13 @@ export class SshOffloadRuntime {
     // workspace from ever spending a VM.
     const tracked = await (this.deps.trackedFiles ?? listTrackedFiles)(binding.source).catch(() => null);
     if (!tracked || tracked.size === 0) return refuse("workspace has no tracked files to sync");
+    // The mirror is tracked-only, so an untracked, non-ignored file (a new
+    // module before its first commit) would build on the host and be missing
+    // on the guest: a false remote failure. Stay local; a git failure counts
+    // as untracked (fail closed).
+    if (await (this.deps.untrackedFiles ?? hasUntrackedFiles)(binding.source).catch(() => true)) {
+      return refuse(UNTRACKED_FILES_REASON);
+    }
     // A tracked secret-bearing name (a .docker/ context, a key file) is
     // withheld from sync, so the guest tree would silently lack a file the
     // build may read: stay local for every tool, cargo included. The one

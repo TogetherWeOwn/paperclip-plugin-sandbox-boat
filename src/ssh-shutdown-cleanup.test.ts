@@ -37,7 +37,7 @@ function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor 
   return value;
 }
 
-import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
+import { listAllFilesAsTracked, noUntrackedFiles } from "./test-support/tracked-files.js";
 import type { BackendCommand } from "./offload/broker.js";
 
 const execFileAsync = promisify(execFile);
@@ -422,7 +422,7 @@ describe("runtime release-hook wiring (no guest)", () => {
     const sshStub = { closeSession, ...options.ssh } as unknown as SshManager;
     const boat = new FakeBoat({ now: Date.now });
     const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: sshStub,
-      accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+      accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
       boat: () => boat as unknown as BoatApiLike,
       ...(options.realOpener ? {} : { session: async (sandboxId: string) => ({ sandboxId }) as SshSession }),
       guestOptions: { stateRoot: root } });

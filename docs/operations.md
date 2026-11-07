@@ -399,6 +399,18 @@ default VM:
    cargo config points at a private registry, a source replacement, or stored
    credentials stays local too, because the guest fetch could not satisfy it.
 
+   The guest mirror holds git-tracked files only. A source tree with any
+   untracked file that git does not ignore (`git ls-files --others
+   --exclude-standard`, for example a new module before its first commit)
+   therefore stays local for every tool, with the reason `untracked files
+   present; running local`: the host build could read that file and the
+   guest build could not, so a remote run would report a false compile
+   error. Dry-run returns `mode: "local"` with the same reason, and the real
+   submit refuses before any VM is reserved. Ignored files (`target/`,
+   anything in `.gitignore`) do not count. If git cannot answer, the
+   command stays local too. Commit or ignore the new files to make the
+   command a remote candidate again. Untracked files are never synced.
+
 ## Smoke procedures
 
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)

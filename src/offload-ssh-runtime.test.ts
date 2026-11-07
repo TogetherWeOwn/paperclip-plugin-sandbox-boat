@@ -7,12 +7,12 @@ import { createHash, randomUUID, scryptSync } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
-import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc } from "./offload-ssh-runtime.js";
+import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc, UNTRACKED_FILES_REASON } from "./offload-ssh-runtime.js";
 import { shellQuote } from "./shell.js";
 import type { SshManager } from "./ssh.js";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
 import type { StateClientLike } from "./state.js";
-import { listAllFilesAsTracked } from "./test-support/tracked-files.js";
+import { listAllFilesAsTracked, noUntrackedFiles } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -59,7 +59,7 @@ beforeEach(async () => {
     offloadAllowedRepos: ["repo:https://github.com/example/public"] };
   boat = new FakeBoat({ now: Date.now });
   const harness = createFakeContext();
-  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
     boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
     guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
   runtime.remember(native());
@@ -213,7 +213,7 @@ describe("stock concrete executor factory", () => {
     const bin = path.join(ssh.root, "stub-bin");
     await mkdir(bin);
     await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
-    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked,
+    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
       guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     const cmd = command();
     const agentId = randomUUID();
@@ -362,8 +362,15 @@ describe("stock concrete executor factory", () => {
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
-  it("admits a clean git work tree with only tracked files syncable", async () => {
+  // The fixture's .env (and any .dev.vars) are ignored, not merely untracked:
+  // an untracked, non-ignored file keeps the command local on its own.
+  async function gitInitIgnoringSecrets(): Promise<void> {
     gitIn(source, "init", "-q", ".");
+    await writeFile(path.join(source, ".gitignore"), ".env\n.dev.vars\ntarget/\n");
+    gitIn(source, "add", ".gitignore");
+  }
+  it("admits a clean git work tree with only tracked files syncable", async () => {
+    await gitInitIgnoringSecrets();
     await writeFile(path.join(source, ".dev.vars"), "CF_API_TOKEN=untracked\n");
     gitIn(source, "add", "Cargo.toml", "Cargo.lock");
     const rt = realGitRuntime();
@@ -383,7 +390,7 @@ describe("stock concrete executor factory", () => {
     } finally { await rt.shutdown(); }
   });
   it("admits cargo when the only tracked .pem is a public CA certificate fixture", async () => {
-    gitIn(source, "init", "-q", ".");
+    await gitInitIgnoringSecrets();
     await mkdir(path.join(source, "scripts/ci/fixtures"), { recursive: true });
     await writeFile(path.join(source, "scripts/ci/fixtures/isrg-x1.pem"),
       readFileSync(new URL("./test-support/isrg-root-x1.pem", import.meta.url), "utf8"));
@@ -391,6 +398,52 @@ describe("stock concrete executor factory", () => {
     const rt = realGitRuntime();
     try {
       mustResolve(await rt.resolve(command(), config));
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps a tracked-only tree a remote candidate on dry-run and real submit", async () => {
+    await gitInitIgnoringSecrets();
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.preflight(command(), config)).toBeNull();
+      mustResolve(await rt.resolve(command(), config));
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps cargo local with the named reason when an untracked, non-ignored file exists (dry-run and real submit agree)", async () => {
+    await gitInitIgnoringSecrets();
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    // A new module the tracked tree references before its first commit.
+    await mkdir(path.join(source, "src"), { recursive: true });
+    await writeFile(path.join(source, "src/new_module.rs"), "pub fn added() {}\n");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.preflight(command(), config)).toBe(UNTRACKED_FILES_REASON);
+      expect(await rt.resolve(command(), config)).toEqual({ refusalReason: UNTRACKED_FILES_REASON });
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps an ignored-only untracked file (target/) a remote candidate", async () => {
+    await gitInitIgnoringSecrets();
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    await mkdir(path.join(source, "target/debug"), { recursive: true });
+    await writeFile(path.join(source, "target/debug/build.log"), "ignored\n");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.preflight(command(), config)).toBeNull();
+      mustResolve(await rt.resolve(command(), config));
+    } finally { await rt.shutdown(); }
+  });
+  it("fails closed to local when the untracked-file check cannot answer", async () => {
+    const harness = createFakeContext();
+    const rt = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+      trackedFiles: listAllFilesAsTracked, untrackedFiles: async () => { throw new Error("git exploded"); },
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
+    rt.remember(native());
+    try {
+      expect(await rt.preflight(command(), config)).toBe(UNTRACKED_FILES_REASON);
+      expect(await rt.resolve(command(), config)).toEqual({ refusalReason: UNTRACKED_FILES_REASON });
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
@@ -726,7 +779,7 @@ describe("pool credential identity and guest token scrub", () => {
   it("binds a new pool to a rotated API key and sweeps the superseded pool", async () => {
     const seenKeys: Array<string | null> = [];
     const harness = createFakeContext();
-    const rotating = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+    const rotating = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
       boat: (cfg) => { seenKeys.push(cfg.apiKey); return boat as unknown as BoatApiLike; }, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "true"] } });
     try {
@@ -787,7 +840,7 @@ describe("journal partial-write recovery", () => {
   }
   function testRuntime(state: StateClientLike) {
     const harness = createFakeContext();
-    const rt = new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked,
+    const rt = new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
       boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
     rt.remember(native());
