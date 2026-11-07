@@ -907,6 +907,9 @@ export class OffloadExecutor {
     // the historical default and keeps the bare layout, so VMs recorded before
     // the opt-out reached offload stay reusable under the default policy.
     if (!this.config.monitoring) key.push(["monitoring", false]);
+    // Size is fixed at creation too. Keep the historical default-size layout
+    // so existing default VMs remain reusable; other sizes must match exactly.
+    if (this.config.size !== "default") key.push(["size", this.config.size]);
     return JSON.stringify(key);
   }
 
