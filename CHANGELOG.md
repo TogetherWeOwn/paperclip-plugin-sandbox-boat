@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.15
+
+Follow-up to 0.2.14: bounded guest delegation settling, optional exact-run
+admission, reliable local duration learning and journal recovery. Offload
+and whole-run behaviour stay off by default; nothing is enabled by
+upgrading.
+
+### Fixed
+
+* Guest preflight waits a bounded window for sshd delegation to settle
+  after a `session_not_delegated` refusal on a still-booting VM. It
+  refreshes the session and repeats the unchanged eligibility probe;
+  only literal `true` admits offload, and an exhausted window retains
+  the existing refusal and local-fallback behaviour (#107).
+* A null or unset `offloadAdmission` keeps the 0.2.14 broad opt-in path:
+  offload flags, allowlisted repositories, host-owned source roots and
+  per-workspace isolation still apply. A configured grant enforces
+  #101's exact-run admission, including the verified run identity,
+  workspace and single-command claim. Malformed, expired or spent
+  grants deny instead of falling back to broad admission, and a failed
+  config read denies rather than being treated as an unset policy
+  (#106, #101).
+* Receipt validation failures (`OFFLOAD_INVALID_REQUEST`, HTTP 400)
+  exit 64 immediately rather than exhausting the receipt-recovery
+  budget and exiting 75 (#102).
+* Local Node/Python duration learning works without credentials or VM
+  admission, using host-owned workspace facts. Reports with an unproven
+  or unbound source are refused rather than inferred, so untrusted
+  duration evidence cannot make a workload eligible (#103, #104).
+* The offload journal recovers from partial index and record writes.
+  A failed terminal commit no longer permits replay of a command that
+  may already have run (#75).
+
+### Changed
+
+* Long-running offload workers prune settled broker chains, executor
+  lookups and per-run state, and back off idle output polling while
+  preserving live executions and uncertain ownership (#80).
+* CI and release workflows use checkout v7.0.1 and setup-node v7.1.0,
+  pinned to their commit SHAs (#51).
+
 ## 0.2.14
 
 Follow-up to 0.2.13: offload preflight can recover from a stale SSH
