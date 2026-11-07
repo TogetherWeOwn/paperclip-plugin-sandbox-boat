@@ -113,7 +113,8 @@ const plugin = definePlugin({
       canonicalPath: fsCanonicalPath,
       onDiskRepoUrl: readGitOriginUrl,
     };
-    // Local runs bind only after exact-run admission on a real submit. Start
+    // Local runs bind only after admission on an offload request: any request on
+    // the broad (null-policy) path, only the real submit of an exact grant. Start
     // events record ownership, never infer telemetry sources or resolve credentials.
     bindLocalRun = async (companyId: string, runId: string, issueId: string, expectedWorkspaceId?: string) => {
       const settings = localRunSettings(await ctx.config.get(companyId).catch(() => ({})));
@@ -153,11 +154,11 @@ const plugin = definePlugin({
       // run's first offload request. The persisted owner row is written only
       // when the company uses Boat at all (local-run offload or a seen
       // whole-run config), so idle companies add no per-run state rows.
-      // Workspace binding still requires an admitted real submit.
+      // Workspace binding still requires an admitted offload request.
       const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
       const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
       // Install the in-memory owner before fetching settings: requests can
-      // race this event, but still pass the exact-run admission gate.
+      // race this event, but still pass the admission gate.
       if (!(await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId, false))) return;
       let companyConfig: unknown;
       try {
@@ -171,7 +172,7 @@ const plugin = definePlugin({
       const persist = localRunSettings(companyConfig).enabled || requireManager().hasWholeRunConfig(event.companyId);
       await requireManager().startLocalRun(event.companyId, payload.runId, issueId, agentId, persist);
       // Start events never bind workspaces or resolve credentials. Only an
-      // admitted real submit may do that through bindOnFirstRequest.
+      // admitted offload request may do that through bindOnFirstRequest.
     });
     for (const done of ["agent.run.finished", "agent.run.failed", "agent.run.cancelled"] as const) {
       ctx.events.on(done, async (event) => {

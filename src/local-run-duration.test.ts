@@ -103,7 +103,10 @@ describe("local-run duration learning through plugin dispatch", () => {
     expect(JSON.stringify([...harness.state.values()])).not.toContain("fake-scoped-key");
   });
 
-  it.each(commands)("an unbound $tool refusal leaves a fresh real submit or dry-run without admission", async (command) => {
+  it.each(commands)("an unbound $tool refusal leaves a fresh real submit or dry-run unadmitted under an exact grant", async (command) => {
+    // A null policy is the broad path; an exact grant naming another run applies here.
+    config.offloadAdmission = { version: 1, companyId, agentId, runId: randomUUID(), executionWorkspaceId: workspaceId,
+      commandId: randomUUID(), issuedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
     await unchanged(report(command));
     const before = structuredClone([...harness.state.entries()]);
     for (const dryRun of [false, true]) {
@@ -207,8 +210,11 @@ describe("local duration reports with registered workspace refusals", () => {
           projectId: "project", projectWorkspaceId, path: source.root, cwd: source.root, repoUrl: source.repo,
         }])),
       });
+      // A null policy is the broad path; an exact grant naming another command applies here.
+      const admission = { version: 1, companyId, agentId, runId, executionWorkspaceId: workspaceId, commandId: randomUUID(),
+        issuedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
       harness.ctx.config.get = async () => ({ offloadLocalRunsEnabled: true, offloadLocalSourceRoots: [dir],
-        offloadExecutorEnabled: false, offloadGuestTransportEnabled: false });
+        offloadExecutorEnabled: false, offloadGuestTransportEnabled: false, offloadAdmission: admission });
       const executor = vi.fn(async () => { throw new Error("unexpected executor resolution"); });
       setManagerOverridesForTests({ offloadExecutor: executor });
       await plugin.definition.setup(harness.ctx as never);

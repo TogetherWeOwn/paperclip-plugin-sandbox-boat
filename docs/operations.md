@@ -87,8 +87,10 @@ check: a bind retried from an offload request runs only for a run with no
 existing binding and only for the workspace that request named, so probing
 with random workspace ids never spends secret resolutions. The started event
 records ownership only, never a workspace binding or credential resolution.
-Binding runs only after the exact-run admission gate on a real submit; a dry-run
-or telemetry report never triggers it. A binding never replaces a whole-run
+Binding runs only after the admission gate: on the broad path (null
+`offloadAdmission`) any offload request, dry-run included, may bind, as in
+0.2.14; under an exact grant only its real submit binds. A telemetry report
+never triggers it. A binding never replaces a whole-run
 realization for the same run and workspace. `agent.run.finished`, `failed` and
 `cancelled` drop the executor binding and the persisted workspace record, and fence
 the run: a late or slow start handler cannot bind it again. A missing or refused
@@ -131,9 +133,15 @@ break whole-run workspace realization.
 This section describes a future, separately authorized procedure. All offload
 flags remain off, and nothing here authorizes enabling them or issuing a grant.
 
-New remote admission is default-deny and needs the company `offloadAdmission`
-policy ([Configuration](configuration.md#company-plugin-settings-offload)) in
-addition to the gates above. The runtime parser (`src/offload/admission.ts`) is
+With `offloadAdmission` null or unset, admission is the 0.2.14 broad opt-in
+path: the offload flags, allowlisted repos, host-owned source roots and
+per-workspace isolation above decide for every owned run, with no grant,
+verified run field or atomic create. Setting any value switches the company to
+default-deny exact-run admission: only the `offloadAdmission` policy
+([Configuration](configuration.md#company-plugin-settings-offload)) admits, in
+addition to the gates above. A malformed, expired or spent grant denies; it
+never falls back to the broad path. A config that cannot be read also denies.
+A run whose exact grant was spent stays spent after a switch back to broad. The runtime parser (`src/offload/admission.ts`) is
 the authority on its shape; the policy names exactly one company, agent, run,
 execution workspace and command, for at most 75 minutes. It is not an
 allowlist, and a policy the parser rejects admits nothing.
@@ -203,7 +211,8 @@ performed now:
 5. In an explicit flags step, turn on the required flags.
 6. Submit once, with the pinned command id.
 7. Collect the receipts.
-8. Expire or clear the policy, then turn the flags off.
+8. Turn the flags off, then expire or clear the policy. Never clear it first:
+   a null policy with the flags on is the broad path.
 
 The window covers one command, never a whole run and never several days.
 Use the approved operator settings surface, not an agent request body or
@@ -233,8 +242,9 @@ separate flags step. Confirm the installed host's verified JWT actor field and
 negotiated atomic-state capability, not merely a source revision or SDK method
 name. Do not log JWTs or bearer credentials. If any readback, capability or
 permanent-claim continuity check is unavailable, stop with the flags OFF.
-Clearing means setting `offloadAdmission` to `null` in that same company and
-reading back null, then verifying the flags OFF; it never means deleting state.
+Clearing means first verifying the flags OFF, then setting `offloadAdmission`
+to `null` in that same company and reading back null; it never means deleting
+state. A null policy with the flags on admits on the broad path.
 
 Negative evidence must distinguish admission refusal from an unrelated disabled
 executor gate. First use isolated fake-host fixtures with otherwise eligible

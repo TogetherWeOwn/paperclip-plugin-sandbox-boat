@@ -63,16 +63,6 @@ describe("strict operator policy", () => {
 });
 
 describe("new admission before binding", () => {
-  it.each([false, true])("missing policy denies dryRun=%s without binding, journal or dispatch", async (dryRun) => {
-    const t = setup();
-    delete t.config.offloadAdmission;
-    expect((await t.exec(request({ dryRun }))).status).toBe(403);
-    expect(t.bind).not.toHaveBeenCalled();
-    expect(t.workspace).not.toHaveBeenCalled();
-    expect(t.create).not.toHaveBeenCalled();
-    expect(t.h.state.size).toBe(0);
-    expect(t.start).not.toHaveBeenCalled();
-  });
   it.each([false, true])("older host without atomic create denies dryRun=%s, no speculative write", async (dryRun) => {
     const t = setup();
     const { create: _create, ...legacyState } = t.h.ctx.state;
@@ -124,7 +114,7 @@ describe("new admission before binding", () => {
   });
   it("revalidates current config after binding and before consumption", async () => {
     const t = setup();
-    t.bind.mockImplementation(async () => { t.config.offloadAdmission = null; });
+    t.bind.mockImplementation(async () => { t.config.offloadAdmission = { ...policy(), commandId: OTHER }; });
     expect((await t.exec()).status).toBe(403);
     expect(t.create).not.toHaveBeenCalled();
     expect(t.start).not.toHaveBeenCalled();
@@ -161,9 +151,98 @@ describe("new admission before binding", () => {
   it("config/state read failure fails closed", async () => {
     const t = setup();
     vi.spyOn(t.h.ctx.state, "get").mockRejectedValue(new Error("storage offline"));
-    expect(await t.routeHost.admission!.check(COMPANY, actor(), request())).toMatchObject({ status: 403 });
+    // Closed to remote; nothing was claimed, so the shim may still run it locally.
+    const unavailable = { status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } };
+    expect(await t.routeHost.admission!.check(COMPANY, actor(), request())).toMatchObject(unavailable);
     const admission = new OffloadAdmission(t.h.ctx.state, () => NOW, async () => { throw new Error("config offline"); });
-    expect(await admission.check(COMPANY, actor(), request())).toMatchObject({ status: 403 });
+    expect(await admission.check(COMPANY, actor(), request())).toMatchObject(unavailable);
+  });
+});
+
+// A null or unset policy keeps the installed v0.2.14 path: no grant, no
+// verified run field, no atomic create and no claim. Run ownership and the
+// flag, profile, workspace and executor gates downstream still decide.
+describe("broad path when no exact grant is configured", () => {
+  const legacyActor = (): RouteActor => ({ actorType: "agent", actorId: AGENT, agentId: AGENT, runId: RUN });
+  it.each(["unset", "null"])("%s policy admits an owned run's dry-run and submit like v0.2.14", async (mode) => {
+    const t = setup();
+    if (mode === "unset") delete t.config.offloadAdmission;
+    else t.config.offloadAdmission = null;
+    const { create: _create, ...legacyState } = t.h.ctx.state;
+    const via = t.host(legacyState);
+    // The unpinned shim dry-runs first, so the broad path binds then, as v0.2.14 did.
+    const dry = await t.exec(request({ dryRun: true }), legacyActor(), COMPANY, via);
+    expect(dry).toMatchObject({ status: 200, body: { mode: "remote_candidate", commandId: CMD } });
+    expect(t.bind).toHaveBeenCalledTimes(1);
+    expect((await t.exec(request(), legacyActor(), COMPANY, via)).status).toBe(202);
+    // Every command of the run is admitted; none writes an admission claim.
+    expect((await t.exec(request({ commandId: OTHER }), legacyActor(), COMPANY, via)).status).toBe(202);
+    expect(t.start).toHaveBeenCalledTimes(2);
+    expect(t.create).not.toHaveBeenCalled();
+    expect(await t.h.ctx.state.get(t.claimScope)).toBeNull();
+  });
+  it("still requires an agent run and keeps the downstream profile and workload gates", async () => {
+    const t = setup();
+    t.config.offloadAdmission = null;
+    expect((await t.exec(request(), { actorType: "user", actorId: "user", runId: null })).status).toBe(401);
+    // A verified run field, where a host supplies one, must match the effective run.
+    expect((await t.exec(request(), { ...actor(), authenticatedRunId: OTHER })).status).toBe(403);
+    t.routeHost.settings = { offloadProfiles: [] };
+    expect((await t.exec(request(), legacyActor())).status).toBe(503);
+    expect(t.bind).not.toHaveBeenCalled();
+    t.routeHost.settings = undefined;
+    expect((await t.exec(request({ argv: ["fmt"] }), legacyActor())).status).toBe(503);
+    expect(t.start).not.toHaveBeenCalled();
+  });
+  it.each([[], {}, "*", { ...policy(), version: 2 }, { ...policy(), runId: "*" }, false, 0, ""])(
+    "a configured but malformed policy %# denies instead of falling back to broad", async (value) => {
+      const t = setup();
+      t.config.offloadAdmission = value;
+      for (const dryRun of [false, true]) expect((await t.exec(request({ dryRun }))).status).toBe(403);
+      expect(t.bind).not.toHaveBeenCalled();
+      expect(t.start).not.toHaveBeenCalled();
+    });
+  it("an expired or spent exact grant never falls back to broad", async () => {
+    const t = setup();
+    t.advance(60_000);
+    expect((await t.exec()).status).toBe(403);
+    expect(t.bind).not.toHaveBeenCalled();
+    const u = setup();
+    expect((await u.exec()).status).toBe(202);
+    u.config.offloadAdmission = null;
+    // A run spent under an exact grant stays spent: receipts, never a remint.
+    expect((await u.exec(request({ commandId: OTHER }), legacyActor())).body).toMatchObject({ code: "OFFLOAD_EXECUTION_UNKNOWN", fallbackSafe: false });
+    expect(u.start).toHaveBeenCalledTimes(1);
+  });
+  it("an unreadable config denies rather than reading as a null policy", async () => {
+    const t = setup();
+    const admission = new OffloadAdmission(t.h.ctx.state, () => NOW, async () => { throw new Error("config offline"); });
+    // Nothing was claimed or started, so both refuse fallback-safe, never forbidden or unknown.
+    expect(await admission.check(COMPANY, legacyActor(), request()))
+      .toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+    expect(await admission.consume(COMPANY, legacyActor(), request(), { companyId: COMPANY, runId: RUN } as never))
+      .toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+  });
+  it("a read failure between dry-run and submit falls back locally with no claim or journal record", async () => {
+    const t = setup();
+    t.config.offloadAdmission = null;
+    const { create: _create, ...legacyState } = t.h.ctx.state;
+    const via = t.host(legacyState);
+    expect((await t.exec(request({ dryRun: true }), legacyActor(), COMPANY, via)).status).toBe(200);
+    // The host reads through the copy, so the fault goes on the copy.
+    const get = legacyState.get.bind(legacyState);
+    const failing = vi.spyOn(legacyState, "get").mockImplementation(async (scope) => {
+      if (scope.namespace === "boat-offload-admission-v1") throw new Error("storage offline");
+      return get(scope);
+    });
+    const submitted = await t.exec(request(), legacyActor(), COMPANY, via);
+    expect(failing).toHaveBeenCalled();
+    expect(submitted).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
+    expect(t.start).not.toHaveBeenCalled();
+    expect(t.create).not.toHaveBeenCalled();
+    expect(await t.store.get(`offload.cmd.${CMD}`)).toBeNull();
+    failing.mockRestore();
+    expect(await t.h.ctx.state.get(t.claimScope)).toBeNull();
   });
 });
 
@@ -191,7 +270,8 @@ describe("durable one-command consumption", () => {
     expect(t.start).toHaveBeenCalledTimes(1);
     expect(t.bind).toHaveBeenCalledTimes(1);
     expect(t.create).toHaveBeenCalledTimes(1);
-    expect((await t.exec(request({ dryRun: true }))).status).toBe(403);
+    // A null policy is the broad path, but this run's exact grant is spent.
+    expect((await t.exec(request({ dryRun: true }))).body).toMatchObject({ code: "OFFLOAD_EXECUTION_UNKNOWN", fallbackSafe: false });
     expect((await t.exec(request({ argv: ["build"] }))).body).toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
   });
   it("rejects a different id after policy replacement, restart and original expiry", async () => {

@@ -232,9 +232,10 @@ describe("native workspace binding", () => {
       expect(response).toMatchObject({ status: 403, body: { code: "OFFLOAD_FORBIDDEN" } });
     const noReceipt = async () => expect((await currentManager().offloadRead(companyId, actor, { commandId }, {})).status).not.toBe(200);
 
-    it("denies dry-run and submit with no operator policy, leaving no receipt or binding", async () => {
+    it("denies dry-run and submit with a malformed operator policy, leaving no receipt or binding", async () => {
       const t = await setup();
-      grant = {};
+      // A null policy is the broad path; a malformed one never falls back to it.
+      grant = { offloadExecutorEnabled: true, offloadAdmission: {} };
       await plugin.definition.onEnvironmentRealizeWorkspace!(nativeWorkspace());
       denied(await submit());
       denied(await submit({ body: { ...body, dryRun: false } }));

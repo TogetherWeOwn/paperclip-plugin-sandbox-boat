@@ -2289,9 +2289,9 @@ describe("offload API routes", () => {
     const noReceipt = async () => expect((await plugin.definition.onApiRequest!(
       apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID } }) as never)).status).not.toBe(200);
 
-    it("denies dry-run and submit with no policy and leaves no receipt or admission claim", async () => {
+    it("denies dry-run and submit outside a configured grant and leaves no receipt or admission claim", async () => {
       await seedWorkspace();
-      setGrant({});
+      setGrant(grantFor({ commandId: "99999999-9999-4999-8999-999999999999" }));
       denied(await submitAs({ body: submitBody({ dryRun: true }) }));
       denied(await submitAs({ body: submitBody() }));
       await noReceipt();
@@ -2317,9 +2317,29 @@ describe("offload API routes", () => {
     it("a denied first request does not bind the workspace eagerly, and run start only records ownership", async () => {
       await currentManager().startLocalRun(COMPANY, RUN_ID, "issue-offload-1", AGENT_ID);
       expect(workspaceBindings()).toEqual([]);
-      setGrant({});
+      setGrant(grantFor({ commandId: "99999999-9999-4999-8999-999999999999" }));
       denied(await submitAs({ body: submitBody() }));
       expect(workspaceBindings()).toEqual([]);
     });
+  });
+
+  // A null policy is the installed v0.2.14 path on a stock host: no verified
+  // run field and no claim. The executor flag, not admission, then decides.
+  it("with no policy, a stock-host run offloads through the v0.2.14 gates without an admission claim", async () => {
+    await seedWorkspace();
+    const stock = { actorType: "agent", actorId: AGENT_ID, agentId: AGENT_ID, runId: RUN_ID };
+    const submitAs = (extra: Record<string, unknown>) => plugin.definition.onApiRequest!(apiInput("offload_exec", { actor: stock, ...extra }) as never);
+    setGrant({ offloadExecutorEnabled: true, offloadAdmission: null });
+    expect(await submitAs({ body: submitBody({ dryRun: true }) })).toMatchObject({ status: 200,
+      body: { mode: "local", reason: "offload guest transport is not enabled" } });
+    expect((await submitAs({ body: submitBody() })).status).toBe(202);
+    const read = await plugin.definition.onApiRequest!(apiInput("offload_read", { method: "GET", params: { commandId: CMD_ID }, actor: stock }) as never);
+    expect(read.body).toMatchObject({ state: "not_started", fallbackSafe: true, fallbackReason: "offload guest transport is not enabled" });
+    // Flags off: the dry-run reads local and the submit journals a fallback-safe refusal.
+    setGrant({});
+    const other = "88888888-8888-4888-8888-888888888888";
+    expect(await submitAs({ body: submitBody({ commandId: other, dryRun: true }) })).toMatchObject({ status: 200,
+      body: { mode: "local", reason: "offload executor is not enabled" } });
+    expect([...harness.state.keys()].filter((key) => key.includes("boat-offload-admission"))).toEqual([]);
   });
 });

@@ -6,7 +6,7 @@
 // caller-selected root, endpoint, VM, shell or environment is trusted.
 
 import path from "node:path";
-import type { OffloadAdmission } from "./admission.js";
+import { BROAD, type OffloadAdmission } from "./admission.js";
 import type { OffloadBroker, BrokerPrincipal, BackendCommand } from "./broker.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory, recordDuration, type DurationStore } from "./duration-history.js";
 import { offloadError } from "./errors.js";
@@ -389,7 +389,9 @@ export async function handleExec(
     if (known) return known;
   }
   if (!host.admission) return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "exact-run admission is unavailable", { commandId: request.commandId }) };
-  const refused = await host.admission.check(input.companyId, input.actor, request);
+  const decision = await host.admission.check(input.companyId, input.actor, request);
+  const broad = decision === BROAD;
+  const refused = decision === BROAD ? null : decision;
   if (refused) {
     // An admission check may have raced another accepted submit. Only the
     // journal may replace this refusal with an existing receipt, never launch.
@@ -409,7 +411,9 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", `profile ${profile.id} is not enabled for offload`, { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  if (!request.dryRun) await host.bindWorkspace?.();
+  // The unpinned shim dry-runs before it submits, so the broad path binds on
+  // either, as v0.2.14 did. An exact grant binds only for its real submit.
+  if (!request.dryRun || broad) await host.bindWorkspace?.();
   const workspace = await host.workspaces.get(request.executionWorkspaceId, input.companyId, runId);
   if (!workspace) {
     if (!request.dryRun) {
