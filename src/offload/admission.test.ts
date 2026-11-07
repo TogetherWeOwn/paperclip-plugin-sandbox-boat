@@ -226,12 +226,14 @@ describe("broad path when no exact grant is configured", () => {
     const { create: _create, ...legacyState } = t.h.ctx.state;
     const via = t.host(legacyState);
     expect((await t.exec(request({ dryRun: true }), legacyActor(), COMPANY, via)).status).toBe(200);
-    const get = t.h.ctx.state.get.bind(t.h.ctx.state);
-    const failing = vi.spyOn(t.h.ctx.state, "get").mockImplementation(async (scope) => {
+    // The host reads through the copy, so the fault goes on the copy.
+    const get = legacyState.get.bind(legacyState);
+    const failing = vi.spyOn(legacyState, "get").mockImplementation(async (scope) => {
       if (scope.namespace === "boat-offload-admission-v1") throw new Error("storage offline");
       return get(scope);
     });
     const submitted = await t.exec(request(), legacyActor(), COMPANY, via);
+    expect(failing).toHaveBeenCalled();
     expect(submitted).toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
     expect(t.start).not.toHaveBeenCalled();
     expect(t.create).not.toHaveBeenCalled();
