@@ -188,7 +188,12 @@ export class Guest {
     ...(this.preflightReprobes !== null ? { delegationReprobes: this.preflightReprobes } : {}) });
   /** Guest timeout each prepare was asked to arm, in call order. */
   preparedTimeouts: Array<number | undefined> = [];
-  prepare = async (_sandboxId: string, cmd: LifecycleCommand, timeoutMs?: number): Promise<GuestIdentity> => {
+  /** Host time a concrete controller's own pre-start work (a cargo fetch)
+   * takes inside prepare, before it asks for the guest timeout. */
+  prepareWorkMs = 0;
+  prepare = async (_sandboxId: string, cmd: LifecycleCommand, armTimeout?: () => number): Promise<GuestIdentity> => {
+    this.clock.t += this.prepareWorkMs;
+    const timeoutMs = armTimeout?.();
     this.preparedTimeouts.push(timeoutMs);
     const identity = {
       guestBootId: "boot-a", processGroupId: 4100 + this.prepared.size,

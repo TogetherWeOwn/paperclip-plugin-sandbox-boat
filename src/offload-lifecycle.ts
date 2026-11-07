@@ -43,9 +43,12 @@ export interface GuestController {
      * failed to reconnect. Server log only. Absent when none ran. */
     delegationReprobes?: number;
   }>;
-  /** `timeoutMs`, when given, is the guest deadline to arm instead of the
-   * command's own timeout: never longer, trimmed to the funded VM window. */
-  prepare(sandboxId: string, command: OffloadCommand, timeoutMs?: number): Promise<GuestIdentity>;
+  /** `timeoutMs`, when given, yields the guest deadline to arm instead of the
+   * command's own timeout: never longer, trimmed to the funded VM window. Call
+   * it after any host-side pre-start work (e.g. a cargo fetch) and immediately
+   * before the guest prepare RPC; it throws when the funded window is gone,
+   * which must abort the prepare before any supervisor exists. */
+  prepare(sandboxId: string, command: OffloadCommand, timeoutMs?: () => number): Promise<GuestIdentity>;
   armDeadline(sandboxId: string, identity: GuestIdentity): Promise<{ verified: boolean; outsideCommandCgroup: boolean }>;
   inspect(sandboxId: string, identity: GuestIdentity): Promise<{
     identity: GuestIdentity; populated: boolean; receipt: string;
@@ -100,17 +103,25 @@ export class OffloadLifecycle {
     // inside the provider TTL the claim funded. The guest deadline must not
     // outlive that window: the funded pre-start allowance normally leaves the
     // full timeout, and a slower pre-start trims the deadline to what is left
-    // instead of letting the provider stop a still-running command.
+    // instead of letting the provider stop a still-running command. The
+    // controller can still do pre-start work of its own (a cargo fetch) inside
+    // prepare, so it asks for the trimmed timeout just before the prepare RPC.
     const timeoutMs = command.timeoutMs ?? 120_000;
     const fundedUntil = this.fundedUntil(command);
     let guestTimeoutMs = timeoutMs;
-    if (fundedUntil !== null) {
-      const remainingMs = Math.floor(fundedUntil - this.now());
-      if (!(remainingMs > 0)) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "funded_window_elapsed");
-      guestTimeoutMs = Math.min(timeoutMs, remainingMs);
-    }
-    const sentAt = this.now();
-    const identity = await this.guest.prepare(sandboxId, command, guestTimeoutMs);
+    let sentAt = this.now();
+    const armTimeout = (): number => {
+      sentAt = this.now();
+      if (fundedUntil !== null) {
+        const remainingMs = Math.floor(fundedUntil - sentAt);
+        if (!(remainingMs > 0)) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "funded_window_elapsed");
+        guestTimeoutMs = Math.min(timeoutMs, remainingMs);
+      }
+      return guestTimeoutMs;
+    };
+    // Refuse early too, before the controller does any work at all.
+    armTimeout();
+    const identity = await this.guest.prepare(sandboxId, command, armTimeout);
     // The guest reports absolutes on its own clock. Map them onto the host
     // clock with the pre-send host time: the supervisor stamps guestNow when
     // it creates the child, which can be no earlier than the send, so

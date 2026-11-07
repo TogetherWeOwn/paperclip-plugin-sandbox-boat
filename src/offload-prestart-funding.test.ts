@@ -89,6 +89,38 @@ describe("offload funds pre-start time in the provider TTL", () => {
     expect(run!.guestDeadline + TAIL_S * 1000).toBeLessThanOrEqual(run!.archiveAfter);
   });
 
+  it("trims the guest timeout after a slow fetch inside prepare, not before it", async () => {
+    const { ex, runs } = executor();
+    // An --offline cargo command primes its cache inside the controller's
+    // prepare: that time comes out of the funded window too.
+    const fetchMs = (OFFLOAD_PRE_START_ALLOWANCE_S + 120) * 1000;
+    s.guest.prepareWorkMs = fetchMs;
+    const createdAt = s.clock.t;
+    expect(await s.execute(command("fetch", { timeoutMs: HOUR_MS }), ex)).toMatchObject({ status: "completed" });
+
+    const fundedUntil = createdAt + HOUR_MS + OFFLOAD_PRE_START_ALLOWANCE_S * 1000;
+    expect(s.guest.preparedTimeouts).toEqual([fundedUntil - (createdAt + fetchMs)]);
+    const [run] = runs;
+    // The deadline the guest arms itself agrees with the funded window.
+    expect(s.guest.prepared.get("fetch")!.guestDeadline).toBe(fundedUntil);
+    expect(run!.guestDeadline).toBe(fundedUntil);
+    expect(run!.guestDeadline + TAIL_S * 1000).toBeLessThanOrEqual(run!.archiveAfter);
+  });
+
+  it("refuses before spawn when a fetch inside prepare used up the funded window", async () => {
+    const { ex, runs } = executor();
+    s.guest.prepareWorkMs = (60 + OFFLOAD_PRE_START_ALLOWANCE_S) * 1000;
+    const result = await s.execute(command("fetch-exhausted", { timeoutMs: 60_000 }), ex);
+    expect(result).toMatchObject({ status: "unavailable", remoteStarted: false, fallbackSafe: true,
+      reason: "guest lifecycle prepare failed before the command could start (OFFLOAD_GUEST_INELIGIBLE)" });
+    expect(runs).toEqual([]);
+    expect(s.guest.preparedTimeouts).toEqual([]);
+    expect(s.guest.prepared.size).toBe(0);
+    const warn = s.logs.find((entry) => entry.message === "boat offload command failed before transport");
+    expect(warn?.meta).toMatchObject({ step: "guest lifecycle prepare", code: "OFFLOAD_GUEST_INELIGIBLE",
+      detail: "funded_window_elapsed" });
+  });
+
   it("refuses before spawn when pre-start used up the whole funded window", async () => {
     const { ex, runs } = executor();
     slowPreflight((60 + OFFLOAD_PRE_START_ALLOWANCE_S) * 1000);
