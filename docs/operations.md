@@ -382,7 +382,8 @@ default VM:
    completed by second 45. Keep tighter connect and overall command bounds.
    Only literal `true` admits; all other refusal, unknown-placement and
    transport results retain their existing no-refresh semantics. Shutdown
-   ends recovery immediately, with no subsequent refresh.
+   stops further refreshes at the loop and post-backoff checks; it does not
+   cancel an in-flight backoff, reconnect or re-probe.
 
    Recovery runs on the command's reserved VM inside its original timed
    window, billed to that command and funded by the pre-start allowance
