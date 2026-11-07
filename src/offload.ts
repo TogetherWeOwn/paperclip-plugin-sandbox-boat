@@ -642,10 +642,9 @@ export class OffloadExecutor {
           stopping: false, stopRequestedAt: null, identity: structuredClone(identity) };
         this.pool.push(vm);
       }
-      if (command) {
-        vm.workspaceKey = this.workspaceKey(command);
-        vm.compatibilityKey ??= this.compatibilityKey(command);
-      }
+      if (command) vm.workspaceKey = this.workspaceKey(command);
+      // A recovered command proves workspace ownership, not the VM's creation
+      // config. Leave a missing compatibility key unknown so it cannot be reused.
       vm.quarantined = true;
       vm.generation += 1;
       this.clearIdleTimer(vm);
@@ -907,6 +906,9 @@ export class OffloadExecutor {
     // the historical default and keeps the bare layout, so VMs recorded before
     // the opt-out reached offload stay reusable under the default policy.
     if (!this.config.monitoring) key.push(["monitoring", false]);
+    // Size is fixed at creation too. Keep the historical default-size layout
+    // so existing default VMs remain reusable; other sizes must match exactly.
+    if (this.config.size !== "default") key.push(["size", this.config.size]);
     return JSON.stringify(key);
   }
 
