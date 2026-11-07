@@ -24,8 +24,8 @@ import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
 import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
-import { hasSecretInFiles, hasUntrackedFiles, listTrackedFiles, pemFilesAreCertificateOnly, type TrackedFilesFn,
-  type UntrackedFilesFn } from "./offload-secret-scan.js";
+import { hasInitializedSubmodule, hasSecretInFiles, hasUntrackedFiles, listTrackedFiles, pemFilesAreCertificateOnly,
+  type SubmodulesFn, type TrackedFilesFn, type UntrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
 import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
@@ -97,9 +97,13 @@ export interface SshOffloadRuntimeDeps {
   trackedFiles?: TrackedFilesFn;
   /** Untracked-file check for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   untrackedFiles?: UntrackedFilesFn;
+  /** Initialized-submodule check for admission; defaults to the real git listing. Test seam for non-git fixtures. */
+  submodules?: SubmodulesFn;
 }
 /** Named stay-local reason when the source has untracked, non-ignored files. */
 export const UNTRACKED_FILES_REASON = "untracked files present; running local";
+/** Named stay-local reason when the source has an initialized submodule. */
+export const SUBMODULES_REASON = "submodules present; running local";
 /** Registry credential files: never synced, and their presence keeps commands local. */
 export const REGISTRY_CREDENTIAL_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pypirc", "pip.conf", ".netrc"];
 
@@ -546,6 +550,12 @@ export class SshOffloadRuntime {
     // as untracked (fail closed).
     if (await (this.deps.untrackedFiles ?? hasUntrackedFiles)(binding.source).catch(() => true)) {
       return refuse(UNTRACKED_FILES_REASON);
+    }
+    // Submodule contents never reach the guest (the mirror is the parent
+    // index only), so a build that reads an initialized submodule would fail
+    // remotely. Stay local; a git failure counts as present (fail closed).
+    if (await (this.deps.submodules ?? hasInitializedSubmodule)(binding.source).catch(() => true)) {
+      return refuse(SUBMODULES_REASON);
     }
     // A tracked secret-bearing name (a .docker/ context, a key file) is
     // withheld from sync, so the guest tree would silently lack a file the

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { containsSecretContent, hasSecretInFiles, hasUntrackedFiles, isCertificateOnlyPem, listTrackedFiles, pemFilesAreCertificateOnly } from "./offload-secret-scan.js";
+import { containsSecretContent, hasInitializedSubmodule, hasSecretInFiles, hasUntrackedFiles, isCertificateOnlyPem, listTrackedFiles, pemFilesAreCertificateOnly } from "./offload-secret-scan.js";
 import { hasRegistryCredentials } from "./offload-ssh-runtime.js";
 import { captureManifest, captureSnapshot, collectAndStage, isCertificatePemSyncCandidate, isDefaultSyncExcluded, LocalGuestStore } from "./offload-sync.js";
 
@@ -127,6 +127,57 @@ describe("hasUntrackedFiles", () => {
     Object.assign(process.env, { GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy,
       GIT_INDEX_FILE: path.join(decoy, ".git/index") });
     try { expect(await hasUntrackedFiles(root)).toBe(false); }
+    finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
+  });
+});
+
+describe("hasInitializedSubmodule", () => {
+  const GITLINK = "1111111111111111111111111111111111111111";
+  function repoWithGitlink(): string {
+    const root = gitRepo();
+    git(root, "update-index", "--add", "--cacheinfo", `160000,${GITLINK},vendor/dep`);
+    return root;
+  }
+
+  it("is false for a tree without gitlinks", async () => {
+    expect(await hasInitializedSubmodule(gitRepo())).toBe(false);
+  });
+
+  it("is false for an uninitialized submodule (gitlink, empty or absent directory)", async () => {
+    const root = repoWithGitlink();
+    expect(await hasInitializedSubmodule(root)).toBe(false);
+    mkdirSync(path.join(root, "vendor/dep"), { recursive: true });
+    expect(await hasInitializedSubmodule(root)).toBe(false);
+  });
+
+  it("is true for an initialized submodule the build could read", async () => {
+    const root = repoWithGitlink();
+    writeTree(root, { "vendor/dep/src/lib.rs": "pub fn dep() {}\n" });
+    git(path.join(root, "vendor/dep"), "init", "-q", ".");
+    expect(await hasInitializedSubmodule(root)).toBe(true);
+  });
+
+  it("fails closed (true) when a file sits at the gitlink path", async () => {
+    const root = repoWithGitlink();
+    writeTree(root, { "vendor/dep": "not a directory\n" });
+    expect(await hasInitializedSubmodule(root)).toBe(true);
+  });
+
+  it("fails closed (true) for a non-git source or a missing root", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/lib.rs": "pub fn f() {}\n" });
+    expect(await hasInitializedSubmodule(root)).toBe(true);
+    expect(await hasInitializedSubmodule(path.join(root, "does-not-exist"))).toBe(true);
+  });
+
+  it("ignores hostile GIT_* worker env when checking", async () => {
+    const root = gitRepo();
+    const decoy = repoWithGitlink();
+    writeTree(decoy, { "vendor/dep/lib.rs": "x\n" });
+    const saved = { ...process.env };
+    Object.assign(process.env, { GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy,
+      GIT_INDEX_FILE: path.join(decoy, ".git/index") });
+    try { expect(await hasInitializedSubmodule(root)).toBe(false); }
     finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
   });
 });

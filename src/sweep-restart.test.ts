@@ -332,7 +332,7 @@ describe("sweep after a worker restart", () => {
       await realSet(key, value);
     };
     const deps = { state: harness.ctx.state, logger: harness.ctx.logger, ssh: {} as never, accountId, boat: () => api,
-      trackedFiles: async () => new Set(["Cargo.toml", "Cargo.lock"]), untrackedFiles: async () => false };
+      trackedFiles: async () => new Set(["Cargo.toml", "Cargo.lock"]), untrackedFiles: async () => false, submodules: async () => false };
     const runtime = new SshOffloadRuntime(deps);
     let restarted: SshOffloadRuntime | undefined;
     vi.useFakeTimers({ toFake: ["Date"], now: clock });

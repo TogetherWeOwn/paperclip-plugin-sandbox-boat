@@ -212,7 +212,7 @@ export interface ManagerDeps {
    * executor without dispatching. Unavailable/unsupported bindings return null. */
   offloadExecutor?: (command: BackendCommand) => Promise<ExecutorPort | null>;
   /** Boundary seams for transport acceptance tests; never sourced from API input. */
-  offloadTransport?: Pick<SshOffloadRuntimeDeps, "session" | "guestOptions" | "trackedFiles" | "untrackedFiles">;
+  offloadTransport?: Pick<SshOffloadRuntimeDeps, "session" | "guestOptions" | "trackedFiles" | "untrackedFiles" | "submodules">;
   ssh?: SshManager;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;

@@ -12,7 +12,9 @@ file, because public CA certificates are fixtures a build may read; any
 `.pem` that is a key, mixed, malformed, oversized or a symlink keeps the
 command local. Untracked or ignored workspace files never sync, so stage new
 files (`git add`) before offloading a command that needs them; submodule
-contents are not in the parent index and do not sync. A source that is not a
+contents are not in the parent index and do not sync, so a source with an
+initialized (populated) submodule stays local (`submodules present; running
+local`). A source that is not a
 git work tree (or whose tracked files cannot be listed) stays local. Before
 admission, the tracked syncable files go through a bounded scan for known
 credential shapes (cloud key ids, private-key headers, provider tokens,

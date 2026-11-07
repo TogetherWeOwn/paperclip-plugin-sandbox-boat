@@ -411,6 +411,16 @@ default VM:
    command stays local too. Commit or ignore the new files to make the
    command a remote candidate again. Untracked files are never synced.
 
+   Submodule contents are not in the parent index, and `git ls-files
+   --others` in the parent does not list files inside a submodule. A source
+   whose index holds a gitlink (mode 160000 in `git ls-files --stage`) with a
+   populated work-tree directory therefore stays local for every tool, with
+   the reason `submodules present; running local`, on dry-run and the real
+   submit alike. A gitlink whose directory is empty or absent (an
+   uninitialized submodule) does not count, a gitlink path that is not a
+   plain directory or a git failure keeps the command local, and submodule
+   contents are never synced.
+
 ## Smoke procedures
 
 ### Deferred one-VM operator smoke (after install, maximum 30 VM-minutes)

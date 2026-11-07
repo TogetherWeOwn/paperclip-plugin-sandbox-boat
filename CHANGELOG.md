@@ -11,6 +11,13 @@
   module built on the host and failed on the guest (exit 101 on a
   `cargo check --locked`). Ignored files still allow a remote run, a git
   failure stays local, and untracked files are still never synced.
+* A source tree with an initialized submodule now keeps offloaded
+  commands local, with the reason `submodules present; running local`, on
+  both dry-run and the real submit. The mirror carries the parent index
+  only, so a build that read submodule files passed on the host and failed
+  on the guest. A gitlink (mode 160000) whose directory is empty or absent
+  (an uninitialized submodule) still allows a remote run, a git failure
+  stays local, and submodule contents are still never synced.
 
 ## 0.2.15
 

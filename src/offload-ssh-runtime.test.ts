@@ -7,12 +7,12 @@ import { createHash, randomUUID, scryptSync } from "node:crypto";
 import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
-import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc, UNTRACKED_FILES_REASON } from "./offload-ssh-runtime.js";
+import { SshOffloadRuntime, hasCargoRegistryAuth, scrubOffloadGuestBashrc, SUBMODULES_REASON, UNTRACKED_FILES_REASON } from "./offload-ssh-runtime.js";
 import { shellQuote } from "./shell.js";
 import type { SshManager } from "./ssh.js";
 import { SshOffloadSync } from "./offload-ssh-sync.js";
 import type { StateClientLike } from "./state.js";
-import { listAllFilesAsTracked, noUntrackedFiles } from "./test-support/tracked-files.js";
+import { listAllFilesAsTracked, noInitializedSubmodules, noUntrackedFiles } from "./test-support/tracked-files.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -59,7 +59,7 @@ beforeEach(async () => {
     offloadAllowedRepos: ["repo:https://github.com/example/public"] };
   boat = new FakeBoat({ now: Date.now });
   const harness = createFakeContext();
-  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+  runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
     boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
     guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
   runtime.remember(native());
@@ -213,7 +213,7 @@ describe("stock concrete executor factory", () => {
     const bin = path.join(ssh.root, "stub-bin");
     await mkdir(bin);
     await writeFile(path.join(bin, "cargo"), "#!/bin/sh\nprintf stock-worker\n", { mode: 0o755 });
-    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+    setManagerOverridesForTests({ ssh: ssh.manager, offloadTransport: { session: async () => ssh.session, trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
       guestOptions: { stateRoot: ssh.root, path: `${bin}:/usr/bin:/bin` } } });
     const cmd = command();
     const agentId = randomUUID();
@@ -434,6 +434,48 @@ describe("stock concrete executor factory", () => {
     try {
       expect(await rt.preflight(command(), config)).toBeNull();
       mustResolve(await rt.resolve(command(), config));
+    } finally { await rt.shutdown(); }
+  });
+  // The mirror is the parent index only: submodule contents never sync.
+  function addGitlink(): void {
+    gitIn(source, "update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,vendor/dep");
+  }
+  it("keeps cargo local with the named reason when an initialized submodule exists (dry-run and real submit agree)", async () => {
+    await gitInitIgnoringSecrets();
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    addGitlink();
+    await mkdir(path.join(source, "vendor/dep/src"), { recursive: true });
+    await writeFile(path.join(source, "vendor/dep/src/lib.rs"), "pub fn dep() {}\n");
+    gitIn(path.join(source, "vendor/dep"), "init", "-q", ".");
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.preflight(command(), config)).toBe(SUBMODULES_REASON);
+      expect(await rt.resolve(command(), config)).toEqual({ refusalReason: SUBMODULES_REASON });
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
+  it("keeps an uninitialized submodule (empty gitlink directory) a remote candidate", async () => {
+    await gitInitIgnoringSecrets();
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock");
+    addGitlink();
+    await mkdir(path.join(source, "vendor/dep"), { recursive: true });
+    const rt = realGitRuntime();
+    try {
+      expect(await rt.preflight(command(), config)).toBeNull();
+      mustResolve(await rt.resolve(command(), config));
+    } finally { await rt.shutdown(); }
+  });
+  it("fails closed to local when the submodule check cannot answer", async () => {
+    const harness = createFakeContext();
+    const rt = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only",
+      trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: async () => { throw new Error("git exploded"); },
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
+      guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
+    rt.remember(native());
+    try {
+      expect(await rt.preflight(command(), config)).toBe(SUBMODULES_REASON);
+      expect(await rt.resolve(command(), config)).toEqual({ refusalReason: SUBMODULES_REASON });
+      expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
   it("fails closed to local when the untracked-file check cannot answer", async () => {
@@ -781,7 +823,7 @@ describe("pool credential identity and guest token scrub", () => {
   it("binds a new pool to a rotated API key and sweeps the superseded pool", async () => {
     const seenKeys: Array<string | null> = [];
     const harness = createFakeContext();
-    const rotating = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+    const rotating = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
       boat: (cfg) => { seenKeys.push(cfg.apiKey); return boat as unknown as BoatApiLike; }, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "true"] } });
     try {
@@ -842,7 +884,7 @@ describe("journal partial-write recovery", () => {
   }
   function testRuntime(state: StateClientLike) {
     const harness = createFakeContext();
-    const rt = new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+    const rt = new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
       boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
     rt.remember(native());
