@@ -141,6 +141,12 @@ export interface PreStartFailure {
   /** Sanitized sub-cause token for the server log only, or null. Never
    * joins `reason`: the reason crosses to the client, the detail must not. */
   detail: string | null;
+  /** Session refreshes a bounded guest delegation wait attempted before
+   * refusing, for the server log only; null when the site ran none. */
+  refreshes: number | null;
+  /** Of those refreshes, how many reconnected and re-ran the probe (server
+   * log only); null when the site ran none. */
+  reprobes: number | null;
   /** Server-authored reason safe for the journal result and shim announcement. */
   reason: string;
 }
@@ -175,10 +181,20 @@ function describePreStartFailure(step: PreStartStep, error: unknown): PreStartFa
   try {
     detail = validPreStartDetail((error as { detail?: unknown } | null)?.detail);
   } catch { /* A throwing accessor contributes no detail. */ }
+  const count = (name: "refreshes" | "reprobes"): number | null => {
+    try {
+      const raw = (error as Record<string, unknown> | null)?.[name];
+      if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 && raw <= 16) return raw;
+    } catch { /* A throwing accessor contributes no count. */ }
+    return null;
+  };
+  const refreshes = count("refreshes");
+  // A probe count only means something next to the refreshes it ran under.
+  const reprobes = refreshes !== null ? count("reprobes") : null;
   const reason = code === "OFFLOAD_COMMAND_NOT_STARTED"
     ? "cancelled before durable starting intent"
     : `${step} failed before the command could start${code ? ` (${code})` : ""}`;
-  return { step, code, detail, reason };
+  return { step, code, detail, refreshes, reprobes, reason };
 }
 
 export function commandDigest(command: OffloadCommand): string {

@@ -335,8 +335,25 @@ default VM:
    appears as `detail=` on the server's "failed before transport" warn
    line. A `:session_not_delegated` refusal is the connection, not the
    template — a control master accepted by a pre-restart sshd listener
-   never enters the `ForceCommand` scope, so the plugin drops that session
-   once, reconnects and re-probes before refusing. Fix that sub-step on
+   never enters the `ForceCommand` scope. A fresh fork or snapshot VM hits
+   this on its first command: the probe runs about 10–15 s after boot,
+   before the step-2 settle unit has restarted sshd, so an immediate
+   reconnect still reaches the old listener. The plugin therefore waits a
+   bounded window for the settle: on `:session_not_delegated` only, it drops
+   the session, reconnects and re-runs the identical probe, backing off 2,
+   4, 8 and 16 s (at most 4 refreshes; no refresh starts past 45 s from the
+   first probe, and each probe keeps its 15 s RPC fence). Only a literal
+   `true` admits; every other refusal is still a single probe. The wait runs
+   on the command's reserved VM inside its timed window, so its seconds are
+   billed to that command. If the window ends without delegation, the
+   command falls back locally with the same `OFFLOAD_GUEST_INELIGIBLE` code
+   and `detail=`, plus `refreshes=` and `reprobes=` on the warn line:
+   `refreshes` counts the reconnects attempted, `reprobes` how many of them
+   connected and re-ran the probe. `refreshes=4 reprobes=4` means sshd never
+   settled into the delegated scope: check the step-2 units on the template.
+   A `reprobes` well below `refreshes` means the reconnects themselves
+   failed (sshd down or restarting), not the delegation. Plugin shutdown
+   ends the wait early, with no reconnect after it begins. Fix that sub-step on
    the template and re-run until it prints `true` — a template that does
    not print `true` refuses every remote command, so never smoke against one.
 6. Save the VM as a named snapshot (not available during the boat free trial)

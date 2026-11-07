@@ -119,7 +119,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     }
   });
 
-  it("preflight refreshes a not-delegated session once and re-runs the identical probe", async () => {
+  it("preflight waits a bounded window for delegation, refreshing and re-running the identical probe", async () => {
     // The counter lives guest-side (the loopback root): it proves how many
     // times the probe actually ran, which is what separates "refreshed and
     // re-probed" from "mapped the same token twice".
@@ -133,53 +133,118 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
         + "print(json.dumps(answers[min(n, len(answers) - 1)]))\n";
       return { counter, script };
     };
-    const attempt = async (name: string, answers: unknown[]) => {
+    const NOT_DELEGATED = "probe_admit_failed:EACCES:session_not_delegated";
+    const refused = (ineligibleReason: string) => ({ cgroupV2Delegated: false, outsideWatchdogVerified: false, ineligibleReason });
+    const attempt = async (name: string, answers: unknown[],
+      options: { delegationWait?: { maxRefreshes?: number; windowMs?: number }; failRefreshes?: number[]; oversleepMs?: number;
+        closeDuringSleep?: number; closeInRefresh?: number } = {}) => {
       const { counter, script } = counting(name, answers);
       let refreshes = 0;
       let sessionCalls = 0;
+      // Virtual clock: the backoff advances it instead of sleeping for real.
+      let clock = 0;
+      const delays: number[] = [];
+      // Runtime shutdown as the guest sees it: a fence that flips mid-wait.
+      let closing = false;
       const candidate = new SshOffloadGuest({ ssh: ssh.manager,
         session: async () => { sessionCalls++; return ssh.session; },
-        refreshSession: async () => { refreshes++; return ssh.session; },
+        refreshSession: async () => {
+          refreshes++;
+          if (options.closeInRefresh === refreshes) closing = true;
+          if (closing) throw new Error("OFFLOAD_RUNTIME_CLOSING");
+          if (options.failRefreshes?.includes(refreshes)) throw new Error("listener restarting");
+          return ssh.session;
+        },
+        sleep: async (ms) => {
+          delays.push(ms);
+          clock += ms + (options.oversleepMs ?? 0);
+          if (options.closeDuringSleep === delays.length) closing = true;
+        },
+        now: () => clock,
+        closing: () => closing,
+        ...(options.delegationWait ? { delegationWait: options.delegationWait } : {}),
         cgroupParent: parent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
       try {
         const capabilities = await candidate.preflight(ssh.session.sandboxId, cmd());
-        return { capabilities, refreshes, sessionCalls, probes: Number(await readFile(counter, "utf8")) };
+        return { capabilities, refreshes, sessionCalls, delays, probes: Number(await readFile(counter, "utf8")) };
       } finally {
         await candidate.shutdown();
       }
     };
-    // Stale-session refusal, eligible on the fresh session: one refresh, two
-    // probes, and only the second probe's literal true admits. The re-probe
-    // is pinned to the refreshed session (no second session() lookup).
-    await expect(attempt("probe-stale", ["probe_admit_failed:EACCES:session_not_delegated", true]))
-      .resolves.toEqual({ capabilities: { cgroupV2Delegated: true, outsideWatchdogVerified: true }, refreshes: 1, sessionCalls: 1, probes: 2 });
-    // Still outside the parent after the refresh: the same refusal stands,
-    // and the refresh is never looped.
-    await expect(attempt("probe-outside", ["probe_admit_failed:EACCES:session_not_delegated"]))
-      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
-        ineligibleReason: "probe_admit_failed:EACCES:session_not_delegated" }, refreshes: 1, sessionCalls: 1, probes: 2 });
+    // Stale-session refusal, eligible on the fresh session: one refresh after
+    // the first backoff, two probes, and only the second probe's literal true
+    // admits. The re-probe is pinned to the refreshed session (no second
+    // session() lookup).
+    await expect(attempt("probe-stale", [NOT_DELEGATED, true])).resolves.toEqual({
+      capabilities: { cgroupV2Delegated: true, outsideWatchdogVerified: true, delegationRefreshes: 1, delegationReprobes: 1 },
+      refreshes: 1, sessionCalls: 1, delays: [2_000], probes: 2 });
+    // Delegated on the Nth refresh (the sshd settle restart lands mid-wait):
+    // eligible, with exactly N refreshes on the backoff schedule.
+    await expect(attempt("probe-settles", [NOT_DELEGATED, NOT_DELEGATED, NOT_DELEGATED, true])).resolves.toEqual({
+      capabilities: { cgroupV2Delegated: true, outsideWatchdogVerified: true, delegationRefreshes: 3, delegationReprobes: 3 },
+      refreshes: 3, sessionCalls: 1, delays: [2_000, 4_000, 8_000], probes: 4 });
+    // Never delegated within the window: the same refusal stands after the
+    // refresh cap, with the exact count attempted.
+    await expect(attempt("probe-outside", [NOT_DELEGATED])).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 4, delegationReprobes: 4 },
+      refreshes: 4, sessionCalls: 1, delays: [2_000, 4_000, 8_000, 16_000], probes: 5 });
+    // Configuration can only tighten the wait: a shorter window stops before
+    // a backoff would cross it, and larger values are clamped to the caps.
+    await expect(attempt("probe-short-window", [NOT_DELEGATED], { delegationWait: { windowMs: 10_000 } })).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 2, delegationReprobes: 2 },
+      refreshes: 2, sessionCalls: 1, delays: [2_000, 4_000], probes: 3 });
+    await expect(attempt("probe-over-cap", [NOT_DELEGATED], { delegationWait: { maxRefreshes: 99, windowMs: 3_600_000 } })).resolves.toMatchObject({
+      capabilities: { delegationRefreshes: 4 }, refreshes: 4, probes: 5 });
+    // A timer that fires late cannot start a refresh past the window: the
+    // 16 s backoff fits on paper (26 s + 16 s) but resumes at 46 s.
+    await expect(attempt("probe-oversleep", [NOT_DELEGATED], { oversleepMs: 4_000 })).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 3, delegationReprobes: 3 },
+      refreshes: 3, sessionCalls: 1, delays: [2_000, 4_000, 8_000, 16_000], probes: 4 });
+    await expect(attempt("probe-disabled", [NOT_DELEGATED, true], { delegationWait: { maxRefreshes: 0 } })).resolves.toEqual({
+      capabilities: refused(NOT_DELEGATED), refreshes: 0, sessionCalls: 1, delays: [], probes: 1 });
+    // A reopen refused mid-restart spends one refresh and probes nothing; the
+    // next refresh's probe decides.
+    await expect(attempt("probe-reopen-fails", [NOT_DELEGATED, true], { failRefreshes: [1] })).resolves.toEqual({
+      capabilities: { cgroupV2Delegated: true, outsideWatchdogVerified: true, delegationRefreshes: 2, delegationReprobes: 1 },
+      refreshes: 2, sessionCalls: 1, delays: [2_000, 4_000], probes: 2 });
+    // Shutdown begins during a backoff: the wait ends with the last refusal
+    // and no refresh (so no key, authorization or master) starts after it.
+    await expect(attempt("probe-shutdown-sleep", [NOT_DELEGATED], { closeDuringSleep: 3 })).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 2, delegationReprobes: 2 },
+      refreshes: 2, sessionCalls: 1, delays: [2_000, 4_000, 8_000], probes: 3 });
+    await expect(attempt("probe-shutdown-first-sleep", [NOT_DELEGATED, true], { closeDuringSleep: 1 })).resolves.toEqual({
+      capabilities: refused(NOT_DELEGATED), refreshes: 0, sessionCalls: 1, delays: [2_000], probes: 1 });
+    // A refresh refused because shutdown began ends the wait at once instead
+    // of spending the budget on further sleeps.
+    await expect(attempt("probe-shutdown-refresh", [NOT_DELEGATED], { closeInRefresh: 2 })).resolves.toEqual({
+      capabilities: { ...refused(NOT_DELEGATED), delegationRefreshes: 2, delegationReprobes: 1 },
+      refreshes: 2, sessionCalls: 1, delays: [2_000, 4_000], probes: 2 });
+    // A refreshed session that reaches the parent but still fails admission
+    // is a template fault: the wait ends on that refusal.
+    await expect(attempt("probe-then-delegated", [NOT_DELEGATED, "probe_admit_failed:EACCES:session_delegated", true])).resolves.toEqual({
+      capabilities: { ...refused("probe_admit_failed:EACCES:session_delegated"), delegationRefreshes: 1, delegationReprobes: 1 },
+      refreshes: 1, sessionCalls: 1, delays: [2_000], probes: 2 });
     // A delegated session whose admit still failed is a template fault: no
     // refresh, one probe. Same for an unreadable placement.
     await expect(attempt("probe-delegated", ["probe_admit_failed:EACCES:session_delegated", true]))
-      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
-        ineligibleReason: "probe_admit_failed:EACCES:session_delegated" }, refreshes: 0, sessionCalls: 1, probes: 1 });
+      .resolves.toEqual({ capabilities: refused("probe_admit_failed:EACCES:session_delegated"),
+        refreshes: 0, sessionCalls: 1, delays: [], probes: 1 });
     await expect(attempt("probe-unknown", ["probe_admit_failed:EACCES:session_placement_unknown", true]))
-      .resolves.toEqual({ capabilities: { cgroupV2Delegated: false, outsideWatchdogVerified: false,
-        ineligibleReason: "probe_admit_failed:EACCES:session_placement_unknown" }, refreshes: 0, sessionCalls: 1, probes: 1 });
+      .resolves.toEqual({ capabilities: refused("probe_admit_failed:EACCES:session_placement_unknown"),
+        refreshes: 0, sessionCalls: 1, delays: [], probes: 1 });
     // Without a refresh path the not-delegated token is reported as-is after
     // a single probe (the token-table case above covers the mapping; this
     // pins the probe count).
-    const { counter, script } = counting("probe-no-refresh", ["probe_admit_failed:EACCES:session_not_delegated", true]);
+    const { counter, script } = counting("probe-no-refresh", [NOT_DELEGATED, true]);
     const noRefresh = new SshOffloadGuest({ ssh: ssh.manager, session: async () => ssh.session,
       cgroupParent: parent, stateRoot: ssh.root, workspace: async () => ssh.root, script });
     try {
-      expect(await noRefresh.preflight(ssh.session.sandboxId, cmd())).toEqual({ cgroupV2Delegated: false,
-        outsideWatchdogVerified: false, ineligibleReason: "probe_admit_failed:EACCES:session_not_delegated" });
+      expect(await noRefresh.preflight(ssh.session.sandboxId, cmd())).toEqual(refused(NOT_DELEGATED));
       expect(Number(await readFile(counter, "utf8"))).toBe(1);
     } finally {
       await noRefresh.shutdown();
     }
-  });
+  }, 20_000);
 
   it("host env gate refuses prepare with its own detail, distinct from guest sub-causes", async () => {
     const command = cmd();

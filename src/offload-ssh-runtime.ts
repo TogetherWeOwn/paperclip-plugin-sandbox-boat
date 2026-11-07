@@ -12,7 +12,7 @@ import { parseDriverConfig, resolveApiKey, type BoatDriverConfig } from "./confi
 import { AccountLedger } from "./account-ledger.js";
 import { describeBoatError } from "./errors.js";
 import { OffloadExecutor, type OffloadCommand, type OffloadLogger } from "./offload.js";
-import { OffloadJournal, type OffloadStore } from "./offload-journal.js";
+import { OffloadJournal, offloadError, type OffloadStore } from "./offload-journal.js";
 import { OffloadPoolStore, type PoolVm } from "./offload-pool.js";
 import { nestedLockfile, planDependencies } from "./offload/deps-install.js";
 import { durationKey, normalizeSignature, pruneDurations, recordDuration } from "./offload/duration-history.js";
@@ -91,7 +91,7 @@ export interface SshOffloadRuntimeDeps {
   // Boundary test seams: real SSH is still used, not an injected guest mock.
   boat?: (config: BoatDriverConfig) => BoatApiLike;
   session?: (sandboxId: string) => Promise<SshSession>;
-  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain">;
+  guestOptions?: Pick<SshOffloadGuestDeps, "executable" | "args" | "path" | "stateRoot" | "uvVenvRoot" | "cargoToolchain" | "delegationWait">;
   /** Tracked-file listing for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   trackedFiles?: TrackedFilesFn;
 }
@@ -676,20 +676,41 @@ export class SshOffloadRuntime {
     // First-touch races share one opener per VM: concurrent guests warming
     // the same pool never authorize the key or open the session twice.
     const pending = new Map<string, Promise<SshSession>>();
+    // Shutdown fences every new open, rechecked after each await: the worker
+    // drains offload for a bounded time and then closes every session and
+    // the key dir, so an open that is still running then must not recreate
+    // the key, authorize it on the VM or start a control master afterwards.
+    // A cached session stays usable for the commands still draining.
+    const fence = () => {
+      if (this.closing) throw offloadError("OFFLOAD_RUNTIME_CLOSING");
+    };
     const session = this.deps.session ?? (async (sandboxId: string) => {
       const cached = sessions.get(sandboxId);
       if (cached) return cached;
       const ongoing = pending.get(sandboxId);
       if (ongoing) return ongoing;
+      fence();
       const opening = (async (): Promise<SshSession> => {
         await waitReady(api, sandboxId, { timeoutMs: binding.config.timeoutMs });
+        fence();
         const sshKey = await this.deps.ssh.ensureKey();
+        fence();
         const response = await api.sshKey({ sandboxId, key: sshKey.publicKey });
+        fence();
         const opened = await this.deps.ssh.openSession({ sandboxId, endpoint: endpointFromSshKeyResponse(response), tunnel: null,
           connectTimeoutSec: binding.config.sshConnectTimeoutSec });
-        // Once per opened session (sessions are cached; a refresh after resume
-        // re-opens and re-scrubs), before any dependency install runs guest code.
-        await scrubOffloadGuestBashrc(this.deps.ssh, opened);
+        try {
+          fence();
+          // Once per opened session (sessions are cached; a refresh after resume
+          // re-opens and re-scrubs), before any dependency install runs guest code.
+          await scrubOffloadGuestBashrc(this.deps.ssh, opened);
+          fence();
+        } catch (error) {
+          // Opened after the fence tripped (or never scrubbed): close it
+          // rather than cache a master that shutdown has already passed.
+          if (this.closing) await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
+          throw error;
+        }
         sessions.set(sandboxId, opened);
         return opened;
       })();
@@ -716,16 +737,19 @@ export class SshOffloadRuntime {
     // Warm commands reuse the cached session and its control master. After a
     // resume (new machine, IP and host key) the first guest op fails on the
     // stale session, and push re-authorizes exactly once through this refresh.
-    // The guest preflight uses the same refresh once when its probe proves the
-    // cached session runs outside the delegated cgroup parent (a master
-    // accepted by a pre-restart sshd listener never enters the template's
-    // ForceCommand scope). Single-flight per VM, like the opener above:
+    // The guest preflight uses the same refresh, in a bounded backoff wait,
+    // when its probe proves the session runs outside the delegated cgroup
+    // parent (a master accepted by a pre-restart sshd listener never enters
+    // the template's ForceCommand scope). Single-flight per VM, like the opener above:
     // concurrent refreshers share one reopen instead of each reopening
     // closing the master the other just started.
     const refreshing = new Map<string, Promise<SshSession>>();
     const refreshSession = async (sandboxId: string) => {
       const ongoing = refreshing.get(sandboxId);
       if (ongoing) return ongoing;
+      // A refresh is always a new open: refuse it once shutdown began, even
+      // when tests inject the opener.
+      fence();
       const reopening = (async (): Promise<SshSession> => {
         sessions.delete(sandboxId);
         return session(sandboxId);
@@ -749,6 +773,7 @@ export class SshOffloadRuntime {
       return sync.directory(cmd);
     };
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, refreshSession, cgroupParent,
+      closing: () => this.closing,
       workspace: (vm, cmd) => sync.cwd(vm, cmd),
       allowedEnv: (cmd) => ((cmd.tool ?? "cargo") === "cargo" ? ["CARGO_TERM_COLOR", "RUST_BACKTRACE"] : []),
       profileEnv: profileGuestEnv,
