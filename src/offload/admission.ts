@@ -79,6 +79,15 @@ export class OffloadAdmission {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", detail, { commandId: request.commandId }) };
   }
 
+  private unavailable(request: OffloadSubmitRequest): RouteResponse {
+    // Nothing was claimed or started: admission reads have no side effect and
+    // the route found no journal record for this ID, so local fallback is safe.
+    // Not a 403: the shim treats OFFLOAD_FORBIDDEN as an auth exit, not a fallback.
+    return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "offload admission could not be read; running local", {
+      commandId: request.commandId, remoteStarted: false, fallbackSafe: true,
+    }) };
+  }
+
   private spent(request: OffloadSubmitRequest): RouteResponse {
     // Consume may have succeeded before a journal write or response was lost.
     // No receipt means unknown, never permission to start again or go local.
@@ -122,7 +131,7 @@ export class OffloadAdmission {
       if (await this.state.get(this.scope(companyId, actor.runId!)) !== null) return this.spent(request);
       return decision;
     } catch {
-      return this.refuse(request, "exact-run admission could not be verified");
+      return this.unavailable(request);
     }
   }
 
@@ -140,11 +149,7 @@ export class OffloadAdmission {
         return await this.state.get(this.scope(companyId, actor.runId!)) === null ? null : this.spent(request);
       }
     } catch {
-      // Nothing was claimed or started: these reads have no side effect and the
-      // broker found no journal record for this ID, so local fallback is safe.
-      return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "offload admission could not be read; running local", {
-        commandId: request.commandId, remoteStarted: false, fallbackSafe: true,
-      }) };
+      return this.unavailable(request);
     }
     if (decision) return decision;
     try {

@@ -151,9 +151,11 @@ describe("new admission before binding", () => {
   it("config/state read failure fails closed", async () => {
     const t = setup();
     vi.spyOn(t.h.ctx.state, "get").mockRejectedValue(new Error("storage offline"));
-    expect(await t.routeHost.admission!.check(COMPANY, actor(), request())).toMatchObject({ status: 403 });
+    // Closed to remote; nothing was claimed, so the shim may still run it locally.
+    const unavailable = { status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } };
+    expect(await t.routeHost.admission!.check(COMPANY, actor(), request())).toMatchObject(unavailable);
     const admission = new OffloadAdmission(t.h.ctx.state, () => NOW, async () => { throw new Error("config offline"); });
-    expect(await admission.check(COMPANY, actor(), request())).toMatchObject({ status: 403 });
+    expect(await admission.check(COMPANY, actor(), request())).toMatchObject(unavailable);
   });
 });
 
@@ -215,8 +217,9 @@ describe("broad path when no exact grant is configured", () => {
   it("an unreadable config denies rather than reading as a null policy", async () => {
     const t = setup();
     const admission = new OffloadAdmission(t.h.ctx.state, () => NOW, async () => { throw new Error("config offline"); });
-    expect(await admission.check(COMPANY, legacyActor(), request())).toMatchObject({ status: 403 });
-    // Nothing was claimed or started, so submit refuses fallback-safe, never unknown.
+    // Nothing was claimed or started, so both refuse fallback-safe, never forbidden or unknown.
+    expect(await admission.check(COMPANY, legacyActor(), request()))
+      .toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
     expect(await admission.consume(COMPANY, legacyActor(), request(), { companyId: COMPANY, runId: RUN } as never))
       .toMatchObject({ status: 503, body: { code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true } });
   });
