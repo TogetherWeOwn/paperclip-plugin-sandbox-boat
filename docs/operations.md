@@ -299,19 +299,38 @@ default VM:
    Every SSH command then runs in `systemd-run --user --scope -p Delegate=yes`,
    with stdio and exit status unchanged.
 
-   Two more units are required, because the platform rewrites
-   `/etc/ssh/sshd_config.d/00-ascii-lockdown.conf` a few seconds after the
-   SSH listener starts: on a fresh boot the already-running sshd then misses
-   the `ForceCommand` above even though the on-disk config is correct, SSH
-   sessions land outside the delegated scope, and the step-5 preflight fails
-   with `probe_admit_failed`. Install and enable
+   Two more units are required by the existing recipe because the platform
+   can rewrite `/etc/ssh/sshd_config.d/00-ascii-lockdown.conf` after the SSH
+   listener starts. Correct files on disk do not prove that the listener,
+   or an already accepted control-master session, uses the intended
+   `ForceCommand` configuration. Install and enable
    `paperclip-sshd-settle.service`, which runs once per boot
-   (`sleep 15; systemctl restart ssh`, after the platform's rewrite has
-   landed), and `paperclip-sshd-config.path`, which watches the sshd config
-   and triggers `paperclip-sshd-config.service`
-   (`sleep 2; sshd -t && systemctl restart ssh`) on any later change. Both
-   units are additive only: they never edit the platform's config, they just
-   restart sshd so it re-reads what is on disk.
+   (`sleep 15; systemctl restart ssh`), and `paperclip-sshd-config.path`,
+   which watches the sshd config and triggers `paperclip-sshd-config.service`
+   (`sleep 2; sshd -t && systemctl restart ssh`) on later changes. The 15 s
+   boot settle and 2 s change debounce are scheduling/coalescing heuristics,
+   not proof that the platform has finished its intended config generation.
+   Retain them: no supported generation-completion event/API has been
+   established. Both units are additive only: they never edit platform
+   lockdown policy or weaken `ForceCommand`/cgroup isolation, but restart
+   sshd to re-read files. This source recipe does not certify installed-unit
+   behavior.
+
+   A safe replacement would require proof of the intended complete config
+   generation, binding every included file to that generation/digest;
+   `sshd -t` and effective-config validation for the actual user/connection
+   constraints; an authorized native service operation loading that exact
+   validated generation; and a fresh pinned transport/session through that
+   listener returning literal `true` from the existing delegated preflight
+   at the configured parent. Any config change invalidates the prior proof;
+   generation, loaded config and session identity must remain consistent
+   through admission. File existence/mtime, a digest alone, syntax or
+   effective validation alone, a quiet interval, provider ready status,
+   host-key pinning or a reused master cannot substitute for the whole proof.
+   With that whole proof, no arbitrary extra 15 s/2 s hold would be needed.
+   This description neither establishes that proof nor authorizes replacing
+   the existing mechanism, unbounded restarts or admission through invalid
+   security configuration.
 3. Link the real stable `cargo`/`rustc` into `/usr/local/bin`, because the
    guest PATH is fixed to root-owned directories and has no `RUSTUP_HOME`.
    Each command also runs with a fresh per-command `HOME`, and its
@@ -333,40 +352,59 @@ default VM:
    particular, no manual `systemctl restart ssh`) — then run the preflight
    with `offloadCgroupParent`
    `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service`. It must print
-   literal `true` on that untouched boot. A template that only prints `true`
-   after a manual sshd restart is missing the step-2 settle/path units and
-   is not done: every pool VM forked or booted from it would fail the same
-   way. Any other output is a token naming the failing probe sub-step
+   literal `true` on that untouched boot, preserving the existing placement,
+   actual admission, outside-containment and kill checks. Refusal or UNKNOWN
+   is not success. A pass proves the checked session's delegated execution
+   capability at that moment, not platform-generation completion. A pass only
+   after manual sshd restart does not qualify the untouched boot or establish
+   root cause: the step-2 units may be absent, late, invalid, misordered or
+   ineffective. Diagnose rather than infer that every later VM will fail
+   identically.
+
+   Recognized refusal tokens name the failing probe sub-step
    (`parent_invalid`, `parent_not_delegated`, `probe_mkdir_failed:EACCES`,
    `probe_admit_failed`, `probe_outside_failed`, `probe_kill_failed`),
-   suffixed with the SSH session's own placement (`:session_delegated`,
-   `:session_not_delegated` or `:session_placement_unknown`: whether the
-   probe process itself ran inside the configured parent); the same token
-   appears as `detail=` on the server's "failed before transport" warn
-   line. A `:session_not_delegated` refusal is the connection, not the
-   template — a control master accepted by a pre-restart sshd listener
-   never enters the `ForceCommand` scope. A fresh fork or snapshot VM hits
-   this on its first command: the probe runs about 10–15 s after boot,
-   before the step-2 settle unit has restarted sshd, so an immediate
-   reconnect still reaches the old listener. The plugin therefore waits a
-   bounded window for the settle: on `:session_not_delegated` only, it drops
-   the session, reconnects and re-runs the identical probe, backing off 2,
-   4, 8 and 16 s (at most 4 refreshes; no refresh starts past 45 s from the
-   first probe, and each probe keeps its 15 s RPC fence). Only a literal
-   `true` admits; every other refusal is still a single probe. The wait runs
-   on the command's reserved VM inside its timed window, so its seconds are
-   billed to that command, and the provider TTL funds it through the
-   pre-start allowance (see "Offload TTL funding" below). If the window ends without delegation, the
-   command falls back locally with the same `OFFLOAD_GUEST_INELIGIBLE` code
-   and `detail=`, plus `refreshes=` and `reprobes=` on the warn line:
-   `refreshes` counts the reconnects attempted, `reprobes` how many of them
-   connected and re-ran the probe. `refreshes=4 reprobes=4` means sshd never
-   settled into the delegated scope: check the step-2 units on the template.
-   A `reprobes` well below `refreshes` means the reconnects themselves
-   failed (sshd down or restarting), not the delegation. Plugin shutdown
-   ends the wait early, with no reconnect after it begins. Fix that sub-step on
-   the template and re-run until it prints `true` — a template that does
-   not print `true` refuses every remote command, so never smoke against one.
+   optionally suffixed with the SSH session's own placement
+   (`:session_delegated`, `:session_not_delegated` or
+   `:session_placement_unknown`: whether the probe process itself ran inside
+   the configured parent); the same token appears as `detail=` on the
+   server's "failed before transport" warn line. An undelegated session can
+   result from a control master accepted before the listener reloaded the
+   intended config; immediate reconnection need not fix it. The suffix is a
+   diagnostic, not proof of that cause or of template correctness.
+
+   Only a `:session_not_delegated` refusal enters the existing bounded
+   drop/reconnect/identical-reprobe recovery. Each re-probe is pinned to the
+   freshly opened session, not a reused pre-reload master. Backoffs are 2,
+   4, 8 and 16 s, with at most 4 refreshes and no refresh starting after 45 s
+   from the first probe; each probe retains its 15 s RPC fence. The 45 s is a
+   refresh-start bound, not a guarantee that the last connection/probe has
+   completed by second 45. Keep tighter connect and overall command bounds.
+   Only literal `true` admits; all other refusal, unknown-placement and
+   transport results retain their existing no-refresh semantics. Shutdown
+   ends recovery immediately, with no subsequent refresh.
+
+   Recovery runs on the command's reserved VM inside its original timed
+   window, billed to that command and funded by the pre-start allowance
+   (see "Offload TTL funding" below). Retries never reset or renew the
+   provider TTL, account reservation or command window. Without literal
+   `true` within the permitted attempts/window, refuse guest eligibility
+   with the existing `OFFLOAD_GUEST_INELIGIBLE` receipt/detail and normal
+   cleanup; do not admit a remote command or claim success. Unknown execution
+   never permits replay. Any local fallback remains subject to applicable
+   policy: full suites and CI mirrors run only in GitHub Actions; the local
+   allowance is focused reproduction of one failing test or crate. Retain
+   source-only export, `--no-env`, guarded budget and cleanup controls for
+   any permitted heavy focused reproduction through the guarded Boat wrapper.
+
+   The warn line's `refreshes=` counts reconnect attempts; `reprobes=` counts
+   those that connected and ran another probe. Four of each without success
+   mean the checked sessions did not produce a passing preflight within the
+   bounded attempts, not that the listener "never settled." Fewer reprobes
+   than refreshes identify failed reconnect attempts, not their root cause.
+   Counts and tokens are diagnostics, not generation/load proof or permission
+   to change the template. Diagnose the failing sub-step and repeat the
+   untouched-boot qualification; do not smoke against an ineligible template.
 6. Save the VM as a named snapshot (not available during the boat free trial)
    and set the driver `templateSnapshot` to that name. Offload pool VMs then
    boot from it, as whole-run leases do; a missing snapshot is a refused start
@@ -501,8 +539,12 @@ Every offload claim sets the pool VM's provider TTL (on create, resume or the
 warm update) to `timeout + 90 s + offloadIdleStopSeconds`, at least 60 s, and
 the account ledger admits and holds exactly that envelope. The 90 s is the
 pre-start allowance: the TTL starts at the claim, but the guest only spawns
-after the sync push, the boot-id read and the guest preflight, whose bounded
-delegation wait on a fresh VM can take up to 45 s plus its last 15 s probe.
+after the sync push, the boot-id read and the guest preflight. The delegation
+recovery's 45 s bounds refresh starts, not final completion: a connection/probe
+can remain in flight, and each probe retains its 15 s RPC fence. Tighter
+connect and overall/funded command bounds remain authoritative. Recovery does
+not reset or renew the original provider TTL, pre-start funding, account
+reservation or command window; this clarification adds no allowance.
 The allowance counts toward `minComputeHoursLeft`, the compute check and the
 monthly cap like the rest of the envelope; it adds no start, so
 `maxStartsPerDay` is unchanged.
