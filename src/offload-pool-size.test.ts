@@ -21,6 +21,41 @@ async function restart(stopped: boolean) {
   s.clock.crashWorker();
 }
 
+it("retires a keyless recovered VM after reconciling its unresolved receipt", async () => {
+  s.boat.stopMode = "stays_up";
+  s.fail.add("exec:legacy");
+  const first = command("legacy");
+  const original = s.make({ size: "default" });
+  expect(await s.execute(first, original)).toMatchObject({ status: "unknown", fallbackSafe: false });
+  const old = s.starts[0]!.sandboxId;
+  s.clock.crashWorker();
+  s.fail.clear();
+  const [encoded, raw] = Object.entries(await s.state.all())
+    .find(([key]) => JSON.parse(key).namespace === "boat-offload-pool")!;
+  const doc = raw as Awaited<ReturnType<typeof savedPool>>;
+  delete doc.vms[0]!.compatibilityKey;
+  await s.state.set(JSON.parse(encoded) as Parameters<typeof s.state.set>[0], doc);
+
+  const recovered = s.make({ size: "large" }, new DiskState(s.state.path));
+  await recovered.recover();
+  expect((await savedPool()).vms[0]).toMatchObject({ sandboxId: old, quarantined: true });
+  expect((await savedPool()).vms[0]!.compatibilityKey).toBeUndefined();
+  expect(s.boat.callsOf("create")).toHaveLength(1);
+  expect(s.boat.callsOf("resume")).toHaveLength(0);
+
+  s.boat.boxes.get(old)!.state = "archived";
+  await recovered.sweep();
+  expect((await savedPool()).vms[0]).toMatchObject({ sandboxId: old, quarantined: false, stopped: true });
+  expect((await savedPool()).vms[0]!.compatibilityKey).toBeUndefined();
+  expect(await s.execute(first, recovered)).toMatchObject({ status: "unknown", fallbackSafe: false });
+  expect(s.starts).toHaveLength(1);
+  expect(await s.execute(command("replacement"), recovered)).toMatchObject({ status: "completed", warm: "cold" });
+  expect(s.starts[1]!.sandboxId).not.toBe(old);
+  expect(s.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toContain(old);
+  expect(s.boat.callsOf("resume")).toHaveLength(0);
+  expect(s.boat.callsOf("create")[1]!.args.type).toBe("large");
+});
+
 describe.each([false, true])("offload pool size compatibility (stopped=%s)", (stopped) => {
   it.each([
     ["default", "large"], ["large", "default"], ["large", "small"],

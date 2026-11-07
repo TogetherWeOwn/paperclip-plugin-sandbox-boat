@@ -642,10 +642,9 @@ export class OffloadExecutor {
           stopping: false, stopRequestedAt: null, identity: structuredClone(identity) };
         this.pool.push(vm);
       }
-      if (command) {
-        vm.workspaceKey = this.workspaceKey(command);
-        vm.compatibilityKey ??= this.compatibilityKey(command);
-      }
+      if (command) vm.workspaceKey = this.workspaceKey(command);
+      // A recovered command proves workspace ownership, not the VM's creation
+      // config. Leave a missing compatibility key unknown so it cannot be reused.
       vm.quarantined = true;
       vm.generation += 1;
       this.clearIdleTimer(vm);
