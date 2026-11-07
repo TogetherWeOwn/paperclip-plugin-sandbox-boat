@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { OFFLOAD_PRE_START_ALLOWANCE_S } from "./offload.js";
 import { DELEGATION_WAIT_WINDOW_MS } from "./offload-ssh.js";
-import { command, completed, fixture, type Fixture, type RunContext } from "./test-support/offload-lifecycle-contract.js";
+import { command, completed, fixture, type Fixture, type LifecycleCommand, type RunContext } from "./test-support/offload-lifecycle-contract.js";
 
 // The provider TTL a claim sets starts before the journal's sync push and the
 // guest preflight (with its bounded delegation wait) have run. These tests pin
@@ -23,6 +23,9 @@ describe("offload funds pre-start time in the provider TTL", () => {
     const ex = s.make({}, s.state, async (sandboxId, cmd, context?: RunContext) => {
       runs.push({ commandId: cmd.commandId, guestDeadline: context!.identity.guestDeadline,
         archiveAfter: s.boat.boxes.get(sandboxId)!.archiveAfter!.getTime(), at: s.clock.t });
+      // Leave a completed guest receipt, as the fixture's default transport does.
+      s.guest.spawn(cmd as LifecycleCommand, context);
+      s.guest.exit(cmd.commandId);
       return completed();
     });
     return { ex, runs };
