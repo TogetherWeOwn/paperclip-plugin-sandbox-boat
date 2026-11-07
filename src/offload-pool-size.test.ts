@@ -36,7 +36,7 @@ describe.each([false, true])("offload pool size compatibility (stopped=%s)", (st
     const replacement = s.starts[1]!.sandboxId;
     expect(replacement).not.toBe(old);
     expect(s.boat.boxes.has(old)).toBe(false);
-    expect(s.boat.callsOf("delete").map((call) => call.args.sandboxId)).toContain(old);
+    expect(s.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toContain(old);
     expect(s.boat.callsOf("resume")).toHaveLength(0);
     expect(s.boat.callsOf("create")).toHaveLength(2);
     expect(s.boat.callsOf("create")[1]!.args.type).toBe(after);
@@ -57,7 +57,7 @@ describe.each([false, true])("offload pool size compatibility (stopped=%s)", (st
     const recovered = s.make({ size: "default", templateSnapshot }, new DiskState(s.state.path));
     expect(await s.execute(command("reuse-default"), recovered)).toMatchObject({ status: "completed", sandboxId: old });
     expect(s.boat.callsOf("create")).toHaveLength(1);
-    expect(s.boat.callsOf("delete")).toHaveLength(0);
+    expect(s.boat.callsOf("deleteSandbox")).toHaveLength(0);
   });
 
   it("reuses a large VM when the configured size is unchanged", async () => {
@@ -73,6 +73,6 @@ describe.each([false, true])("offload pool size compatibility (stopped=%s)", (st
     const recovered = s.make({ size: "large" }, new DiskState(s.state.path));
     expect(await s.execute(command("reuse-large"), recovered)).toMatchObject({ status: "completed", sandboxId: old });
     expect(s.boat.callsOf("create")).toHaveLength(1);
-    expect(s.boat.callsOf("delete")).toHaveLength(0);
+    expect(s.boat.callsOf("deleteSandbox")).toHaveLength(0);
   });
 });
