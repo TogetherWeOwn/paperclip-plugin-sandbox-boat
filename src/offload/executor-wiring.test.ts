@@ -64,7 +64,9 @@ describe("executor opt-in wiring", () => {
     const t = await setup({ offloadExecutorEnabled: true });
     t.readConfig.mockRejectedValue(new Error("config unavailable"));
     const bind = vi.fn(async () => {});
-    expect((await t.manager.offloadExec(companyId, actor, body, bind)).status).toBe(403);
+    const refused = await t.manager.offloadExec(companyId, actor, body, bind);
+    expect(refused.status).toBe(503);
+    expect(refused.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
     expect(bind).not.toHaveBeenCalled();
     expect(t.resolveExecutor).not.toHaveBeenCalled();
     expect((await t.manager.offloadRead(companyId, actor, { commandId }, {})).status).toBe(400);

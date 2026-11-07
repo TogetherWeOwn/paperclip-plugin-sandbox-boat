@@ -664,7 +664,7 @@ describe("plugin wiring", () => {
     expect((await exec(randomUUID())).status).toBe(403);
   });
 
-  it("a config read failure fails the first offload request closed and the retry recovers", async () => {
+  it("a config read failure falls the first offload request back locally and the retry recovers", async () => {
     let failing = true;
     let reads = 0;
     const harness = await setup(enabled, async () => { reads += 1; if (failing) throw new Error("config unavailable"); return current; });
@@ -672,7 +672,9 @@ describe("plugin wiring", () => {
     await harness.emit("agent.run.started", started);
     const closed = await exec(runId);
     expect(reads).toBeGreaterThan(0);
-    expect(closed.status).toBe(403);
+    // Closed to remote work, but fallback-safe: a 403 would be an auth exit in the shim.
+    expect(closed.status).toBe(503);
+    expect(closed.body).toMatchObject({ code: "OFFLOAD_UNAVAILABLE", remoteStarted: false, fallbackSafe: true });
     expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     failing = false;
