@@ -352,16 +352,6 @@ describe("stock concrete executor factory", () => {
       expect(boat.calls).toHaveLength(0);
     } finally { await rt.shutdown(); }
   });
-  it("keeps a workspace with a tracked fake AWS key local", async () => {
-    gitIn(source, "init", "-q", ".");
-    await writeFile(path.join(source, "config.rs"), 'const K: &str = "AKIAIOSFODNN7EXAMPLE";\n');
-    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "config.rs");
-    const rt = realGitRuntime();
-    try {
-      expect(await rt.resolve(command(), config)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
-      expect(boat.calls).toHaveLength(0);
-    } finally { await rt.shutdown(); }
-  });
   // The fixture's .env (and any .dev.vars) are ignored, not merely untracked:
   // an untracked, non-ignored file keeps the command local on its own.
   async function gitInitIgnoringSecrets(): Promise<void> {
@@ -369,6 +359,18 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, ".gitignore"), ".env\n.dev.vars\ntarget/\n");
     gitIn(source, "add", ".gitignore");
   }
+  it("keeps a workspace with a tracked fake AWS key local", async () => {
+    await gitInitIgnoringSecrets();
+    await writeFile(path.join(source, "config.rs"), 'const K: &str = "AKIAIOSFODNN7EXAMPLE";\n');
+    gitIn(source, "add", "Cargo.toml", "Cargo.lock", "config.rs");
+    const rt = realGitRuntime();
+    try {
+      const refused = await rt.resolve(command(), config);
+      expect(refused).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+      expect(refused).not.toEqual({ refusalReason: UNTRACKED_FILES_REASON });
+      expect(boat.calls).toHaveLength(0);
+    } finally { await rt.shutdown(); }
+  });
   it("admits a clean git work tree with only tracked files syncable", async () => {
     await gitInitIgnoringSecrets();
     await writeFile(path.join(source, ".dev.vars"), "CF_API_TOKEN=untracked\n");
@@ -379,7 +381,7 @@ describe("stock concrete executor factory", () => {
     } finally { await rt.shutdown(); }
   });
   it("keeps cargo local when a tracked .pem is not a verifiable public certificate", async () => {
-    gitIn(source, "init", "-q", ".");
+    await gitInitIgnoringSecrets();
     await mkdir(path.join(source, "tests/fixtures"), { recursive: true });
     await writeFile(path.join(source, "tests/fixtures/ca.pem"), "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
     gitIn(source, "add", "Cargo.toml", "Cargo.lock", "tests/fixtures/ca.pem");
