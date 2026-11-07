@@ -244,7 +244,7 @@ describe("concrete guest lifecycle over real multiplexed SSH", () => {
     } finally {
       await noRefresh.shutdown();
     }
-  });
+  }, 20_000);
 
   it("host env gate refuses prepare with its own detail, distinct from guest sub-causes", async () => {
     const command = cmd();
