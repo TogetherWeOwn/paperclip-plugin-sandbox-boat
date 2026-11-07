@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* A source tree with untracked, non-ignored files now keeps offloaded
+  commands local, with the reason `untracked files present; running
+  local`, on both dry-run and the real submit. The guest mirror carries
+  tracked files only, so a tracked file that referenced an uncommitted
+  module built on the host and failed on the guest (exit 101 on a
+  `cargo check --locked`). Ignored files still allow a remote run, a git
+  failure stays local, and untracked files are still never synced.
+
 ## 0.2.15
 
 Follow-up to 0.2.14: bounded guest delegation settling, optional exact-run

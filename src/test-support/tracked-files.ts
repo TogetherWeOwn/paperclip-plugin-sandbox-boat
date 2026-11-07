@@ -27,3 +27,11 @@ export async function listAllFilesAsTracked(root: string): Promise<Set<string>> 
   }
   return out;
 }
+
+/**
+ * UntrackedFilesFn seam paired with listAllFilesAsTracked: when every file
+ * counts as tracked, nothing is untracked. Production uses hasUntrackedFiles.
+ */
+export async function noUntrackedFiles(): Promise<boolean> {
+  return false;
+}

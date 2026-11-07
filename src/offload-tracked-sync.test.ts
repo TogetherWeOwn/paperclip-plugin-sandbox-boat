@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { containsSecretContent, hasSecretInFiles, isCertificateOnlyPem, listTrackedFiles, pemFilesAreCertificateOnly } from "./offload-secret-scan.js";
+import { containsSecretContent, hasSecretInFiles, hasUntrackedFiles, isCertificateOnlyPem, listTrackedFiles, pemFilesAreCertificateOnly } from "./offload-secret-scan.js";
 import { hasRegistryCredentials } from "./offload-ssh-runtime.js";
 import { captureManifest, captureSnapshot, collectAndStage, isCertificatePemSyncCandidate, isDefaultSyncExcluded, LocalGuestStore } from "./offload-sync.js";
 
@@ -79,6 +79,55 @@ describe("listTrackedFiles", () => {
     git(root, "init", "-q", ".");
     writeTree(root, { "src/lib.rs": "pub fn f() {}\n" });
     expect((await listTrackedFiles(root))!.size).toBe(0);
+  });
+});
+
+describe("hasUntrackedFiles", () => {
+  function cleanRepo(files: Record<string, string> = {}): string {
+    const root = makeTemp();
+    writeTree(root, { "src/lib.rs": "pub fn f() {}\n", ".gitignore": "target/\n*.log\n", ...files });
+    git(root, "init", "-q", ".");
+    git(root, "add", "src/lib.rs", ".gitignore");
+    return root;
+  }
+
+  it("is false for a tracked-only tree", async () => {
+    expect(await hasUntrackedFiles(cleanRepo())).toBe(false);
+  });
+
+  it("is true for an untracked, non-ignored file (a new module before commit)", async () => {
+    expect(await hasUntrackedFiles(cleanRepo({ "src/new_module.rs": "pub fn g() {}\n" }))).toBe(true);
+  });
+
+  it("is true for a non-ignored file inside an untracked directory", async () => {
+    expect(await hasUntrackedFiles(cleanRepo({ "crates/new/src/lib.rs": "pub fn h() {}\n" }))).toBe(true);
+  });
+
+  it("is false when the only untracked files are ignored (target/, *.log)", async () => {
+    expect(await hasUntrackedFiles(cleanRepo({ "target/debug/out.bin": "x", "build.log": "x", "logs/run.log": "x" }))).toBe(false);
+  });
+
+  it("is false for an empty untracked directory, which git never mirrors", async () => {
+    const root = cleanRepo();
+    mkdirSync(path.join(root, "empty/nested"), { recursive: true });
+    expect(await hasUntrackedFiles(root)).toBe(false);
+  });
+
+  it("fails closed (true) for a non-git source or a missing root", async () => {
+    const root = makeTemp();
+    writeTree(root, { "src/lib.rs": "pub fn f() {}\n" });
+    expect(await hasUntrackedFiles(root)).toBe(true);
+    expect(await hasUntrackedFiles(path.join(root, "does-not-exist"))).toBe(true);
+  });
+
+  it("ignores hostile GIT_* worker env when checking", async () => {
+    const root = cleanRepo();
+    const decoy = cleanRepo({ "untracked.rs": "x\n" });
+    const saved = { ...process.env };
+    Object.assign(process.env, { GIT_DIR: path.join(decoy, ".git"), GIT_WORK_TREE: decoy,
+      GIT_INDEX_FILE: path.join(decoy, ".git/index") });
+    try { expect(await hasUntrackedFiles(root)).toBe(false); }
+    finally { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); }
   });
 });
 
