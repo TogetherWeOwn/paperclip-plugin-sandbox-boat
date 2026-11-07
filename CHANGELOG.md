@@ -1,16 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.2.16
+
+Follow-up to 0.2.15: keep untracked source trees local and fund bounded
+pre-start work in the provider VM TTL. Offload and whole-run behaviour
+stay off by default; nothing is enabled by upgrading.
 
 ### Fixed
 
 * A source tree with untracked, non-ignored files now keeps offloaded
-  commands local, with the reason `untracked files present; running
-  local`, on both dry-run and the real submit. The guest mirror carries
-  tracked files only, so a tracked file that referenced an uncommitted
-  module built on the host and failed on the guest (exit 101 on a
+  commands local, with the reason `untracked files present; running local`,
+  on both dry-run and the real submit. The guest mirror carries tracked
+  files only, so a tracked file that referenced an uncommitted module
+  built on the host and failed on the guest (exit 101 on a
   `cargo check --locked`). Ignored files still allow a remote run, a git
-  failure stays local, and untracked files are still never synced.
+  failure stays local, and untracked files are still never synced (#111).
+* The provider VM TTL funds a 90-second pre-start allowance in addition
+  to the command timeout and idle tail, covering ordinary sync, boot-id
+  and guest delegation settling. Create, resume, warm update, replay
+  adoption and admission use the same funded envelope. If pre-start work
+  exceeds the allowance, the guest deadline is trimmed to the remaining
+  funded window; an exhausted window refuses before spawn with
+  `funded_window_elapsed` and falls back locally. The allowance counts
+  toward compute reserves and the monthly cap, without adding a start
+  (#109).
 
 ## 0.2.15
 
