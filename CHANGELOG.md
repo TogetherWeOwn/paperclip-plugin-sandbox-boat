@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* A source tree with an initialized submodule now keeps offloaded
+  commands local, with the reason `submodules present; running local`, on
+  both dry-run and the real submit. The mirror carries the parent index
+  only, so a build that read submodule files passed on the host and failed
+  on the guest. A gitlink (mode 160000) whose directory is empty or absent
+  (an uninitialized submodule) still allows a remote run, a git failure
+  stays local, and submodule contents are still never synced (#112).
+
 ## 0.2.16
 
 Follow-up to 0.2.15: keep untracked source trees local and fund bounded

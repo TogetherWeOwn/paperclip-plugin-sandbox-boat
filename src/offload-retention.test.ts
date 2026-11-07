@@ -16,7 +16,7 @@ function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor 
   return value;
 }
 
-import { listAllFilesAsTracked, noUntrackedFiles } from "./test-support/tracked-files.js";
+import { listAllFilesAsTracked, noInitializedSubmodules, noUntrackedFiles } from "./test-support/tracked-files.js";
 import { OffloadJournal, type OffloadSync } from "./offload-journal.js";
 import { command as lifecycleCommand, DiskState, EPOCH } from "./test-support/offload-lifecycle-contract.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -130,7 +130,7 @@ describe("stock runtime journal retention", () => {
   }, 15_000);
   function stockRuntime(state: StateClientLike = harness.ctx.state): SshOffloadRuntime {
     const boat = new FakeBoat({ now: Date.now });
-    return new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+    return new SshOffloadRuntime({ state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
       boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
       guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "printf done"] } });
   }

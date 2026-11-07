@@ -14,7 +14,7 @@ function mustResolve(value: OffloadExecutor | ExecutorRefusal): OffloadExecutor 
   return value;
 }
 
-import { listAllFilesAsTracked, noUntrackedFiles } from "./test-support/tracked-files.js";
+import { listAllFilesAsTracked, noInitializedSubmodules, noUntrackedFiles } from "./test-support/tracked-files.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import type { BackendCommand } from "./offload/broker.js";
@@ -52,7 +52,7 @@ function backend(source: string): { runtime: SshOffloadRuntime; boat: FakeBoat; 
     ssh: sshStub as never, accountId: "test-only",
     boat: () => boat as unknown as BoatApiLike,
     session: async () => ({} as never),
-    guestOptions: { stateRoot: workRoot }, trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+    guestOptions: { stateRoot: workRoot }, trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
   });
   runtime.remember({
     driverKey: "boat", companyId, environmentId: "env",

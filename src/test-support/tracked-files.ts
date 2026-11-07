@@ -35,3 +35,11 @@ export async function listAllFilesAsTracked(root: string): Promise<Set<string>> 
 export async function noUntrackedFiles(): Promise<boolean> {
   return false;
 }
+
+/**
+ * SubmodulesFn seam paired with listAllFilesAsTracked: a fixture that is not
+ * a git work tree has no gitlinks. Production uses hasInitializedSubmodule.
+ */
+export async function noInitializedSubmodules(): Promise<boolean> {
+  return false;
+}

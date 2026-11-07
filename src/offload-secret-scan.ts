@@ -7,6 +7,7 @@
 // files cannot be listed, stays local (fail closed). Because the guest only
 // ever sees tracked files, a source with untracked, non-ignored files also
 // stays local: the host build could read them and the guest build could not.
+// The same holds for an initialized submodule: its contents are never synced.
 //
 // Before admission the tracked, sync-eligible files also go through a bounded
 // content scan for known credential shapes (cloud keys, private-key headers,
@@ -17,7 +18,7 @@
 import { execFile, spawn } from "node:child_process";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { X509Certificate } from "node:crypto";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, opendir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { containsJwt } from "./env-policy.js";
@@ -29,6 +30,9 @@ export type TrackedFilesFn = (sourceRoot: string) => Promise<ReadonlySet<string>
 
 /** True when the source has untracked, non-ignored files, or when that cannot be determined. */
 export type UntrackedFilesFn = (sourceRoot: string) => Promise<boolean>;
+
+/** True when the source has an initialized submodule, or when that cannot be determined. */
+export type SubmodulesFn = (sourceRoot: string) => Promise<boolean>;
 
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 32 * 1024 * 1024;
@@ -85,6 +89,52 @@ export function hasUntrackedFiles(sourceRoot: string): Promise<boolean> {
     child.on("error", () => finish(true));
     child.on("close", (code, signal) => finish(code !== 0 || signal !== null));
   });
+}
+
+/**
+ * True when the index of sourceRoot holds a submodule gitlink (mode 160000 in
+ * `git ls-files --stage`) whose work-tree directory is populated. The mirror
+ * carries the parent index only: the walk never enters a gitlink, and
+ * `--others` in the parent does not list files inside one. So a build that
+ * reads an initialized submodule would succeed on the host and fail on the
+ * guest: the command must stay local. An uninitialized submodule is an empty
+ * (or absent) directory that neither build can read, so it does not count.
+ * Any git failure, a malformed entry, or a gitlink path that is not a plain
+ * directory returns true: fail closed to local. Same hardened invocation as
+ * listTrackedFiles.
+ */
+export async function hasInitializedSubmodule(sourceRoot: string): Promise<boolean> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      hardenedGitArgs(sourceRoot, "ls-files", "-z", "--stage"),
+      { timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, encoding: "utf8", env: hardenedGitEnv() },
+    ));
+  } catch {
+    return true;
+  }
+  for (const entry of stdout.split("\0")) {
+    // `<mode> <object> <stage>\t<path>`; only gitlinks matter here.
+    if (!entry.startsWith("160000 ")) continue;
+    const tab = entry.indexOf("\t");
+    const rel = tab < 0 ? "" : entry.slice(tab + 1);
+    if (rel === "" || rel.startsWith("/") || rel.split("/").some((part) => part === ".." || part === "")) return true;
+    try {
+      const stat = await lstat(path.join(sourceRoot, rel));
+      if (!stat.isDirectory()) return true;
+      const dir = await opendir(path.join(sourceRoot, rel));
+      try {
+        if (await dir.read() !== null) return true;
+      } finally {
+        await dir.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
