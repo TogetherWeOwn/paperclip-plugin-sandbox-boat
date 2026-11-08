@@ -88,6 +88,65 @@ describe("scheduled capacity telemetry", () => {
     await manager.sampleCapacity();
     const summary = await manager.usageSummary(COMPANY);
     expect(summary.capacity.accounts[0].status).toBe("unavailable");
+    expect(summary.capacity.accounts[0].reasons).toEqual(["limits_read_failed"]);
+    expect(JSON.stringify(harness.logs)).not.toContain(KEY);
+  });
+
+  it("persists a source discovery failure without discarding the last numeric evidence", async () => {
+    const manager = currentManager();
+    manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));
+    await manager.sampleCapacity();
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    const failure = vi.spyOn(harness.ctx.state, "get").mockImplementation(async (input) => {
+      if (input.stateKey === "offload.pools") throw new Error(`source read error ${KEY}`);
+      return get(input);
+    });
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    const summary = await manager.usageSummary(COMPANY);
+    expect(summary.capacity.error).toBe("sources_read_failed");
+    expect(summary.capacity.accounts[0]).toMatchObject({
+      status: "unavailable", reasons: expect.arrayContaining(["sources_read_failed"]),
+      plan: { vmHoursRemaining: 552 }, observedAtMs: clock - 5 * 60_000,
+    });
+    const stored = await get({ scopeKind: "company", scopeId: COMPANY, namespace: "capacity", stateKey: "samples" }) as {
+      accounts: Record<string, { report: { status: string; reasons: string[] } }>;
+    };
+    expect(Object.values(stored.accounts)[0].report).toMatchObject({
+      status: "unavailable", reasons: expect.arrayContaining(["sources_read_failed"]),
+    });
+    expect((await manager.usageSummary("other-company")).capacity).toEqual({ accounts: [], error: null });
+    expect(JSON.stringify(harness.logs)).not.toContain(KEY);
+    failure.mockRestore();
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity.error).toBeNull();
+    expect((await manager.usageSummary(COMPANY)).capacity.accounts[0].status).toBe("insufficient");
+  });
+
+  it("exposes a failed sample write to usage readers until a later sample is stored", async () => {
+    const manager = currentManager();
+    manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));
+    await manager.sampleCapacity();
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    const failure = vi.spyOn(harness.ctx.state, "set").mockImplementation(async (input, value) => {
+      if (input.namespace === "capacity") throw new Error(`state write error ${KEY}`);
+      return set(input, value);
+    });
+    fake.limitsResponse = { ...limits(), activeSandboxes: 90 };
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    const summary = await manager.usageSummary(COMPANY);
+    expect(summary.capacity.error).toBe("state_write_failed");
+    expect(summary.capacity.accounts[0]).toMatchObject({
+      status: "unavailable", reasons: expect.arrayContaining(["state_write_failed"]),
+      plan: { vmHoursRemaining: 552 }, observedAtMs: clock - 5 * 60_000,
+    });
+    expect((await manager.usageSummary("other-company")).capacity.error).toBeNull();
+    failure.mockRestore();
+    await manager.sampleCapacity();
+    const recovered = await manager.usageSummary(COMPANY);
+    expect(recovered.capacity.error).toBeNull();
+    expect(recovered.capacity.accounts[0].warningReasons).toContain("active_sandboxes_pressure");
     expect(JSON.stringify(harness.logs)).not.toContain(KEY);
   });
 

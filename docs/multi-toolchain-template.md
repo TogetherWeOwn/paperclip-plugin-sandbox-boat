@@ -23,7 +23,7 @@ Install tools into root-owned prefixes and link their executables into `/usr/loc
 
 ## Browser cache and fresh HOME
 
-The server-owned `node-public-1` environment sets exactly:
+The server-owned `node-public-1` profile adds only the following key to the guest command environment (which also includes runtime-owned keys such as `HOME` and `CARGO_HOME`):
 
 ```text
 PLAYWRIGHT_BROWSERS_PATH=/opt/paperclip-boat/ms-playwright

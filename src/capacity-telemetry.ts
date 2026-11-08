@@ -60,16 +60,22 @@ export function parseLimits(raw: unknown): ParseResult {
   const root = obj(raw);
   if (!root) return { ok: false, reason: "malformed_payload" };
   if (root.ok === false) return { ok: false, reason: "payload_not_ok" };
-  const body = [root, obj(root._package), obj(root.upgradeEffects)].find((c) => c && obj(c.planIncluded));
-  if (!body) return { ok: false, reason: "missing_plan_included" };
-  const plan = obj(body.planIncluded)!;
+  // Same independent per-field resolution as budget.ts / account-ledger.ts: the
+  // first present value (flat, upgradeEffects, then _package) wins and is then
+  // validated; an invalid higher-precedence value never falls through.
+  const nested = obj(root.upgradeEffects) ?? {};
+  const pkg = obj(root._package !== undefined ? root._package : nested._package) ?? {};
+  const field = (key: string): unknown =>
+    root[key] !== undefined ? root[key] : nested[key] !== undefined ? nested[key] : pkg[key];
+  const plan = obj(field("planIncluded"));
+  if (!plan) return { ok: false, reason: "missing_plan_included" };
   const vmHours = num(plan.vmHours, MAX_HOURS), remaining = num(plan.vmHoursRemaining, MAX_HOURS);
   if (vmHours === null || remaining === null || remaining > vmHours + EPS) return { ok: false, reason: "invalid_vm_hours" };
   // The pinned SDK decodes periodEnd to a Date; a raw JSON payload has a string.
   const periodEndMs = plan.periodEnd instanceof Date ? plan.periodEnd.getTime()
     : typeof plan.periodEnd === "string" ? Date.parse(plan.periodEnd) : NaN;
   if (!Number.isFinite(periodEndMs)) return { ok: false, reason: "invalid_period_end" };
-  const startsRaw = obj(body.starts);
+  const startsRaw = obj(field("starts"));
   if (!startsRaw || typeof startsRaw.unlimited !== "boolean") return { ok: false, reason: "invalid_starts" };
   let starts: ParsedLimits["starts"] = null;
   if (!startsRaw.unlimited) {
@@ -77,15 +83,16 @@ export function parseLimits(raw: unknown): ParseResult {
     if (!minute || !hour || !day) return { ok: false, reason: "invalid_starts" };
     starts = { minute, hour, day };
   }
-  const active = num(body.activeSandboxes, MAX_COUNT), maxActive = num(body.maxActiveSandboxes, MAX_COUNT);
+  const active = num(field("activeSandboxes"), MAX_COUNT), maxActive = num(field("maxActiveSandboxes"), MAX_COUNT);
   if (active === null || maxActive === null) return { ok: false, reason: "invalid_active_sandboxes" };
-  if (body.canStart !== undefined && typeof body.canStart !== "boolean") return { ok: false, reason: "invalid_can_start" };
+  const canStart = field("canStart");
+  if (canStart !== undefined && typeof canStart !== "boolean") return { ok: false, reason: "invalid_can_start" };
   return {
     ok: true,
     limits: {
       periodEndMs, vmHours, vmHoursRemaining: remaining, starts,
       activeSandboxes: active, maxActiveSandboxes: maxActive,
-      canStart: typeof body.canStart === "boolean" ? body.canStart : null,
+      canStart: typeof canStart === "boolean" ? canStart : null,
     },
   };
 }
@@ -180,7 +187,9 @@ export function buildForecast(history: Sample[], cur: Sample, nowMs: number): Fo
     status: burn24 !== null && avg7 !== null ? "ok" : "insufficient_history",
     burn24hHours: burn24, avg7dDailyHours: avg7, daysRemaining, remainingHours: remaining,
     thresholdHours: threshold, projectedHours: projected,
-    exceeds: burn24 === null || projected === null ? null : projected > threshold,
+    // A shortfall is proven by any available rate (or by a balance already under
+    // the reserve); "fits" is only claimed once the 24h window is also known.
+    exceeds: (projected ?? 0) > threshold ? true : burn24 === null ? null : false,
   };
 }
 
@@ -236,6 +245,19 @@ function pruneAccounts(doc: CapacityDoc, nowMs: number): boolean {
   return changed;
 }
 
+/** Update the notify marker for these warning reasons; true when a log hint is due. */
+function dedup(acct: AccountDoc, warningReasons: string[], nowMs: number, clearWhenEmpty: boolean): boolean {
+  const sorted = [...warningReasons].sort();
+  const prev = acct.marker;
+  if (sorted.length === 0) {
+    if (clearWhenEmpty) acct.marker = null; // an unavailable forecast is never an all-clear
+    return false;
+  }
+  if (prev && prev.reasons.join() === sorted.join() && nowMs - prev.lastNotifiedMs < NOTIFY_REPEAT_MS) return false;
+  acct.marker = { reasons: sorted, lastNotifiedMs: nowMs };
+  return true;
+}
+
 export class CapacityTelemetry {
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -253,31 +275,45 @@ export class CapacityTelemetry {
   }
 
   /** Record one observation and return the report. Never throws: failures become "unavailable". */
-  sample(companyId: string, accountKey: string, rawLimits: unknown, nowMs: number): Promise<CapacityReport> {
+  sample(companyId: string, accountKey: string, rawLimits: unknown, nowMs: number, failureReason?: "limits_read_failed"): Promise<CapacityReport> {
     const accountId = digest(accountKey);
     if (typeof nowMs !== "number" || !Number.isFinite(nowMs) || nowMs < 0) {
       return Promise.resolve(unavailable(accountId, "invalid_observation_time", null));
     }
     return this.serialize(async () => {
       try {
-        return await this.sampleLocked(companyId, accountId, rawLimits, nowMs);
+        return await this.sampleLocked(companyId, accountId, rawLimits, nowMs, failureReason);
       } catch {
         return unavailable(accountId, "state_unavailable", nowMs);
       }
     });
   }
 
-  private async sampleLocked(companyId: string, accountId: string, rawLimits: unknown, nowMs: number): Promise<CapacityReport> {
+  private async sampleLocked(companyId: string, accountId: string, rawLimits: unknown, nowMs: number, failureReason?: "limits_read_failed"): Promise<CapacityReport> {
     const doc = readDoc(await this.state.get(this.key(companyId)));
     pruneAccounts(doc, nowMs);
     let acct = doc.accounts[accountId];
-    const parsed = parseLimits(rawLimits);
+    const parsed: ParseResult = failureReason ? { ok: false, reason: failureReason } : parseLimits(rawLimits);
     let report: CapacityReport;
 
     if (!parsed.ok) {
       report = unavailable(accountId, parsed.reason, nowMs);
     } else if (parsed.limits.periodEndMs <= nowMs) {
-      report = unavailable(accountId, "plan_period_ended", nowMs);
+      // The forecast stays unavailable (no sample is stored), but the start/active
+      // readings are still valid current evidence: report them and dedup as usual.
+      const l = parsed.limits;
+      const pressure = startPressureReasons(l);
+      if (!acct) acct = { seenAt: nowMs, samples: [], marker: null, report: null };
+      report = {
+        ...unavailable(accountId, "plan_period_ended", nowMs),
+        reasons: ["plan_period_ended", ...pressure], warning: pressure.length > 0, warningReasons: pressure,
+        shouldNotify: dedup(acct, pressure, nowMs, false),
+        plan: { periodEnd: new Date(l.periodEndMs).toISOString(), vmHours: l.vmHours, vmHoursRemaining: l.vmHoursRemaining },
+        startPressure: {
+          pressure: pressure.length > 0, reasons: pressure, starts: l.starts,
+          activeSandboxes: l.activeSandboxes, maxActiveSandboxes: l.maxActiveSandboxes, canStart: l.canStart,
+        },
+      };
     } else if (acct?.samples.length && nowMs < acct.samples[acct.samples.length - 1][0]) {
       report = unavailable(accountId, "clock_regression", nowMs);
     } else {
@@ -298,14 +334,7 @@ export class CapacityTelemetry {
       const pressure = startPressureReasons(l);
       const warningReasons = [...pressure, ...(fc.exceeds ? ["vm_hours_forecast"] : [])];
       const reasons = [...warningReasons, ...(fc.status === "ok" ? [] : ["insufficient_history"])];
-      const sorted = [...warningReasons].sort();
-      const prev = acct.marker;
-      let shouldNotify = false;
-      if (sorted.length === 0) acct.marker = null;
-      else if (!prev || prev.reasons.join() !== sorted.join() || nowMs - prev.lastNotifiedMs >= NOTIFY_REPEAT_MS) {
-        shouldNotify = true;
-        acct.marker = { reasons: sorted, lastNotifiedMs: nowMs };
-      }
+      const shouldNotify = dedup(acct, warningReasons, nowMs, true);
       report = {
         accountId, status: fc.status === "ok" ? "fresh" : "insufficient",
         observedAt: new Date(nowMs).toISOString(), observedAtMs: nowMs,
@@ -336,6 +365,21 @@ export class CapacityTelemetry {
       return { ...unavailable(accountId, "state_write_failed", nowMs) };
     }
     return report;
+  }
+
+  /** Failed discovery invalidates current status, not the last numeric evidence. */
+  async markUnavailable(companyId: string, reason: "sources_read_failed" | "state_unavailable", nowMs: number): Promise<void> {
+    await this.serialize(async () => {
+      const doc = readDoc(await this.state.get(this.key(companyId)));
+      pruneAccounts(doc, nowMs);
+      for (const account of Object.values(doc.accounts)) {
+        if (account.report) account.report = {
+          ...account.report, status: "unavailable", shouldNotify: false,
+          reasons: [reason, ...account.report.reasons.filter((r) => r !== reason)],
+        };
+      }
+      await this.state.set(this.key(companyId), doc);
+    });
   }
 
   /** Scheduled maintenance still expires history when no verified source remains. */
