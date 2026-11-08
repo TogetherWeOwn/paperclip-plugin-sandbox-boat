@@ -15,7 +15,7 @@ function result(error: Error | null, stdout: string): void {
     const callback = args[3] as (error: Error | null, stdout: string) => void;
     queueMicrotask(() => callback(error, stdout));
     return { stdin };
-  }) as typeof execFile);
+  }) as unknown as typeof execFile);
 }
 
 describe("isolated uv TOML validation", () => {
