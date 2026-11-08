@@ -44,7 +44,13 @@ describe("lost finish integration recovery", () => {
     };
     try {
       expect(await s.execute(command("snapshot-a"), ex)).toMatchObject({ status: "completed" });
-      s.fail.add("push:snapshot-b");
+      // Fail after a successful sync: an interrupted push now fences the whole
+      // boot and cannot exercise normal finish/reuse of the second VM.
+      const prepare = s.guest.prepare;
+      s.guest.prepare = async (sandboxId, cmd, armTimeout) => {
+        if (cmd.commandId === "snapshot-b") throw new Error("injected prepare failure");
+        return prepare(sandboxId, cmd, armTimeout);
+      };
       const b = s.execute(command("snapshot-b", { executionWorkspaceId: "workspace-b" }), ex);
       await until(() => committing);
       outage = false;
