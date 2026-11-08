@@ -84,6 +84,7 @@ describe("runtime uv venv wiring", () => {
     const source = await mkdtemp(path.join(tmpdir(), "boat-venv-src-"));
     tmpdirs.push(source);
     await writeFile(path.join(source, "uv.lock"), "x");
+    await writeFile(path.join(source, "pyproject.toml"), '[project]\nname = "example"\n');
     const { runtime, config, seen } = backend(source);
     try {
       const cmd = pyCommand();

@@ -102,6 +102,53 @@ describe("installDependencies", () => {
     expect(lastInstall).toContain("npm");
   });
 
+  it.each([false, true])("resyncs a warm uv mirror on manifest-only A→B→A changes (failed B: %s)", async (failB) => {
+    const manifest = (groups: string) => `[project]\nname = "example"\nversion = "0.1.0"\n[dependency-groups]\ntest = ["pytest>=7"]\n[tool.uv]\ndefault-groups = ${groups}\n`;
+    const lock = `version = 1
+revision = 5
+[[package]]
+name = "example"
+version = "0.1.0"
+source = { virtual = "." }
+[package.dev-dependencies]
+test = [{ name = "pytest" }]
+[package.metadata.requires-dev]
+test = [{ name = "pytest", specifier = ">=7" }]
+[[package]]
+name = "pytest"
+version = "9.2.0"
+source = { registry = "https://pypi.org/simple" }
+`;
+    const root = source({ "uv.lock": lock, "pyproject.toml": manifest("[]") });
+    const py = command({ tool: "python", runner: "pytest", profileId: "python-public-1", argv: ["tests/"] });
+    const { sync, ssh, calls } = setup(root);
+    await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+    expect(ssh.runStream).toHaveBeenCalledTimes(1);
+    await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+    expect(ssh.runStream).toHaveBeenCalledTimes(1);
+    writeFileSync(path.join(root, "pyproject.toml"), manifest('["test"]'));
+    if (failB) {
+      ssh.runStream.mockResolvedValueOnce({ exitCode: 1, timedOut: false, signal: null, stdout: "sync failed after mutation" });
+      await expect(sync.installDependencies("vm-1", py, root, "/guest/mirror")).rejects.toThrow(/install failed/i);
+    } else {
+      await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+      await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+    }
+    expect(ssh.runStream).toHaveBeenCalledTimes(2);
+    writeFileSync(path.join(root, "pyproject.toml"), manifest("[]"));
+    await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+    expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    await sync.installDependencies("vm-1", py, root, "/guest/mirror");
+    expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    for (const call of calls) {
+      expect(call).toContain("/guest/mirror");
+      expect(call).toContain("uv");
+      expect(call).toContain("--frozen");
+      expect(call).not.toContain("--extra");
+      expect(call).not.toContain("test -f");
+    }
+  });
+
   it("fails the push when the install fails", async () => {
     const root = source({ "requirements.txt": "pytest==7.4.2 \\\n    --hash=sha256:abc123\n" });
     const ssh = {
