@@ -54,6 +54,7 @@ const timestamp = (value: unknown) => value === null || Number.isSafeInteger(val
 
 export class OffloadPoolStore {
   private readonly key;
+  private saving: Promise<void> = Promise.resolve();
   constructor(private readonly state: StateClientLike, accountId: string, poolId: string) {
     this.key = { scopeKind: "instance" as const, namespace: "boat-offload-pool",
       stateKey: createHash("sha256").update(JSON.stringify([accountId, poolId])).digest("hex") };
@@ -117,6 +118,12 @@ export class OffloadPoolStore {
   async save(config: OffloadExecutorConfig, vms: readonly PoolVm[]): Promise<void> {
     const doc: PoolDoc = { version: 1, config: structuredClone(config),
       vms: vms.map(({ idleHandle: _timer, ...vm }) => structuredClone(vm)) };
-    await this.state.set(this.key, doc);
+    // Whole-document saves can originate outside admission (notably sync).
+    // Keep invocation snapshots ordered so an older write cannot erase a fence
+    // after its save has completed and authorized guest mutation. Never hold
+    // admission or this queue across the guest work itself.
+    const saved = this.saving.then(() => this.state.set(this.key, doc));
+    this.saving = saved.catch(() => undefined); // one failure must not poison later saves
+    await saved;
   }
 }

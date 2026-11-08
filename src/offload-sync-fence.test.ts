@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OffloadExecutor } from "./offload.js";
 import type { OffloadCommand, OffloadLifecycleDeps } from "./offload.js";
 import type { BoatApiLike } from "./boat-client.js";
@@ -18,12 +18,12 @@ type PushHook = (sandboxId: string, cmd: LifecycleCommand) => Promise<void>;
 
 // The shared fixture hard-wires its sync port, so build the executor here from
 // the same fixture clock/boat/guest/disk with an instrumented sync port.
-function build(pushHook: PushHook, stopped: string[], disk = s.state) {
+function build(pushHook: PushHook, stopped: string[], disk = s.state, maxOffloadVms = 1) {
   const deps = {
     boat: s.boat as unknown as BoatApiLike,
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     now: s.clock.now, timers: { set: s.clock.set, clear: s.clock.clear },
-    config: { maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+    config: { maxOffloadVms, offloadIdleStopSeconds: 15 },
     state: disk, accountId: `guest-test:${s.root}`, poolId: "guest-test-pool", guest: s.guest,
     journalStore: disk.store(),
     guestReceipts: { bootId: async () => "boot-a", read: async () => null },
@@ -105,6 +105,135 @@ describe("offload sync fence: durable syncInFlight", () => {
     expect(s.starts.map((v) => v.commandId)).toEqual(["c1"]);
     expect(s.boat.callsOf("create")).toHaveLength(1);
     expect(await flagOnDisk(id)).toBe(true);
+  });
+
+  it("orders a delayed second-VM admission save before the sync fence and preserves it on recovery", async () => {
+    const warmGate = deferred<void>();
+    const syncGate = deferred<void>();
+    const journalGate = deferred<void>();
+    const oldSaveGate = deferred<void>();
+    const pushes: string[] = [];
+    const stopped: string[] = [];
+    const first = build(async (_id, cmd) => {
+      pushes.push(cmd.commandId);
+      if (cmd.commandId === "warm-a") await warmGate.promise;
+      if (cmd.commandId.startsWith("next-")) await syncGate.promise;
+    }, stopped, s.state, 2);
+    const warmA = s.execute(command("warm-a"), first);
+    await until(() => pushes.includes("warm-a"));
+    await s.execute(command("warm-b", { executionWorkspaceId: "workspace-b" }), first);
+    warmGate.resolve();
+    await warmA;
+    const idA = s.starts.find((v) => v.commandId === "warm-a")!.sandboxId;
+    const idB = s.starts.find((v) => v.commandId === "warm-b")!.sandboxId;
+    expect(idA).not.toBe(idB);
+    expect(s.boat.callsOf("create")).toHaveLength(2);
+
+    const set = s.state.set.bind(s.state);
+    let journalHeld = false;
+    let oldSaveHeld = false;
+    let fenceRequested = false;
+    type Snapshot = { vms: Array<{ sandboxId: string; busy: boolean; syncInFlight?: boolean; identity: { commandId: string } | null }> };
+    vi.spyOn(s.state, "set").mockImplementation(async (key, value) => {
+      const record = value as { commandId?: string; state?: string };
+      if (key.namespace === "guest-test-journal" && record.commandId === "next-a" && record.state === "syncing_in") {
+        journalHeld = true;
+        await journalGate.promise;
+      }
+      if (key.namespace === "boat-offload-pool") {
+        const vms = (value as Snapshot).vms;
+        const a = vms.find((vm) => vm.sandboxId === idA)!;
+        const b = vms.find((vm) => vm.sandboxId === idB)!;
+        if (!oldSaveHeld && a.busy && !a.syncInFlight && b.busy) {
+          expect(a.identity?.commandId).toBe("warm-a");
+          oldSaveHeld = true;
+          await oldSaveGate.promise; // backend would allow a later set to commit first
+        }
+      }
+      await set(key, value);
+    });
+    // Observe invocation of the fence save, even when its state.set is queued.
+    const store = (first as unknown as { poolStore: { save: (...args: unknown[]) => Promise<void> } }).poolStore;
+    const save = store.save.bind(store);
+    vi.spyOn(store, "save").mockImplementation((...args) => {
+      const vms = args[1] as Snapshot["vms"];
+      if (vms.find((vm) => vm.sandboxId === idA)?.syncInFlight) fenceRequested = true;
+      return save(...args);
+    });
+    const nextA = s.execute(command("next-a"), first);
+    let nextB: ReturnType<typeof s.execute> | undefined;
+    try {
+      await until(() => journalHeld);
+      nextB = s.execute(command("next-b", { executionWorkspaceId: "workspace-b" }), first);
+      await until(() => oldSaveHeld);
+      journalGate.resolve();
+      await until(() => fenceRequested);
+      // The old save must complete before a fence authorizes guest mutation.
+      expect(pushes).not.toContain("next-a");
+      oldSaveGate.resolve();
+      await until(() => pushes.includes("next-a") && pushes.includes("next-b"));
+      expect(await flagOnDisk(idA)).toBe(true);
+      const beforeCrash = await persistedVms(new DiskState(s.state.path));
+      expect(beforeCrash).toHaveLength(2);
+      expect(beforeCrash.every((vm) => vm.syncInFlight)).toBe(true);
+
+      // Both installers are suspended outside their previous empty cgroups.
+      // A new executor reads disk only; accepted-but-running stops prove nothing.
+      s.clock.crashWorker();
+      s.boat.stopMode = "stays_up";
+      const recoveredPushes: string[] = [];
+      const second = build(async (id) => { recoveredPushes.push(id); }, stopped, new DiskState(s.state.path), 2);
+      await api(second).recover();
+      await api(second).sweep();
+      const recovered = await persistedVms(new DiskState(s.state.path));
+      expect(recovered).toHaveLength(2);
+      for (const vm of recovered) expect(vm).toMatchObject({ syncInFlight: true, quarantined: true });
+      expect(s.boat.callsOf("stop").map((v) => v.args.sandboxId)).toEqual(expect.arrayContaining([idA, idB]));
+      expect(await s.execute(command("probe-a"), second)).toMatchObject({ status: "unavailable" });
+      expect(await s.execute(command("probe-b", { executionWorkspaceId: "workspace-b" }), second)).toMatchObject({ status: "unavailable" });
+      expect(recoveredPushes).toEqual([]);
+      expect(stopped).toEqual([]);
+      expect(s.starts.map((v) => v.commandId).sort()).toEqual(["warm-a", "warm-b"]);
+    } finally {
+      journalGate.resolve();
+      oldSaveGate.resolve();
+      // Settle abandoned callers only after recovery evidence has been inspected.
+      syncGate.reject(new Error("abandoned worker"));
+      await Promise.allSettled([nextA, ...(nextB ? [nextB] : [])]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("requests stop despite a failed quarantined-release pool save and retains the durable fence", async () => {
+    const stopped: string[] = [];
+    let n = 0;
+    let failedRelease = false;
+    const set = s.state.set.bind(s.state);
+    const first = build(async () => {
+      n += 1;
+      if (n === 2) {
+        vi.spyOn(s.state, "set").mockImplementation(async (key, value) => {
+          if (key.namespace === "boat-offload-pool" && (value as { vms: Array<{ busy: boolean; syncInFlight?: boolean }> }).vms
+            .some((vm) => !vm.busy && vm.syncInFlight) && !failedRelease) {
+            failedRelease = true;
+            throw new Error("release persistence unavailable");
+          }
+          await set(key, value);
+        });
+        throw new Error("installer outcome unknown");
+      }
+    }, stopped);
+    try {
+      await s.execute(command("c1"), first);
+      const id = s.starts[0]!.sandboxId;
+      s.boat.stopMode = "stays_up";
+      await s.execute(command("c2"), first);
+      expect(failedRelease).toBe(true);
+      expect(s.boat.callsOf("stop").map((v) => v.args.sandboxId)).toContain(id);
+      expect(await flagOnDisk(id)).toBe(true);
+      expect(stopped).toEqual([]);
+      expect(s.starts.map((v) => v.commandId)).toEqual(["c1"]);
+    } finally { vi.restoreAllMocks(); }
   });
 
   it("provider-proven terminal recovery clears the flag and resumes the same sandbox under maxOffloadVms 1", async () => {

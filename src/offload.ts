@@ -1740,7 +1740,9 @@ export class OffloadExecutor {
         vm.quarantined = true;
         vm.generation += 1;
         this.clearIdleTimer(vm);
-        await this.persistPool();
+        await this.persistPool().catch(() => {
+          this.logger.error("boat offload sync fence persistence failed; stop still required", { sandboxId: vm.sandboxId });
+        });
         // A never-started command may still have a live sync installer.
         // Keep the durable fence until terminal provider reconciliation.
         await this.stopVm(vm, true, true);
