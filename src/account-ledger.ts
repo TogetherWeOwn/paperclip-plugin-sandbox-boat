@@ -575,6 +575,51 @@ export class AccountLedger {
     });
   }
 
+  /** A same-key replay may be the first effective create. Fund it before POST,
+   * retaining the old elapsed exposure and renewing all unreflected holds. */
+  async revalidateReplay(api: BoatApiLike, reservation: AccountReservation, req: AdmissionRequest, ttlSeconds: number): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read();
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || intent.operation !== "create" || intent.size !== req.size
+        || !["intent", "ambiguous"].includes(intent.status) || !Number.isFinite(ttlSeconds) || ttlSeconds < 60) {
+        throw new Error("no retained create intent can fund replay");
+      }
+      const limits = await this.observe(api, doc, false, req);
+      const ttlBound = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - intent.at) / 1000) + ttlSeconds);
+      const jobSeconds = ttlBound - intent.tailSeconds;
+      this.check(doc, limits, { ...req, jobSeconds }, intent.tailSeconds, intent.id);
+      if (req.monthlyCap && req.monthlyCap.capHours > 0
+        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)
+          + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
+        throw new Error("monthly offload VM-hour cap reached during replay");
+      }
+      intent.jobSeconds = jobSeconds;
+      intent.ttlSeconds = ttlBound;
+      intent.compute = Math.max(intent.compute, ttlBound * WEIGHT[intent.size]);
+      intent.active = true;
+      intent.activeReflected = false;
+      for (const name of Object.keys(WINDOWS) as Window[]) {
+        intent.starts[name] = { reflected: false, expiresAt: limits.windows[name]?.resetAt ?? this.now() + WINDOWS[name] };
+      }
+      await this.write(doc);
+      reservation.periodEndMs = limits.periodEndMs;
+      this.assertDispatchable(reservation, ttlSeconds);
+      if (this.now() - limits.at > 5000) throw new Error("limits expired before create replay");
+    });
+  }
+
+  /** Undo an optional extension only before its provider update was attempted. */
+  async restoreTail(reservation: AccountReservation): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
+      const released = Math.max(0, intent.tailSeconds - reservation.tailSeconds) * WEIGHT[intent.size];
+      intent.compute = Math.max(intent.computeReflected, intent.compute - released);
+      intent.tailSeconds = reservation.tailSeconds;
+      await this.write(doc);
+    });
+  }
+
   async started(api: BoatApiLike, reservation: AccountReservation, sandboxId: string): Promise<number> {
     return await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;

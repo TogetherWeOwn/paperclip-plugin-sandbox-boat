@@ -147,6 +147,33 @@ describe("included account reservations", () => {
   });
 });
 
+describe("post-admission persistence boundaries", () => {
+  it("keeps the funded command when persistence consumes optional resume-tail headroom", async () => {
+    const f = fixture();
+    try {
+      const p = f.pool();
+      await p.execute(command("seed"));
+      await advance(15_000);
+      const periodEnd = Date.now() + 451_000;
+      f.boat.limitsResponse = modern({ planIncluded: included(90_000, periodEnd), starts: starts(1) });
+      const resume = f.boat.resume.bind(f.boat);
+      f.boat.resume = async (args) => {
+        const result = await resume(args);
+        f.boat.limitsResponse = modern({ planIncluded: included(90_000, periodEnd), starts: starts(2) });
+        f.state.beforeWrite = async () => { f.state.beforeWrite = undefined; await advance(2_000); };
+        return result;
+      };
+      expect(await p.execute(command("short-tail-resume"))).toMatchObject({ status: "completed" });
+      expect(f.executions).toEqual(["seed", "short-tail-resume"]);
+      expect(f.boat.callsOf("update")).toHaveLength(0);
+      await advance(15_000);
+      expect(f.boat.callsOf("stop")).toHaveLength(2);
+      const doc = JSON.parse([...f.state.rows.values()][0]!);
+      expect(doc.intents.find((i: { operation: string }) => i.operation === "resume").tailSeconds).toBe(15);
+    } finally { await f.close(); }
+  });
+});
+
 describe("never-started fallback contract", () => {
   it.each([modern({ planIncluded: included(0) }), modern({ planIncluded: undefined }), modern({ nextStartDollars: 0.01 })])(
     "returns a verified never-started refusal, not execution uncertainty", async (raw) => {

@@ -77,6 +77,42 @@ describe("offload uncertain create", () => {
     expect(s.fake.callsOf("stop")).toHaveLength(0);
   });
 
+  it.each([
+    { nextStartDollars: 0.01 },
+    { planIncluded: undefined },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 0, periodEnd: new Date(EPOCH + 86_400_000) } },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 25, periodEnd: new Date(EPOCH) } },
+  ])("never replays a request lost before the provider when current included admission refuses: %j", async (overrides) => {
+    const s = setup();
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    expect(await s.executor.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.size).toBe(0);
+    const original = ledgerDoc(s).intents[0]!.id;
+    s.fake.limitsResponse = trialLimits(overrides);
+    expect(await s.executor.execute(command("cmd-refused"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("create")).toHaveLength(1);
+    expect(s.fake.boxes.size).toBe(0);
+    expect(ledgerDoc(s).intents[0]!.id).toBe(original);
+    expect(ledgerDoc(s).intents[0]!.status).toBe("ambiguous");
+    s.fake.limitsResponse = trialLimits();
+    expect(await s.executor.execute(command("cmd-recovered"))).toMatchObject({ status: "completed" });
+    expect(s.fake.callsOf("create")[1]!.args.idempotencyKey).toBe(s.fake.callsOf("create")[0]!.args.idempotencyKey);
+    expect(s.fake.boxes.size).toBe(1);
+  });
+
+  it("retains renewed replay funding when the replay itself loses its reply", async () => {
+    const s = setup();
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    await s.executor.execute(command("cmd-lost"));
+    s.clock.t += 120_000;
+    s.fake.failNext("create", () => new Error("synthetic replay reply lost"));
+    expect(await s.executor.execute(command("cmd-retry"))).toMatchObject({ status: "unavailable" });
+    // Original timeout 120 + preparation 90 + tail 15, plus elapsed 120.
+    expect(ledgerDoc(s).intents[0]!.ttlSeconds).toBe(345);
+    expect(ledgerDoc(s).intents[0]!.status).toBe("ambiguous");
+    expect(s.fake.callsOf("create")[1]!.args).toEqual(s.fake.callsOf("create")[0]!.args);
+  });
+
   it("an incompatible retry stops the replayed VM and frees the slot", async () => {
     // One VM of account capacity: the retained hold must be released before a
     // fresh create is admitted, or the slot leaks quarantined forever.
@@ -198,9 +234,9 @@ describe("offload uncertain create", () => {
     expect(rows.filter((row) => row.kind === "failed_start").map((row) => row.commandId)).toEqual(["cmd-1"]);
   });
 
-  it("adopts a compatible replay without charging a second active slot at maxActive=1", async () => {
-    // The lost VM already occupies the single provider slot. Adoption reuses
-    // it warm, so no second create slot is admitted.
+  it("retains uncertainty when current capacity cannot fund a possible first-effect replay", async () => {
+    // A same-key POST might be the first request that reaches the provider.
+    // Without read-only key lookup, a full account cannot safely replay it.
     const s = setup(undefined, { maxActive: 1 });
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
@@ -208,9 +244,10 @@ describe("offload uncertain create", () => {
     s.fake.limitsResponse = trialLimits({ activeSandboxes: 1 });
     const second = await s.executor.execute(command("cmd-2"));
     const [id] = [...s.fake.boxes.keys()];
-    expect(second).toMatchObject({ status: "completed", warm: "cold", sandboxId: id });
+    expect(second).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.has(id!)).toBe(true);
     expect(s.fake.boxes.size).toBe(1);
-    expect(s.fake.callsOf("create")).toHaveLength(2);
+    expect(s.fake.callsOf("create")).toHaveLength(1);
     expect(s.fake.callsOf("stop")).toHaveLength(0);
   });
 

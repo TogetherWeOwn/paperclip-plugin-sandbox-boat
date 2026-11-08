@@ -1119,6 +1119,15 @@ export class OffloadExecutor {
       // create, so only the persisted body is ever resent. Placeholders that
       // predate the persisted body fall back to the current config.
       const pending = vm.pendingCreate;
+      const replayTtl = pending?.ttlSeconds ?? legacyTtlSeconds;
+      const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+      // Idempotency prevents duplication, not a first effect: the original
+      // request may never have reached the provider. Refuse without releasing
+      // uncertainty if current included capacity cannot fund the exact replay.
+      await ledger.revalidateReplay(this.boat, reservation, { ...this.config, operation: "create",
+        size: pending?.type ?? this.config.size, poolId: this.poolId,
+        jobSeconds: replayTtl - reservation.tailSeconds, tailSeconds: reservation.tailSeconds,
+        ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) }, replayTtl);
       if (pending?.kind === "fork" && pending.sourceSandboxId) {
         response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
           ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
@@ -1388,8 +1397,16 @@ export class OffloadExecutor {
       // the longer, already-funded reservation before starting the command.
       if (vm.tailSeconds > reservation.tailSeconds) {
         const extendedTtl = Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds));
-        ledger.assertDispatchable(reservation, extendedTtl);
-        await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds: extendedTtl });
+        let extend = true;
+        try { ledger.assertDispatchable(reservation, extendedTtl); }
+        catch {
+          // No update was attempted. Persistence may consume the optional
+          // extension's headroom without invalidating the original deadline.
+          await ledger.restoreTail(reservation);
+          vm.tailSeconds = reservation.tailSeconds;
+          extend = false;
+        }
+        if (extend) await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds: extendedTtl });
       }
       await this.persistPool();
       return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
