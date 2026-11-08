@@ -52,7 +52,7 @@ describe("pinned journal process-boundary semantics", () => {
     }
   });
 
-  it.each(pairs)("%s → %s recovers a delayed matching receipt and retains the staged artifact on the return trip", async (from, to) => {
+  it.each(pairs)("%s → %s legacy recovery stages a delayed matching receipt and retains the artifact on the return trip", async (from, to) => {
     const cmd = command("delayed-receipt"), seeded = record("running", cmd);
     await new FileStore(root).set(hostKey(cmd), seeded);
     const first = await journal(from);
@@ -70,6 +70,31 @@ describe("pinned journal process-boundary semantics", () => {
     expect(await returned.instance.execute(cmd, launch)).toEqual(result);
     expect(returned.stage).not.toHaveBeenCalled();
     expect(returned.hold).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it.each(pairs)("%s → %s lifecycle recovery keeps a delayed matching receipt unknown and isolated", async (from, to) => {
+    const cmd = command("lifecycle-delayed-receipt"), seeded = record("running", cmd);
+    await new FileStore(root).set(hostKey(cmd), seeded);
+    const launch = vi.fn(async () => { throw new Error("must not redispatch"); });
+    const first = await journal(from, null, true);
+    const result = await first.instance.execute(cmd, launch);
+    expect(result).toMatchObject({ status: "unknown", fallbackSafe: false });
+    await reopen();
+    const next = await journal(to, receipt("result", seeded.identity!), true);
+    expect(await next.instance.execute(cmd, launch)).toEqual(result);
+    expect(next.hold).toHaveBeenCalledWith(seeded.identity, cmd);
+    expect(next.stage).not.toHaveBeenCalled();
+    expect(next.release).not.toHaveBeenCalled();
+    expect(await new FileStore(root).get(hostKey(cmd))).toMatchObject({
+      state: "unknown", identity: seeded.identity, resultAt: null, fallbackSafe: false,
+    });
+    expect(await next.instance.hasUnsettled(seeded.identity!.sandboxId)).toBe(true);
+    await reopen();
+    const returned = await journal(from, receipt("result", seeded.identity!), true);
+    expect(await returned.instance.execute(cmd, launch)).toEqual(result);
+    expect(returned.stage).not.toHaveBeenCalled();
+    expect(returned.release).not.toHaveBeenCalled();
     expect(launch).not.toHaveBeenCalled();
   });
 

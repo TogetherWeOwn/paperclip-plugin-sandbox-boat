@@ -14,12 +14,16 @@ command. Required refusal is a useful result. No production enforcement is added
 The fixture checks both commit and tree objects before exporting tracked source
 into independent temporary module roots. Missing objects fail the test; there is
 no network fetch or substitution with current `main`. CI fetches history during
-checkout. When the existing package stager tests a Git archive on Actions, the
-helper resolves objects from that job's verified repository checkout and keeps
-imports in the archive. A containment regression covers this path without
-changing the stager or adding package hooks. Outside Actions, an archive without
-pinned Git objects fails closed. The PR base may include later repairs; that does
-not change this pair.
+checkout. An extracted archive has no `.git` directory. The package stager now
+passes its source repository through `HANDOVER_SOURCE_REPO` only to its existing
+test gate; the helper validates that root, origin and exact pinned objects before
+reading tracked sources. On Actions, `GITHUB_WORKSPACE` is also supported. Imports
+and dependencies remain in the archive. Containment regressions cover both
+layouts, missing/invalid source refusal and the stager's environment wiring with
+sentinel commands (no actual staging build or installation). This is test-source
+plumbing only: no package hook, admission guard, installation or publication
+behavior changes. An archive without a verified source checkout fails closed.
+The PR base may include later repairs; that does not change this pair.
 Each persistence handoff reopens JSON state or actual files and uses new module
 roots. No installed-state paths, credentials, provider SDK clients or host state
 are inputs. In-process network entrypoints are denied while fixtures are open;
@@ -51,10 +55,15 @@ restore stale state, or offer automatic old-package fallback.
 implementations. Synthetic `remoteStarted: true` and `remoteStarted: null` UNKNOWN
 shapes preserve command/digest/scope/guest identity, retained holds, no local
 fallback, and no relaunch. Missing or mismatched receipts cannot manufacture
-completion or release isolation. A delayed matching receipt stages one synthetic
-artifact, then a reverse handoff returns that same result/reference without
-restaging or dispatching. These are synthetic shapes, not a claim to have read
-or resolved either historical installed UNKNOWN record.
+completion or release isolation. **Legacy (no-lifecycle) recovery only:** a delayed
+matching receipt stages one synthetic artifact, then a reverse handoff returns
+that same result/reference without restaging or dispatching. With lifecycle
+recovery enabled, even a matching delayed result receipt remains UNKNOWN, held
+and unsettled across both handovers: observation alone cannot certify cleanup or
+revoke a watchdog. Separate fixtures assert no staging, release or dispatch on
+that path. These are synthetic shapes, not production lifecycle artifact-staging
+qualification or a claim to have read or resolved either historical installed
+UNKNOWN record.
 
 ## Client/broker and alias coverage
 

@@ -83,7 +83,8 @@ git -C "$repo" archive "$sha" | tar -x -C "$work/src"
 (
   cd "$work/src"
   npm ci --no-audit --no-fund
-  npm run check # typecheck + tests + build
+  # Test-only historical object lookup; imports/build still use the archive.
+  HANDOVER_SOURCE_REPO="$repo" npm run check # typecheck + tests + build
 )
 
 pkg="$work/pkg"

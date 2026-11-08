@@ -242,6 +242,7 @@ describe("pinned fake-provider pool handover", () => {
     boat.failNext("create", (args) => boat.loseCreateReply(args));
     expect(await first.execute(command("lost-create"))).toMatchObject({ status: "unavailable" });
     const key = boat.callsOf("create")[0]!.args.idempotencyKey;
+    expect(key).toEqual(expect.any(String));
     expect(executions).toEqual([]);
     await boundary();
     const next = await executor(to, executions);
@@ -257,6 +258,7 @@ describe("pinned fake-provider pool handover", () => {
     boat.failNext("create", () => new Error("synthetic lost before provider effect"));
     expect(await first.execute(command("lost-before-effect"))).toMatchObject({ status: "unavailable" });
     const key = boat.callsOf("create")[0]!.args.idempotencyKey;
+    expect(key).toEqual(expect.any(String));
     await boundary();
     const next = await executor("candidate", executions);
     boat.limitsResponse = trialLimits({ nextStartDollars: 0.01 });

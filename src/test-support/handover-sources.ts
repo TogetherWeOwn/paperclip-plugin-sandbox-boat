@@ -18,12 +18,13 @@ export const HANDOVER_SOURCES = {
 // CI fetches the pinned objects before running tests; this helper never fetches.
 export async function openHandoverSources() {
   const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  // stage-package tests a git archive on Actions. Resolve objects from that
-  // job's verified checkout, while imports/dependencies stay in the archive.
-  const sourceRepo = existsSync(resolve(repo, ".git")) ? repo
-    : process.env.GITHUB_ACTIONS === "true" && process.env.GITHUB_WORKSPACE
-      ? resolve(process.env.GITHUB_WORKSPACE) : null;
-  if (!sourceRepo) throw new Error("pinned handover objects require a source checkout on Actions");
+  // An extracted archive has no Git objects. The stager explicitly supplies
+  // its source checkout; Actions can also use its verified workspace. Imports
+  // and dependencies stay in the archive, never in the external checkout.
+  const externalRepo = process.env.HANDOVER_SOURCE_REPO
+    || (process.env.GITHUB_ACTIONS === "true" ? process.env.GITHUB_WORKSPACE : undefined);
+  const sourceRepo = existsSync(resolve(repo, ".git")) ? repo : externalRepo ? resolve(externalRepo) : null;
+  if (!sourceRepo) throw new Error("pinned handover objects require a verified source checkout");
   const git = (...args: string[]) => execFileSync("git", args, { cwd: sourceRepo, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   if (resolve(git("rev-parse", "--show-toplevel").trim()) !== sourceRepo
     || !/^https:\/\/github\.com\/TogetherWeOwn\/paperclip-plugin-sandbox-boat(?:\.git)?$/.test(git("config", "--get", "remote.origin.url").trim())) {
