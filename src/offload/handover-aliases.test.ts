@@ -8,7 +8,21 @@ import { openHandoverSources } from "../test-support/handover-sources.js";
 const aliases = { cargo: "cargo", npm: "node", pnpm: "node", yarn: "node", npx: "node", pytest: "python", python: "python", python3: "python" } as const;
 let root: string, sources: Awaited<ReturnType<typeof openHandoverSources>>;
 beforeEach(async () => { root = mkdtempSync(join(tmpdir(), "handover-aliases-")); sources = await openHandoverSources(); });
-afterEach(async () => { await sources.close(); rmSync(root, { recursive: true, force: true }); });
+afterEach(async () => {
+  await sources.close();
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.isDirectory() && ["old", "candidate"].includes(entry.name)) packageMode(join(root, entry.name), 0o755);
+  }
+  rmSync(root, { recursive: true, force: true });
+});
+function packageMode(dir: string, mode: number) {
+  chmodSync(dir, mode);
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const file = join(dir, entry.name);
+    if (entry.isDirectory()) packageMode(file, mode);
+    else chmodSync(file, mode);
+  }
+}
 
 function packageFixture(version: "old" | "candidate") {
   const pkg = join(root, version);
@@ -25,6 +39,7 @@ function packageFixture(version: "old" | "candidate") {
 export async function shimMain(script, args, deps, tool = "cargo") {
   process.stdout.write(JSON.stringify({ version: "${version}", invoked: script.split("/").pop(), tool })); return 0;
 }`);
+  packageMode(pkg, 0o555); // Match staged packages' read-only immutable targets.
   return pkg;
 }
 function install(pkg: string, shimDir: string, env: Record<string, string> = {}) {
@@ -84,7 +99,11 @@ describe("eight aliases with actual pinned bins and publisher", () => {
     // Restore is another publication, not rollback of process/journal state.
     expect(install(old, shims).status).toBe(0);
     expect(Object.values(resolution(shims)).every((target) => target.startsWith(`${old}/`))).toBe(true);
-    expect(readdirSync(shims).sort()).toEqual(names.sort());
+    const entries = readdirSync(shims);
+    expect(entries.filter((name) => !name.startsWith(".install.")).sort()).toEqual(names.sort());
+    // The pinned script has only an EXIT trap. Dash's default TERM termination
+    // can retain its staging directory; restoring aliases does not remove it.
+    expect(entries.filter((name) => name.startsWith(".install."))).toHaveLength(signal ? 1 : 0);
   });
 
   it("a failed restore retains the exact mixed targets until an exclusive retry completes", () => {

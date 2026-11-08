@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,17 @@ export const HANDOVER_SOURCES = {
 // CI fetches the pinned objects before running tests; this helper never fetches.
 export async function openHandoverSources() {
   const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  // stage-package tests a git archive on Actions. Resolve objects from that
+  // job's verified checkout, while imports/dependencies stay in the archive.
+  const sourceRepo = existsSync(resolve(repo, ".git")) ? repo
+    : process.env.GITHUB_ACTIONS === "true" && process.env.GITHUB_WORKSPACE
+      ? resolve(process.env.GITHUB_WORKSPACE) : null;
+  if (!sourceRepo) throw new Error("pinned handover objects require a source checkout on Actions");
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: sourceRepo, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  if (resolve(git("rev-parse", "--show-toplevel").trim()) !== sourceRepo
+    || !/^https:\/\/github\.com\/TogetherWeOwn\/paperclip-plugin-sandbox-boat(?:\.git)?$/.test(git("config", "--get", "remote.origin.url").trim())) {
+    throw new Error("handover source repository mismatch");
+  }
   const base = await mkdtemp(resolve(repo, ".handover-fixture-"));
   const deny = () => { throw new Error("handover fixture forbids real network"); };
   const guards = [
@@ -34,7 +46,6 @@ export async function openHandoverSources() {
   try {
     async function materialize(name: keyof typeof HANDOVER_SOURCES) {
       const pin = HANDOVER_SOURCES[name];
-      const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
       if (git("rev-parse", `${pin.commit}^{commit}`).trim() !== pin.commit ||
           git("rev-parse", `${pin.commit}^{tree}`).trim() !== pin.tree) throw new Error("handover source identity mismatch");
       const root = resolve(base, name);

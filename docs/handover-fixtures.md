@@ -14,10 +14,18 @@ command. Required refusal is a useful result. No production enforcement is added
 The fixture checks both commit and tree objects before exporting tracked source
 into independent temporary module roots. Missing objects fail the test; there is
 no network fetch or substitution with current `main`. CI fetches history during
-checkout. The PR base may include later repairs; that does not change this pair.
+checkout. When the existing package stager tests a Git archive on Actions, the
+helper resolves objects from that job's verified repository checkout and keeps
+imports in the archive. A containment regression covers this path without
+changing the stager or adding package hooks. Outside Actions, an archive without
+pinned Git objects fails closed. The PR base may include later repairs; that does
+not change this pair.
 Each persistence handoff reopens JSON state or actual files and uses new module
 roots. No installed-state paths, credentials, provider SDK clients or host state
-are inputs. Network entrypoints are denied while fixtures are open.
+are inputs. In-process network entrypoints are denied while fixtures are open;
+this is not an OS egress firewall. Child processes are limited to tracked Git
+source reads, the installer shell, and pinned bins loading controlled sentinel
+modules, not provider code.
 
 ## Semantic ledger and journal coverage
 
@@ -30,9 +38,13 @@ observations; lifetime and cached-allowance expiry refusal. Provider calls use
 
 Downgrade cannot be justified by `version: 1` parser acceptance. The old source
 can reserve against wallet/trial counters even when the included allowance has
-expired, while the candidate refuses. The fixture characterizes that behavior
-without dispatching it. **Required operational outcome: downgrade REFUSAL and
-fix-forward.** This PR does not claim that installed old code enforces refusal,
+expired, while the candidate refuses. Initial exact-head Actions also exposed
+that the old `failed()` path does not restore a predecessor after a failed warm
+or resume handoff: the synthetic predecessor's funded compute falls from 90 to
+30 seconds and its open tail is closed. The candidate restores it. The fixtures
+characterize these old-source failures without provider dispatch. **Required
+operational outcome: downgrade REFUSAL and fix-forward.** This PR does not claim
+that installed old code enforces refusal,
 restore stale state, or offer automatic old-package fallback.
 
 `src/handover-journal.test.ts` reopens file-backed stores between pinned journal
@@ -65,6 +77,9 @@ shim/client logic is tested separately. This is **not** compiled release tarball
 qualification. Already-resolved old bin paths remain present after publication.
 Interrupted renames, publication failure, failed restore and restart resolution
 leave visible old/new mixtures; no claim of eight-rename atomicity is made.
+On dash, SIGTERM can also retain the interrupted staging directory because the
+pinned installer traps only EXIT. Alias restoration does not imply its cleanup;
+this existing installer behavior is characterized, not repaired or certified.
 
 The shipped installer requires, but does not enforce, an exclusive publisher. A
 deterministic interleaving test demonstrates two successful publishers can leave
