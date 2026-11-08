@@ -66,14 +66,16 @@ def validate(manifest, lock):
         return False
     locked_names = []
     for edge in edges:
-        if not isinstance(edge, dict) or set(edge) - {"name", "version", "source", "marker"}:
+        if not isinstance(edge, dict) or set(edge) - {"name", "version", "source"}:
             return False
         dep = canonical(edge["name"])
         locked_names.append(dep)
-        targets = [p for p in packages if canonical(p["name"]) == dep
-                   and ("version" not in edge or p.get("version") == edge["version"])
-                   and ("source" not in edge or p.get("source") == edge["source"])]
-        if not targets or any(not isinstance(p.get("version"), str) or not p["version"]
+        targets = [p for p in packages if canonical(p["name"]) == dep]
+        # Forked resolutions and conditional edges need a wider contract.
+        # Require one unconditional target, including any explicit edge pins.
+        if len(targets) != 1 or any(not isinstance(p.get("version"), str) or not p["version"]
+                              or ("version" in edge and p.get("version") != edge["version"])
+                              or ("source" in edge and p.get("source") != edge["source"])
                               or set(p.get("source", {})) != {"registry"}
                               or not isinstance(p["source"]["registry"], str) for p in targets):
             return False
