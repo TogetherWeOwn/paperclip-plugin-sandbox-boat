@@ -38,6 +38,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
+import { CapacityTelemetry, type CapacityReport } from "./capacity-telemetry.js";
 import type { AccountReservation } from "./account-ledger.js";
 import { DEFAULT_API_BASE, PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
@@ -447,6 +448,10 @@ export const SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
 export class BoatVmManager {
   private readonly store: VmStateStore;
   private readonly accountState: StateClientLike;
+  private readonly capacity: CapacityTelemetry;
+  /** A failed state write cannot record its own failure durably. Keep the
+   * company unavailable in this worker until an entire sampling pass succeeds. */
+  private readonly capacityErrors = new Map<string, string>();
   private readonly accountId: string;
   private readonly accounts = new Map<string, AccountLedger>();
   private readonly ssh: SshManager;
@@ -523,6 +528,7 @@ export class BoatVmManager {
     // Without an explicit credential-free account identity, conservatively group
     // this worker's provider clients. Never persist a key or partition by company.
     this.accountState = deps.state;
+    this.capacity = new CapacityTelemetry(deps.state);
     this.accountId = deps.accountId ?? "boat-default-account";
     this.nativeOffload = new SshOffloadRuntime({ state: deps.state, logger: deps.logger, ssh: this.ssh,
       accountId: this.accountId, ...deps.offloadTransport });
@@ -3984,6 +3990,49 @@ export class BoatVmManager {
 
   // ----------------------------------------------------------------- usage
 
+  /** The existing scheduled sweep calls this after cleanup. Reads only provider
+   * limits; persisted observations and warnings are company scoped. */
+  async sampleCapacity(): Promise<void> {
+    const companies = new Set([
+      ...this.offloadBrokers.keys(),
+      ...[...this.configs.values()].map((entry) => entry.companyId),
+      ...(await this.store.companies().catch(() => [] as string[])),
+    ]);
+    await Promise.all([...companies].map(async (companyId) => {
+      let failureReason: "state_unavailable" | "sources_read_failed" = "state_unavailable";
+      try {
+        await this.capacity.maintain(companyId, this.now());
+        failureReason = "sources_read_failed";
+        const sources = await withDeadline(this.nativeOffload.capacitySources(companyId, this.sweepConfigsFor(companyId)),
+          this.offloadUpkeepTimeoutMs, "capacity sources");
+        const reports = await Promise.all(sources.map(async ({ accountKey, api }) => {
+          const reading = await withDeadline(api.limits({}), 3_000, "capacity limits")
+            .then((raw) => ({ raw, failed: false }), () => ({ raw: null, failed: true }));
+          const report = await this.capacity.sample(companyId, accountKey, reading.raw, this.now(), reading.failed ? "limits_read_failed" : undefined);
+          if (report.shouldNotify) this.logger.warn("boat: capacity warning; report to owner before any plan change", { companyId, ...report });
+          return report;
+        }));
+        const stateFailure = reports.flatMap((report) => report.reasons)
+          .find((reason) => reason === "state_write_failed" || reason === "state_unavailable");
+        if (stateFailure) this.capacityErrors.set(companyId, stateFailure);
+        else if (this.capacityErrors.has(companyId)) {
+          const replaced = new Set(reports.map((report) => report.accountId));
+          const stored = await this.capacity.latest(companyId, this.now());
+          // Empty discovery or a different account's success cannot revive
+          // historical evidence whose replacement write failed.
+          if (stored.every((report) => replaced.has(report.accountId) || report.status === "unavailable")) {
+            this.capacityErrors.delete(companyId);
+          }
+        }
+      } catch {
+        this.capacityErrors.set(companyId, failureReason);
+        await this.capacity.markUnavailable(companyId, failureReason, this.now()).catch(() => undefined);
+        // Never log provider error text, which can contain request credentials.
+        this.logger.warn("boat: capacity sampling unavailable", { companyId });
+      }
+    }));
+  }
+
   async usageSummary(companyId: string, options: { refresh?: boolean } = {}): Promise<UsageSummary> {
     let doc = await this.store.read(companyId);
     if (options.refresh) {
@@ -4068,6 +4117,18 @@ export class BoatVmManager {
       entry.runs += vm.runs.length;
       cards.set(cardKey, entry);
     }
+    const capacity = await this.capacity.latest(companyId, this.now())
+      .then((accounts) => {
+        const error = this.capacityErrors.get(companyId) ?? null;
+        return {
+          accounts: error ? accounts.map((report): CapacityReport => ({
+            ...report, status: "unavailable", shouldNotify: false,
+            reasons: [error, ...report.reasons.filter((reason) => reason !== error)],
+          })) : accounts,
+          error,
+        };
+      })
+      .catch(() => ({ accounts: [], error: "state_unavailable" }));
     return {
       companyId,
       generatedAt: this.nowIso(),
@@ -4080,6 +4141,7 @@ export class BoatVmManager {
         running: vms.filter((vm) => vm.status === "running" || vm.status === "starting").length,
       },
       budget: this.budgetObservation(companyId),
+      capacity,
       cards: [...cards.values()].sort((a, b) => b.dollars - a.dollars),
       vms,
     };
@@ -4165,6 +4227,7 @@ export interface UsageSummary {
   note: string;
   totals: { seconds: number; dollars: number; vms: number; runs: number; running: number };
   budget: BudgetObservation | null;
+  capacity: { accounts: CapacityReport[]; error: string | null };
   cards: Array<{ issueId: string | null; vmKey: string; seconds: number; dollars: number; vms: number; runs: number }>;
   vms: Array<Record<string, unknown> & { runs: unknown[] }>;
 }

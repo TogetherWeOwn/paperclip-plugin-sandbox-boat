@@ -219,8 +219,11 @@ describe("install-offload-shims.sh", () => {
     const p = path.join(dir, "pkg");
     mkdirSync(path.join(p, "bin"), { recursive: true });
     mkdirSync(path.join(p, "dist/offload"), { recursive: true });
-    writeFileSync(path.join(p, "bin/boat-offload-cargo"), "");
+    for (const bin of ["boat-offload-cargo", "boat-offload-node", "boat-offload-python"]) {
+      writeFileSync(path.join(p, "bin", bin), "");
+    }
     writeFileSync(path.join(p, "dist/offload/shim-main.js"), "");
+    writeFileSync(path.join(p, "dist/offload/shim-node.js"), "");
     return p;
   }
 

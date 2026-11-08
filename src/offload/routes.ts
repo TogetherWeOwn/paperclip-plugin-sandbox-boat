@@ -190,6 +190,9 @@ export const NODE_PROFILE: ServerProfile = {
   toolchains: [],
   allowRustflags: false,
   runners: ["npm", "pnpm", "yarn", "npx"],
+  // Fresh command HOME cannot find browsers installed in the image builder's
+  // home. Templates provide this root-owned, non-user-writable shared cache.
+  env: { PLAYWRIGHT_BROWSERS_PATH: "/opt/paperclip-boat/ms-playwright" },
 };
 
 /** Python suite profile: pytest and python -m pytest/unittest. */

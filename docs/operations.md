@@ -284,6 +284,10 @@ The shim's own rollback and the native network-policy rollback rules are in [Car
 
 ## Delegated guest template (required for remote offload)
 
+For additional Node/browser and Python toolchains, follow the
+[multi-toolchain template contract](multi-toolchain-template.md) alongside the
+steps below; adding tools does not waive the untouched fresh-boot preflight.
+
 The stock boat image has no cgroup v2 delegation for SSH sessions: session
 scopes sit under `user-1000.slice`, systemd ignores `Delegate=` on slices,
 and the guest preflight therefore returns false. Build a template once, on one
@@ -544,6 +548,49 @@ hold capacity only until their provider TTL plus 10 minutes, then retire as
 * Observations are worker-local and start empty after restart. A changed operations credential, API base or credential source invalidates the environment's observation when its config is next seen; a missing or changed host credential is also checked on usage reads. A pending result from a replaced source is not retained. An unsuccessful probe on an unchanged source keeps the earlier successful observation and its original timestamp. There is no age-based expiry: `at` describes freshness, not a promise of current provider capacity. Usage reads do not fetch provider limits; run an environment probe to update them. The account-wide admission ledger remains independent of these observations.
 * `refresh=0` skips the live usage-meter re-read, not the provenance checks above. By default, run windows read right at a stop are read again, because the meter can lag.
 * `POST .../api/sweep` runs the sweep now.
+
+### Included-capacity telemetry
+
+After lifecycle cleanup, the existing five-minute scheduled job samples Boat
+`limits` for accounts already known through trusted configs/bindings or a
+registered pool whose credential provenance matches. It starts no VM, resolves
+no new company secret and changes no plan, budget or admission gate. Unmarked
+legacy pools and foreign credentials do not authorize account reads. The job
+keeps company-scoped observations for at most eight accounts and 2,560 samples
+per account, with eight-day retention. Only numeric capacity facts and an
+opaque account id are stored, never keys or raw provider payloads.
+
+The usage response adds `capacity: { accounts, error }`. Each account includes
+its observation time, included balance/renewal, start-window and active counts,
+coverage and forecast operands. Included hours come from
+`planIncluded.vmHoursRemaining`, not deprecated credit fields or a partial
+per-run meter; they already use Boat's size-equivalent accounting. Burn is the
+decrease in that account balance, including activity outside this plugin and
+subject to the provider's reporting precision. A new period, changed allowance
+or increasing balance resets history rather than inventing negative burn.
+
+The forecast warns when
+`1.25 * max(last24hHours, avg7dHoursPerDay) * daysRemaining > remainingHours - 5`.
+Both windows need an observation at or up to 15 minutes before their baseline;
+missing windows are explicitly `insufficient`, never an all-clear. A 24-hour
+window alone can raise a conservative warning while seven-day history fills.
+Separately, any minute/hour/day start window or active count at **80% or more**
+of its actual provider cap raises pressure. No plan price or fixed plan cap is
+hard-coded. `canStart=false` is also reported as a warning.
+
+A warning transition, or an unchanged warning after 24 hours, emits a deduplicated
+log hint with its numbers. A read/state failure is unavailable; reports older
+than 15 minutes are stale, even if the last stored observation looked healthy.
+An empty account list means no verified telemetry source, not zero demand.
+`capacity.error` names unreadable telemetry state without hiding the existing
+per-run usage. Reading usage does not trigger new capacity provider calls.
+
+The existing reporting routine should consume the persisted reasons, timestamps
+and numeric operands and relay a triggered warning to the owner. A log hint is
+not proof that a person was notified. Recommend an upgrade only from measured
+need, after distinguishing routing gaps and start churn; any purchase, wallet
+top-up or plan change retains its separate approval. This telemetry adds no host
+automation, duplicate routine, automatic notification card or spend authority.
 
 ## Worker topology and command activity
 

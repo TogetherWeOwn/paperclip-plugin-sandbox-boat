@@ -307,10 +307,11 @@ function profileForId(profileId: string): ServerProfile | null {
   return null;
 }
 
-/** Server-owned guest build env for a command's profile; Node/Python stay empty. */
+/** Server-owned guest build env; never copied from the host environment. */
 export function profileGuestEnv(command: OffloadCommand): Record<string, string> {
-  if ((command.tool ?? "cargo") !== "cargo") return {};
-  return { ...(profileForId(command.profileId)?.env ?? {}) };
+  const profile = profileForId(command.profileId);
+  if (profile?.tool !== (command.tool ?? "cargo")) return {};
+  return { ...(profile?.env ?? {}) };
 }
 
 /** Path-bearing flags whose values must resolve inside the workspace. */
@@ -397,6 +398,36 @@ export class SshOffloadRuntime {
   /** True when this run/workspace already has a native binding (whole-run realization wins). */
   has(companyId: string, runId: string, workspaceId: string): boolean {
     return this.bindings.has(key(companyId, runId, workspaceId));
+  }
+
+  /** Read-only account clients from trusted bindings/configs or verified pool
+   * provenance. Never resolve a company secret or invent a host-account binding. */
+  async capacitySources(companyId: string, configs: BoatDriverConfig[] = []): Promise<Array<{ accountKey: string; api: BoatApiLike }>> {
+    const sources = new Map<string, BoatApiLike>();
+    const seenCredentials = new Set<string>(); // call-local only; never persisted or logged
+    const candidates = [...configs, ...[...this.bindings.values()]
+      .filter((binding) => binding.companyId === companyId).map((binding) => binding.config)];
+    for (const config of candidates) {
+      if (sources.size >= 8) break;
+      // A keyless realization has not captured account provenance yet. A later
+      // host-key rotation must not enroll its company in the new account.
+      if (typeof config.apiKey !== "string" || !config.apiKey.trim()) continue;
+      const bound = { ...config, apiKey: resolveApiKey(config) };
+      const credential = `${bound.apiBase}\u0000${bound.apiKey}`;
+      if (seenCredentials.has(credential)) continue;
+      seenCredentials.add(credential);
+      const digest = await poolCredentialDigest(bound);
+      if (!sources.has(digest)) sources.set(digest, this.deps.boat?.(bound) ?? boatApi({ apiKey: bound.apiKey, apiBase: bound.apiBase }));
+    }
+    const registry = await this.deps.state.get(poolRegistryScope(companyId)) as PoolRegistry | null;
+    for (const entry of Object.values(registry ?? {})) {
+      if (sources.size >= 8) break;
+      const digest = entry?.credentialDigest;
+      if (typeof digest !== "string" || sources.has(digest)) continue;
+      const api = await this.poolBoatFor(companyId, digest, () => configs);
+      if (api) sources.set(digest, api);
+    }
+    return [...sources].map(([accountKey, api]) => ({ accountKey, api }));
   }
 
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */

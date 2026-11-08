@@ -59,11 +59,48 @@ describe("node/python guest prepare", () => {
     expect(input.args).toEqual(["run", "test"]);
   });
 
-  it("rejects any env on node/python commands", async () => {
-    const { guest, ssh } = stubGuest();
-    await expect(guest.prepare("vm-1", command({ env: { FOO: "bar" } })))
-      .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
-    expect(ssh.runStream).not.toHaveBeenCalled();
+  it.each(["FOO", "PLAYWRIGHT_BROWSERS_PATH", "HOME"])("rejects agent-supplied %s on node/python commands", async (key) => {
+    for (const tool of ["node", "python"] as const) {
+      const { guest, ssh } = stubGuest();
+      await expect(guest.prepare("vm-1", command({ tool, env: { [key]: "/host/cache" } })))
+        .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+      expect(ssh.runStream).not.toHaveBeenCalled();
+    }
+  });
+
+  it("uses the template browser cache with a fresh HOME for each Node command", async () => {
+    const { guest, seen } = stubGuest();
+    await guest.prepare("vm-1", command());
+    await guest.prepare("vm-1", command({ commandId: "83c315cf-16d6-49c9-8da0-f182cd898b9e" }));
+    const first = (seen[0] as { env: Record<string, string> }).env;
+    const second = (seen[1] as { env: Record<string, string> }).env;
+    expect(first.PLAYWRIGHT_BROWSERS_PATH).toBe("/opt/paperclip-boat/ms-playwright");
+    expect(second.PLAYWRIGHT_BROWSERS_PATH).toBe(first.PLAYWRIGHT_BROWSERS_PATH);
+    expect(first.HOME).not.toBe(second.HOME);
+    expect(Object.keys(first).sort()).toEqual(["CARGO_HOME", "HOME", "PLAYWRIGHT_BROWSERS_PATH"]);
+    expect(profileGuestEnv(command({ tool: "python", profileId: "python-public-1" }))).toEqual({});
+    expect(profileGuestEnv(command({ tool: "cargo", profileId: "rust-public-1" })))
+      .not.toHaveProperty("PLAYWRIGHT_BROWSERS_PATH");
+  });
+
+  it("never derives the browser cache path from the host environment", async () => {
+    vi.stubEnv("PLAYWRIGHT_BROWSERS_PATH", "/host/private-browser-cache");
+    try {
+      const { guest, seen } = stubGuest();
+      await guest.prepare("vm-1", command());
+      const env = (seen[0] as { env: Record<string, string> }).env;
+      expect(env.PLAYWRIGHT_BROWSERS_PATH).toBe("/opt/paperclip-boat/ms-playwright");
+      expect(JSON.stringify(seen)).not.toContain("/host/private-browser-cache");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not copy profile env to an unknown or mismatched tool/profile pair", () => {
+    expect(profileGuestEnv(command({ profileId: "unknown" }))).toEqual({});
+    expect(profileGuestEnv(command({ tool: "python" }))).toEqual({});
+    expect(profileGuestEnv(command({ tool: "cargo" }))).toEqual({});
+    expect(profileGuestEnv(command({ profileId: "rust-public-1" }))).toEqual({});
   });
 
   it("keeps the cargo env contract", async () => {
@@ -89,9 +126,10 @@ describe("node/python guest prepare", () => {
     expect(env.CARGO_HOME).toMatch(/^\/tmp\/paperclip-boat-toolchain-[0-9a-f]{32}\/cargo$/);
     expect(env.CARGO_HOME.startsWith(env.HOME)).toBe(false);
     expect(Object.keys(env).sort()).toEqual(["CARGO_HOME", "CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_TEST_DEBUG", "CARGO_TERM_COLOR", "HOME"]);
-    // Node commands never pick up the cargo profile env (only HOME/CARGO_HOME).
+    // Node commands get only their own fixed browser path, never Cargo settings.
     await guest.prepare("vm-1", command());
-    expect(Object.keys((seen[1] as { env: Record<string, string> }).env).sort()).toEqual(["CARGO_HOME", "HOME"]);
+    expect(Object.keys((seen[1] as { env: Record<string, string> }).env).sort())
+      .toEqual(["CARGO_HOME", "HOME", "PLAYWRIGHT_BROWSERS_PATH"]);
   });
 
   it("primes the guest cache with a fixed fetch before an offline prepare", async () => {

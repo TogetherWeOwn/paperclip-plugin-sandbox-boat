@@ -59,12 +59,21 @@ Pool creates carry the reservation id as the `Idempotency-Key`, so a create whos
 
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
+The [multi-toolchain template contract](multi-toolchain-template.md) defines the
+source-free image and fresh-boot evidence required before enabling these profiles.
+`node-public-1` sets the server-owned
+`PLAYWRIGHT_BROWSERS_PATH=/opt/paperclip-boat/ms-playwright`, so browsers must be
+installed there, root-owned and non-writable by the SSH user, rather than in the
+image builder's HOME. It never forwards a host browser path; callers still cannot
+supply environment keys on Node/Python requests. The browser key is not set for
+Rust or Python. This contract is not a claim that a template is qualified.
+
 Rust offload above extends to long Node and Python commands on two more server
 profiles: `node-public-1` (npm/pnpm/yarn scripts and test binaries such as
 `vitest run`, `jest`, `playwright test`, `next build`) and `python-public-1`
 (`pytest` and `python -m pytest|unittest` suites). Install the shim as
 `npm`/`pytest`/etc. ahead of the real executable for opted-in runs
-(`BOAT_OFFLOAD=1`); anything else runs locally. Diagnostics work the same:
+(`BOAT_OFFLOAD=1`); anything else runs locally. `scripts/install-offload-shims.sh <staged package dir> <shim dir>` links `cargo`, `npm`/`pnpm`/`yarn`/`npx` and `pytest`/`python`/`python3` to the matching bins. It checks the whole package and every destination first, refuses a non-symlink destination, and replaces each link with one rename, so a refused run changes nothing. Diagnostics work the same:
 `boat-offload-node --dry-run -- run test`. Only profile `rust-public-1` is
 enabled by default; add profiles explicitly:
 
