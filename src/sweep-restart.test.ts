@@ -313,7 +313,7 @@ describe("sweep after a worker restart", () => {
     expect(fake.callsOf("stop").map((call) => call.args.sandboxId)).not.toContain(box.id);
   });
 
-  it("expires a durable reservation after failed pool saves without a new command or pool document", async () => {
+  it("reaps an absent pool after settling a definitively never-attempted start", async () => {
     const root = await mkdtemp(join(tmpdir(), "absent-offload-pool-"));
     const api = fake as unknown as BoatApiLike;
     const accountId = "account-absent-pool";
@@ -347,10 +347,12 @@ describe("sweep after a worker restart", () => {
       const executor = await runtime.resolve(input, { offloadExecutorEnabled: true, offloadGuestTransportEnabled: true,
         offloadCgroupParent: "/sys/fs/cgroup/test", offloadArtifactRoot: join(root, "artifacts"), offloadAllowedRepos: [input.repoId] });
       if (isExecutorRefusal(executor)) throw new Error(executor.refusalReason);
-      expect(await executor.execute(input)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("reservation retained") });
+      expect(await executor.execute(input)).toMatchObject({ status: "unavailable", reason: "provider rejected start; no command dispatched",
+        remoteStarted: false, fallbackSafe: true });
       expect(poolFailures).toBeGreaterThanOrEqual(2);
       expect(fake.callsOf("create")).toEqual([]);
-      // The dying worker cannot flush its quarantined placeholder either.
+      // Pool persistence failed before any provider attempt. The account
+      // settlement is durable even though the worker cannot flush its pool.
       await expect(runtime.shutdown()).rejects.toThrow("pool-only write outage");
       const registry = await harness.ctx.state.get(registryScope) as Record<string, unknown>;
       const [poolId] = Object.keys(registry);
@@ -360,8 +362,8 @@ describe("sweep after a worker restart", () => {
       const account = () => [...harness.state.entries()].find(([key]) => key.includes("|boat-account|"))?.[1] as {
         intents: Array<{ active: boolean; status: string; sandboxId: string | null; compute: number; computeReflected: number; ttlSeconds: number }>;
       };
-      expect(account().intents).toEqual([expect.objectContaining({ active: true, status: "ambiguous", sandboxId: null })]);
-      expect(account().intents[0]!.compute).toBeGreaterThan(0);
+      expect(account().intents).toEqual([expect.objectContaining({ active: false, status: "rejected", sandboxId: null })]);
+      expect(account().intents[0]!.compute).toBe(0);
       expect(account().intents[0]!.ttlSeconds).toBeGreaterThanOrEqual(60);
       // No whole-run config, new admission or loaded-pool recovery can help.
       expect(await harness.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "boat-sandbox", stateKey: "sweep-configs" })).toBeNull();
@@ -373,17 +375,13 @@ describe("sweep after a worker restart", () => {
       await restarted.sweep([companyId]); // compact the ended command to a tombstone
       clock += 31 * 86_400_000; // funded TTL + margin, token and tombstone retention
       vi.setSystemTime(clock);
-      // A missing or foreign credential/endpoint still cannot settle the hold.
-      for (const config of [{}, { apiKey: "wrong-account" }, { apiKey: fakeKey, apiBase: "https://other-provider.invalid" }]) {
-        delete process.env.BOAT_API_KEY;
-        await expect(restarted.sweep([companyId], { configsFor: () => [parseDriverConfig(config)] }))
-          .rejects.toThrow("Offload pool sweep unverified");
-        expect(account().intents[0]).toMatchObject({ active: true, status: "ambiguous" });
-        expect(await harness.ctx.state.get(registryScope)).toEqual(registry);
-      }
-      process.env.BOAT_API_KEY = fakeKey;
+      // No VM was ever attempted and all accounting is durably settled.
+      // Retention can reap this empty pool without provider credentials;
+      // unlike an uncertain start, it needs no provider deletion proof.
+      const callsBeforeRetention = [...fake.calls];
       await restarted.sweep([companyId]);
-      expect(account().intents[0]).toMatchObject({ active: false, status: "stopped", compute: 0 });
+      expect(fake.calls).toEqual(callsBeforeRetention);
+      expect(account().intents[0]).toMatchObject({ active: false, status: "rejected", compute: 0 });
       expect(await harness.ctx.state.get(registryScope)).toEqual({});
       await restarted.sweep([companyId]);
       await expect(store.loadDoc()).rejects.toThrow("OFFLOAD_POOL_ABSENT");
@@ -905,6 +903,44 @@ describe("sweep after a worker restart", () => {
         expect((await store.load()).find((vm) => vm.sandboxId === sandboxId)).toBeUndefined();
         expect(await journalState()).toMatchObject({ state: "unknown" });
         expect((await journalState())?.resultAt).not.toBeNull();
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
+    it.each([false, true])("sweeps a terminal lost-create placeholder of an unloaded pool without a POST (known id=%s)", async (known) => {
+      const lostId = "bx_lostcreate0001";
+      const ledger = new AccountLedger(harness.ctx.state, accountId, () => clock);
+      const reservation = await ledger.reserve(fake as unknown as BoatApiLike, { operation: "create", size: "default" as never,
+        poolId, jobSeconds: 60, tailSeconds: 15, maxActive: 2, maxStartsPerDay: 100, minComputeHoursLeft: 0 });
+      if (known) {
+        fake.addSandbox({ id: lostId, state: "archived" });
+        await ledger.started(fake as unknown as BoatApiLike, reservation, lostId);
+      }
+      await ledger.failed(reservation, true);
+      const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+      await store.save({ maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+        [{ sandboxId: "", busy: false, stopped: false, stopping: false, quarantined: true, lastActiveAt: clock - 60_000,
+          generation: 1, idleHandle: null, stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null,
+          accountReservation: reservation }]);
+      await harness.ctx.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+        { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-account", seenAt: clock - 60_000,
+          credentialDigest: poolDigestOf(keyA) } });
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+      try {
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
+        if (known) {
+          // The first sweep durably takes the known identity; deletion follows.
+          expect(await store.load()).toMatchObject([{ sandboxId: lostId, quarantined: true, deletePending: true }]);
+          expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+          await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
+        }
+        expect(await store.load()).toEqual([]);
+        expect(fake.callsOf("create")).toHaveLength(0);
+        expect(fake.callsOf("fork")).toHaveLength(0);
+        expect(fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual(known ? [lostId] : []);
       } finally {
         await runtime.shutdown();
       }

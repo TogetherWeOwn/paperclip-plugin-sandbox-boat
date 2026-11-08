@@ -524,6 +524,7 @@ export class OffloadExecutor {
     await this.durable?.settlePending().catch(() => undefined);
     await this.retryFinishAccounting();
     await this.withAdmission(async () => {
+      await this.sweepTerminalPlaceholders();
       for (const vm of [...this.pool]) {
         // A pending ephemeral delete is quarantined against reuse, but sweep
         // still owns retrying it: skipped, it would bill until provider TTL.
@@ -1096,6 +1097,46 @@ export class OffloadExecutor {
   }
 
   /**
+   * A terminal retained create needs no same-key POST (sweep only queues the delete; its main loop retries it once). Without a known sandbox
+   * the placeholder is simply retired. With one, the archived sandbox may still
+   * hold a disk: durably take delete ownership first, then try the delete; a
+   * failure leaves it quarantined with deletePending for sweep to retry.
+   * Returns true once the placeholder no longer occupies the pool.
+   */
+  private async settleTerminalPlaceholder(vm: PoolVm, sandboxId?: string, attemptDelete = true): Promise<boolean> {
+    if (!sandboxId) {
+      this.retireVm(vm);
+      await this.persistPool().catch(() => undefined);
+      return true;
+    }
+    vm.sandboxId = sandboxId;
+    vm.pendingCreate = undefined;
+    vm.quarantined = true;
+    vm.deletePending = true;
+    vm.busy = false;
+    // Ownership must be durable before any delete; a write failure retains the
+    // in-memory owner and skips the delete (the placeholder is reloaded next time).
+    try { await this.persistPool(); } catch { return false; }
+    if (!attemptDelete) return false;
+    const deleted = await this.retryPendingDelete(vm);
+    await this.persistPool().catch(() => undefined);
+    return deleted;
+  }
+
+  /** Runs under admission. Resolves every workspace's terminal empty-ID
+   * placeholder (never POSTs, never touches another scope: recoverCreate only
+   * reads intents this ledger owns). Pending or unreadable intents stay held. */
+  private async sweepTerminalPlaceholders(): Promise<void> {
+    for (const vm of [...this.pool]) {
+      if (!vm.quarantined || vm.sandboxId !== "" || !vm.accountReservation || vm.busy) continue;
+      let recovered: Awaited<ReturnType<AccountLedger["recoverCreate"]>>;
+      try { recovered = await this.ledger.recoverCreate(vm.accountReservation); }
+      catch { continue; }
+      if (recovered.status === "terminal") await this.settleTerminalPlaceholder(vm, recovered.sandboxId, false);
+    }
+  }
+
+  /**
    * Adopt (or stop) a create whose reply was lost, replayed under the same
    * idempotency key. A compatible retry adopts the VM and runs on it; an
    * incompatible one stops it and frees the slot. Null keeps the uncertain
@@ -1113,47 +1154,74 @@ export class OffloadExecutor {
     // was so the replay resends the closest body to the lost create.
     const legacyJobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
     const legacyTtlSeconds = Math.max(60, Math.ceil(legacyJobSeconds + reservation.tailSeconds));
+    // The retained create intent is the durable truth. A terminal intent (stale
+    // hold expired, or stopped/rejected) proves nothing is left to replay: retire
+    // the placeholder and free the slot without any same-key POST. A running
+    // receipt saved before the pool learned the identity supplies the sandbox id
+    // directly. Unknown or missing intents throw and keep the uncertain hold.
+    let recovered: Awaited<ReturnType<AccountLedger["recoverCreate"]>>;
+    try {
+      recovered = await ledger.recoverCreate(reservation);
+    } catch {
+      return null;
+    }
+    if (recovered.status === "terminal") {
+      return await this.settleTerminalPlaceholder(vm, recovered.sandboxId) ? { kind: "freed" } : null;
+    }
     let id: string;
     let response: unknown = null;
     try {
-      // Same key + same body: replay the exact persisted create body. A
-      // provider that refuses a mismatched body proves nothing about the lost
-      // create, so only the persisted body is ever resent. Placeholders that
-      // predate the persisted body fall back to the current config.
-      const pending = vm.pendingCreate;
-      if (pending?.kind === "fork" && pending.sourceSandboxId) {
-        response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
-          ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
-          noEnv: pending.noEnv, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("fork returned no sandbox id");
-        id = replayed;
-      } else if (pending) {
-        response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
-          monitoring: pending.monitoring, failFast: pending.failFast, noEnv: pending.noEnv,
-          ...(pending.from ? { from: pending.from } : {}), idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
-      } else if (this.config.templateSnapshot) {
-        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
-          monitoring: this.config.monitoring, failFast: true, noEnv: true,
-          from: this.config.templateSnapshot, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
-      } else if (this.config.templateSourceSandboxId) {
-        response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
-          ttlSeconds: legacyTtlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("fork returned no sandbox id");
-        id = replayed;
+      if (recovered.status === "running") {
+        id = recovered.sandboxId;
       } else {
-        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
-          monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
+        // Same key + same body: replay the exact persisted create body. A
+        // provider that refuses a mismatched body proves nothing about the lost
+        // create, so only the persisted body is ever resent. Placeholders that
+        // predate the persisted body fall back to the current config.
+        const pending = vm.pendingCreate;
+        const replayTtl = pending?.ttlSeconds ?? legacyTtlSeconds;
+        const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+        // Idempotency prevents duplication, not a first effect: the original
+        // request may never have reached the provider. Refuse without releasing
+        // uncertainty if current included capacity cannot fund the exact replay.
+        await ledger.revalidateReplay(this.boat, reservation, { ...this.config, operation: "create",
+          size: pending?.type ?? this.config.size, poolId: this.poolId,
+          jobSeconds: replayTtl - reservation.tailSeconds, tailSeconds: reservation.tailSeconds,
+          ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) }, replayTtl);
+        if (pending?.kind === "fork" && pending.sourceSandboxId) {
+          response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
+            ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
+            noEnv: pending.noEnv, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("fork returned no sandbox id");
+          id = replayed;
+        } else if (pending) {
+          response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
+            monitoring: pending.monitoring, failFast: pending.failFast, noEnv: pending.noEnv,
+            ...(pending.from ? { from: pending.from } : {}), idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        } else if (this.config.templateSnapshot) {
+          response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+            monitoring: this.config.monitoring, failFast: true, noEnv: true,
+            from: this.config.templateSnapshot, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        } else if (this.config.templateSourceSandboxId) {
+          response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+            ttlSeconds: legacyTtlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("fork returned no sandbox id");
+          id = replayed;
+        } else {
+          response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+            monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        }
       }
     } catch (error) {
       if (!await definitiveStartRejection(error)) return null;
@@ -1318,6 +1386,14 @@ export class OffloadExecutor {
     const jobSeconds = this.fundedJobSeconds(command);
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
       stopping: false, stopRequestedAt: null, identity: null, compatibilityKey: this.compatibilityKey(command) };
+    // reserveVm clears the idle deadline/timer and the ledger reservation
+    // supersedes the predecessor's tail. Keep what a definitive pre-effect
+    // refusal must put back; failed(reservation, true) restores the ledger side.
+    const predecessor = existing ? {
+      busy: vm.busy, workspaceKey: vm.workspaceKey, stopDueAt: vm.stopDueAt, stopRequestedAt: vm.stopRequestedAt,
+      stopObservedAt: vm.stopObservedAt, stopAttempts: vm.stopAttempts, accountReservation: vm.accountReservation,
+      tailSeconds: vm.tailSeconds, stopFailure: this.stopFailures.has(vm.sandboxId),
+    } : null;
     this.reserveVm(vm, command);
     vm.accountReservation = reservation;
     vm.tailSeconds = reservation.tailSeconds;
@@ -1325,7 +1401,8 @@ export class OffloadExecutor {
     // Funded whole seconds at or above the enforced minimum, so the enforced
     // deadline below equals the funded envelope exactly.
     const ttlSeconds = Math.max(60, Math.ceil(jobSeconds + reservation.tailSeconds));
-    let effectConfirmed = operation === "warm";
+    let effectConfirmed = false;
+    let effectAttempted = false;
     // The replay contract is same key + same body. Fix the exact body before
     // the first persist so a lost reply (or a restart before the receipt)
     // replays it verbatim instead of rebuilding it from a newer command.
@@ -1342,9 +1419,20 @@ export class OffloadExecutor {
     if (pending) vm.pendingCreate = pending;
     try {
       await this.persistPool();
+      // Caller persistence can outlive the limits snapshot validated by reserve.
+      // Refresh the same retained intent before marking any provider effect attempted.
+      const observationAge = reservation.observedAt == null ? Infinity : this.now() - reservation.observedAt;
+      if (observationAge < 0 || observationAge > 5000) {
+        const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+        await ledger.revalidate(this.boat, reservation, { ...this.config, operation, sandboxId: existing?.sandboxId,
+          poolId: this.poolId, jobSeconds, tailSeconds: reservation.tailSeconds,
+          ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) });
+      }
       // Taken before the provider call: the provider deadline it sets is no
       // earlier than fundedFrom + ttlSeconds.
       const fundedFrom = this.now();
+      ledger.assertDispatchable(reservation, ttlSeconds);
+      effectAttempted = true;
       if (operation === "create") {
         // Same semantics as whole-run leases (vm-manager): a configured named
         // snapshot is the guest image; a missing one is a refused start, so the
@@ -1385,19 +1473,46 @@ export class OffloadExecutor {
       vm.tailSeconds = await ledger.started(this.boat, reservation, vm.sandboxId);
       // A metered resume may select C=300. Keep provider auto-stop aligned with
       // the longer, already-funded reservation before starting the command.
-      if (vm.tailSeconds > reservation.tailSeconds) await this.boat.update({ sandboxId: vm.sandboxId,
-        ttlSeconds: Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds)) });
+      if (vm.tailSeconds > reservation.tailSeconds) {
+        const extendedTtl = Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds));
+        let extend = true;
+        try { ledger.assertDispatchable(reservation, extendedTtl); }
+        catch {
+          // No update was attempted. Persistence may consume the optional
+          // extension's headroom without invalidating the original deadline.
+          await ledger.restoreTail(reservation);
+          vm.tailSeconds = reservation.tailSeconds;
+          extend = false;
+        }
+        if (extend) await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds: extendedTtl });
+      }
       await this.persistPool();
       return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
     } catch (error) {
-      const definitive = !effectConfirmed && await definitiveStartRejection(error);
+      const definitive = !effectConfirmed && (!effectAttempted || await definitiveStartRejection(error));
       await ledger.failed(reservation, definitive).catch(() => {
         // The original durable intent remains held. No command was dispatched;
         // a failing follow-up write must not poison the idempotency receipt.
         this.logger.error("boat offload start reconciliation persistence failed; intent retained");
       });
       vm.busy = false;
-      if (definitive) vm.workspaceKey = null;
+      if (predecessor && definitive) {
+        // Known no-effect refusal: the predecessor is exactly as before, with
+        // its original absolute idle deadline re-armed (an overdue one fires
+        // immediately). Generation stays advanced so old callbacks stay stale.
+        vm.workspaceKey = predecessor.workspaceKey;
+        vm.stopRequestedAt = predecessor.stopRequestedAt;
+        vm.stopObservedAt = predecessor.stopObservedAt;
+        vm.stopAttempts = predecessor.stopAttempts;
+        vm.accountReservation = predecessor.accountReservation;
+        vm.tailSeconds = predecessor.tailSeconds;
+        vm.stopDueAt = predecessor.stopDueAt;
+        if (predecessor.stopFailure) this.stopFailures.add(vm.sandboxId);
+        this.clearIdleTimer(vm);
+        if (vm.stopDueAt !== null && !vm.stopped && !vm.stopping && !vm.quarantined && !this.closed) {
+          this.scheduleIdleStop(vm, vm.generation, Math.max(0, vm.stopDueAt - this.now()));
+        }
+      } else if (definitive) vm.workspaceKey = null;
       if (!definitive) vm.quarantined = true;
       else if (!existing) this.retireVm(vm);
       await this.persistPool().catch(() => { vm.quarantined = true; });

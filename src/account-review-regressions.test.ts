@@ -3,7 +3,7 @@ import { AccountLedger } from "./account-ledger.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { responseError } from "./test-support/fake-boat.js";
 import {
-  COMPANY, EPOCH, advance, command, fixture, limits, reconcile, starts, usage,
+  COMPANY, EPOCH, advance, command, fixture, includedPlan, limits, reconcile, starts, usage,
 } from "./test-support/account-admission.fixture.js";
 
 // Regression probes for the account-admission review findings. Each case
@@ -138,7 +138,7 @@ describe("funding and accounting", () => {
     // 16 s of timeout+tail plus the 1 h reserve fits 3705, but the enforced
     // 106 s envelope (1 s + 90 s pre-start allowance + 15 s tail) does not:
     // admission must refuse without dispatching.
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3705 });
+    f.boat.limitsResponse = limits({ planIncluded: includedPlan(3705) });
     const p = f.pool();
     expect(await p.execute(command("tiny", { timeoutMs: 1_000 }))).toMatchObject({ status: "unavailable" });
     expect(f.boat.callsOf("create")).toHaveLength(0);
@@ -174,9 +174,9 @@ describe("funding and accounting", () => {
 
   it("runs the command with the funded tail when the metered upgrade does not fit", async () => {
     const p = await stoppedPool();
-    f.boat.limitsResponse = limits({ starts: starts(0), creditBalanceSeconds: 3959 });
+    f.boat.limitsResponse = limits({ starts: starts(0), planIncluded: includedPlan(3959) });
     f.boat.failNext("resume", () => {
-      f.boat.limitsResponse = limits({ starts: starts(1), creditBalanceSeconds: 3959 });
+      f.boat.limitsResponse = limits({ starts: starts(1), planIncluded: includedPlan(3959) });
       return null;
     });
     // The resume counted against the daily starts, but 285 s of extra C=300

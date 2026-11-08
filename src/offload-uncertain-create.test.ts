@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { BoatApiLike } from "./boat-client.js";
 import { OffloadExecutor } from "./offload.js";
+import { OffloadPoolStore } from "./offload-pool.js";
 import type { OffloadCommand, OffloadDeps } from "./offload.js";
 import { FakeBoat, responseError, trialLimits } from "./test-support/fake-boat.js";
 import { JsonState } from "./test-support/account-admission.fixture.js";
@@ -33,17 +34,25 @@ function setup(runCommand: OffloadDeps["runCommand"] = async () => ({ exitCode: 
   const fake = new FakeBoat({ now });
   const timers = new Map<number, { at: number; cb: () => void }>();
   let serial = 0;
-  const executor = new OffloadExecutor({
-    ...account,
-    boat: fake as unknown as BoatApiLike,
-    logger: { info() {}, warn() {}, error() {} },
-    now,
-    timers: { set: (cb: () => void, ms: number) => { const id = ++serial; timers.set(id, { at: clock.t + ms, cb }); return id; },
-      clear: (handle: unknown) => { timers.delete(handle as number); } },
-    config: { maxOffloadVms: 1, offloadIdleStopSeconds: 15, queueLimit: 0, ...config },
-    runCommand,
-  });
-  return { executor, fake, account, clock };
+  // `durablePool` wires the pool store the harness otherwise omits, so a
+  // second executor over the same state models a process restart.
+  const open = (durablePool = false) => {
+    const opened = new OffloadExecutor({
+      ...account,
+      boat: fake as unknown as BoatApiLike,
+      logger: { info() {}, warn() {}, error() {} },
+      now,
+      timers: { set: (cb: () => void, ms: number) => { const id = ++serial; timers.set(id, { at: clock.t + ms, cb }); return id; },
+        clear: (handle: unknown) => { timers.delete(handle as number); } },
+      config: { maxOffloadVms: 1, offloadIdleStopSeconds: 15, queueLimit: 0, ...config },
+      runCommand,
+    });
+    if (durablePool) (opened as unknown as { poolStore: OffloadPoolStore }).poolStore =
+      new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    return opened;
+  };
+  const executor = open();
+  return { executor, fake, account, clock, open };
 }
 
 function ledgerDoc(s: ReturnType<typeof setup>) {
@@ -75,6 +84,42 @@ describe("offload uncertain create", () => {
     const [id] = [...s.fake.boxes.keys()];
     expect(second).toMatchObject({ sandboxId: id });
     expect(s.fake.callsOf("stop")).toHaveLength(0);
+  });
+
+  it.each([
+    { nextStartDollars: 0.01 },
+    { planIncluded: undefined },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 0, periodEnd: new Date(EPOCH + 86_400_000) } },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 25, periodEnd: new Date(EPOCH) } },
+  ])("never replays a request lost before the provider when current included admission refuses: %j", async (overrides) => {
+    const s = setup();
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    expect(await s.executor.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.size).toBe(0);
+    const original = ledgerDoc(s).intents[0]!.id;
+    s.fake.limitsResponse = trialLimits(overrides);
+    expect(await s.executor.execute(command("cmd-refused"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("create")).toHaveLength(1);
+    expect(s.fake.boxes.size).toBe(0);
+    expect(ledgerDoc(s).intents[0]!.id).toBe(original);
+    expect(ledgerDoc(s).intents[0]!.status).toBe("ambiguous");
+    s.fake.limitsResponse = trialLimits();
+    expect(await s.executor.execute(command("cmd-recovered"))).toMatchObject({ status: "completed" });
+    expect(s.fake.callsOf("create")[1]!.args.idempotencyKey).toBe(s.fake.callsOf("create")[0]!.args.idempotencyKey);
+    expect(s.fake.boxes.size).toBe(1);
+  });
+
+  it("retains renewed replay funding when the replay itself loses its reply", async () => {
+    const s = setup();
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    await s.executor.execute(command("cmd-lost"));
+    s.clock.t += 120_000;
+    s.fake.failNext("create", () => new Error("synthetic replay reply lost"));
+    expect(await s.executor.execute(command("cmd-retry"))).toMatchObject({ status: "unavailable" });
+    // Original timeout 120 + preparation 90 + tail 15, plus elapsed 120.
+    expect(ledgerDoc(s).intents[0]!.ttlSeconds).toBe(345);
+    expect(ledgerDoc(s).intents[0]!.status).toBe("ambiguous");
+    expect(s.fake.callsOf("create")[1]!.args).toEqual(s.fake.callsOf("create")[0]!.args);
   });
 
   it("an incompatible retry stops the replayed VM and frees the slot", async () => {
@@ -198,9 +243,9 @@ describe("offload uncertain create", () => {
     expect(rows.filter((row) => row.kind === "failed_start").map((row) => row.commandId)).toEqual(["cmd-1"]);
   });
 
-  it("adopts a compatible replay without charging a second active slot at maxActive=1", async () => {
-    // The lost VM already occupies the single provider slot. Adoption reuses
-    // it warm, so no second create slot is admitted.
+  it("retains uncertainty when current capacity cannot fund a possible first-effect replay", async () => {
+    // A same-key POST might be the first request that reaches the provider.
+    // Without read-only key lookup, a full account cannot safely replay it.
     const s = setup(undefined, { maxActive: 1 });
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
@@ -208,9 +253,10 @@ describe("offload uncertain create", () => {
     s.fake.limitsResponse = trialLimits({ activeSandboxes: 1 });
     const second = await s.executor.execute(command("cmd-2"));
     const [id] = [...s.fake.boxes.keys()];
-    expect(second).toMatchObject({ status: "completed", warm: "cold", sandboxId: id });
+    expect(second).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.has(id!)).toBe(true);
     expect(s.fake.boxes.size).toBe(1);
-    expect(s.fake.callsOf("create")).toHaveLength(2);
+    expect(s.fake.callsOf("create")).toHaveLength(1);
     expect(s.fake.callsOf("stop")).toHaveLength(0);
   });
 
@@ -371,5 +417,71 @@ describe("offload uncertain create", () => {
     expect(s.fake.callsOf("stop")).toHaveLength(3);
     expect(s.fake.boxes.size).toBe(1);
     expect(third).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
+  });
+
+  // F3: an empty-ID placeholder whose intent is durably settled (stale TTL
+  // expiry or an explicit rejection) must retire and free the pool without
+  // any same-key replay, in process and across a restart.
+  type Internals = { pool: Array<{ sandboxId: string; accountReservation?: unknown }>; ledger: {
+    failed(r: unknown, definitive: boolean): Promise<void>; started(api: unknown, r: unknown, id: string): Promise<number> } };
+  const internals = (executor: OffloadExecutor) => executor as unknown as Internals;
+
+  it.each([false, true])("retires a request lost before the provider once its hold is stale, without replay (restart=%s)", async (restart) => {
+    const s = setup();
+    const first = s.open(true);
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    expect(await first.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.size).toBe(0);
+    const lostKey = s.fake.callsOf("create")[0]!.args.idempotencyKey;
+    // Past the funded TTL (225 s) plus the 10 minute stale-hold margin.
+    s.clock.t += 225_000 + 10 * 60_000 + 60_000;
+    const executor = restart ? s.open(true) : first;
+
+    expect(await executor.execute(command("cmd-after"))).toMatchObject({ status: "completed" });
+    const creates = s.fake.callsOf("create");
+    // Exactly one more create, and it is a fresh allocation, not a replay.
+    expect(creates).toHaveLength(2);
+    expect(creates[1]!.args.idempotencyKey).not.toBe(lostKey);
+    expect(s.fake.boxes.size).toBe(1);
+    expect(internals(executor).pool.filter((vm) => vm.sandboxId === "")).toHaveLength(0);
+    expect(ledgerDoc(s).intents.find((i) => i.operation === "create")?.status).toBe("stopped");
+  });
+
+  it.each([false, true])("retires a placeholder whose intent was durably rejected, without replay (restart=%s)", async (restart) => {
+    const s = setup();
+    const first = s.open(true);
+    s.fake.failNext("create", () => new Error("synthetic request lost before provider effect"));
+    expect(await first.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    const [placeholder] = internals(first).pool;
+    // The definitive rejection landed in the ledger but the retire never persisted.
+    await internals(first).ledger.failed(placeholder!.accountReservation, true);
+    expect(ledgerDoc(s).intents[0]!.status).toBe("rejected");
+    const executor = restart ? s.open(true) : first;
+
+    expect(await executor.execute(command("cmd-after"))).toMatchObject({ status: "completed" });
+    const creates = s.fake.callsOf("create");
+    expect(creates).toHaveLength(2);
+    expect(creates[1]!.args.idempotencyKey).not.toBe(creates[0]!.args.idempotencyKey);
+    expect(s.fake.boxes.size).toBe(1);
+    expect(internals(executor).pool.filter((vm) => vm.sandboxId === "")).toHaveLength(0);
+  });
+
+  it.each([false, true])("recovers the sandbox of a running receipt saved before the pool identity, without a same-key POST (restart=%s)", async (restart) => {
+    const s = setup();
+    const first = s.open(true);
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await first.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    const [id] = [...s.fake.boxes.keys()];
+    const [placeholder] = internals(first).pool;
+    // The running receipt is durable; the pool still holds the empty identity.
+    await internals(first).ledger.started(s.fake, placeholder!.accountReservation, id!);
+    expect(ledgerDoc(s).intents.find((i) => i.operation === "create")).toMatchObject({ status: "running", sandboxId: id });
+    const executor = restart ? s.open(true) : first;
+
+    const second = await executor.execute(command("cmd-2"));
+    expect(second).toMatchObject({ status: "completed", sandboxId: id });
+    expect(s.fake.callsOf("create")).toHaveLength(1);
+    expect(s.fake.boxes.size).toBe(1);
+    expect(internals(executor).pool.filter((vm) => vm.sandboxId === "")).toHaveLength(0);
   });
 });

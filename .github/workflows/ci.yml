@@ -51,11 +51,24 @@ jobs:
       # Internal links and #anchors in the docs. Blocking: a moved heading or
       # file must update every link to it. No network.
       - name: Check internal doc links
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
-        with:
-          lycheeVersion: v0.24.2
-          args: --offline --include-fragments --no-progress README.md CHANGELOG.md 'docs/**/*.md'
-          jobSummary: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release browser URL can fail with HTTP 504; use the asset API
+          # for the same v0.24.2 x86_64 GNU archive and verify its pinned digest.
+          lychee_dir=$(mktemp -d "$RUNNER_TEMP/lychee.XXXXXX")
+          trap 'rm -rf "$lychee_dir"' EXIT
+          timeout 90s gh api --hostname github.com \
+            -H 'Accept: application/octet-stream' \
+            repos/lycheeverse/lychee/releases/assets/409959156 > "$lychee_dir/lychee.tar.gz"
+          printf '%s  %s\n' \
+            1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a \
+            "$lychee_dir/lychee.tar.gz" | sha256sum --check --strict
+          tar -xzf "$lychee_dir/lychee.tar.gz" -C "$lychee_dir" \
+            lychee-x86_64-unknown-linux-gnu/lychee
+          unset GH_TOKEN
+          "$lychee_dir/lychee-x86_64-unknown-linux-gnu/lychee" \
+            --offline --include-fragments --no-progress README.md CHANGELOG.md 'docs/**/*.md'
 
   check:
     # Required status check on main. Renaming this changes the check context
