@@ -431,6 +431,9 @@ export class BoatVmManager {
   private readonly store: VmStateStore;
   private readonly accountState: StateClientLike;
   private readonly capacity: CapacityTelemetry;
+  /** A failed state write cannot record its own failure durably. Keep the
+   * company unavailable in this worker until an entire sampling pass succeeds. */
+  private readonly capacityErrors = new Map<string, string>();
   private readonly accountId: string;
   private readonly accounts = new Map<string, AccountLedger>();
   private readonly ssh: SshManager;
@@ -3914,26 +3917,26 @@ export class BoatVmManager {
       ...(await this.store.companies().catch(() => [] as string[])),
     ]);
     await Promise.all([...companies].map(async (companyId) => {
-      let failureReason: "state_unavailable" | "source_discovery_failed" = "state_unavailable";
+      let failureReason: "state_unavailable" | "sources_read_failed" = "state_unavailable";
       try {
         await this.capacity.maintain(companyId, this.now());
-        failureReason = "source_discovery_failed";
+        failureReason = "sources_read_failed";
         const sources = await withDeadline(this.nativeOffload.capacitySources(companyId, this.sweepConfigsFor(companyId)),
           this.offloadUpkeepTimeoutMs, "capacity sources");
-        failureReason = "state_unavailable";
         const reports = await Promise.all(sources.map(async ({ accountKey, api }) => {
-          let readFailed = false;
-          const raw = await withDeadline(api.limits({}), 3_000, "capacity limits").catch(() => { readFailed = true; return null; });
-          const report = await this.capacity.sample(companyId, accountKey, raw, this.now(), readFailed);
+          const reading = await withDeadline(api.limits({}), 3_000, "capacity limits")
+            .then((raw) => ({ raw, failed: false }), () => ({ raw: null, failed: true }));
+          const report = await this.capacity.sample(companyId, accountKey, reading.raw, this.now(), reading.failed ? "limits_read_failed" : undefined);
           if (report.shouldNotify) this.logger.warn("boat: capacity warning; report to owner before any plan change", { companyId, ...report });
           return report;
         }));
         const stateFailure = reports.flatMap((report) => report.reasons)
           .find((reason) => reason === "state_write_failed" || reason === "state_unavailable");
-        if (stateFailure) await this.capacity.failSampling(companyId, stateFailure);
-        else if (sources.length > 0) await this.capacity.completeSampling(companyId);
+        if (stateFailure) this.capacityErrors.set(companyId, stateFailure);
+        else this.capacityErrors.delete(companyId);
       } catch {
-        await this.capacity.failSampling(companyId, failureReason);
+        this.capacityErrors.set(companyId, failureReason);
+        await this.capacity.markUnavailable(companyId, failureReason, this.now()).catch(() => undefined);
         // Never log provider error text, which can contain request credentials.
         this.logger.warn("boat: capacity sampling unavailable", { companyId });
       }
@@ -4024,7 +4027,17 @@ export class BoatVmManager {
       entry.runs += vm.runs.length;
       cards.set(cardKey, entry);
     }
-    const capacity = await this.capacity.summary(companyId, this.now())
+    const capacity = await this.capacity.latest(companyId, this.now())
+      .then((accounts) => {
+        const error = this.capacityErrors.get(companyId) ?? null;
+        return {
+          accounts: error ? accounts.map((report): CapacityReport => ({
+            ...report, status: "unavailable", shouldNotify: false,
+            reasons: [error, ...report.reasons.filter((reason) => reason !== error)],
+          })) : accounts,
+          error,
+        };
+      })
       .catch(() => ({ accounts: [], error: "state_unavailable" }));
     return {
       companyId,

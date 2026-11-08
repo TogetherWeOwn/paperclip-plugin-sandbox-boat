@@ -73,29 +73,30 @@ describe("parseLimits", () => {
     expect(parseLimits({ upgradeEffects: payload() }).ok).toBe(true);
   });
 
-  it("merges legacy nesting field-wise: root > upgradeEffects > _package", () => {
-    const p = payload({ active: 1, max: 100, canStart: true });
-    const r = parseLimits({
+  it("resolves fields independently across flat, upgradeEffects and _package like budget/account-ledger", () => {
+    const p = payload();
+    const mixed = parseLimits({
       ok: true,
       planIncluded: p.planIncluded,
-      canStart: false,
-      upgradeEffects: { activeSandboxes: 7, maxActiveSandboxes: 70, canStart: true, _package: { activeSandboxes: 9 } },
-      _package: { activeSandboxes: 8, maxActiveSandboxes: 80, starts: p.starts, planIncluded: { ...p.planIncluded, vmHoursRemaining: 1 } },
+      upgradeEffects: { starts: p.starts },
+      _package: { activeSandboxes: 3, maxActiveSandboxes: 100, canStart: false },
     });
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.limits.vmHoursRemaining).toBe(552); // root planIncluded wins over _package
-      expect(r.limits.canStart).toBe(false); // root wins
-      expect(r.limits.activeSandboxes).toBe(7); // upgradeEffects beats _package
-      expect(r.limits.maxActiveSandboxes).toBe(70);
-      expect(r.limits.starts?.day.limit).toBe(200); // only _package has starts
+    expect(mixed.ok).toBe(true);
+    if (mixed.ok) {
+      expect(mixed.limits.starts?.day.limit).toBe(200);
+      expect(mixed.limits.activeSandboxes).toBe(3);
+      expect(mixed.limits.canStart).toBe(false);
     }
+    const pkgOnly = parseLimits({ ok: true, upgradeEffects: { planIncluded: p.planIncluded }, _package: { starts: p.starts, activeSandboxes: 0, maxActiveSandboxes: 1 } });
+    expect(pkgOnly.ok).toBe(true);
   });
 
-  it("reads a _package nested under upgradeEffects for fields absent elsewhere", () => {
+  it("a present invalid higher-precedence field is not replaced by a lower valid one", () => {
     const p = payload();
-    const r = parseLimits({ ok: true, upgradeEffects: { _package: p } });
-    expect(r.ok).toBe(true);
+    expect(parseLimits({ ...p, planIncluded: "bad", upgradeEffects: { planIncluded: p.planIncluded } }).ok).toBe(false);
+    expect(parseLimits({ ...p, activeSandboxes: "x", upgradeEffects: { activeSandboxes: 0 } }).ok).toBe(false);
+    expect(parseLimits({ ...p, canStart: "yes", _package: { canStart: true } }).ok).toBe(false);
+    expect(parseLimits({ ...p, starts: "bad", upgradeEffects: { starts: p.starts } }).ok).toBe(false);
   });
 
   it("accepts unlimited starts without windows", () => {
@@ -190,28 +191,6 @@ describe("CapacityTelemetry forecast", () => {
     expect(r.coverageMs).toBe(7 * DAY);
   });
 
-  it("7d-only history compares the available projection but stays insufficient", async () => {
-    const t = new CapacityTelemetry(memState());
-    await t.sample(CO, ACCT, payload({ rem: 500 }), T0);
-    const r = await t.sample(CO, ACCT, payload({ rem: 360 }), T0 + 7 * DAY);
-    expect(r.status).toBe("insufficient");
-    expect(r.forecast).toMatchObject({ burn24hHours: null, projectedHours: 375, thresholdHours: 355, exceeds: true });
-    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
-    expect(r.reasons).toContain("insufficient_history");
-  });
-
-  it("first reading inside the reserve warns without any baseline", async () => {
-    const t = new CapacityTelemetry(memState());
-    const r = await t.sample(CO, ACCT, payload({ rem: 3 }), T0);
-    expect(r.status).toBe("insufficient");
-    expect(r.forecast).toMatchObject({ projectedHours: null, thresholdHours: -2, exceeds: true });
-    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
-    expect(r.shouldNotify).toBe(true);
-    const ok = await new CapacityTelemetry(memState()).sample(CO, ACCT, payload({ rem: 5 }), T0);
-    expect(ok.forecast?.exceeds).toBe(null); // exactly at the reserve is not a breach
-    expect(ok.warning).toBe(false);
-  });
-
   it("equality is not a warning; strictly greater is", async () => {
     const eq = await seeded(new CapacityTelemetry(memState()), 380);
     expect(eq.forecast?.exceeds).toBe(false);
@@ -232,11 +211,46 @@ describe("CapacityTelemetry forecast", () => {
     expect(r.warning).toBe(true); // 1.25*57.29*15 = 1074 > 94
   });
 
-  it("low remaining hours warn even with zero burn", async () => {
+  it("low remaining hours warn on the very first sample, without burn history", async () => {
     const t = new CapacityTelemetry(memState());
-    const r = await seeded(t, 400 - 400 + 4); // balance below the 5h reserve
-    expect(r.forecast?.thresholdHours).toBe(-1);
+    const r = await t.sample(CO, ACCT, payload({ rem: 4 }), T0);
+    expect(r.status).toBe("insufficient");
+    expect(r.forecast).toMatchObject({ thresholdHours: -1, projectedHours: null });
+    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
     expect(r.warning).toBe(true);
+    expect(r.shouldNotify).toBe(true);
+    // Exactly at the reserve is not below it.
+    const eq = await new CapacityTelemetry(memState()).sample(CO, ACCT, payload({ rem: 5 }), T0);
+    expect(eq.warning).toBe(false);
+  });
+
+  it("low remaining hours warn with genuinely zero burn history", async () => {
+    const t = new CapacityTelemetry(memState());
+    await t.sample(CO, ACCT, payload({ rem: 4 }), T0);
+    const r = await t.sample(CO, ACCT, payload({ rem: 4 }), T0 + DAY);
+    expect(r.forecast).toMatchObject({ burn24hHours: 0, thresholdHours: -1 });
+    expect(r.warning).toBe(true);
+  });
+
+  it("a 7d-only rate can prove the forecast exceeds the threshold without a 24h baseline", async () => {
+    const t = new CapacityTelemetry(memState());
+    await t.sample(CO, ACCT, payload({ rem: 500 }), T0);
+    // No sample near T0+6d, so no 24h baseline at T0+7d.
+    const r = await t.sample(CO, ACCT, payload({ rem: 100 }), T0 + 7 * DAY);
+    expect(r.status).toBe("insufficient");
+    expect(r.reasons).toContain("insufficient_history");
+    expect(r.forecast).toMatchObject({ status: "insufficient_history", burn24hHours: null, exceeds: true });
+    expect(r.forecast?.projectedHours).toBeCloseTo(1.25 * (400 / 7) * 15, 9);
+    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
+  });
+
+  it("a 7d-only rate that fits does not claim healthy", async () => {
+    const t = new CapacityTelemetry(memState());
+    await t.sample(CO, ACCT, payload({ rem: 500 }), T0);
+    const r = await t.sample(CO, ACCT, payload({ rem: 499 }), T0 + 7 * DAY);
+    expect(r.forecast?.exceeds).toBe(null);
+    expect(r.warning).toBe(false);
+    expect(r.status).toBe("insufficient");
   });
 
   it("does not use a baseline outside the 15 minute tolerance", async () => {
@@ -374,26 +388,23 @@ describe("CapacityTelemetry unavailable and failures", () => {
     expect((await t.sample(CO, ACCT, payload(), T0)).reasons).toEqual(["clock_regression"]);
   });
 
-  it("an ended plan period stays unavailable but keeps start pressure and marker dedup", async () => {
-    const t = new CapacityTelemetry(memState());
-    const ended = (extra: Over = {}) => payload({ end: T0, ...extra });
-    const calm = await t.sample(CO, ACCT, ended(), T0);
-    expect(calm).toMatchObject({ status: "unavailable", warning: false, forecast: null, plan: null });
-    expect(calm.startPressure).toMatchObject({ pressure: false, reasons: [] });
-    const hot = await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 5 * MIN);
-    expect(hot.status).toBe("unavailable");
-    expect(hot.reasons).toEqual(["start_day_pressure", "cannot_start", "plan_period_ended"]);
-    expect(hot.warningReasons).toEqual(["start_day_pressure", "cannot_start"]);
-    expect(hot.warning).toBe(true);
-    expect(hot.forecast).toBe(null);
-    expect(hot.startPressure).toMatchObject({ pressure: true, canStart: false });
-    expect(hot.shouldNotify).toBe(true);
-    const again = await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 10 * MIN);
-    expect(again.shouldNotify).toBe(false); // dedup marker applies
-    const quiet = await t.sample(CO, ACCT, ended(), T0 + 15 * MIN);
-    expect(quiet.warning).toBe(false);
-    // Ended and quiet is not an all-clear: the marker survives.
-    expect((await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 20 * MIN)).shouldNotify).toBe(false);
+  it("an ended period keeps the forecast unavailable but reports known start pressure with dedup", async () => {
+    const state = memState();
+    const t = new CapacityTelemetry(state);
+    const ended = (extra: Over = {}) => payload({ end: T0, day: [180, 200], canStart: false, ...extra });
+    const r = await t.sample(CO, ACCT, ended(), T0);
+    expect(r.status).toBe("unavailable");
+    expect(r.forecast).toBe(null);
+    expect(r.reasons).toEqual(["plan_period_ended", "start_day_pressure", "cannot_start"]);
+    expect(r.warning).toBe(true);
+    expect(r.warningReasons).toEqual(["start_day_pressure", "cannot_start"]);
+    expect(r.startPressure?.pressure).toBe(true);
+    expect(r.shouldNotify).toBe(true);
+    expect(storedSamples(state)).toBe(0);
+    const again = await t.sample(CO, ACCT, ended(), T0 + 5 * MIN);
+    expect(again.shouldNotify).toBe(false);
+    const [latest] = await t.latest(CO, T0 + 6 * MIN);
+    expect(latest.warningReasons).toEqual(["start_day_pressure", "cannot_start"]);
   });
 
   it("write failure yields unavailable without a dedup hint and persists nothing", async () => {

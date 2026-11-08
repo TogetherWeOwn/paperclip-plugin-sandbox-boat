@@ -11,6 +11,10 @@
 #   Creates <shim dir> if needed and replaces each alias in one rename, so a run
 #   never sees one missing. Run it again after staging a new package.
 #
+# Requires GNU mv (-T) on Linux and exclusive operator control of the shim
+# directory for the whole install. Concurrent writers can invalidate preflight;
+# the per-link renames are not a transaction across all aliases.
+#
 # It validates everything before changing any link, and refuses:
 #   - a package missing any of the three bins or their dist files;
 #   - a <shim dir>/<alias> that exists and is not a symlink (it never replaces
