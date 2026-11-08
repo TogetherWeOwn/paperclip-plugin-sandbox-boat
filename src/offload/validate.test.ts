@@ -124,6 +124,36 @@ describe("validateSubmit", () => {
   });
 });
 
+describe("explicit Python dependency selection", () => {
+  const python = { ...BASE, tool: "python", runner: "pytest", argv: ["tests/"], env: {} };
+  const options = { tool: "python" as const, runners: ["pytest"] };
+  const depSelection = { uvExtra: "test", cwdRelative: "." };
+
+  it("retains a closed explicit selection and leaves omitted defaults absent", () => {
+    expect(validateSubmit({ ...python, depSelection }, options)).toMatchObject({ ok: true, value: { depSelection } });
+    const plain = validateSubmit(python, options);
+    expect(plain.ok && Object.hasOwn(plain.value, "depSelection")).toBe(false);
+    const nested = { uvExtra: "test", cwdRelative: "tests/unit" };
+    expect(validateSubmit({ ...python, cwdRelative: "tests/unit", depSelection: nested }, options))
+      .toMatchObject({ ok: true, value: { depSelection: nested } });
+  });
+
+  it.each([null, [], "test", {}, { uvExtra: "dev", cwdRelative: "." },
+    { ...depSelection, extra: true }, { uvExtra: "test" }, { ...depSelection, cwdRelative: "other" },
+    ...["../x", "/abs", "x/../y", "x//y", "x\\y", "\ud800", "a".repeat(1025)].map((cwdRelative) => ({ uvExtra: "test", cwdRelative })),
+  ])("rejects malformed, unsupported or mismatched selection %j", (selection) => {
+    expect(validateSubmit({ ...python, depSelection: selection }, options).ok).toBe(false);
+  });
+
+  it.each(["cargo", "node"] as const)("refuses a selection for %s", (tool) => {
+    expect(validateSubmit({ ...BASE, tool, env: {}, depSelection }, { tool }).ok).toBe(false);
+  });
+
+  it("does not allow selection via forwarded environment", () => {
+    expect(validateSubmit({ ...python, env: { BOAT_OFFLOAD_UV_EXTRA: "test" } }, options).ok).toBe(false);
+  });
+});
+
 describe("bodyTooLarge", () => {
   it("flags bodies over 64 KiB", () => {
     expect(bodyTooLarge("x".repeat(OFFLOAD_BOUNDS.maxBodyBytes + 1))).toBe(true);

@@ -212,6 +212,9 @@ export class SshOffloadGuest implements GuestController {
     // empty and the activation applies to that command only.
     if ((command.tool ?? "cargo") === "python") {
       const venvRoot = await this.deps.uvVenvRoot?.(command).catch(() => null);
+      if (command.depSelection !== undefined && (venvRoot === null || venvRoot === undefined)) {
+        throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_selected_venv_gate");
+      }
       if (venvRoot !== null && venvRoot !== undefined) {
         const base = command.runner ?? command.executable ?? this.deps.executable ?? "python";
         if (!base || base.includes("/") || base.includes("\\") || base.includes("\0")

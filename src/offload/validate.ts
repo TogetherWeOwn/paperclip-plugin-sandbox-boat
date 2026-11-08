@@ -1,4 +1,5 @@
 import { containsJwt } from "../env-policy.js";
+import type { DepSelection } from "./deps-install.js";
 import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadSubmitRequest } from "./protocol.js";
 
 export interface ValidateOptions {
@@ -16,6 +17,7 @@ const KNOWN_KEYS = new Set([
   "commandId",
   "executionWorkspaceId",
   "cwdRelative",
+  "depSelection",
   "runner",
   "tool",
   "argv",
@@ -52,6 +54,22 @@ export function cwdProblem(cwd: string): string | null {
     stack.push(segment);
   }
   return null;
+}
+
+/** Shared wire/backend guard; no inference, coercion or cwd substitution. */
+export function depSelectionProblem(selection: unknown, tool: string, cwdRelative: string): string | null {
+  if (selection === undefined) return null;
+  if (tool !== "python") return "depSelection requires the python tool";
+  if (!selection || typeof selection !== "object" || Array.isArray(selection)) return "depSelection must be an object";
+  const record = selection as Record<string, unknown>;
+  if (Object.keys(record).sort().join(",") !== "cwdRelative,uvExtra" || record.uvExtra !== "test") {
+    return "depSelection must contain only uvExtra=test and cwdRelative";
+  }
+  const cwd = record.cwdRelative;
+  if (typeof cwd !== "string" || cwdProblem(cwd) !== null
+    || !/^(?:\.|[A-Za-z0-9_-][A-Za-z0-9._/-]*)$/.test(cwd)
+    || cwd.split("/").some((part) => part === ".." || part === "")) return "depSelection cwdRelative is invalid";
+  return cwd === cwdRelative ? null : "depSelection cwdRelative must equal command cwdRelative";
 }
 
 function isIntIn(value: unknown, min: number, max: number): boolean {
@@ -132,6 +150,8 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
   if (record.tool !== undefined && record.tool !== expectedTool) {
     return invalid(`tool must be ${expectedTool}`);
   }
+  const selectionIssue = depSelectionProblem(record.depSelection, expectedTool, record.cwdRelative);
+  if (selectionIssue) return invalid(selectionIssue);
   if (record.runner !== undefined) {
     if (typeof record.runner !== "string" || record.runner.length === 0 || record.runner.length > 64) {
       return invalid("runner must be a non-empty string");
@@ -151,6 +171,7 @@ export function validateSubmit(body: unknown, options: ValidateOptions = {}): Va
       commandId: record.commandId as string,
       executionWorkspaceId: record.executionWorkspaceId as string,
       cwdRelative: record.cwdRelative as string,
+      ...(record.depSelection === undefined ? {} : { depSelection: { ...(record.depSelection as DepSelection) } }),
       ...(record.runner === undefined ? {} : { runner: record.runner as string }),
       ...(record.tool === undefined ? {} : { tool: record.tool as "cargo" | "node" | "python" }),
       argv: argv as string[],

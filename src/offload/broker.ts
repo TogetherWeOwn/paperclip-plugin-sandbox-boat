@@ -10,6 +10,7 @@
 // permission to replay) until the executor follow-up reconciles the guest.
 
 import { runOutsideInvocation } from "../proactive.js";
+import type { DepSelection } from "./deps-install.js";
 import { offloadError } from "./errors.js";
 import {
   OFFLOAD_BOUNDS,
@@ -84,6 +85,7 @@ export interface BackendCommand {
   /** Host-resolved pool trust domain (see BrokerPrincipal). */
   trustDomainId?: string;
   cwdRelative: string;
+  depSelection?: DepSelection;
   argv: string[];
   env: Record<string, string>;
   queueTimeoutMs: number;
@@ -183,6 +185,7 @@ function digestOf(request: OffloadSubmitRequest, canonicalEnv = true): string {
     cwd: request.cwdRelative,
     tool: request.tool ?? "cargo",
     runner: request.runner ?? "cargo",
+    ...(request.depSelection === undefined ? {} : { depSelection: { uvExtra: request.depSelection.uvExtra, cwdRelative: request.depSelection.cwdRelative } }),
     argv: request.argv,
     env: canonicalEnv ? Object.fromEntries(Object.entries(request.env).sort(([a], [b]) => a.localeCompare(b))) : request.env,
     q: request.queueTimeoutMs,
@@ -597,6 +600,7 @@ export class OffloadBroker {
             // workspace itself is the smallest safe domain.
             trustDomainId: principal.trustDomainId ?? `workspace:${request.executionWorkspaceId}`,
             cwdRelative: request.cwdRelative,
+            ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
             argv: request.argv,
             env: request.env,
             queueTimeoutMs: request.queueTimeoutMs,

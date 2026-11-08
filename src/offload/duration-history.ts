@@ -6,6 +6,7 @@
 // behaviour and is never gated here.
 
 import path from "node:path";
+import type { DepSelection } from "./deps-install.js";
 
 export interface DurationSample {
   /** Wall-clock seconds for one local or remote run. */
@@ -44,9 +45,12 @@ export function durationKey(repoId: string, profileId: string, signature: string
  * unknown/local), so no fuzzy normalization that could promote a short command
  * to remote. The workspace root keeps the original three-part encoding, so
  * history recorded before the directory was part of the key stays valid.
+ * A validated selection has its own signature; its cwd already equals the
+ * command cwd. Omitted selections retain both legacy default encodings.
  */
-export function normalizeSignature(tool: string, runner: string, argv: string[], cwdRelative = "."): string {
+export function normalizeSignature(tool: string, runner: string, argv: string[], cwdRelative = ".", depSelection?: DepSelection): string {
   const cwd = path.posix.normalize(cwdRelative).replace(/\/+$/, "") || ".";
+  if (depSelection !== undefined) return JSON.stringify([tool, runner, argv, cwd, { uvExtra: depSelection.uvExtra }]);
   return cwd === "." ? JSON.stringify([tool, runner, argv]) : JSON.stringify([tool, runner, argv, cwd]);
 }
 

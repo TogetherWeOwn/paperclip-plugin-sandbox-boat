@@ -146,6 +146,24 @@ describe("durable host journal: run-scoped identity", () => {
     expect(h.attempts).toHaveLength(1);
   });
 
+  it.each([false, true])("persists Python selection identity across restart (selected=%s)", async (selected) => {
+    const depSelection = { uvExtra: "test" as const, cwdRelative: "." };
+    const cmd = command("python-selection", { tool: "python", runner: "pytest", argv: ["tests/"],
+      ...(selected ? { depSelection } : {}) });
+    const result = await h.openExecutor().executor.execute(cmd);
+    const stored = await new FileStore(h.hostDirectory).get(hostKey(cmd)) as RecordV1;
+    if (selected) expect(stored.command).toMatchObject({ depSelection });
+    else expect(stored.command).not.toHaveProperty("depSelection");
+    h.crash();
+    const restarted = h.openExecutor().executor;
+    expect(await restarted.execute(cmd)).toEqual(result);
+    expect(await settled(restarted.execute({ ...cmd, depSelection: selected ? undefined : depSelection })))
+      .toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+    expect(await settled(restarted.execute({ ...cmd, cwdRelative: "tests", depSelection: { ...depSelection, cwdRelative: "tests" } })))
+      .toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT" });
+    expect(h.attempts).toHaveLength(1);
+  });
+
   it("same logical environment in a different key order is not a new payload", async () => {
     const cmd = command("ordered", { env: { CARGO_TERM_COLOR: "never", RUST_BACKTRACE: "1" } });
     const result = await h.openExecutor().executor.execute(cmd);
