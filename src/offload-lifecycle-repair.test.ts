@@ -172,8 +172,8 @@ describe("warm pre-effect refusal", () => {
     expect(s.starts).toHaveLength(1);
     expect(s.boat.callsOf("create")).toHaveLength(1);
     expect(s.boat.callsOf("resume")).toHaveLength(0);
-    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1]
-      as { intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
+    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1] as {
+      intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
     expect(account.intents.find((i) => i.id === b!.accountReservation!.id)).toMatchObject({ status: "stopped" });
   });
 
@@ -198,8 +198,8 @@ describe("warm pre-effect refusal", () => {
     s.clock.t = b!.accountReservation!.at + ttlMs + 600_001;
     const next = restart();
     await next.sweep();
-    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1]
-      as { intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
+    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1] as {
+      intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
     const intent = account.intents.find((i) => i.id === b!.accountReservation!.id)!;
     expect(intent.status).toBe("stopped");
     expect(intent.compute).toBeLessThanOrEqual(intent.computeReflected);
