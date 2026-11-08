@@ -380,10 +380,12 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     // Discovery consults the server profile even for locally-routable argv.
     try {
       const result = await runDryRun(request, clientDeps);
+      if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
       if (json) writeStdout(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, ...result })}\n`);
       else writeStdout(`mode: ${result.mode} (${result.reason}) profile: ${result.profileId || "(none)"}\n`);
       return 0;
     } catch (error) {
+      if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
       writeStderr(`offload dry-run failed: ${error instanceof Error ? error.message : String(error)}\n`);
       return 64;
     }

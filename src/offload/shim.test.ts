@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HttpResult } from "./client.js";
-import { shimMain, type ShimDeps } from "./shim-main.js";
+import { CARGO_SHIM, NODE_SHIM, PYTHON_SHIM, shimMain, type ShimDeps } from "./shim-main.js";
 
 const CMD = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
 const WS = "b9d0e6ac-a14e-4440-a324-7dcdd758be08";
@@ -262,6 +262,86 @@ describe("passthrough (invoked as cargo)", () => {
     ));
     await shimMain(asCargo, ["test"], t.deps);
     expect(t.deps.http.post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe.each([CARGO_SHIM, NODE_SHIM, PYTHON_SHIM].flatMap((tool) =>
+  tool.exeNames.map((runner) => ({ tool, runner })),
+))("explicit discovery cancellation ($runner)", ({ tool, runner }) => {
+  const signals: Array<{ name: string; sequence: Array<"SIGINT" | "SIGTERM">; exit: number | null }> = [
+    { name: "no signal", sequence: [], exit: null },
+    { name: "SIGINT", sequence: ["SIGINT"], exit: 130 },
+    { name: "SIGTERM", sequence: ["SIGTERM"], exit: 143 },
+    { name: "SIGINT then SIGTERM", sequence: ["SIGINT", "SIGTERM"], exit: 130 },
+    { name: "SIGTERM then SIGINT", sequence: ["SIGTERM", "SIGINT"], exit: 143 },
+  ];
+  const outcomes: Array<{ name: string; response?: HttpResult; error?: Error; mode?: string }> = [
+    { name: "remote candidate", mode: "remote_candidate", response: { ok: true, status: 200, json: { mode: "remote_candidate", reason: "eligible", profileId: "profile-1" } } },
+    { name: "local", mode: "local", response: { ok: true, status: 200, json: { mode: "local", reason: "eligible", profileId: "profile-1" } } },
+    { name: "transport failure", response: { ok: false, error: "connection lost" } },
+    { name: "server rejection", response: { ok: true, status: 503, json: { version: 1, code: "OFFLOAD_UNAVAILABLE", detail: "disabled" } } },
+    { name: "rejected promise", error: new Error("request rejected") },
+  ];
+
+  describe.each([false, true])("json=%s", (json) => {
+    describe.each([false, true])("active and pinned=%s", (guarded) => {
+      describe.each(outcomes)("$name", (outcome) => {
+        it.each(signals)("$name preserves discovery-only effects and signal precedence", async (signal) => {
+          const pinned = "22222222-2222-4222-8222-222222222222";
+          const commandId = guarded ? pinned : CMD;
+          const t = setup(guarded ? {
+            BOAT_OFFLOAD_SHIM_ACTIVE: "1",
+            BOAT_OFFLOAD_COMMAND_ID: pinned,
+            ...(tool.tool === "python" ? { BOAT_OFFLOAD_UV_EXTRA: "test" } : {}),
+          } : {});
+          t.deps.findExecutable = (dir, name) => dir === "/usr/bin" && name === runner ? `/usr/bin/${runner}` : null;
+          t.deps.randomId = vi.fn(() => CMD);
+          t.deps.sleep = vi.fn(t.deps.sleep);
+          let onSignal: ((value: "SIGINT" | "SIGTERM") => void) | undefined;
+          t.deps.onSignal = (handler) => { onSignal = handler; };
+          let resolve!: (response: HttpResult) => void;
+          let reject!: (error: Error) => void;
+          const response = new Promise<HttpResult>((yes, no) => { resolve = yes; reject = no; });
+          (t.deps.http.post as ReturnType<typeof vi.fn>).mockReturnValue(response);
+          const argv = tool.tool === "python" ? ["tests/"] : ["test"];
+          const flags = ["--dry-run", ...(json ? ["--json"] : []), "--runner", runner,
+            ...(tool.tool === "python" && !guarded ? ["--uv-extra", "test"] : [])];
+          const result = shimMain(`/opt/boat-offload/bin/${tool.diagnosticName}`, [...flags, "--", ...argv], t.deps, tool);
+
+          // The request has started but cannot settle until after the injected signals.
+          expect(t.deps.http.post).toHaveBeenCalledTimes(1);
+          expect(onSignal).toBeTypeOf("function");
+          expect(t.stdoutText()).toBe("");
+          for (const value of signal.sequence) onSignal!(value);
+          if (outcome.error) reject(outcome.error);
+          else resolve(outcome.response!);
+
+          expect(await result).toBe(signal.exit ?? (outcome.mode ? 0 : 64));
+          if (signal.exit !== null) {
+            expect(t.stdoutText()).toBe("");
+            expect(t.stderrText()).toBe("");
+          } else if (outcome.mode) {
+            expect(t.stdoutText()).toBe(json
+              ? `${JSON.stringify({ version: 1, commandId, mode: outcome.mode, reason: "eligible", profileId: "profile-1" })}\n`
+              : `mode: ${outcome.mode} (eligible) profile: profile-1\n`);
+            expect(t.stderrText()).toBe("");
+          } else {
+            expect(t.stdoutText()).toBe("");
+            expect(t.stderrText()).toMatch(/^offload dry-run failed: /);
+          }
+          expect(t.deps.http.post).toHaveBeenCalledTimes(1);
+          expect(t.deps.http.post).toHaveBeenCalledWith("/offload/exec", expect.objectContaining({
+            commandId, executionWorkspaceId: WS, cwdRelative: ".", argv, dryRun: true,
+            ...(tool.tool === "cargo" ? {} : { tool: tool.tool, runner }),
+            ...(tool.tool === "python" ? { depSelection: { uvExtra: "test", cwdRelative: "." } } : {}),
+          }));
+          expect(t.deps.http.get).not.toHaveBeenCalled();
+          expect(t.deps.spawn).not.toHaveBeenCalled();
+          expect(t.deps.sleep).not.toHaveBeenCalled();
+          expect(t.deps.randomId).toHaveBeenCalledTimes(guarded ? 0 : 1);
+        });
+      });
+    });
   });
 });
 
