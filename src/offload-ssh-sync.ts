@@ -293,7 +293,9 @@ export class SshOffloadSync implements OffloadSync {
         this.uncertainInstalls.add(installedKey);
         throw error;
       }
-      if (result.timedOut || result.signal) this.uncertainInstalls.add(installedKey);
+      if (result.timedOut || result.signal || result.exitCode === 255 || result.exitCode === null) {
+        this.uncertainInstalls.add(installedKey);
+      }
       if (result.exitCode !== 0 || result.timedOut || result.signal) {
         throw new Error("Offload dependency install failed; no command ran");
       }

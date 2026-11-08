@@ -156,6 +156,8 @@ describe("installDependencies", () => {
     });
 
     const ambiguous: Array<[string, Result | Error]> = [
+      ["SSH exit 255", { exitCode: 255, timedOut: false, signal: null, stdout: "" }],
+      ["a missing exit status", { exitCode: null, timedOut: false, signal: null, stdout: "" }],
       ["a timeout", { exitCode: null, timedOut: true, signal: null, stdout: "" }],
       ["a signal", { exitCode: null, timedOut: false, signal: "SIGKILL", stdout: "" }],
       ["a transport throw", new Error("ssh dropped")],
