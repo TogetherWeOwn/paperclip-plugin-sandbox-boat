@@ -256,7 +256,7 @@ interface BudgetObservation {
 }
 
 interface BudgetSource {
-  config: BoatDriverConfig;
+  apiBase: string;
   accountDigest: string;
   credentialSource: "inline" | "host";
   observation: BudgetObservation | null;
@@ -483,6 +483,7 @@ export class BoatVmManager {
   private lastBudgetAt: string | null = null;
   private readonly budgetSources = new Map<string, Map<string, BudgetSource>>();
   private budgetObservationOrder = 0;
+  private hostBudgetCredential: { apiKey: string; accountDigest: string } | null = null;
   private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
   /** A caller-supplied executor replaces the native gates, so dry-run preflight has no opinion. */
   private readonly hasCustomOffloadExecutor: boolean;
@@ -1110,10 +1111,11 @@ export class BoatVmManager {
       const accountDigest = sweepAccountDigest(config.apiBase, bound.apiKey);
       const credentialSource = config.apiKey == null ? "host" : "inline";
       const previous = sources.get(environmentId);
-      if (!previous || previous.accountDigest !== accountDigest || previous.config.apiBase !== config.apiBase
+      if (!previous || previous.accountDigest !== accountDigest || previous.apiBase !== config.apiBase
         || previous.credentialSource !== credentialSource) {
-        sources.set(environmentId, { config, accountDigest, credentialSource, observation: null, completedOrder: 0 });
+        sources.set(environmentId, { apiBase: config.apiBase, accountDigest, credentialSource, observation: null, completedOrder: 0 });
       }
+      if (credentialSource === "host") this.hostBudgetCredential = { apiKey: bound.apiKey, accountDigest };
       this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: this.now() });
     } catch {
       this.budgetSources.get(companyId)?.delete(environmentId);
@@ -1311,9 +1313,20 @@ export class BoatVmManager {
     const sources = this.budgetSources.get(companyId);
     const source = sources?.get(environmentId);
     if (!source) return null;
-    try {
-      if (sweepAccountDigest(source.config.apiBase, resolveApiKey(source.config)) === source.accountDigest) return source;
-    } catch { /* A missing host key invalidates the source, too. */ }
+    // Inline bindings are immutable source records, replaced by configuration
+    // hooks. Only the shared host credential can change between hook calls.
+    if (source.credentialSource === "inline") return source;
+    const apiKey = process.env.BOAT_API_KEY?.trim() ?? "";
+    if (!apiKey) {
+      this.hostBudgetCredential = null;
+    } else {
+      // A separate one-entry cache prevents an inline-key LRU scan from forcing
+      // repeated host derivations. Keep the persisted scrypt format unchanged.
+      if (this.hostBudgetCredential?.apiKey !== apiKey) {
+        this.hostBudgetCredential = { apiKey, accountDigest: sweepAccountDigest(DEFAULT_API_BASE, apiKey) };
+      }
+      if (source.apiBase === DEFAULT_API_BASE && this.hostBudgetCredential.accountDigest === source.accountDigest) return source;
+    }
     sources!.delete(environmentId);
     return null;
   }
@@ -3063,6 +3076,7 @@ export class BoatVmManager {
       }
     }
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
     const sandboxId = params.lease.providerLeaseId;
@@ -3530,6 +3544,7 @@ export class BoatVmManager {
     const kind = params.templateKind ?? "snapshot";
     if (kind !== "snapshot") throw new BoatProviderError("BOAT_TEMPLATE_KIND", `boat templates are named snapshots, not ${kind}.`);
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
     try {
       await this.opsApi(config).deleteNamedSnapshot({ name: params.templateRef });
       return { deleted: true, metadata: { provider: "boat", reason: params.reason ?? null } };
@@ -4082,6 +4097,7 @@ export class BoatVmManager {
 
   async shutdown(): Promise<void> {
     this.budgetSources.clear();
+    this.hostBudgetCredential = null;
     this.lastBudgetAt = null;
     // The digest memo is keyed by key-derived preimages: drop it so rotated
     // keys stop being recoverable from worker memory. Live keys stay in the

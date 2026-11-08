@@ -5,6 +5,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 
+const kdf = vi.hoisted(() => ({ calls: 0 }));
+
+// Counts every scrypt derivation (sync or callback) while still computing the real digest.
+vi.mock("node:crypto", async () => {
+  const actual = await vi.importActual<typeof import("node:crypto")>("node:crypto");
+  const scryptSync = ((...args: Parameters<typeof actual.scryptSync>) => {
+    kdf.calls += 1;
+    return actual.scryptSync(...args);
+  }) as typeof actual.scryptSync;
+  const scrypt = ((...args: unknown[]) => {
+    kdf.calls += 1;
+    return (actual.scrypt as (...inner: unknown[]) => unknown)(...args);
+  }) as unknown as typeof actual.scrypt;
+  return { ...actual, scryptSync, scrypt, default: { ...actual, scryptSync, scrypt } };
+});
+
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   return { ...actual, spawn: spawnMock };
@@ -70,6 +86,7 @@ beforeEach(async () => {
   clock = { t: Date.parse("2026-10-22T18:00:00Z"), now: () => clock.t };
   ssh = new FakeSsh();
   clients = new Map();
+  kdf.calls = 0;
   spawnMock.mockReset();
   spawnMock.mockImplementation(ssh.spawn);
   setBoatApiFactoryForTests((input: BoatApiFactoryInput) => client(input.apiBase, input.apiKey) as unknown as BoatApiLike);
@@ -375,5 +392,127 @@ describe("usage budget observations", () => {
     expect(await budgetOf(CO_A)).toEqual(expected("line-env1", 1, tFirst, ENV_A1, BASE1, "inline"));
     expect(await budgetOf(CO_B)).toBeNull();
     expect(await budgetOf(CO_C)).toBeNull();
+  });
+
+  describe("binding changes consumed by other hooks", () => {
+    const consumers: Array<[string, (companyId: string, environmentId: string, config: Record<string, unknown>) => Promise<unknown>]> = [
+      ["onEnvironmentDeleteTemplate", (companyId, environmentId, config) => inHostInvocation(companyId, () =>
+        plugin.definition.onEnvironmentDeleteTemplate!({
+          driverKey: DRIVER_KEY, companyId, environmentId, config: { cliproxyTunnel: false, ...config },
+          templateRef: "tpl-synthetic", templateKind: "snapshot",
+        } as never))],
+      ["onEnvironmentRealizeWorkspace", (companyId, environmentId, config) => inHostInvocation(companyId, () =>
+        plugin.definition.onEnvironmentRealizeWorkspace!({
+          driverKey: DRIVER_KEY, companyId, environmentId, config: { cliproxyTunnel: false, ...config },
+          lease: { providerLeaseId: null, metadata: {} }, workspace: { localPath: "/tmp/synthetic" },
+        } as never))],
+    ];
+
+    it.each(consumers)("%s: a changed key, base or missing credentials drops the observation; an unchanged binding keeps it", async (_name, consume) => {
+      const run = async (environmentId: string, config: Record<string, unknown>) => {
+        const operation = consume(CO_A, environmentId, config);
+        if (_name === "onEnvironmentDeleteTemplate" && !config.apiKey) {
+          await expect(operation).rejects.toThrow("API key");
+        } else {
+          await expect(operation).resolves.toBeDefined();
+        }
+      };
+      client(BASE1, KEY_B, "line-older", 2);
+      client(BASE1, KEY_A, "line-a", 1);
+      const establish = async () => {
+        clock.t += 1_000;
+        expect((await probe(CO_A, ENV_A2, inline(BASE1, KEY_B))).ok).toBe(true);
+        clock.t += 1_000;
+        const at = iso();
+        expect((await probe(CO_A, ENV_A1, inline(BASE1, KEY_A))).ok).toBe(true);
+        expect(await budgetOf(CO_A)).toEqual(expected("line-a", 1, at, ENV_A1, BASE1, "inline"));
+        return at;
+      };
+
+      let at = await establish();
+      await run(ENV_A1, inline(BASE1, KEY_A));
+      expect(await budgetOf(CO_A)).toEqual(expected("line-a", 1, at, ENV_A1, BASE1, "inline"));
+
+      // Changed key: only that environment's observation goes; the other environment's stays selectable.
+      await run(ENV_A1, inline(BASE1, "fake-ops-key-rotated"));
+      const olderAt = (await budgetOf(CO_A))!.at;
+      expect(await budgetOf(CO_A)).toEqual(expected("line-older", 2, olderAt, ENV_A2, BASE1, "inline"));
+
+      // Changed base.
+      at = await establish();
+      await run(ENV_A1, inline(BASE2, KEY_A));
+      expect(await budgetOf(CO_A)).toEqual(expected("line-older", 2, (await budgetOf(CO_A))!.at, ENV_A2, BASE1, "inline"));
+
+      // Missing credentials (no inline key, no host key).
+      at = await establish();
+      await run(ENV_A1, {});
+      expect((await budgetOf(CO_A))?.provenance.environmentId).toBe(ENV_A2);
+      await run(ENV_A2, {});
+      expect(await budgetOf(CO_A)).toBeNull();
+      expect(await budgetOf(CO_B)).toBeNull();
+    });
+  });
+
+  describe("cached usage reads do not re-derive credential digests", () => {
+    const envId = (prefix: string, index: number) => `${prefix}-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    const COUNT = 18; // above the 16-entry digest cache
+
+    it("derives nothing on unchanged reads across more inline sources than the digest cache holds, with or without observations", async () => {
+      let lastAt = "";
+      for (let i = 0; i < COUNT; i += 1) {
+        client(BASE1, `fake-ops-key-many-${i}`, `line-many-${i}`, i);
+        clock.t += 1_000;
+        lastAt = iso();
+        expect((await probe(CO_A, envId("d0d0d0d0", i), inline(BASE1, `fake-ops-key-many-${i}`))).ok).toBe(true);
+        client(BASE1, `fake-ops-key-none-${i}`).failNext("limits", responseError(403, { code: "forbidden", message: "refused" }));
+        expect((await probe(CO_B, envId("e0e0e0e0", i), inline(BASE1, `fake-ops-key-none-${i}`))).ok).toBe(false);
+      }
+      const latest = expected(`line-many-${COUNT - 1}`, COUNT - 1, lastAt, envId("d0d0d0d0", COUNT - 1), BASE1, "inline");
+
+      kdf.calls = 0;
+      for (let round = 0; round < 3; round += 1) {
+        expect(await budgetOf(CO_A)).toEqual(latest);
+        expect(await budgetOf(CO_A, "0")).toEqual(latest);
+        expect(await budgetOf(CO_B)).toBeNull(); // sources without any observation
+        expect(await budgetOf(CO_B, "0")).toBeNull();
+        expect(await budgetOf(CO_C)).toBeNull();
+      }
+      expect(kdf.calls).toBe(0);
+    });
+
+    it("derives at most once per changed shared host key across more host and inline sources than the digest cache holds", async () => {
+      process.env.BOAT_API_KEY = KEY_HOST_1;
+      client(DEFAULT_API_BASE, KEY_HOST_1, "line-host", 3);
+      let hostAt = "";
+      for (let i = 0; i < COUNT; i += 1) {
+        clock.t += 1_000;
+        hostAt = iso();
+        expect((await probe(CO_A, envId("f0f0f0f0", i), {})).ok).toBe(true);
+        client(BASE1, `fake-ops-key-mix-${i}`, `line-mix-${i}`, i);
+        expect((await probe(CO_B, envId("f1f1f1f1", i), inline(BASE1, `fake-ops-key-mix-${i}`))).ok).toBe(true);
+      }
+      const hostBudget = expected("line-host", 3, hostAt, envId("f0f0f0f0", COUNT - 1), DEFAULT_API_BASE, "host");
+      const inlineBudget = (await budgetOf(CO_B))!;
+      expect(inlineBudget.provenance.credentialSource).toBe("inline");
+
+      kdf.calls = 0;
+      for (let round = 0; round < 3; round += 1) {
+        expect(await budgetOf(CO_A)).toEqual(hostBudget);
+        expect(await budgetOf(CO_B)).toEqual(inlineBudget);
+        expect(await budgetOf(CO_A, "0")).toEqual(hostBudget);
+      }
+      expect(kdf.calls).toBe(0);
+
+      // Rotating the shared host key invalidates every host source at once, at the cost of at most one derivation.
+      process.env.BOAT_API_KEY = KEY_HOST_2;
+      kdf.calls = 0;
+      expect(await budgetOf(CO_A)).toBeNull();
+      expect(kdf.calls).toBeLessThanOrEqual(1);
+      kdf.calls = 0;
+      expect(await budgetOf(CO_A)).toBeNull();
+      expect(await budgetOf(CO_A, "0")).toBeNull();
+      expect(await budgetOf(CO_B)).toEqual(inlineBudget);
+      expect(kdf.calls).toBe(0);
+    });
   });
 });
