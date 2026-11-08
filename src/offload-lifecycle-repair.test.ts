@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AccountReservation } from "./account-ledger.js";
 import type { OffloadExecutor } from "./offload.js";
 import { command, DiskState, EPOCH, fixture, type Fixture } from "./test-support/offload-lifecycle-contract.js";
-import { includedPlan, trialLimits } from "./test-support/fake-boat.js";
+import { includedPlan, responseError, trialLimits } from "./test-support/fake-boat.js";
 
 let s: Fixture;
 beforeEach(async () => { s = await fixture(); });
@@ -125,6 +125,105 @@ describe("receipt-to-pool failure ordering", () => {
 });
 
 describe("warm pre-effect refusal", () => {
+  it.each(["provider", "local"])("keeps B fenced when the accounting rollback write fails once (%s refusal)", async (refusal) => {
+    const ex = s.make(config);
+    expect(await s.execute(command("warm-a"), ex)).toMatchObject({ status: "completed" });
+    const [a] = await savedVms();
+    await s.clock.advance(5_000);
+    const set = s.state.set.bind(s.state);
+    let failures = 0;
+    s.state.set = async (key, value) => {
+      if (key.namespace === "boat-account" && failures === 0
+        && (value as { intents?: Array<{ status: string; operation: string }> }).intents
+          ?.some((i) => i.operation === "warm" && i.status === "rejected")) {
+        failures += 1;
+        throw new Error("one-shot rollback write outage");
+      }
+      await set(key, value);
+    };
+    if (refusal === "provider") {
+      s.boat.failNext("update", responseError(400, { message: "refused" }));
+    } else {
+      ledgerOf(ex).assertDispatchable = () => { throw new Error("local no-effect refusal"); };
+    }
+    s.boat.stopMode = "stays_up";
+    expect(await s.execute(command("warm-b"), ex)).toMatchObject({ status: "unavailable", remoteStarted: false });
+    expect(failures).toBe(1);
+    s.state.set = set;
+    const [b] = await savedVms();
+    expect(b!.accountReservation!.id).not.toBe(a!.accountReservation!.id);
+    expect(b).toMatchObject({ sandboxId: a!.sandboxId, quarantined: true, stopDueAt: a!.stopDueAt });
+    expect(s.starts.map((start) => start.commandId)).toEqual(["warm-a"]);
+    expect(s.boat.callsOf("update")).toHaveLength(refusal === "provider" ? 1 : 0);
+    // A fresh process owns B and the same stop duty, not an invented A rollback.
+    s.clock.crashWorker();
+    s.boat.stopMode = "immediate";
+    const next = restart();
+    await s.clock.advance(10_000);
+    await next.sweep();
+    expect(s.boat.boxes.get(a!.sandboxId)!.state).toBe("archived");
+    expect(await savedVms()).toMatchObject([{ sandboxId: a!.sandboxId, stopped: true }]);
+    const rows = next.getUsage();
+    expect(rows.filter((row) => row.commandId === "warm-a")).toHaveLength(1);
+    expect(rows.filter((row) => row.commandId === "warm-b")).toMatchObject([{ kind: "aborted_start" }]);
+    const aEnd = rows.find((row) => row.commandId === "warm-a")!.intervals.at(-1)!.until;
+    const bStart = rows.find((row) => row.commandId === "warm-b")!.intervals[0]!.since;
+    expect(aEnd).toBe(bStart);
+    expect(s.starts).toHaveLength(1);
+    expect(s.boat.callsOf("create")).toHaveLength(1);
+    expect(s.boat.callsOf("resume")).toHaveLength(0);
+    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1]
+      as { intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
+    expect(account.intents.find((i) => i.id === b!.accountReservation!.id)).toMatchObject({ status: "stopped" });
+  });
+
+  it("bounds an unsettled warm intent by TTL plus margin if both failure writes remain unavailable", async () => {
+    const ex = s.make(config);
+    await s.execute(command("warm-a"), ex);
+    await s.clock.advance(5_000);
+    const set = s.state.set.bind(s.state);
+    s.state.set = async (key, value) => {
+      if (key.namespace === "boat-account" && (value as { intents?: Array<{ operation: string; status: string }> }).intents
+        ?.some((i) => i.operation === "warm" && ["rejected", "ambiguous"].includes(i.status))) {
+        throw new Error("failure settlement outage");
+      }
+      await set(key, value);
+    };
+    s.boat.failNext("update", responseError(400, { message: "refused" }));
+    expect(await s.execute(command("warm-b"), ex)).toMatchObject({ status: "unavailable", remoteStarted: false });
+    s.state.set = set;
+    const [b] = await savedVms();
+    s.clock.crashWorker();
+    const ttlMs = Number(s.boat.callsOf("create")[0]!.args.ttlSeconds) * 1000;
+    s.clock.t = b!.accountReservation!.at + ttlMs + 600_001;
+    const next = restart();
+    await next.sweep();
+    const account = Object.entries(await s.state.all()).find(([key]) => JSON.parse(key).namespace === "boat-account")![1]
+      as { intents: Array<{ id: string; status: string; compute: number; computeReflected: number }> };
+    const intent = account.intents.find((i) => i.id === b!.accountReservation!.id)!;
+    expect(intent.status).toBe("stopped");
+    expect(intent.compute).toBeLessThanOrEqual(intent.computeReflected);
+    const row = next.getUsage().find((item) => item.commandId === "warm-b")!;
+    expect(row.kind).toBe("aborted_start");
+    expect(Date.parse(row.intervals[0]!.until) - Date.parse(row.intervals[0]!.since)).toBeLessThanOrEqual(ttlMs);
+    expect(s.starts.map((start) => start.commandId)).toEqual(["warm-a"]);
+    expect(s.boat.callsOf("create")).toHaveLength(1);
+  });
+
+  it("restores A after a definitive provider refusal only when its accounting rollback commits", async () => {
+    const ex = s.make(config);
+    await s.execute(command("warm-a"), ex);
+    const [a] = await savedVms();
+    await s.clock.advance(5_000);
+    s.boat.failNext("update", responseError(400, { message: "refused" }));
+    expect(await s.execute(command("warm-b"), ex)).toMatchObject({ status: "unavailable", remoteStarted: false });
+    expect(await savedVms()).toMatchObject([{ accountReservation: a!.accountReservation, quarantined: false, stopDueAt: a!.stopDueAt }]);
+    expect(ex.getUsage().find((row) => row.commandId === "warm-b")).toMatchObject({ kind: "failed_start", intervals: [] });
+    await s.clock.advance(10_000);
+    expect(s.boat.callsOf("stop")).toHaveLength(1);
+    expect(s.starts).toHaveLength(1);
+  });
+
   it.each(["machine type unavailable", "period ends inside the funded TTL"])("restores the predecessor's idle deadline, timer and quarantine state on a known no-effect refusal (%s)", async (refusal) => {
     const ex = s.make(config);
     expect(await s.execute(command("warm-a"), ex)).toMatchObject({ status: "completed" });

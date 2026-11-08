@@ -908,7 +908,10 @@ describe("sweep after a worker restart", () => {
       }
     });
 
-    it.each([false, true])("sweeps a terminal lost-create placeholder of an unloaded pool without a POST (known id=%s)", async (known) => {
+    it.each([{ known: false, busy: false }, { known: true, busy: false },
+      { known: false, busy: true }, { known: true, busy: true }])(
+      "sweeps an abandoned unloaded create only after terminal proof ($known, $busy)", async ({ known, busy }) => {
+      clock = Date.now();
       const lostId = "bx_lostcreate0001";
       const ledger = new AccountLedger(harness.ctx.state, accountId, () => clock);
       const reservation = await ledger.reserve(fake as unknown as BoatApiLike, { operation: "create", size: "default" as never,
@@ -917,31 +920,89 @@ describe("sweep after a worker restart", () => {
         fake.addSandbox({ id: lostId, state: "archived" });
         await ledger.started(fake as unknown as BoatApiLike, reservation, lostId);
       }
-      await ledger.failed(reservation, true);
       const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
       await store.save({ maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
-        [{ sandboxId: "", busy: false, stopped: false, stopping: false, quarantined: true, lastActiveAt: clock - 60_000,
+        [{ sandboxId: "", busy, stopped: false, stopping: false, quarantined: !busy, lastActiveAt: clock - 60_000,
           generation: 1, idleHandle: null, stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null,
           accountReservation: reservation }]);
-      await harness.ctx.state.set(
-        { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
-        { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-account", seenAt: clock - 60_000,
+      const registryKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" };
+      await harness.ctx.state.set(registryKey,
+        { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-account", seenAt: clock - 8 * 86_400_000,
           credentialDigest: poolDigestOf(keyA) } });
       const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
         ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+      const set = harness.ctx.state.set.bind(harness.ctx.state);
+      const get = harness.ctx.state.get.bind(harness.ctx.state);
+      const sweep = () => runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
       try {
-        await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
-        if (known) {
-          // The first sweep durably takes the known identity; deletion follows.
-          expect(await store.load()).toMatchObject([{ sandboxId: lostId, quarantined: true, deletePending: true }]);
+        // A different credential cannot resolve even the abandoned crash flags.
+        const beforeForeign = fake.calls.length;
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyB)] }).catch(() => undefined);
+        expect(fake.calls).toHaveLength(beforeForeign);
+        expect(await store.load()).toMatchObject([{ sandboxId: "", busy, quarantined: !busy }]);
+        // Never load an executor: pending (even busy=true/quarantined=false)
+        // remains held despite an old registry timestamp and no journal entries.
+        await sweep().catch(() => undefined);
+        expect(await store.load()).toMatchObject([{ sandboxId: "", busy, quarantined: !busy }]);
+        expect(await harness.ctx.state.get(registryKey)).toHaveProperty(poolId);
+        await ledger.failed(reservation, true);
+        harness.ctx.state.get = async (key) => {
+          if (key.namespace === "boat-account") throw new Error("unreadable account");
+          return await get(key);
+        };
+        await expect(sweep()).rejects.toThrow("unverified");
+        expect(await store.load()).toMatchObject([{ sandboxId: "", busy, quarantined: !busy }]);
+        expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+        harness.ctx.state.get = get;
+        if (busy) {
+          // A pre-fence owner commits during terminal-proof IO. Its fresh
+          // generation must survive this sweep's stale pool snapshot.
+          let claimed = false;
+          harness.ctx.state.set = async (key, value) => {
+            if (key.namespace === "boat-account" && !claimed) {
+              claimed = true;
+              const fresh = await store.loadDoc();
+              fresh.vms[0]!.generation += 1;
+              await store.save(fresh.config, fresh.vms);
+            }
+            await set(key, value);
+          };
+          await sweep();
+          expect(await store.load()).toMatchObject([{ sandboxId: "", busy: true, quarantined: false, generation: 2 }]);
           expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
-          await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
+          harness.ctx.state.set = set;
         }
+        if (known) {
+          let failSave = true;
+          harness.ctx.state.set = async (key, value) => {
+            if (key.namespace === "boat-offload-pool" && failSave) {
+              failSave = false;
+              throw new Error("one-shot ownership save outage");
+            }
+            await set(key, value);
+          };
+          await expect(sweep()).rejects.toThrow("unverified");
+          expect(await store.load()).toMatchObject([{ sandboxId: "", busy }]);
+          expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+          harness.ctx.state.set = set;
+          await sweep();
+          // Durable identity/delete ownership must precede the first DELETE.
+          expect(await store.load()).toMatchObject([{ sandboxId: lostId, busy: false, quarantined: true, deletePending: true }]);
+          expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+          fake.failNext("deleteSandbox", new Error("delete outage"));
+          await sweep();
+          expect(await store.load()).toMatchObject([{ sandboxId: lostId, deletePending: true }]);
+          expect(await harness.ctx.state.get(registryKey)).toHaveProperty(poolId);
+        }
+        await sweep();
         expect(await store.load()).toEqual([]);
+        expect(await harness.ctx.state.get(registryKey)).not.toHaveProperty(poolId);
         expect(fake.callsOf("create")).toHaveLength(0);
         expect(fake.callsOf("fork")).toHaveLength(0);
-        expect(fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual(known ? [lostId] : []);
+        expect(fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual(known ? [lostId, lostId] : []);
       } finally {
+        harness.ctx.state.set = set;
+        harness.ctx.state.get = get;
         await runtime.shutdown();
       }
     });

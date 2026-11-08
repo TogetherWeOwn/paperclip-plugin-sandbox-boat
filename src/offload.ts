@@ -1490,13 +1490,28 @@ export class OffloadExecutor {
       return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
     } catch (error) {
       const definitive = !effectConfirmed && (!effectAttempted || await definitiveStartRejection(error));
-      await ledger.failed(reservation, definitive).catch(() => {
+      const failurePersisted = await ledger.failed(reservation, definitive).then(() => true, () => {
         // The original durable intent remains held. No command was dispatched;
         // a failing follow-up write must not poison the idempotency receipt.
         this.logger.error("boat offload start reconciliation persistence failed; intent retained");
+        return false;
       });
       vm.busy = false;
-      if (predecessor && definitive) {
+      const failedRollback = predecessor && definitive && !failurePersisted;
+      if (failedRollback) {
+        // B still owns the durable envelope; A's tail was already closed by
+        // reserve. Do not restore A in the pool without its accounting commit.
+        // The idle predecessor has no command running. Fence B, discard the
+        // old guest identity as reuse proof, and retain its original stop duty.
+        vm.quarantined = true;
+        vm.workspaceKey = null;
+        vm.identity = null;
+        vm.stopDueAt = predecessor.stopDueAt ?? this.now();
+        // Reuse shipped terminal settlement for B, conservatively attributing
+        // the remaining idle exposure to an aborted start, never a command.
+        // A continuing outage retains the intent until bounded TTL recovery.
+        await ledger.failed(reservation, false).catch(() => undefined);
+      } else if (predecessor && definitive) {
         // Known no-effect refusal: the predecessor is exactly as before, with
         // its original absolute idle deadline re-armed (an overdue one fires
         // immediately). Generation stays advanced so old callbacks stay stale.
@@ -1516,6 +1531,7 @@ export class OffloadExecutor {
       if (!definitive) vm.quarantined = true;
       else if (!existing) this.retireVm(vm);
       await this.persistPool().catch(() => { vm.quarantined = true; });
+      if (failedRollback) await this.stopVm(vm, true, true);
       return { kind: "unavailable", reason: definitive ? "provider rejected start; no command dispatched" : "start outcome uncertain; reservation retained, no command dispatched" };
     }
   }

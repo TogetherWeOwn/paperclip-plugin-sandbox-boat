@@ -1012,7 +1012,8 @@ export class SshOffloadRuntime {
     // Fields a concurrent claim changes; compared against a reload before
     // saving so the sweep never overwrites a reservation made from a snapshot
     // taken before this upkeep's fence existed.
-    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.stopDueAt]);
+    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined,
+      vm.stopDueAt, vm.accountReservation?.id, vm.deletePending, vm.pendingCreate]);
     // Placeholders without a provider ID key on their durable reservation,
     // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
     const vmKey = (vm: PoolVm) => vm.sandboxId || vm.accountReservation?.id || "";
@@ -1026,10 +1027,15 @@ export class SshOffloadRuntime {
       if (!vm.sandboxId) {
         // A lost create reply: only a terminal retained intent resolves here,
         // never a POST. Pending or unreadable intents stay held.
-        if (!vm.quarantined || !vm.accountReservation || vm.busy) continue;
+        if (!vm.accountReservation) continue;
         try {
           const recovered = await ledger.recoverCreate(vm.accountReservation);
           if (recovered.status !== "terminal") continue;
+          // Initial pre-create persistence leaves busy=true/quarantined=false.
+          // The unloaded fence plus durable terminal proof, not those flags,
+          // permits recovery. A claim predating the fence still wins on reload.
+          const live = (await poolStore.loadDoc()).vms.find((entry) => vmKey(entry) === vmKey(vm));
+          if (!live || fingerprint(live) !== original.get(vmKey(vm))) continue;
           if (!recovered.sandboxId) {
             pool.splice(pool.indexOf(vm), 1);
             deletedKeys.add(keyOf.get(vm)!);
@@ -1037,6 +1043,7 @@ export class SshOffloadRuntime {
             // Keep the known archived sandbox owned (and deletable) durably.
             vm.sandboxId = recovered.sandboxId;
             vm.pendingCreate = undefined;
+            vm.busy = false;
             vm.quarantined = true;
             vm.deletePending = true;
           }
