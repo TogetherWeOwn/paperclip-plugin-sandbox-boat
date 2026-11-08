@@ -1324,6 +1324,7 @@ export class OffloadExecutor {
     // deadline below equals the funded envelope exactly.
     const ttlSeconds = Math.max(60, Math.ceil(jobSeconds + reservation.tailSeconds));
     let effectConfirmed = operation === "warm";
+    let effectAttempted = false;
     // The replay contract is same key + same body. Fix the exact body before
     // the first persist so a lost reply (or a restart before the receipt)
     // replays it verbatim instead of rebuilding it from a newer command.
@@ -1343,6 +1344,8 @@ export class OffloadExecutor {
       // Taken before the provider call: the provider deadline it sets is no
       // earlier than fundedFrom + ttlSeconds.
       const fundedFrom = this.now();
+      ledger.assertDispatchable(reservation, ttlSeconds);
+      effectAttempted = true;
       if (operation === "create") {
         // Same semantics as whole-run leases (vm-manager): a configured named
         // snapshot is the guest image; a missing one is a refused start, so the
@@ -1383,12 +1386,15 @@ export class OffloadExecutor {
       vm.tailSeconds = await ledger.started(this.boat, reservation, vm.sandboxId);
       // A metered resume may select C=300. Keep provider auto-stop aligned with
       // the longer, already-funded reservation before starting the command.
-      if (vm.tailSeconds > reservation.tailSeconds) await this.boat.update({ sandboxId: vm.sandboxId,
-        ttlSeconds: Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds)) });
+      if (vm.tailSeconds > reservation.tailSeconds) {
+        const extendedTtl = Math.max(60, Math.ceil(jobSeconds + vm.tailSeconds));
+        ledger.assertDispatchable(reservation, extendedTtl);
+        await this.boat.update({ sandboxId: vm.sandboxId, ttlSeconds: extendedTtl });
+      }
       await this.persistPool();
       return { kind: "run", vm, warm: operation === "warm" ? "warm" : "cold", fundedUntil: fundedFrom + jobSeconds * 1000 };
     } catch (error) {
-      const definitive = !effectConfirmed && await definitiveStartRejection(error);
+      const definitive = !effectConfirmed && (!effectAttempted || await definitiveStartRejection(error));
       await ledger.failed(reservation, definitive).catch(() => {
         // The original durable intent remains held. No command was dispatched;
         // a failing follow-up write must not poison the idempotency receipt.

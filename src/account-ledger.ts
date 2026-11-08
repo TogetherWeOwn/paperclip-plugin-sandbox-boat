@@ -5,7 +5,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { BoatProviderError, describeBoatError } from "./errors.js";
 import type { StateClientLike } from "./state.js";
-import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
+import { BoatBudgetError, checkBudget, readBudget, readIncludedAllowance } from "./budget.js";
 import type { BudgetLimitName } from "./budget.js";
 
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 } as const;
@@ -74,6 +74,9 @@ interface Limits {
   canStart: boolean;
   available: number;
   used: number;
+  includedHours: number;
+  periodEndMs: number;
+  nextStartDollars: number;
   windows: Record<Window, StartWindow | null>;
   sizes: Array<{ type: string; available: boolean }>;
 }
@@ -126,7 +129,7 @@ export interface AdmissionRequest {
   /** Monthly offload VM-hour cap: enforced atomically with admission inside the ledger lock. */
   monthlyCap?: { companyId: string; nowMs: number; capHours: number };
 }
-export interface AccountReservation { id: string; tailSeconds: number; at: number }
+export interface AccountReservation { id: string; tailSeconds: number; at: number; periodEndMs?: number }
 
 function number(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error("limits unreadable: invalid numeric capacity");
@@ -143,11 +146,12 @@ function parseLimits(raw: unknown, at: number): Limits {
   if (!root || root.ok !== true) throw new Error("limits unreadable: invalid response");
   const nested = (root.upgradeEffects ?? {}) as Record<string, unknown>;
   const pkg = (root._package ?? nested._package ?? {}) as Record<string, unknown>;
-  const field = (key: string) => root[key] ?? nested[key] ?? pkg[key];
-  const used = number(field("creditUsedSeconds"));
-  const balance = number(field("creditBalanceSeconds"));
-  const trial = field("trialComputeCapSeconds");
-  const available = trial == null || trial === 0 ? balance : Math.min(balance, Math.max(0, number(trial) - used));
+  const field = (key: string) => root[key] !== undefined ? root[key] : nested[key] !== undefined ? nested[key] : pkg[key];
+  const included = readIncludedAllowance(field("planIncluded"));
+  if (!included || included.periodEndMs <= at) throw new Error("limits unreadable: missing current included allowance");
+  const available = included.remaining * 3600;
+  const used = (included.hours - included.remaining) * 3600;
+  const nextStartDollars = number(field("nextStartDollars"));
   const starts = field("starts") as Record<string, unknown> | undefined;
   if (!starts || typeof starts.unlimited !== "boolean" || typeof field("canStart") !== "boolean") throw new Error("limits unreadable: missing start capacity");
   const windows = {} as Limits["windows"];
@@ -160,7 +164,7 @@ function parseLimits(raw: unknown, at: number): Limits {
   const sizes = field("machineTypes");
   if (!Array.isArray(sizes)) throw new Error("limits unreadable: missing machine types");
   return { at, active: number(field("activeSandboxes")), activeCap: number(field("maxActiveSandboxes")), canStart: field("canStart") === true,
-    available, used, windows, sizes: sizes as Limits["sizes"] };
+    available, used, includedHours: included.hours, periodEndMs: included.periodEndMs, nextStartDollars, windows, sizes: sizes as Limits["sizes"] };
 }
 
 async function bounded<T>(fn: () => Promise<T>): Promise<T> {
@@ -308,15 +312,16 @@ export class AccountLedger {
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
     const prior = this.observation(doc);
     const age = prior ? this.now() - prior.at : Infinity;
-    if (allowCached && age >= 0 && age <= 5000) return prior!;
+    if (allowCached && age >= 0 && age <= 5000 && prior!.periodEndMs > this.now()
+      && Number.isFinite(prior!.includedHours) && prior!.nextStartDollars === 0) return prior!;
     let current: Limits;
     try {
       const raw = await bounded(() => api.limits({}));
       // Preserve an actionable refusal even for a partial exhausted response.
-      // This legacy projection can only REFUSE; every admission still requires
-      // the complete, finite strict snapshot below.
+      // This projection can only REFUSE; every admission still requires the
+      // complete, finite strict snapshot below.
       if (request && request.operation !== "warm") {
-        const refusal = checkBudget(readBudget(raw), request, request.size);
+        const refusal = checkBudget(readBudget(raw), request, request.size, this.now());
         if (refusal) throw new BoatBudgetError(refusal);
       }
       current = parseLimits(raw, this.now());
@@ -331,7 +336,10 @@ export class AccountLedger {
     doc.observationOwner ??= doc.observation ? "unscoped" : scope;
     if (prior && doc.observationOwner === scope) {
       let activeDelta = Math.max(0, current.active - prior.active);
-      let computeDelta = Math.max(0, current.used - prior.used, prior.available - current.available);
+      // Rollover, plan changes and legacy observations cannot attribute a
+      // balance change to these holds. Retain their unreflected reservations.
+      const samePeriod = current.periodEndMs === prior.periodEndMs && current.includedHours === prior.includedHours;
+      let computeDelta = samePeriod ? Math.max(0, current.used - prior.used, prior.available - current.available) : 0;
       for (const intent of doc.intents) {
         if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.settledAt == null) continue;
         if (activeDelta > 0 && intent.active && !intent.activeReflected) { intent.activeReflected = true; activeDelta--; }
@@ -371,7 +379,7 @@ export class AccountLedger {
     const refuse = (limit: BudgetLimitName, message: string): never => { throw new BoatBudgetError({ limit, message, details: {} }); };
     const intents = doc.intents.filter((i) => i.id !== ignore && i.status !== "rejected");
     if (req.operation !== "warm") {
-      if (!limits.canStart) refuse("boat_cannot_start", "provider refused admission");
+      if (!limits.canStart || limits.nextStartDollars !== 0) refuse("boat_cannot_start", "provider did not verify a zero-cost start");
       const active = limits.active + intents.filter((i) => i.active && !i.activeReflected).length;
       if (active + 1 > Math.min(req.maxActive, limits.activeCap)) refuse("maxActive", "account active capacity exhausted");
       for (const name of Object.keys(WINDOWS) as Window[]) {
@@ -382,6 +390,11 @@ export class AccountLedger {
           refuse(name === "day" ? "maxStartsPerDay" : name === "hour" ? "boatStartsPerHour" : "boatStartsPerMinute", `account ${name} start capacity exhausted`);
         }
       }
+    }
+    // No allowance beyond this billing boundary is known. Fund the complete
+    // preparation/command/idle envelope without assuming next period's plan.
+    if (!Number.isFinite(limits.periodEndMs) || this.now() + Math.max(60, Math.ceil(req.jobSeconds + tailSeconds)) * 1000 > limits.periodEndMs) {
+      refuse("minComputeHoursLeft", "included billing period does not fund the complete lifetime");
     }
     const machine = limits.sizes.find((s) => s.type === req.size);
     if (!machine?.available) refuse("machineType", "unavailable size");
@@ -518,11 +531,18 @@ export class AccountLedger {
       await this.write(candidate);
       // Persistence may itself have waited for the store. Revalidate the exact
       // intent before any external effect if its observation aged out.
+      try {
+        this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, intent.ttlSeconds);
+      } catch (error) {
+        await this.write(doc);
+        throw error;
+      }
       if (this.now() - limits.at > 5000) {
         try {
           limits = await this.observe(api, candidate);
           this.check(candidate, limits, req, tailSeconds, id);
           await this.write(candidate);
+          this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, intent.ttlSeconds);
           if (this.now() - limits.at > 5000) throw new Error("limits expired while persisting admission");
         } catch (error) {
           // No external effect occurred. Restore the predecessor's open tail;
@@ -531,8 +551,16 @@ export class AccountLedger {
           throw error;
         }
       }
-      return { id, tailSeconds, at };
+      return { id, tailSeconds, at, periodEndMs: limits.periodEndMs };
     });
+  }
+
+  /** Synchronous final check: caller persistence must not outlive the funded period. */
+  assertDispatchable(reservation: AccountReservation, ttlSeconds: number): void {
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds < 60 || !Number.isFinite(reservation.periodEndMs)
+      || this.now() + ttlSeconds * 1000 > reservation.periodEndMs!) {
+      throw new BoatBudgetError({ limit: "minComputeHoursLeft", message: "included billing period no longer funds dispatch", details: {} });
+    }
   }
 
   async revalidate(api: BoatApiLike, reservation: AccountReservation, req: AdmissionRequest): Promise<void> {
@@ -541,6 +569,8 @@ export class AccountLedger {
       const limits = await this.observe(api, doc);
       this.check(doc, limits, req, reservation.tailSeconds, reservation.id);
       await this.write(doc);
+      reservation.periodEndMs = limits.periodEndMs;
+      this.assertDispatchable(reservation, Math.max(60, Math.ceil(req.jobSeconds + reservation.tailSeconds)));
       if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
     });
   }
@@ -561,6 +591,7 @@ export class AccountLedger {
           if (delta != null && delta > 0) {
             doc.countedResumeUntil = limits.windows.day?.resetAt ?? this.now() + WINDOWS.day;
             if (intent.poolId && intent.tailSeconds < 300) {
+              this.assertDispatchable({ ...reservation, periodEndMs: limits.periodEndMs }, Math.max(60, Math.ceil(intent.jobSeconds + 300)));
               const extra = (300 - intent.tailSeconds) * WEIGHT[intent.size];
               const outstanding = doc.intents.reduce((n, i) => n + Math.max(0, i.compute - i.computeReflected), 0);
               if (limits.available - outstanding < extra + intent.reserveSeconds) throw new Error("insufficient compute for metered-resume tail");

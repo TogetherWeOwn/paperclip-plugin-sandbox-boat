@@ -4,7 +4,7 @@ import type { AccountUsageRow, AdmissionRequest } from "./account-ledger.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { parseDriverConfig } from "./config.js";
 import { responseError } from "./test-support/fake-boat.js";
-import { COMPANY, EPOCH, advance, command, fixture, limits, starts } from "./test-support/account-admission.fixture.js";
+import { COMPANY, EPOCH, advance, command, fixture, includedPlan, limits, starts } from "./test-support/account-admission.fixture.js";
 
 let f: ReturnType<typeof fixture>;
 beforeEach(() => {
@@ -29,7 +29,7 @@ describe("review safety mutation pins", () => {
     const id = lease.providerLeaseId!;
     const oldDeadline = f.boat.boxes.get(id)!.archiveAfter;
     await advance(31_000); // Extension is due; cached limits can no longer authorize it.
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 3601 });
+    f.boat.limitsResponse = limits({ planIncluded: includedPlan(3601) });
     const updates = f.boat.callsOf("update").length;
     const intents = journal().intents;
     await manager.maybeExtend(parseDriverConfig({ apiKey: "boat_synthetic_not_a_credential", autoStopMinutes: 1, cliproxyTunnel: false }), COMPANY, id);
@@ -148,7 +148,7 @@ describe("review safety mutation pins", () => {
     f.state.beforeWrite = async () => {
       f.state.beforeWrite = undefined;
       vi.setSystemTime(Date.now() + 6_001);
-      f.boat.limitsResponse = limits({ creditBalanceSeconds: 3600 });
+      f.boat.limitsResponse = limits({ planIncluded: includedPlan(3600) });
     };
     await expect(ledger.reserve(api(), { ...req, operation: "warm", sandboxId: id, command: identity("refused-handoff") }))
       .rejects.toThrow();

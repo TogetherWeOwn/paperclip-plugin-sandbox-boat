@@ -52,11 +52,11 @@ import { endpointFromSshKeyResponse } from "./ssh.js";
 import { resolveVmKey, sandboxNameFor, sanitizeSnapshotName } from "./vm-manager.js";
 import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
 import { PAPERCLIP_INSTRUCTION_GIT_EXCLUDE_PROGRAM } from "./test-support/paperclip-instruction-git-exclude.js";
-import { responseError, trialLimits } from "./test-support/fake-boat.js";
+import { includedPlan, responseError, trialLimits } from "./test-support/fake-boat.js";
 
 describe("readBudget", () => {
   it("reads the flat GET /limits shape that boat returns on the trial", () => {
-    const snapshot = readBudget(trialLimits({ creditUsedSeconds: 3600 }));
+    const snapshot = readBudget(trialLimits({ planIncluded: includedPlan(86_400), creditUsedSeconds: 3600 }));
     expect(snapshot).toMatchObject({
       accessTier: "trial",
       canStart: true,
@@ -71,17 +71,17 @@ describe("readBudget", () => {
   });
 
   it("also reads fields nested under upgradeEffects (older SDK typings)", () => {
-    const snapshot = readBudget({ ok: true, upgradeEffects: { canStart: true, activeSandboxes: 1, maxActiveSandboxes: 100, creditBalanceSeconds: 7200 } });
+    const snapshot = readBudget({ ok: true, upgradeEffects: { canStart: true, activeSandboxes: 1, maxActiveSandboxes: 100, planIncluded: includedPlan(7200), nextStartDollars: 0 } });
     expect(snapshot).toMatchObject({ activeSandboxes: 1, maxActiveSandboxes: 100, computeHoursLeft: 2 });
   });
 
-  it("prefers the trial consumption counter when the trial reports one", () => {
+  it("ignores legacy consumption counters when modern included allowance is present", () => {
     const snapshot = readBudget(trialLimits({ creditUsedSeconds: 3600, trialComputeUsedSeconds: 7200 }));
-    expect(snapshot.computeHoursLeft).toBe(23);
+    expect(snapshot.computeHoursLeft).toBe(25);
   });
 
-  it("uses the smaller of the trial cap and the balance", () => {
-    expect(readBudget(trialLimits({ creditBalanceSeconds: 1800 })).computeHoursLeft).toBe(0.5);
+  it("does not substitute legacy credits for missing included capacity", () => {
+    expect(readBudget(trialLimits({ planIncluded: undefined, creditBalanceSeconds: 1800 })).computeHoursLeft).toBeNull();
   });
 
   it("passes when everything is within limits and never counts past boat's own plan limits", () => {

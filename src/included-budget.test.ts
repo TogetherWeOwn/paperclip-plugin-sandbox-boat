@@ -1,0 +1,160 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AccountLedger } from "./account-ledger.js";
+import type { AdmissionRequest } from "./account-ledger.js";
+import type { BoatApiLike } from "./boat-client.js";
+import { checkBudget, readBudget } from "./budget.js";
+import { EPOCH, JsonState, advance, command, fixture, noDispatch, safeRefusal, starts } from "./test-support/account-admission.fixture.js";
+
+const END = EPOCH + 30 * 86_400_000;
+const included = (seconds = 90_000, periodEnd = END) => ({ vmHours: 25, vmHoursRemaining: seconds / 3600, periodEnd: new Date(periodEnd) });
+function modern(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ok: true, planIncluded: included(), nextStartDollars: 0, canStart: true,
+    activeSandboxes: 0, maxActiveSandboxes: 100, starts: starts(),
+    machineTypes: [{ type: "default", available: true }, { type: "large", available: true }], ...overrides };
+}
+const request: AdmissionRequest = { operation: "create", size: "default", jobSeconds: 150,
+  tailSeconds: 15, maxActive: 100, maxStartsPerDay: 70, minComputeHoursLeft: 0 };
+
+beforeEach(() => { vi.useFakeTimers({ now: EPOCH, toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] }); });
+afterEach(() => { vi.useRealTimers(); });
+
+describe("authoritative included-only budget", () => {
+  it("reads modern-only limits and ignores wallet, trial and deprecated credit counters", () => {
+    const raw = modern({ planIncluded: included(7200), creditBalanceSeconds: 0,
+      creditUsedSeconds: 2_000_000, trialComputeCapSeconds: 1, walletDollars: 999, grace: true });
+    expect(readBudget(raw)).toMatchObject({ computeHoursLeft: 2, includedPeriodEndMs: END, nextStartDollars: 0 });
+    expect(checkBudget(readBudget(raw), request, "default")).toBeNull();
+    expect(readBudget({ ok: true, upgradeEffects: modern({ planIncluded: included(7200) }) }).computeHoursLeft).toBe(2);
+    expect(readBudget({ ok: true, _package: modern({ planIncluded: included(7200) }) }).computeHoursLeft).toBe(2);
+  });
+
+  it.each([
+    { planIncluded: undefined }, { planIncluded: null },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: "25", periodEnd: new Date(END) } },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: -1, periodEnd: new Date(END) } },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 26, periodEnd: new Date(END) } },
+    { planIncluded: { vmHours: 25, vmHoursRemaining: 25, periodEnd: 12 } },
+    { planIncluded: included(90_000, EPOCH) },
+    { nextStartDollars: undefined }, { nextStartDollars: null },
+    { nextStartDollars: 0.01 }, { nextStartDollars: -1 }, { nextStartDollars: "0" },
+    { canStart: undefined },
+  ])("refuses missing/malformed or paid capacity despite legacy balance: %j", (overrides) => {
+    const raw = modern({ creditBalanceSeconds: 2_000_000, ...overrides });
+    expect(checkBudget(readBudget(raw), request, "default")).not.toBeNull();
+  });
+
+  it("does not repair explicit invalid modern fields with nested capacity", () => {
+    const raw = modern({ planIncluded: null, upgradeEffects: modern() });
+    expect(checkBudget(readBudget(raw), request, "default")).not.toBeNull();
+  });
+
+  it("zero allowance is a refusal even when canStart is true and reserve is zero", () => {
+    expect(checkBudget(readBudget(modern({ planIncluded: included(0) })), request, "default")).not.toBeNull();
+  });
+});
+
+describe("included account reservations", () => {
+  function setup(raw = modern()) {
+    const state = new JsonState();
+    const api = { limits: async () => raw } as unknown as BoatApiLike;
+    const ledger = new AccountLedger(state, "included-budget-test", Date.now);
+    return { state, api, ledger, set: (next: Record<string, unknown>) => { raw = next; } };
+  }
+
+  it("admits exactly one concurrent size-weighted preparation + command + tail envelope", async () => {
+    const { ledger, api } = setup(modern({ planIncluded: included(659) }));
+    const req = { ...request, size: "large" as const }; // (150 + 15) * 2 = 330 seconds
+    const results = await Promise.allSettled([ledger.reserve(api, req), ledger.reserve(api, req)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
+  });
+
+  it.each(["minute", "hour", "day"] as const)("retains the shared last %s start window", async (window) => {
+    const windows = starts(); windows[window] = { limit: 1, used: 0, remaining: 1 };
+    const { ledger, api } = setup(modern({ starts: windows }));
+    const results = await Promise.allSettled([ledger.reserve(api, request), ledger.reserve(api, request)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  });
+
+  it.each(["create", "resume", "warm"] as const)("requires a modern allowance before %s", async (operation) => {
+    const { ledger, api } = setup(modern({ planIncluded: undefined, creditBalanceSeconds: 2_000_000 }));
+    await expect(ledger.reserve(api, { ...request, operation })).rejects.toThrow();
+  });
+
+  it.each(["create", "resume"] as const)("requires a zero-cost %s, not just canStart", async (operation) => {
+    const { ledger, api } = setup(modern({ nextStartDollars: 0.01 }));
+    await expect(ledger.reserve(api, { ...request, operation })).rejects.toThrow();
+  });
+
+  it("never reflects a reservation using a decrease across different billing periods", async () => {
+    const s = setup(modern({ planIncluded: included(500) }));
+    const first = await s.ledger.reserve(s.api, request);
+    await s.ledger.started(s.api, first, "synthetic-vm");
+    await advance(100_000);
+    // A lower allowance in a different period is NOT consumption of this hold.
+    s.set(modern({ planIncluded: included(300, END + 30 * 86_400_000) }));
+    const recovered = new AccountLedger(s.state, "included-budget-test", Date.now);
+    await expect(recovered.reserve(s.api, request)).rejects.toThrow();
+  });
+
+  it("reflects actual included consumption only within the same period", async () => {
+    const s = setup(modern({ planIncluded: included(500) }));
+    const first = await s.ledger.reserve(s.api, request);
+    await s.ledger.started(s.api, first, "synthetic-vm");
+    await advance(100_000);
+    s.set(modern({ planIncluded: included(300) }));
+    await expect(s.ledger.reserve(s.api, request)).resolves.toHaveProperty("id");
+  });
+
+  it("does not reuse a legacy cached observation without included provenance", async () => {
+    const s = setup();
+    await s.ledger.reserve(s.api, request);
+    for (const [key, json] of s.state.rows) {
+      const doc = JSON.parse(json); delete doc.observation.periodEndMs;
+      s.state.rows.set(key, JSON.stringify(doc));
+    }
+    s.set(modern({ planIncluded: undefined }));
+    await expect(s.ledger.reserve(s.api, { ...request, allowCachedLimits: true })).rejects.toThrow();
+  });
+
+  it("keeps the original tail when a metered resume cannot fit the included period", async () => {
+    const s = setup(modern({ planIncluded: included(90_000, EPOCH + 200_000) }));
+    const reservation = await s.ledger.reserve(s.api, { ...request, operation: "resume", poolId: "resume-pool" });
+    s.set(modern({ planIncluded: included(90_000, EPOCH + 200_000), starts: starts(1) }));
+    expect(await s.ledger.started(s.api, reservation, "synthetic-vm")).toBe(15);
+  });
+
+  it("refuses if persistence consumes the remaining lifetime headroom", async () => {
+    const s = setup(modern({ planIncluded: included(90_000, EPOCH + 166_000) }));
+    s.state.beforeWrite = async () => { await advance(2_000); };
+    await expect(s.ledger.reserve(s.api, request)).rejects.toThrow();
+    const doc = JSON.parse([...s.state.rows.values()][0]!);
+    expect(doc.intents).toHaveLength(0);
+  });
+
+  it("refuses dispatch when caller persistence consumes lifetime headroom", async () => {
+    const { ledger, api } = setup(modern({ planIncluded: included(90_000, EPOCH + 166_000) }));
+    const reservation = await ledger.reserve(api, request);
+    await advance(2_000);
+    expect(() => ledger.assertDispatchable(reservation, 165)).toThrow();
+  });
+
+  it("does not fund work beyond the known included period, including cached limits", async () => {
+    const { ledger, api } = setup(modern({ planIncluded: included(90_000, EPOCH + 168_000) }));
+    await ledger.reserve(api, request);
+    await advance(4_000);
+    await expect(ledger.reserve(api, { ...request, allowCachedLimits: true })).rejects.toThrow();
+  });
+});
+
+describe("never-started fallback contract", () => {
+  it.each([modern({ planIncluded: included(0) }), modern({ planIncluded: undefined }), modern({ nextStartDollars: 0.01 })])(
+    "returns a verified never-started refusal, not execution uncertainty", async (raw) => {
+      const f = fixture();
+      try {
+        f.boat.limitsResponse = raw;
+        safeRefusal(await f.pool().execute(command("included-refused")));
+        noDispatch(f);
+      } finally { await f.close(); }
+    });
+});

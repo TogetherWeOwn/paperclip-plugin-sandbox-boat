@@ -35,6 +35,10 @@ export function responseError(status: number, body: Record<string, unknown>): Er
   return error;
 }
 
+export function includedPlan(seconds = 90_000) {
+  return { vmHours: 555.56, vmHoursRemaining: seconds / 3600, periodEnd: new Date("2100-01-01T00:00:00Z") };
+}
+
 export function trialLimits(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     ok: true,
@@ -47,6 +51,8 @@ export function trialLimits(overrides: Record<string, unknown> = {}): Record<str
     creditBalanceSeconds: 2_000_000,
     creditUsedSeconds: 0,
     trialComputeCapSeconds: 90_000,
+    planIncluded: includedPlan(),
+    nextStartDollars: 0,
     machineTypes: [
       { type: "small", available: true, reason: null },
       { type: "default", available: true, reason: null },

@@ -16,6 +16,8 @@ export interface BudgetSnapshot {
   startsHourRemaining: number | null;
   startsMinuteRemaining: number | null;
   computeHoursLeft: number | null;
+  includedPeriodEndMs: number | null;
+  nextStartDollars: number | null;
   trialComputeCapHours: number | null;
   machineTypes: Array<{ type: string; available: boolean; reason: string | null }>;
   trialLine: string | null;
@@ -44,6 +46,21 @@ function s(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function object(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** The included allowance is distinct from wallet, grace and legacy credits. */
+export function readIncludedAllowance(value: unknown): { hours: number; remaining: number; periodEndMs: number } | null {
+  const plan = object(value);
+  const hours = n(plan.vmHours), remaining = n(plan.vmHoursRemaining);
+  const periodEndMs = plan.periodEnd instanceof Date ? plan.periodEnd.getTime()
+    : typeof plan.periodEnd === "string" ? Date.parse(plan.periodEnd) : NaN;
+  if (hours == null || remaining == null || hours < 0 || remaining < 0 || remaining > hours
+    || hours > 1e7 || !Number.isFinite(periodEndMs)) return null;
+  return { hours, remaining, periodEndMs };
+}
+
 /** GET /limits is flat in practice; older SDK typings nest some fields under `upgradeEffects`. Read both. */
 export function readBudget(response: unknown): BudgetSnapshot {
   const root = (response && typeof response === "object" ? response : {}) as Record<string, unknown>;
@@ -61,17 +78,7 @@ export function readBudget(response: unknown): BudgetSnapshot {
   const minute = starts.minute ?? {};
 
   const trialCap = n(field("trialComputeCapSeconds"));
-  // The trial reports its own consumption counter; only without a trial cap
-  // does the legacy credit counter apply.
-  const used = trialCap != null && trialCap > 0
-    ? (n(field("trialComputeUsedSeconds")) ?? n(field("creditUsedSeconds")) ?? 0)
-    : (n(field("creditUsedSeconds")) ?? 0);
-  const balanceSeconds = n(field("creditBalanceSeconds"));
-  const trialLeft = trialCap != null && trialCap > 0 ? Math.max(0, trialCap - used) : null;
-  let computeSecondsLeft: number | null = trialLeft;
-  if (balanceSeconds != null) {
-    computeSecondsLeft = computeSecondsLeft == null ? balanceSeconds : Math.min(computeSecondsLeft, balanceSeconds);
-  }
+  const included = readIncludedAllowance(field("planIncluded"));
 
   const machineTypesRaw = field("machineTypes");
   const machineTypes = Array.isArray(machineTypesRaw)
@@ -86,7 +93,7 @@ export function readBudget(response: unknown): BudgetSnapshot {
 
   return {
     accessTier: s(field("accessTier")),
-    canStart: field("canStart") !== false,
+    canStart: root.ok === true && field("canStart") === true,
     startBlockedReason: s(field("startBlockedReason")) ?? s(field("blockedReason")),
     activeSandboxes: n(field("activeSandboxes")),
     maxActiveSandboxes: n(field("maxActiveSandboxes")),
@@ -94,15 +101,26 @@ export function readBudget(response: unknown): BudgetSnapshot {
     startsDayLimit: n(day.limit),
     startsHourRemaining: n(hour.remaining),
     startsMinuteRemaining: n(minute.remaining),
-    computeHoursLeft: computeSecondsLeft == null ? null : computeSecondsLeft / 3600,
+    computeHoursLeft: included?.remaining ?? null,
+    includedPeriodEndMs: included?.periodEndMs ?? null,
+    nextStartDollars: n(field("nextStartDollars")),
     trialComputeCapHours: trialCap != null && trialCap > 0 ? trialCap / 3600 : null,
     machineTypes,
     trialLine: s(field("trialLine")),
   };
 }
 
-export function checkBudget(snapshot: BudgetSnapshot, config: Pick<BoatDriverConfig, "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">, size: BoatSize): BudgetRefusal | null {
+export function checkBudget(snapshot: BudgetSnapshot, config: Pick<BoatDriverConfig, "maxActive" | "maxStartsPerDay" | "minComputeHoursLeft">, size: BoatSize, nowMs = Date.now()): BudgetRefusal | null {
   const nothingStarted = "Nothing was started or billed.";
+  if (snapshot.nextStartDollars !== 0) {
+    return { limit: "boat_cannot_start", message: `boat did not verify a zero-cost start. ${nothingStarted}`,
+      details: { nextStartDollars: snapshot.nextStartDollars } };
+  }
+  if (snapshot.computeHoursLeft == null || snapshot.computeHoursLeft <= 0
+    || snapshot.includedPeriodEndMs == null || snapshot.includedPeriodEndMs <= nowMs) {
+    return { limit: "minComputeHoursLeft", message: `boat included compute allowance is missing, exhausted or expired. ${nothingStarted}`,
+      details: { computeHoursLeft: snapshot.computeHoursLeft, includedPeriodEndMs: snapshot.includedPeriodEndMs } };
+  }
   if (!snapshot.canStart) {
     return {
       limit: "boat_cannot_start",
@@ -145,7 +163,7 @@ export function checkBudget(snapshot: BudgetSnapshot, config: Pick<BoatDriverCon
   if (snapshot.computeHoursLeft != null && snapshot.computeHoursLeft < config.minComputeHoursLeft) {
     return {
       limit: "minComputeHoursLeft",
-      message: `only ${snapshot.computeHoursLeft.toFixed(2)} hours of boat compute are left and the reserve is ${config.minComputeHoursLeft} hours (config minComputeHoursLeft). ${nothingStarted} The owner must add time (plan or credit pack) before more boat runs.`,
+      message: `only ${snapshot.computeHoursLeft.toFixed(2)} hours of boat compute are left and the reserve is ${config.minComputeHoursLeft} hours (config minComputeHoursLeft). ${nothingStarted} Retry only when included allowance is sufficient; wallet or paid credits do not authorize admission.`,
       details: { computeHoursLeft: snapshot.computeHoursLeft, minComputeHoursLeft: config.minComputeHoursLeft },
     };
   }

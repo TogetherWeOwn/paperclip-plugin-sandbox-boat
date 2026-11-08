@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountLedger } from "./account-ledger.js";
-import { COMPANY, EPOCH, advance, command, fixture, limits, starts } from "./test-support/account-admission.fixture.js";
+import { COMPANY, EPOCH, advance, command, fixture, includedPlan, limits, starts } from "./test-support/account-admission.fixture.js";
 
 let f: ReturnType<typeof fixture>;
 beforeEach(() => {
@@ -101,7 +101,7 @@ describe("review findings", () => {
     const ledger = new AccountLedger(f.state, f.accountId, () => Date.now());
     // Just enough balance for one envelope: with the expired 660 s hold still
     // outstanding, the next 660 s envelope would not fit.
-    f.boat.limitsResponse = limits({ creditBalanceSeconds: 1000 });
+    f.boat.limitsResponse = limits({ planIncluded: includedPlan(1000) });
     const api = f.boat as never;
     const base = { operation: "create" as const, size: "default" as const, jobSeconds: JOB, tailSeconds: TAIL,
       maxActive: 10, maxStartsPerDay: 70, minComputeHoursLeft: 0, poolId: "expiry" };
