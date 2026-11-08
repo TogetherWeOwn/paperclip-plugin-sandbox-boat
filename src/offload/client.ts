@@ -320,6 +320,12 @@ async function poll(ctx: PollContext, cursor: number): Promise<number> {
     } catch {
       response = { ok: false, error: "read failed" };
     }
+    // A signal received during the read wins over both receipts and errors.
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      await cancelBestEffort(ctx);
+      return signalExit(readSignal);
+    }
     if (response.ok && response.status === 200) {
       const view = asReadView(response.json, commandId, cursor);
       if (view) {
@@ -381,6 +387,12 @@ async function recover(ctx: PollContext): Promise<number> {
     } catch {
       response = { ok: false, error: "read failed" };
     }
+    // A signal received during the read wins over both receipts and errors.
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      await cancelBestEffort(ctx);
+      return signalExit(readSignal);
+    }
     if (response.ok && response.status === 200) {
       const view = asReadView(response.json, commandId, cursor);
       if (view) {
@@ -429,6 +441,11 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
       receipt = await readReceipt(ctx, 0);
     } catch {
       receipt = { ok: false, error: "read failed" };
+    }
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      await cancelBestEffort(ctx);
+      return signalExit(readSignal);
     }
     if (receipt.ok && receipt.status === 200) {
       const view = asReadView(receipt.json, commandId);
