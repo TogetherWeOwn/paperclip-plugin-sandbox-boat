@@ -616,7 +616,7 @@ describe("delta push over stub SSH", () => {
     const root = source({ [lock]: "{}", "old.txt": "old" });
     const cmd = () => command({ tool, runner: tool === "node" ? "npm" : "pytest" });
     const { sync, ssh, guest, spawn } = setup(root);
-    const original = ssh.runStream.getMockImplementation()!;
+    const original = ssh.runStream.getMockImplementation()! as (session: unknown, script: string, opts: unknown) => Promise<unknown>;
     let fail = false;
     ssh.runStream.mockImplementation(async (session: unknown, script: string, opts: unknown) => {
       if (fail && script.includes(tool === "node" ? "npm" : "--frozen")) {
