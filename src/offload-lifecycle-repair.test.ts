@@ -144,7 +144,16 @@ describe("warm pre-effect refusal", () => {
     if (refusal === "provider") {
       s.boat.failNext("update", responseError(400, { message: "refused" }));
     } else {
-      ledgerOf(ex).assertDispatchable = () => { throw new Error("local no-effect refusal"); };
+      // Arm only after reserve commits B: reserve itself also checks this
+      // invariant, so an unconditional override would refuse before the path
+      // under test ever owns a warm reservation or attempts rollback.
+      const persist = ex as unknown as { persistPool: () => Promise<void> };
+      const inner = persist.persistPool.bind(ex);
+      persist.persistPool = async () => {
+        persist.persistPool = inner;
+        await inner();
+        ledgerOf(ex).assertDispatchable = () => { throw new Error("local no-effect refusal"); };
+      };
     }
     s.boat.stopMode = "stays_up";
     expect(await s.execute(command("warm-b"), ex)).toMatchObject({ status: "unavailable", remoteStarted: false });
