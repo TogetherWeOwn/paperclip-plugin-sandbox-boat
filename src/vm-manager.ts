@@ -1457,6 +1457,12 @@ export class BoatVmManager {
           throw error;
         }
       }
+      try {
+        this.account(config).assertDispatchable(reservation, Math.max(60, Math.ceil(request.jobSeconds)));
+      } catch (error) {
+        await this.account(config).failed(reservation, !uncertainEffect);
+        throw error;
+      }
       let response: T;
       try {
         response = await call();
@@ -1875,6 +1881,7 @@ export class BoatVmManager {
       const api = this.opsApi(config);
       pending = await this.account(config).reserve(api, { ...config, operation: "warm", sandboxId, allowCachedLimits: true,
         jobSeconds: ttlSeconds, tailSeconds: 0 });
+      this.account(config).assertDispatchable(pending, ttlSeconds);
       const response = await api.update({ sandboxId, ttlSeconds });
       const reservation = pending;
       pending = null;

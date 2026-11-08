@@ -256,6 +256,11 @@ async function readReceipt(ctx: PollContext, cursor: number): Promise<HttpResult
   return ctx.deps.http.get(`/offload/commands/${ctx.commandId}?after=${cursor}`);
 }
 
+function isVerificationRejected(response: HttpResult): boolean {
+  return isVerificationInvalid(response)
+    || (response.ok && response.status === 409 && asError(response.json)?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT");
+}
+
 async function cancelBestEffort(ctx: PollContext): Promise<void> {
   try {
     await ctx.deps.http.post(`/offload/commands/${ctx.commandId}/cancel`, { reason: "client_signal" });
@@ -320,6 +325,12 @@ async function poll(ctx: PollContext, cursor: number): Promise<number> {
     } catch {
       response = { ok: false, error: "read failed" };
     }
+    // A signal received during the read wins over both receipts and errors.
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      await cancelBestEffort(ctx);
+      return signalExit(readSignal);
+    }
     if (response.ok && response.status === 200) {
       const view = asReadView(response.json, commandId, cursor);
       if (view) {
@@ -381,6 +392,12 @@ async function recover(ctx: PollContext): Promise<number> {
     } catch {
       response = { ok: false, error: "read failed" };
     }
+    // Signal exit wins, but a rejected pinned payload must not cancel that ID.
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      if (!ctx.verifyRequest || ctx.verified || !isVerificationRejected(response)) await cancelBestEffort(ctx);
+      return signalExit(readSignal);
+    }
     if (response.ok && response.status === 200) {
       const view = asReadView(response.json, commandId, cursor);
       if (view) {
@@ -430,6 +447,11 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     } catch {
       receipt = { ok: false, error: "read failed" };
     }
+    const readSignal = ctx.pendingSignal();
+    if (readSignal) {
+      if (!isVerificationRejected(receipt)) await cancelBestEffort(ctx);
+      return signalExit(readSignal);
+    }
     if (receipt.ok && receipt.status === 200) {
       const view = asReadView(receipt.json, commandId);
       if (!view) return recover(ctx);
@@ -450,6 +472,9 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     if (pending) return signalExit(pending);
   }
 
+  // A replayed signal must stop before any fresh submit or local fallback.
+  // Existing pinned receipts above still use original-ID cancellation/recovery.
+  if (pending) return signalExit(pending);
   const env = buildEnv(request.processEnv, tool);
   if (env.local) {
     if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);

@@ -613,7 +613,8 @@ describe("delta push over stub SSH", () => {
 
   it.each(["node", "python"] as const)("fences uncertain %s installers before any next mirror RPC and recovers only after a proven stop", async (tool) => {
     const lock = tool === "node" ? "package-lock.json" : "uv.lock";
-    const root = source({ [lock]: "{}", "old.txt": "old" });
+    const root = source({ [lock]: "{}", "old.txt": "old",
+      ...(tool === "python" ? { "pyproject.toml": '[project]\nname = "example"\n' } : {}) });
     const cmd = () => command({ tool, runner: tool === "node" ? "npm" : "pytest" });
     const { sync, ssh, guest, spawn } = setup(root);
     const original = ssh.runStream.getMockImplementation()! as (session: unknown, script: string, opts: unknown) => Promise<unknown>;

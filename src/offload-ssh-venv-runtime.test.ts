@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -99,6 +99,7 @@ async function source(lockfile = "uv.lock", contents = "x") {
   const dir = await mkdtemp(path.join(tmpdir(), "boat-venv-src-"));
   tmpdirs.push(dir);
   await writeFile(path.join(dir, lockfile), contents);
+  if (lockfile === "uv.lock") await writeFile(path.join(dir, "pyproject.toml"), '[project]\nname = "example"\n');
   return dir;
 }
 
@@ -122,6 +123,34 @@ describe("runtime uv venv wiring", () => {
       await guest.prepare("vm-1", cmd);
       expectVenv(seen[0], sync.directory(cmd));
     } finally { await runtime.shutdown(); }
+  });
+
+  describe.each([false, true])("live manifest edits after successful install: %s", (installed) => {
+    it.each(["missing", "symlink", "oversized"])("never selects system Python after a %s live manifest", async (kind) => {
+      const root = await source();
+      const manifest = path.join(root, "pyproject.toml");
+      const { runtime, config, seen, ssh } = backend(root);
+      try {
+        const cmd = pyCommand();
+        mustResolve(await runtime.resolve(cmd, config));
+        const { sync, guest } = pool(runtime);
+        if (installed) await sync.push("vm-1", cmd);
+        await rm(manifest);
+        if (kind === "symlink") await symlink(path.join(root, "missing"), manifest);
+        if (kind === "oversized") {
+          await writeFile(manifest, "");
+          await truncate(manifest, 256 * 1024 + 1);
+        }
+        if (installed) {
+          await guest.prepare("vm-1", cmd);
+          expectVenv(seen[0], sync.directory(cmd));
+        } else {
+          await expect(guest.prepare("vm-1", cmd)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+          expect(seen).toEqual([]);
+          expect(ssh.runStream).not.toHaveBeenCalled();
+        }
+      } finally { await runtime.shutdown(); }
+    });
   });
 
   it("plans the uploaded bytes even when live lock removal happens during install", async () => {
@@ -203,13 +232,13 @@ describe("runtime uv venv wiring", () => {
       const cmd = pyCommand();
       mustResolve(await runtime.resolve(cmd, config));
       const { sync, guest } = pool(runtime);
-      await expect(guest.prepare("vm-1", cmd)).rejects.toThrow(/frozen Python/);
+      await expect(guest.prepare("vm-1", cmd)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
       expect(ssh.runStream).not.toHaveBeenCalled();
       await sync.push("vm-1", cmd);
       const count = ssh.runStream.mock.calls.length;
-      await expect(guest.prepare("vm-2", cmd)).rejects.toThrow(/frozen Python/);
-      await expect(guest.prepare("vm-1", pyCommand())).rejects.toThrow(/frozen Python/);
-      await expect(guest.prepare("vm-1", { ...cmd, runner: "pytest" })).rejects.toThrow(/frozen Python/);
+      await expect(guest.prepare("vm-2", cmd)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+      await expect(guest.prepare("vm-1", pyCommand())).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+      await expect(guest.prepare("vm-1", { ...cmd, runner: "pytest" })).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
       expect(ssh.runStream).toHaveBeenCalledTimes(count);
     } finally { await runtime.shutdown(); }
   });
@@ -237,7 +266,7 @@ describe("runtime uv venv wiring", () => {
         await expect(sync.push("vm-1", cmd)).rejects.toThrow(/install failed/);
       }
       const count = ssh.runStream.mock.calls.length;
-      await expect(guest.prepare("vm-1", cmd)).rejects.toThrow(/frozen Python/);
+      await expect(guest.prepare("vm-1", cmd)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
       expect(ssh.runStream).toHaveBeenCalledTimes(count);
     } finally { await runtime.shutdown(); }
   });
@@ -253,7 +282,7 @@ describe("runtime uv venv wiring", () => {
       await writeFile(path.join(root, "uv.lock"), "B");
       const second = pyCommand();
       await sync.push("vm-1", second);
-      await expect(guest.prepare("vm-1", first)).rejects.toThrow(/frozen Python/);
+      await expect(guest.prepare("vm-1", first)).rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
       await guest.prepare("vm-1", second);
       expectVenv(seen[0], sync.directory(second));
     } finally { await runtime.shutdown(); }

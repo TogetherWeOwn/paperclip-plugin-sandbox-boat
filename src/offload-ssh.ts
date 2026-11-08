@@ -211,7 +211,11 @@ export class SshOffloadGuest implements GuestController {
     // checkout path plus a validated runner name; every other env key stays
     // empty and the activation applies to that command only.
     if ((command.tool ?? "cargo") === "python") {
-      const venvRoot = await this.deps.uvVenvRoot?.(command, sandboxId);
+      const venvRoot = await this.deps.uvVenvRoot?.(command, sandboxId).catch(() => {
+        // A lookup failure cannot establish that the system runner is safe.
+        throw offloadError("OFFLOAD_GUEST_INELIGIBLE", command.depSelection !== undefined
+          ? "python_selected_venv_gate" : "python_dependency_plan_gate");
+      });
       if (command.depSelection !== undefined && (venvRoot === null || venvRoot === undefined)) {
         throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_selected_venv_gate");
       }

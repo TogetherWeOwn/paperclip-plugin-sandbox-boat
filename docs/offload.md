@@ -151,11 +151,22 @@ caches and build outputs; the guest installs dependencies from the lockfile
 (`npm ci`, `pnpm/yarn --frozen-lockfile`, `uv sync --frozen`, hash-pinned
 `requirements.txt` via `pip install --require-hashes -r`, where every
 requirement is `name[extras]==version` with `--hash=sha256:` and no pip
-option lines) into a per-VM cache keyed by lockfile hash. Global pip installs reuse the cache across runs;
+option lines) into a per-VM cache keyed by the dependency plan hash. Global pip installs reuse the cache across runs;
 checkout-local installs (`node_modules`, `.venv`) live in the per-card mirror
-and run again only when the lockfile hash changes, the mirror was wiped or
+and run again only when the plan hash changes, the mirror was wiped or
 lost, or the previous install failed, so a warm mirror never reuses a stale
-checkout. Python commands from a `uv.lock` plan
+checkout. For uv, the hash includes the root `pyproject.toml` bytes as well as
+`uv.lock`: even frozen sync reads manifest configuration such as
+[`tool.uv.default-groups`](https://docs.astral.sh/uv/concepts/projects/dependencies/#default-groups).
+Default and explicit-extra plans have distinct identities. Comment-only manifest
+edits conservatively invalidate the cache too. A uv plan requires a safely
+readable regular root manifest, at most 256 KiB, with no symlink following;
+missing or unsafe manifests keep the command local instead of reusing old trust.
+If dependency planning becomes unavailable during guest preparation, preparation
+refuses instead of silently switching to system Python.
+This manifest probe is uv-only, not applied to Node, pip or Cargo plans. It does not hash
+workspace members, `uv.toml` or arbitrary source/build inputs.
+Python commands from a `uv.lock` plan
 run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with
 `VIRTUAL_ENV=<checkout>/.venv` and `<checkout>/.venv/bin` prepended to the
 guest `PATH` for that command only (every other env key stays empty), so

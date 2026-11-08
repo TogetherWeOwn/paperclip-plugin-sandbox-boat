@@ -299,6 +299,160 @@ describe("cancel", () => {
   });
 });
 
+describe.each(["poll", "submit recovery", "initial verify", "verify recovery", "verified poll"] as const)("cancellation during %s receipt reads", (path) => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  function pendingRead(cancel: "success" | "network" | "rejected" | "throw" = "success") {
+    const t = setup();
+    const entered = deferred<void>();
+    const response = deferred<HttpResult>();
+    const pinned = path.includes("verify") || path === "verified poll";
+    const verifyPath = `/offload/commands/${CMD}/verify`;
+    let verifies = 0;
+    t.request.allowLocalFallback = !pinned;
+    t.deps.randomId = vi.fn(() => CMD);
+    t.deps.reportFallback = vi.fn();
+    const read = () => {
+      entered.resolve();
+      return response.promise;
+    };
+    t.http.post.mockImplementation(async (url: string): Promise<HttpResult> => {
+      if (url.endsWith("/cancel")) {
+        if (cancel === "throw") throw new Error("cancel lost");
+        if (cancel === "network") return { ok: false, error: "cancel lost" };
+        return { ok: true, status: cancel === "rejected" ? 403 : 200, json: {} };
+      }
+      if (url === verifyPath) {
+        verifies += 1;
+        if (verifies === 1 && path === "verify recovery") return { ok: false, error: "verify lost" };
+        if (path === "verified poll") return { ok: true, status: 200, json: readView() };
+        return read();
+      }
+      expect(url).toBe("/offload/exec");
+      return path === "submit recovery" ? { ok: false, error: "submit lost" } : { ok: true, status: 202, json: {} };
+    });
+    t.http.get.mockImplementation(read);
+    const run = runOffload(t.request, t.deps);
+    return { ...t, entered: entered.promise, response, run, pinned, verifyPath };
+  }
+
+  const completed = (exitCode = 0): HttpResult => ({ ok: true, status: 200, json: readView({
+    state: "completed", result: { exitCode, signal: null, timedOut: false, cancelled: false,
+      syncBack: { state: "clean", changedPaths: [], conflictPaths: [], artifactId: null }, usageRecordId: null },
+  }) });
+  const neverStarted: HttpResult = { ok: true, status: 200, json: readView({ state: "not_started", remoteStarted: false, fallbackSafe: true }) };
+
+  function expectOriginalIdOnly(t: ReturnType<typeof pendingRead>, cancelled: boolean) {
+    expect(t.deps.randomId).toHaveBeenCalledTimes(1);
+    expect(t.http.post.mock.calls.map(([url]) => url)).toEqual([
+      ...(t.pinned ? Array(path === "verify recovery" ? 2 : 1).fill(t.verifyPath) : ["/offload/exec"]),
+      ...(cancelled ? [`/offload/commands/${CMD}/cancel`] : []),
+    ]);
+    if (cancelled) expect(t.http.post).toHaveBeenLastCalledWith(`/offload/commands/${CMD}/cancel`, { reason: "client_signal" });
+    expect(t.http.get.mock.calls.map(([url]) => url)).toEqual(t.pinned && path !== "verified poll" ? [] : [`/offload/commands/${CMD}?after=0`]);
+    expect(t.deps.runLocal).not.toHaveBeenCalled();
+    expect(t.deps.reportFallback).not.toHaveBeenCalled();
+    expect(t.deps.reportUnknown).not.toHaveBeenCalled();
+  }
+
+  it.each(["SIGINT", "SIGTERM"] as const)("preserves the first %s over terminal completion and failed cancellation", async (signal) => {
+    for (const cancel of ["success", "network", "rejected", "throw"] as const) {
+      const t = pendingRead(cancel);
+      await t.entered;
+      t.fireSignal(signal);
+      t.fireSignal(signal === "SIGINT" ? "SIGTERM" : "SIGINT");
+      t.response.resolve(completed());
+      expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
+      expectOriginalIdOnly(t, true);
+      expect(t.sleeps).toEqual([]);
+    }
+  });
+
+  it.each(["SIGINT", "SIGTERM"] as const)("does not fall back on a never-started receipt after %s", async (signal) => {
+    const t = pendingRead();
+    await t.entered;
+    t.fireSignal(signal);
+    t.response.resolve(neverStarted);
+    expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
+    expectOriginalIdOnly(t, true);
+    expect(t.sleeps).toEqual([]);
+  });
+
+  it.each(["SIGINT", "SIGTERM"] as const)("gives %s precedence over post-read errors, including thrown reads", async (signal) => {
+    const errors: HttpResult[] = [
+      ...[401, 403, 410].map((status): HttpResult => ({ ok: true, status, json: {} })),
+      { ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST", { detail: "invalid argv" }) },
+      { ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST", { detail: "unknown commandId" }) },
+      { ok: true, status: 409, json: errorBody("OFFLOAD_IDEMPOTENCY_CONFLICT") },
+      { ok: true, status: 200, json: {} },
+      { ok: true, status: 503, json: {} },
+      { ok: false, error: "read lost" },
+    ];
+    for (const response of [...errors, null]) {
+      const t = pendingRead();
+      await t.entered;
+      t.fireSignal(signal);
+      if (response) t.response.resolve(response);
+      else t.response.reject(new Error("read lost"));
+      expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
+      const verificationRejected = (path === "initial verify" || path === "verify recovery") && response?.ok
+        && (response.status === 409 || (response.status === 400 && (response.json as { detail?: string }).detail === "invalid argv"));
+      expectOriginalIdOnly(t, !verificationRejected);
+      expect(t.sleeps).toEqual([]);
+    }
+  });
+
+  if (path === "initial verify" || path === "verify recovery") {
+    const rejections: HttpResult[] = [
+      { ok: true, status: 409, json: errorBody("OFFLOAD_IDEMPOTENCY_CONFLICT") },
+      { ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST", { detail: "invalid argv" }) },
+    ];
+
+    it.each(["SIGINT", "SIGTERM"] as const)("exits on the first %s without cancelling a rejected payload", async (signal) => {
+      for (const response of rejections) {
+        const t = pendingRead();
+        await t.entered;
+        t.fireSignal(signal);
+        t.fireSignal(signal === "SIGINT" ? "SIGTERM" : "SIGINT");
+        t.response.resolve(response);
+        expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
+        expectOriginalIdOnly(t, false);
+        expect(t.sleeps).toEqual([]);
+      }
+    });
+
+    it.each(rejections)("retains payload rejection HTTP $status without a signal", async (response) => {
+      const t = pendingRead();
+      await t.entered;
+      t.response.resolve(response);
+      expect(await t.run).toBe(64);
+      expectOriginalIdOnly(t, false);
+      expect(t.sleeps).toEqual([]);
+    });
+  }
+
+  it.each([0, 101])("retains terminal exit %s without a signal", async (exitCode) => {
+    const t = pendingRead();
+    await t.entered;
+    t.response.resolve(completed(exitCode));
+    expect(await t.run).toBe(exitCode);
+    expectOriginalIdOnly(t, false);
+  });
+
+  it.each([401, 403, 410])("retains HTTP %s error classification without a signal", async (status) => {
+    const t = pendingRead();
+    await t.entered;
+    t.response.resolve({ ok: true, status, json: {} });
+    expect(await t.run).toBe(status === 410 ? 75 : 77);
+    expectOriginalIdOnly(t, false);
+  });
+});
+
 describe("fallback and errors", () => {
   it("falls back exactly once on a durable never-started receipt", async () => {
     const t = setup();

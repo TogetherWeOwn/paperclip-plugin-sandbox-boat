@@ -247,17 +247,6 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
       }
     }
     toolArgv = dash >= 0 ? args.slice(dash + 1) : [];
-    // Explicit diagnostic invocation bypasses BOAT_OFFLOAD, but re-entry still
-    // short-circuits: a fallbacked command must never route back into the shim.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) {
-      if (pinnedId) return refusePinned("shim re-entry");
-      const real = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", runner, deps);
-      if (!real) {
-        writeStderr(`${diag}: no real ${runner} on PATH\n`);
-        return 127;
-      }
-      return spawnExit(await deps.spawn(real, toolArgv, fallbackEnv(deps.env, shimDir)));
-    }
   } else {
     toolArgv = args;
   }
@@ -273,11 +262,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // with 128+N; recording it for later would let the build finish and exit 0.
   let pendingSignal: "SIGINT" | "SIGTERM" | null = null;
   let killChild: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+  let clientSignalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
   deps.onSignal((signal) => {
     pendingSignal ??= signal;
     killChild?.(signal);
+    clientSignalHandler?.(signal);
   });
   const spawnLocal = async (exe: string, argv: string[], env: Record<string, string>): Promise<number> => {
+    if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     const result = await deps.spawn(exe, argv, env, {
       onSpawn: (kill) => {
         killChild = kill;
@@ -293,10 +285,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     return spawnLocal(realExe, argv, localEnv);
   };
 
+  // Diagnostic execution bypasses BOAT_OFFLOAD, but both entry modes must
+  // short-circuit re-entry through the signal-aware local path. Dry-run still
+  // performs discovery without spawning.
+  if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) return pinnedReal ? refusePinned("shim re-entry") : runLocal(toolArgv);
+
   const workspaceId = deps.env.PAPERCLIP_WORKSPACE_ID;
   if (!diagnostic) {
-    // Passthrough gating: strict opt-in, re-entry guard, workspace binding.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return pinnedReal ? refusePinned("shim re-entry") : runLocal(toolArgv);
+    // Passthrough gating: strict opt-in, workspace binding.
     if (deps.env.BOAT_OFFLOAD !== "1") return pinnedReal ? refusePinned("BOAT_OFFLOAD is not 1") : runLocal(toolArgv);
     if (!workspaceId) return pinnedReal ? refusePinned("no workspace binding") : runLocal(toolArgv);
   } else if (!workspaceId) {
@@ -344,7 +340,11 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     sleep: deps.sleep,
     stdout: deps.stdout,
     stderr: deps.stderr,
-    onSignal: deps.onSignal,
+    onSignal: (handler) => {
+      // Classification may have observed cancellation before the client existed.
+      clientSignalHandler = handler;
+      if (pendingSignal) handler(pendingSignal);
+    },
     randomId: () => commandId,
     runLocal: (argv) => (pinnedReal ? Promise.resolve(refusePinned("local run")) : runLocalMeasured(argv)),
     reportStaged: (syncBack) => {
@@ -363,24 +363,29 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // A remote-candidate command that ends up running locally teaches the
   // server duration gate. Cargo never reports; pre-opt-in runs never report.
   const runLocalMeasured = async (argv: string[]): Promise<number> => {
+    if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     if (tool.tool === "cargo") return runLocal(argv);
     const startedAt = deps.now();
+    let exit: number;
     try {
-      return await runLocal(argv);
+      exit = await runLocal(argv);
     } finally {
       const seconds = Math.max(0, (deps.now() - startedAt) / 1000);
       await reportDuration(request, clientDeps, seconds);
     }
+    return pendingSignal ? SIGNAL_EXIT[pendingSignal]! : exit;
   };
 
   if (diagnostic && dryRun) {
     // Discovery consults the server profile even for locally-routable argv.
     try {
       const result = await runDryRun(request, clientDeps);
+      if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
       if (json) writeStdout(`${JSON.stringify({ version: OFFLOAD_VERSION, commandId, ...result })}\n`);
       else writeStdout(`mode: ${result.mode} (${result.reason}) profile: ${result.profileId || "(none)"}\n`);
       return 0;
     } catch (error) {
+      if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
       writeStderr(`offload dry-run failed: ${error instanceof Error ? error.message : String(error)}\n`);
       return 64;
     }

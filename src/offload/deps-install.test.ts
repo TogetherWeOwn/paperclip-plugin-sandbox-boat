@@ -44,7 +44,7 @@ describe("planDependencies", () => {
     const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
     expect((await planDependencies(root({ "requirements.txt": pinned })))?.installs)
       .toEqual([{ lockfile: "requirements.txt", install: ["pip", "install", "--require-hashes", "-r", "requirements.txt"] }]);
-    expect((await planDependencies(root({ "uv.lock": "x" })))?.installs)
+    expect((await planDependencies(root({ "uv.lock": "x", "pyproject.toml": "[project]\nname = \"example\"\n" })))?.installs)
       .toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen"] }]);
   });
 
@@ -84,7 +84,7 @@ describe("planDependencies", () => {
   });
 
   it("ignores unpinned requirements beside uv.lock", async () => {
-    const plan = await planDependencies(root({ "uv.lock": "x", "requirements.txt": "pytest\n" }));
+    const plan = await planDependencies(root({ "uv.lock": "x", "pyproject.toml": "[project]\nname = \"example\"\n", "requirements.txt": "pytest\n" }));
     expect(plan?.installs).toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen"] }]);
   });
 
@@ -139,6 +139,61 @@ source = { registry = "https://pypi.org/simple" }
 const testSelection = { uvExtra: "test", cwdRelative: "." } as const;
 const uvFiles = () => ({ "pyproject.toml": uvManifest, "uv.lock": uvLock });
 
+describe("default uv manifest identity", () => {
+  const manifest = (groups: string) => uvManifest + `[dependency-groups]\ntest = ["pytest>=7"]\n[tool.uv]\ndefault-groups = ${groups}\n`;
+  // The test group is already resolved in this unchanged lock; only the
+  // manifest controls whether frozen sync installs it by default.
+  const lock = uvLock.replace("[package.metadata]", '[package.dev-dependencies]\ntest = [{ name = "pytest" }]\n[package.metadata]')
+    .replace('provides-extras = ["api", "test"]', 'provides-extras = ["api", "test"]\n[package.metadata.requires-dev]\ntest = [{ name = "pytest", specifier = ">=7" }]');
+
+  it("keys default frozen sync on manifest-only default-group changes", async () => {
+    const dir = root({ "uv.lock": lock, "pyproject.toml": manifest("[]") });
+    const a = await planDependencies(dir, "python");
+    expect(a?.hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(a?.installs).toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen"] }]);
+    expect((await planDependencies(dir, "python"))?.hash).toBe(a?.hash);
+    writeFileSync(path.join(dir, "pyproject.toml"), manifest('["test"]'));
+    const b = await planDependencies(dir, "python");
+    expect(b?.hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(b?.hash).not.toBe(a?.hash);
+    expect(b?.installs).toEqual(a?.installs);
+    expect((await planDependencies(dir, "python"))?.hash).toBe(b?.hash);
+    writeFileSync(path.join(dir, "pyproject.toml"), manifest("[]"));
+    expect((await planDependencies(dir, "python"))?.hash).toBe(a?.hash);
+  });
+
+  it("requires a manifest rather than trusting a lock-only uv project", async () => {
+    const dir = root({ "uv.lock": lock, "pyproject.toml": manifest("[]") });
+    expect(await planDependencies(dir, "python")).not.toBe(null);
+    rmSync(path.join(dir, "pyproject.toml"));
+    expect(await planDependencies(dir, "python")).toBe(null);
+    expect(await planDependencies(dir)).toBe(null);
+  });
+
+  it.each(["symlink", "directory", "oversized", "fifo"])("refuses a default uv %s manifest without affecting other tools", async (kind) => {
+    const dir = root({ "uv.lock": lock, "package-lock.json": "{}", "pyproject.toml": manifest("[]") });
+    const node = await planDependencies(dir, "node");
+    const file = path.join(dir, "pyproject.toml");
+    rmSync(file);
+    if (kind === "symlink") symlinkSync(path.join(dir, "missing"), file);
+    else if (kind === "directory") mkdirSync(file);
+    else if (kind === "fifo") execFileSync("mkfifo", [file]);
+    else { writeFileSync(file, ""); truncateSync(file, 256 * 1024 + 1); }
+    expect(await planDependencies(dir, "python")).toBe(null);
+    expect(await planDependencies(dir)).toBe(null);
+    expect(await planDependencies(dir, "node")).toEqual(node);
+    expect(await planDependencies(dir, "cargo")).toEqual(node);
+    rmSync(path.join(dir, "uv.lock"));
+    writeFileSync(path.join(dir, "requirements.txt"), "pytest==7.4.2 --hash=sha256:abc123\n");
+    const pip = await planDependencies(dir, "python");
+    expect(pip?.installs[0]?.lockfile).toBe("requirements.txt");
+    rmSync(file, { recursive: true });
+    writeFileSync(file, "unrelated manifest bytes");
+    expect(await planDependencies(dir, "python")).toEqual(pip);
+    expect(await planDependencies(dir, "node")).toEqual(node);
+  });
+});
+
 describe("explicit locked uv test extra", () => {
   it("adds only the selected test extra, with a distinct deterministic cache identity", async () => {
     const dir = root(uvFiles());
@@ -151,7 +206,7 @@ describe("explicit locked uv test extra", () => {
     expect((await planDependencies(dir, "python", testSelection))?.hash).toBe(selected?.hash);
     writeFileSync(path.join(dir, "pyproject.toml"), uvManifest + "# changed manifest\n");
     expect((await planDependencies(dir, "python", testSelection))?.hash).not.toBe(selected?.hash);
-    expect((await planDependencies(dir, "python"))?.hash).toBe(plain?.hash);
+    expect((await planDependencies(dir, "python"))?.hash).not.toBe(plain?.hash);
     writeFileSync(path.join(dir, "uv.lock"), uvLock + "# changed lock\n");
     expect((await planDependencies(dir, "python", testSelection))?.hash).not.toBe(selected?.hash);
   });
