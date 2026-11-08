@@ -60,9 +60,15 @@ export function parseLimits(raw: unknown): ParseResult {
   const root = obj(raw);
   if (!root) return { ok: false, reason: "malformed_payload" };
   if (root.ok === false) return { ok: false, reason: "payload_not_ok" };
-  const body = [root, obj(root._package), obj(root.upgradeEffects)].find((c) => c && obj(c.planIncluded));
-  if (!body) return { ok: false, reason: "missing_plan_included" };
-  const plan = obj(body.planIncluded)!;
+  // Field-wise precedence root > upgradeEffects > _package, as in budget.ts and account-ledger.ts.
+  const nested = obj(root.upgradeEffects) ?? {};
+  const pkg = obj(root._package) ?? obj(nested._package) ?? {};
+  const body: Record<string, unknown> = {};
+  for (const key of ["planIncluded", "starts", "activeSandboxes", "maxActiveSandboxes", "canStart"]) {
+    body[key] = root[key] ?? nested[key] ?? pkg[key];
+  }
+  const plan = obj(body.planIncluded);
+  if (!plan) return { ok: false, reason: "missing_plan_included" };
   const vmHours = num(plan.vmHours, MAX_HOURS), remaining = num(plan.vmHoursRemaining, MAX_HOURS);
   if (vmHours === null || remaining === null || remaining > vmHours + EPS) return { ok: false, reason: "invalid_vm_hours" };
   // The pinned SDK decodes periodEnd to a Date; a raw JSON payload has a string.
@@ -122,7 +128,11 @@ export interface ForecastReport {
   thresholdHours: number;
   /** 1.25 * max(available burn rates) * daysRemaining, or null with no burn data. */
   projectedHours: number | null;
-  /** null when there is nothing to compare (no 24h window). */
+  /**
+   * Compares whatever projection exists (24h and/or 7d), even with incomplete
+   * history. With no burn data it is true only when the balance is already
+   * inside the reserve, else null (nothing to compare).
+   */
   exceeds: boolean | null;
 }
 
@@ -153,7 +163,8 @@ export interface CapacityReport {
 
 interface Marker { reasons: string[]; lastNotifiedMs: number }
 interface AccountDoc { seenAt: number; samples: Sample[]; marker: Marker | null; report: CapacityReport | null }
-interface CapacityDoc { version: 1; accounts: Record<string, AccountDoc> }
+type SamplingError = "source_discovery_failed" | "state_unavailable" | "state_write_failed";
+interface CapacityDoc { version: 1; accounts: Record<string, AccountDoc>; samplingError?: SamplingError | null }
 
 function digest(accountKey: string): string {
   return createHash("sha256").update(accountKey).digest("hex").slice(0, 16);
@@ -180,8 +191,16 @@ export function buildForecast(history: Sample[], cur: Sample, nowMs: number): Fo
     status: burn24 !== null && avg7 !== null ? "ok" : "insufficient_history",
     burn24hHours: burn24, avg7dDailyHours: avg7, daysRemaining, remainingHours: remaining,
     thresholdHours: threshold, projectedHours: projected,
-    exceeds: burn24 === null || projected === null ? null : projected > threshold,
+    exceeds: projected === null ? (threshold < 0 ? true : null) : projected > threshold,
   };
+}
+
+/** Dedup hint: true on a new/changed reason set or >= 24h since the last hint; records the marker. */
+function markWarning(acct: AccountDoc, sorted: string[], nowMs: number): boolean {
+  const prev = acct.marker;
+  if (prev && prev.reasons.join() === sorted.join() && nowMs - prev.lastNotifiedMs < NOTIFY_REPEAT_MS) return false;
+  acct.marker = { reasons: sorted, lastNotifiedMs: nowMs };
+  return true;
 }
 
 function unavailable(accountId: string, reason: string, nowMs: number | null): CapacityReport {
@@ -197,7 +216,11 @@ function readDoc(raw: unknown): CapacityDoc {
   const d = obj(raw);
   const accounts = d && d.version === 1 ? obj(d.accounts) : null;
   if (!accounts) throw new Error("boat: capacity state unreadable");
-  const out: CapacityDoc = { version: 1, accounts: {} };
+  const error = d!.samplingError;
+  if (error != null && error !== "source_discovery_failed" && error !== "state_unavailable" && error !== "state_write_failed") {
+    throw new Error("boat: capacity sampling state unreadable");
+  }
+  const out: CapacityDoc = { version: 1, accounts: {}, samplingError: error as SamplingError | null | undefined };
   for (const [id, entry] of Object.entries(accounts)) {
     const a = obj(entry);
     if (!a || typeof a.seenAt !== "number" || !Array.isArray(a.samples)) continue;
@@ -238,6 +261,9 @@ function pruneAccounts(doc: CapacityDoc, nowMs: number): boolean {
 
 export class CapacityTelemetry {
   private chain: Promise<unknown> = Promise.resolve();
+  // A failed state write cannot persist its own failure. Keep it visible to
+  // this worker's usage readers until a complete sampling pass is committed.
+  private readonly samplingErrors = new Map<string, SamplingError>();
 
   constructor(private readonly state: StateClientLike) {}
 
@@ -253,31 +279,56 @@ export class CapacityTelemetry {
   }
 
   /** Record one observation and return the report. Never throws: failures become "unavailable". */
-  sample(companyId: string, accountKey: string, rawLimits: unknown, nowMs: number): Promise<CapacityReport> {
+  sample(companyId: string, accountKey: string, rawLimits: unknown, nowMs: number, readFailed = false): Promise<CapacityReport> {
     const accountId = digest(accountKey);
     if (typeof nowMs !== "number" || !Number.isFinite(nowMs) || nowMs < 0) {
       return Promise.resolve(unavailable(accountId, "invalid_observation_time", null));
     }
     return this.serialize(async () => {
       try {
-        return await this.sampleLocked(companyId, accountId, rawLimits, nowMs);
+        return await this.sampleLocked(companyId, accountId, rawLimits, nowMs, readFailed);
       } catch {
+        this.samplingErrors.set(companyId, "state_unavailable");
         return unavailable(accountId, "state_unavailable", nowMs);
       }
     });
   }
 
-  private async sampleLocked(companyId: string, accountId: string, rawLimits: unknown, nowMs: number): Promise<CapacityReport> {
+  private async sampleLocked(companyId: string, accountId: string, rawLimits: unknown, nowMs: number, readFailed: boolean): Promise<CapacityReport> {
     const doc = readDoc(await this.state.get(this.key(companyId)));
     pruneAccounts(doc, nowMs);
     let acct = doc.accounts[accountId];
-    const parsed = parseLimits(rawLimits);
+    const parsed = readFailed ? { ok: false as const, reason: "limits_read_failed" } : parseLimits(rawLimits);
     let report: CapacityReport;
 
     if (!parsed.ok) {
       report = unavailable(accountId, parsed.reason, nowMs);
     } else if (parsed.limits.periodEndMs <= nowMs) {
+      // Forecast is unavailable for an ended period, but the start, concurrency
+      // and canStart readings are still valid: report and dedup that pressure.
       report = unavailable(accountId, "plan_period_ended", nowMs);
+      const pressure = startPressureReasons(parsed.limits);
+      if (pressure.length > 0) {
+        if (!acct) acct = { seenAt: nowMs, samples: [], marker: null, report: null };
+        const l = parsed.limits;
+        report = {
+          ...report, reasons: [...pressure, "plan_period_ended"], warning: true, warningReasons: pressure,
+          shouldNotify: markWarning(acct, [...pressure].sort(), nowMs),
+          startPressure: {
+            pressure: true, reasons: pressure, starts: l.starts,
+            activeSandboxes: l.activeSandboxes, maxActiveSandboxes: l.maxActiveSandboxes, canStart: l.canStart,
+          },
+        };
+      } else {
+        const l = parsed.limits;
+        report = {
+          ...report,
+          startPressure: {
+            pressure: false, reasons: [], starts: l.starts,
+            activeSandboxes: l.activeSandboxes, maxActiveSandboxes: l.maxActiveSandboxes, canStart: l.canStart,
+          },
+        };
+      }
     } else if (acct?.samples.length && nowMs < acct.samples[acct.samples.length - 1][0]) {
       report = unavailable(accountId, "clock_regression", nowMs);
     } else {
@@ -299,13 +350,9 @@ export class CapacityTelemetry {
       const warningReasons = [...pressure, ...(fc.exceeds ? ["vm_hours_forecast"] : [])];
       const reasons = [...warningReasons, ...(fc.status === "ok" ? [] : ["insufficient_history"])];
       const sorted = [...warningReasons].sort();
-      const prev = acct.marker;
       let shouldNotify = false;
       if (sorted.length === 0) acct.marker = null;
-      else if (!prev || prev.reasons.join() !== sorted.join() || nowMs - prev.lastNotifiedMs >= NOTIFY_REPEAT_MS) {
-        shouldNotify = true;
-        acct.marker = { reasons: sorted, lastNotifiedMs: nowMs };
-      }
+      else shouldNotify = markWarning(acct, sorted, nowMs);
       report = {
         accountId, status: fc.status === "ok" ? "fresh" : "insufficient",
         observedAt: new Date(nowMs).toISOString(), observedAtMs: nowMs,
@@ -333,7 +380,8 @@ export class CapacityTelemetry {
     try {
       await this.state.set(this.key(companyId), doc); // samples + marker + report in one write
     } catch {
-      return { ...unavailable(accountId, "state_write_failed", nowMs) };
+      this.samplingErrors.set(companyId, "state_write_failed");
+      return unavailable(accountId, "state_write_failed", nowMs);
     }
     return report;
   }
@@ -346,11 +394,46 @@ export class CapacityTelemetry {
     });
   }
 
-  /** Last stored report per account (most recently seen first); reports older than 15 min are returned unavailable/stale_observation with their old evidence and observation time. */
-  async latest(companyId: string, nowMs: number = Date.now()): Promise<CapacityReport[]> {
+  /** Preserve historical evidence while making a failed pass immediately visible. */
+  async failSampling(companyId: string, reason: SamplingError): Promise<void> {
+    await this.serialize(async () => {
+      this.samplingErrors.set(companyId, reason);
+      try {
+        const doc = readDoc(await this.state.get(this.key(companyId)));
+        doc.samplingError = reason;
+        await this.state.set(this.key(companyId), doc);
+      } catch { /* The in-memory marker also covers an unavailable state store. */ }
+    });
+  }
+
+  /** Called only after discovery and every account write have succeeded. */
+  async completeSampling(companyId: string): Promise<void> {
+    await this.serialize(async () => {
+      const doc = readDoc(await this.state.get(this.key(companyId)));
+      if (doc.samplingError || this.samplingErrors.has(companyId)) {
+        doc.samplingError = null;
+        await this.state.set(this.key(companyId), doc);
+      }
+      this.samplingErrors.delete(companyId);
+    });
+  }
+
+  /** Usage reads keep old operands, but never label a failed pass current. */
+  async summary(companyId: string, nowMs: number = Date.now()): Promise<{ accounts: CapacityReport[]; error: SamplingError | null }> {
     const doc = readDoc(await this.state.get(this.key(companyId)));
-    return Object.values(doc.accounts)
+    const error = this.samplingErrors.get(companyId) ?? doc.samplingError ?? null;
+    const accounts = Object.values(doc.accounts)
       .sort((a, b) => b.seenAt - a.seenAt)
-      .flatMap((a) => (a.report ? [markStale(a.report, nowMs)] : []));
+      .flatMap((a) => (a.report ? [markStale(a.report, nowMs)] : []))
+      .map((report): CapacityReport => error ? {
+        ...report, status: "unavailable", shouldNotify: false,
+        reasons: [error, ...report.reasons.filter((reason) => reason !== error)],
+      } : report);
+    return { accounts, error };
+  }
+
+  /** Last stored report per account, including stale or failed-pass evidence. */
+  async latest(companyId: string, nowMs: number = Date.now()): Promise<CapacityReport[]> {
+    return (await this.summary(companyId, nowMs)).accounts;
   }
 }

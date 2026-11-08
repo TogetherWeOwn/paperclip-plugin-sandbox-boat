@@ -2,6 +2,7 @@ import { scryptSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setBoatApiFactoryForTests, type BoatApiLike } from "./boat-client.js";
 import { DEFAULT_API_BASE, parseDriverConfig } from "./config.js";
+import { CapacityTelemetry } from "./capacity-telemetry.js";
 import { SWEEP_JOB_KEY } from "./manifest.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
@@ -88,7 +89,76 @@ describe("scheduled capacity telemetry", () => {
     await manager.sampleCapacity();
     const summary = await manager.usageSummary(COMPANY);
     expect(summary.capacity.accounts[0].status).toBe("unavailable");
+    expect(summary.capacity.accounts[0].reasons).toEqual(["limits_read_failed"]);
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity.accounts[0].status).toBe("insufficient");
     expect(JSON.stringify(harness.logs)).not.toContain(KEY);
+  });
+
+  it("exposes a failed sampling write on usage reads, retaining evidence until recovery", async () => {
+    const manager = currentManager();
+    manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));
+    fake.limitsResponse = { ...limits(), starts: { ...limits().starts, day: { used: 0, limit: 200, remaining: 200 } } };
+    await manager.sampleCapacity();
+    const previous = (await manager.usageSummary(COMPANY)).capacity.accounts[0];
+    expect(previous.warning).toBe(false);
+    const stored = structuredClone(harness.state.get(`company|${COMPANY}|capacity|samples`));
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    const failing = vi.spyOn(harness.ctx.state, "set").mockImplementation(async (input, value) => {
+      if (input.namespace === "capacity") throw new Error(`state transport error ${KEY}`);
+      return set(input, value);
+    });
+    clock += 5 * 60_000;
+    fake.limitsResponse = limits();
+    await manager.sampleCapacity();
+    const failed = (await manager.usageSummary(COMPANY)).capacity;
+    expect(failed.error).toBe("state_write_failed");
+    expect(failed.accounts[0]).toEqual(expect.objectContaining({
+      status: "unavailable", observedAt: previous.observedAt, plan: previous.plan, shouldNotify: false,
+    }));
+    expect(failed.accounts[0].reasons).toContain("state_write_failed");
+    expect(harness.state.get(`company|${COMPANY}|capacity|samples`)).toEqual(stored);
+    expect((await manager.usageSummary("other-company")).capacity).toEqual({ accounts: [], error: null });
+    failing.mockRestore();
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    const recovered = (await manager.usageSummary(COMPANY)).capacity;
+    expect(recovered.error).toBeNull();
+    expect(recovered.accounts[0]).toEqual(expect.objectContaining({ status: "insufficient", warningReasons: ["start_day_pressure"] }));
+    expect(recovered.accounts[0].reasons).not.toContain("state_write_failed");
+    expect(harness.logs.filter((log) => log.message.includes("capacity warning"))).toHaveLength(1);
+    expect(JSON.stringify([failed, recovered, [...harness.state.values()], harness.logs])).not.toContain(KEY);
+  });
+
+  it("exposes source discovery failure before staleness and clears it only after sampling recovers", async () => {
+    const manager = currentManager();
+    manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));
+    await manager.sampleCapacity();
+    const previous = (await manager.usageSummary(COMPANY)).capacity.accounts[0];
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    const failing = vi.spyOn(harness.ctx.state, "get").mockImplementation(async (input) => {
+      if (input.namespace === "boat-offload") throw new Error(`source transport error ${KEY}`);
+      return get(input);
+    });
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect(fake.callsOf("limits")).toHaveLength(1);
+    const failed = (await manager.usageSummary(COMPANY)).capacity;
+    expect(failed.error).toBe("source_discovery_failed");
+    expect(failed.accounts[0]).toEqual(expect.objectContaining({ status: "unavailable", observedAt: previous.observedAt, plan: previous.plan }));
+    expect(failed.accounts[0].reasons).toContain("source_discovery_failed");
+    expect((await new CapacityTelemetry(harness.ctx.state).summary(COMPANY, clock)).error).toBe("source_discovery_failed");
+    expect((await manager.usageSummary("other-company")).capacity).toEqual({ accounts: [], error: null });
+    failing.mockRestore();
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    const recovered = (await manager.usageSummary(COMPANY)).capacity;
+    expect(recovered.error).toBeNull();
+    expect(recovered.accounts[0].status).toBe("insufficient");
+    expect(recovered.accounts[0].reasons).not.toContain("source_discovery_failed");
+    expect((await new CapacityTelemetry(harness.ctx.state).summary(COMPANY, clock)).error).toBeNull();
+    expect(JSON.stringify([failed, recovered, [...harness.state.values()], harness.logs])).not.toContain(KEY);
   });
 
   it("labels stored reports stale if sampling stops", async () => {

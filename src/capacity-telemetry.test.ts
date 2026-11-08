@@ -73,6 +73,31 @@ describe("parseLimits", () => {
     expect(parseLimits({ upgradeEffects: payload() }).ok).toBe(true);
   });
 
+  it("merges legacy nesting field-wise: root > upgradeEffects > _package", () => {
+    const p = payload({ active: 1, max: 100, canStart: true });
+    const r = parseLimits({
+      ok: true,
+      planIncluded: p.planIncluded,
+      canStart: false,
+      upgradeEffects: { activeSandboxes: 7, maxActiveSandboxes: 70, canStart: true, _package: { activeSandboxes: 9 } },
+      _package: { activeSandboxes: 8, maxActiveSandboxes: 80, starts: p.starts, planIncluded: { ...p.planIncluded, vmHoursRemaining: 1 } },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.limits.vmHoursRemaining).toBe(552); // root planIncluded wins over _package
+      expect(r.limits.canStart).toBe(false); // root wins
+      expect(r.limits.activeSandboxes).toBe(7); // upgradeEffects beats _package
+      expect(r.limits.maxActiveSandboxes).toBe(70);
+      expect(r.limits.starts?.day.limit).toBe(200); // only _package has starts
+    }
+  });
+
+  it("reads a _package nested under upgradeEffects for fields absent elsewhere", () => {
+    const p = payload();
+    const r = parseLimits({ ok: true, upgradeEffects: { _package: p } });
+    expect(r.ok).toBe(true);
+  });
+
   it("accepts unlimited starts without windows", () => {
     const p = payload({ unlimited: true }) as Record<string, unknown>;
     p.starts = { unlimited: true };
@@ -163,6 +188,28 @@ describe("CapacityTelemetry forecast", () => {
     expect(r.forecast?.thresholdHours).toBe(375);
     expect(r.forecast?.projectedHours).toBe(375);
     expect(r.coverageMs).toBe(7 * DAY);
+  });
+
+  it("7d-only history compares the available projection but stays insufficient", async () => {
+    const t = new CapacityTelemetry(memState());
+    await t.sample(CO, ACCT, payload({ rem: 500 }), T0);
+    const r = await t.sample(CO, ACCT, payload({ rem: 360 }), T0 + 7 * DAY);
+    expect(r.status).toBe("insufficient");
+    expect(r.forecast).toMatchObject({ burn24hHours: null, projectedHours: 375, thresholdHours: 355, exceeds: true });
+    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
+    expect(r.reasons).toContain("insufficient_history");
+  });
+
+  it("first reading inside the reserve warns without any baseline", async () => {
+    const t = new CapacityTelemetry(memState());
+    const r = await t.sample(CO, ACCT, payload({ rem: 3 }), T0);
+    expect(r.status).toBe("insufficient");
+    expect(r.forecast).toMatchObject({ projectedHours: null, thresholdHours: -2, exceeds: true });
+    expect(r.warningReasons).toEqual(["vm_hours_forecast"]);
+    expect(r.shouldNotify).toBe(true);
+    const ok = await new CapacityTelemetry(memState()).sample(CO, ACCT, payload({ rem: 5 }), T0);
+    expect(ok.forecast?.exceeds).toBe(null); // exactly at the reserve is not a breach
+    expect(ok.warning).toBe(false);
   });
 
   it("equality is not a warning; strictly greater is", async () => {
@@ -325,6 +372,28 @@ describe("CapacityTelemetry unavailable and failures", () => {
     }
     await t.sample(CO, ACCT, payload(), T0 + HOUR);
     expect((await t.sample(CO, ACCT, payload(), T0)).reasons).toEqual(["clock_regression"]);
+  });
+
+  it("an ended plan period stays unavailable but keeps start pressure and marker dedup", async () => {
+    const t = new CapacityTelemetry(memState());
+    const ended = (extra: Over = {}) => payload({ end: T0, ...extra });
+    const calm = await t.sample(CO, ACCT, ended(), T0);
+    expect(calm).toMatchObject({ status: "unavailable", warning: false, forecast: null, plan: null });
+    expect(calm.startPressure).toMatchObject({ pressure: false, reasons: [] });
+    const hot = await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 5 * MIN);
+    expect(hot.status).toBe("unavailable");
+    expect(hot.reasons).toEqual(["start_day_pressure", "cannot_start", "plan_period_ended"]);
+    expect(hot.warningReasons).toEqual(["start_day_pressure", "cannot_start"]);
+    expect(hot.warning).toBe(true);
+    expect(hot.forecast).toBe(null);
+    expect(hot.startPressure).toMatchObject({ pressure: true, canStart: false });
+    expect(hot.shouldNotify).toBe(true);
+    const again = await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 10 * MIN);
+    expect(again.shouldNotify).toBe(false); // dedup marker applies
+    const quiet = await t.sample(CO, ACCT, ended(), T0 + 15 * MIN);
+    expect(quiet.warning).toBe(false);
+    // Ended and quiet is not an all-clear: the marker survives.
+    expect((await t.sample(CO, ACCT, ended({ day: [180, 200], canStart: false }), T0 + 20 * MIN)).shouldNotify).toBe(false);
   });
 
   it("write failure yields unavailable without a dedup hint and persists nothing", async () => {

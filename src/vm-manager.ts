@@ -3914,16 +3914,26 @@ export class BoatVmManager {
       ...(await this.store.companies().catch(() => [] as string[])),
     ]);
     await Promise.all([...companies].map(async (companyId) => {
+      let failureReason: "state_unavailable" | "source_discovery_failed" = "state_unavailable";
       try {
         await this.capacity.maintain(companyId, this.now());
+        failureReason = "source_discovery_failed";
         const sources = await withDeadline(this.nativeOffload.capacitySources(companyId, this.sweepConfigsFor(companyId)),
           this.offloadUpkeepTimeoutMs, "capacity sources");
-        await Promise.all(sources.map(async ({ accountKey, api }) => {
-          const raw = await withDeadline(api.limits({}), 3_000, "capacity limits").catch(() => null);
-          const report = await this.capacity.sample(companyId, accountKey, raw, this.now());
+        failureReason = "state_unavailable";
+        const reports = await Promise.all(sources.map(async ({ accountKey, api }) => {
+          let readFailed = false;
+          const raw = await withDeadline(api.limits({}), 3_000, "capacity limits").catch(() => { readFailed = true; return null; });
+          const report = await this.capacity.sample(companyId, accountKey, raw, this.now(), readFailed);
           if (report.shouldNotify) this.logger.warn("boat: capacity warning; report to owner before any plan change", { companyId, ...report });
+          return report;
         }));
+        const stateFailure = reports.flatMap((report) => report.reasons)
+          .find((reason) => reason === "state_write_failed" || reason === "state_unavailable");
+        if (stateFailure) await this.capacity.failSampling(companyId, stateFailure);
+        else if (sources.length > 0) await this.capacity.completeSampling(companyId);
       } catch {
+        await this.capacity.failSampling(companyId, failureReason);
         // Never log provider error text, which can contain request credentials.
         this.logger.warn("boat: capacity sampling unavailable", { companyId });
       }
@@ -4014,8 +4024,7 @@ export class BoatVmManager {
       entry.runs += vm.runs.length;
       cards.set(cardKey, entry);
     }
-    const capacity = await this.capacity.latest(companyId, this.now())
-      .then((accounts) => ({ accounts, error: null }))
+    const capacity = await this.capacity.summary(companyId, this.now())
       .catch(() => ({ accounts: [], error: "state_unavailable" }));
     return {
       companyId,
