@@ -831,7 +831,10 @@ export class SshOffloadRuntime {
       const checked = checkDepSelection(cmd);
       if (!checked) return null;
       const plan = await planDependencies(native.source, cmd.tool, checked.selection).catch(() => null);
-      if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
+      // A refused live probe is not evidence of a pip plan. In particular,
+      // losing a uv manifest after capture must not select system Python.
+      if (!plan) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_dependency_plan_gate");
+      if (!plan.installs.some((item) => item.lockfile === "uv.lock")) return null;
       return sync.directory(cmd);
     };
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, refreshSession, cgroupParent,

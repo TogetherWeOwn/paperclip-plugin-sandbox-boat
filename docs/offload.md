@@ -162,7 +162,9 @@ Default and explicit-extra plans have distinct identities. Comment-only manifest
 edits conservatively invalidate the cache too. A uv plan requires a safely
 readable regular root manifest, at most 256 KiB, with no symlink following;
 missing or unsafe manifests keep the command local instead of reusing old trust.
-This probe is uv-only, not applied to Node, pip or Cargo plans. It does not hash
+If dependency planning becomes unavailable during guest preparation, preparation
+refuses instead of silently switching to system Python.
+This manifest probe is uv-only, not applied to Node, pip or Cargo plans. It does not hash
 workspace members, `uv.toml` or arbitrary source/build inputs.
 Python commands from a `uv.lock` plan
 run from the checkout `.venv` interpreter (`.venv/bin/<runner>`) with
