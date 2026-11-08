@@ -23,7 +23,7 @@ import type { BackendCommand, ExecutorRefusal } from "./offload/broker.js";
 import type { StateClientLike } from "./state.js";
 import { endpointFromSshKeyResponse, type SshManager, type SshSession } from "./ssh.js";
 import { SshOffloadGuest, type SshOffloadGuestDeps } from "./offload-ssh.js";
-import { ARTIFACT_RETENTION_MS, SshOffloadSync, sweepArtifactRoot } from "./offload-ssh-sync.js";
+import { ARTIFACT_RETENTION_MS, SshOffloadSync, checkDepSelection, sweepArtifactRoot } from "./offload-ssh-sync.js";
 import { hasInitializedSubmodule, hasSecretInFiles, hasUntrackedFiles, listTrackedFiles, pemFilesAreCertificateOnly,
   type SubmodulesFn, type TrackedFilesFn, type UntrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
@@ -630,12 +630,19 @@ export class SshOffloadRuntime {
       && await hasCargoRegistryAuth(binding.source, command.cwdRelative).catch(() => true)) {
       return refuse("cargo config needs private registry auth; stays local");
     }
+    if (tool === "cargo" && command.depSelection !== undefined) {
+      return refuse("explicit dependency selection is not valid for this command; stays local");
+    }
     if (tool !== "cargo") {
       // No lockfile, no remote: the guest only installs from a lockfile and
       // never from an unlocked manifest. A registry credential file also
       // stays local: its token is excluded from sync, so the guest could not
       // authenticate a private registry without it.
-      const plan = await planDependencies(binding.source, tool).catch(() => null);
+      // The same selection reaches installation and venv discovery; a refused
+      // selection never retries with the default plan.
+      const checked = checkDepSelection(command, tool);
+      if (!checked) return refuse("explicit dependency selection is not valid for this command; stays local");
+      const plan = await planDependencies(binding.source, tool, checked.selection).catch(() => null);
       if (!plan) return refuse("no lockfile-based dependency plan; stays local");
       if (await nestedLockfile(binding.source, command.cwdRelative, tool).catch(() => "unreadable") !== null) {
         return refuse("nested lockfile below the workspace root; stays local");
@@ -821,7 +828,9 @@ export class SshOffloadRuntime {
       if ((cmd.tool ?? "cargo") !== "python") return null;
       const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
       if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) return null;
-      const plan = await planDependencies(native.source, cmd.tool).catch(() => null);
+      const checked = checkDepSelection(cmd);
+      if (!checked) return null;
+      const plan = await planDependencies(native.source, cmd.tool, checked.selection).catch(() => null);
       if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
       return sync.directory(cmd);
     };
@@ -860,7 +869,7 @@ export class SshOffloadRuntime {
         const tool = cmd.tool ?? "cargo";
         if (tool === "cargo") return;
         const scope = { scopeKind: "company" as const, scopeId: cmd.companyId, namespace: "boat-offload", stateKey: "" };
-        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
+        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative, cmd.depSelection));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
             set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value),

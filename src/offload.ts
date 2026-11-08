@@ -8,6 +8,7 @@
 // wired here. Guest lifecycle and incremental output are opt-in; persisted
 // pool recovery is opt-in too; HTTP routing and real sync adapters remain separate.
 import { createHash } from "node:crypto";
+import type { DepSelection } from "./offload/deps-install.js";
 import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { PRICE_PER_HOUR } from "./size-policy.js";
@@ -40,6 +41,7 @@ export interface OffloadCommand {
   executionWorkspaceId?: string;
   trustDomainId?: string;
   cwdRelative?: string;
+  depSelection?: DepSelection;
   env?: Record<string, string>;
   queueTimeoutMs?: number;
   timeoutMs?: number;

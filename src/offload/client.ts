@@ -5,6 +5,7 @@
 // explicit exit, never a silent replay.
 
 import { exitForError, exitForTerminal } from "./errors.js";
+import type { DepSelection } from "./deps-install.js";
 import {
   OFFLOAD_BOUNDS,
   OFFLOAD_EXIT,
@@ -32,6 +33,7 @@ export interface ShimRequest {
   runner?: string;
   argv: string[];
   cwdRelative: string;
+  depSelection?: DepSelection;
   executionWorkspaceId: string;
   queueTimeoutMs: number;
   timeoutMs: number;
@@ -93,6 +95,7 @@ export async function reportDuration(request: ShimRequest, deps: ClientDeps, dur
       runner: request.runner ?? (tool === "node" ? "npm" : "pytest"),
       argv: request.argv,
       cwdRelative: request.cwdRelative,
+      ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
       durationSeconds,
     });
   } catch {
@@ -157,6 +160,7 @@ function executionRequest(request: ShimRequest, commandId: string): OffloadSubmi
     executionWorkspaceId: request.executionWorkspaceId,
     cwdRelative: request.cwdRelative,
     ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
+    ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
     argv: request.argv,
     env: executionEnv(request.processEnv, tool),
     queueTimeoutMs: request.queueTimeoutMs,
@@ -214,6 +218,7 @@ export async function runDryRun(request: ShimRequest, deps: ClientDeps): Promise
     executionWorkspaceId: request.executionWorkspaceId,
     cwdRelative: request.cwdRelative,
     ...(tool === "cargo" ? {} : { tool, runner: request.runner ?? (tool === "node" ? "npm" : "pytest") }),
+    ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
     argv: request.argv,
     env: env.env,
     queueTimeoutMs: request.queueTimeoutMs,

@@ -77,6 +77,35 @@ function errorBody(code: string, over: Record<string, unknown> = {}) {
   };
 }
 
+describe("explicit Python selection wire identity", () => {
+  it.each([false, true])("uses the same selection for dry-run, submit and pinned receipt verification (selected=%s)", async (selected) => {
+    const t = setup();
+    const depSelection = { uvExtra: "test" as const, cwdRelative: "tests/unit" };
+    Object.assign(t.request, { tool: "python", runner: "pytest", argv: ["tests/"], cwdRelative: "tests/unit",
+      processEnv: { BOAT_OFFLOAD_UV_EXTRA: "test", GITHUB_TOKEN: "not-forwarded" },
+      ...(selected ? { depSelection } : {}) });
+    const bodies: { path: string; body: unknown }[] = [];
+    t.http.post.mockImplementation(async (path: string, body: unknown): Promise<HttpResult> => {
+      bodies.push({ path, body });
+      if (path === "/offload/exec" && (body as { dryRun: boolean }).dryRun) {
+        return { ok: true, status: 200, json: { mode: "remote_candidate", reason: "eligible", profileId: "python-public-1" } };
+      }
+      if (path === "/offload/exec") return { ok: false, error: "submit reply lost" };
+      return { ok: true, status: 200, json: readView({ state: "not_started", remoteStarted: false, fallbackSafe: true }) };
+    });
+    t.http.get.mockResolvedValue({ ok: true, status: 200, json: readView({ state: "not_started", remoteStarted: false, fallbackSafe: true }) });
+    await runDryRun(t.request, t.deps);
+    await runOffload(t.request, t.deps);
+    await runOffload({ ...t.request, allowLocalFallback: false }, t.deps);
+    expect(bodies.some(({ path }) => path === `/offload/commands/${CMD}/verify`)).toBe(true);
+    for (const { body } of bodies) {
+      expect(body).toMatchObject({ cwdRelative: "tests/unit", tool: "python", env: {} });
+      if (selected) expect(body).toMatchObject({ depSelection });
+      else expect(body).not.toHaveProperty("depSelection");
+    }
+  });
+});
+
 describe("submit and env", () => {
   it("sends only allowlisted env in the request", async () => {
     const t = setup();
