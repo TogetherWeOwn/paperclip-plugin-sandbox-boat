@@ -163,6 +163,28 @@ describe("explicit locked uv test extra", () => {
     expect(await planDependencies(dir, "python", testSelection)).not.toBe(null);
   });
 
+  it.each(["neither", "manifest", "lock", "both"])("checks conflict declarations in %s without changing default sync", async (location) => {
+    const manifest = uvManifest + '[dependency-groups]\ndev = ["ruff>=0.9"]\n';
+    const lock = uvLock.replace("[package.metadata]", '[package.dev-dependencies]\ndev = [{ name = "ruff" }]\n[package.metadata]')
+      .replace('provides-extras = ["api", "test"]', 'provides-extras = ["api", "test"]\n[package.metadata.requires-dev]\ndev = [{ name = "ruff", specifier = ">=0.9" }]')
+      + '[[package]]\nname = "ruff"\nversion = "0.9.0"\nsource = { registry = "https://pypi.org/simple" }\n';
+    const dir = root({
+      "pyproject.toml": manifest + (["manifest", "both"].includes(location)
+        ? '[tool.uv]\nconflicts = [[{ extra = "test" }, { group = "dev" }]]\n' : ""),
+      "uv.lock": (["lock", "both"].includes(location)
+        ? 'conflicts = [[{ package = "example", extra = "test" }, { package = "example", group = "dev" }]]\n' : "") + lock,
+    });
+    const selected = await planDependencies(dir, "python", testSelection);
+    if (location === "neither") expect(selected?.installs[0]?.install).toEqual(["uv", "sync", "--frozen", "--extra", "test"]);
+    else expect(selected).toBe(null);
+    expect((await planDependencies(dir, "python"))?.installs[0]?.install).toEqual(["uv", "sync", "--frozen"]);
+  });
+
+  it.each(["[]", '"invalid"', "{}"])("refuses unsupported conflict value %s in either input", async (conflicts) => {
+    expect(await planDependencies(root({ ...uvFiles(), "pyproject.toml": uvManifest + `[tool.uv]\nconflicts = ${conflicts}\n` }), "python", testSelection)).toBe(null);
+    expect(await planDependencies(root({ ...uvFiles(), "uv.lock": `conflicts = ${conflicts}\n` + uvLock }), "python", testSelection)).toBe(null);
+  });
+
   it("refuses a stale locked version even when manifest and lock metadata still match", async () => {
     const files = { ...uvFiles(), "uv.lock": uvLock.replace('version = "9.2.0"', 'version = "6.2.5"') };
     expect(await planDependencies(root(files), "python", testSelection)).toBe(null);

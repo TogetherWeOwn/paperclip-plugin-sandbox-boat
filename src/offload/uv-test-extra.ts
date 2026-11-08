@@ -50,7 +50,9 @@ def validate(manifest, lock):
         return False
     project = manifest["project"]
     uv = manifest.get("tool", {}).get("uv", {})
-    if any(key in uv for key in ("workspace", "sources")):
+    # Extra/group conflicts require selection resolution outside this contract.
+    # Inspect both inputs independently: frozen sync uses lock-recorded conflicts.
+    if any(key in uv for key in ("workspace", "sources", "conflicts")) or "conflicts" in lock:
         return False
     if "dynamic" in project:
         return False
