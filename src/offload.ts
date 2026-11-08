@@ -1111,56 +1111,76 @@ export class OffloadExecutor {
     // was so the replay resends the closest body to the lost create.
     const legacyJobSeconds = Math.max(Math.ceil((command.timeoutMs ?? 120_000) / 1000), 60 - this.config.offloadIdleStopSeconds);
     const legacyTtlSeconds = Math.max(60, Math.ceil(legacyJobSeconds + reservation.tailSeconds));
+    // The retained create intent is the durable truth. A terminal intent (stale
+    // hold expired, or stopped/rejected) proves nothing is left to replay: retire
+    // the placeholder and free the slot without any same-key POST. A running
+    // receipt saved before the pool learned the identity supplies the sandbox id
+    // directly. Unknown or missing intents throw and keep the uncertain hold.
+    let recovered: Awaited<ReturnType<AccountLedger["recoverCreate"]>>;
+    try {
+      recovered = await ledger.recoverCreate(reservation);
+    } catch {
+      return null;
+    }
+    if (recovered.status === "terminal") {
+      this.retireVm(vm);
+      await this.persistPool().catch(() => undefined);
+      return { kind: "freed" };
+    }
     let id: string;
     let response: unknown = null;
     try {
-      // Same key + same body: replay the exact persisted create body. A
-      // provider that refuses a mismatched body proves nothing about the lost
-      // create, so only the persisted body is ever resent. Placeholders that
-      // predate the persisted body fall back to the current config.
-      const pending = vm.pendingCreate;
-      const replayTtl = pending?.ttlSeconds ?? legacyTtlSeconds;
-      const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
-      // Idempotency prevents duplication, not a first effect: the original
-      // request may never have reached the provider. Refuse without releasing
-      // uncertainty if current included capacity cannot fund the exact replay.
-      await ledger.revalidateReplay(this.boat, reservation, { ...this.config, operation: "create",
-        size: pending?.type ?? this.config.size, poolId: this.poolId,
-        jobSeconds: replayTtl - reservation.tailSeconds, tailSeconds: reservation.tailSeconds,
-        ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) }, replayTtl);
-      if (pending?.kind === "fork" && pending.sourceSandboxId) {
-        response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
-          ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
-          noEnv: pending.noEnv, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("fork returned no sandbox id");
-        id = replayed;
-      } else if (pending) {
-        response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
-          monitoring: pending.monitoring, failFast: pending.failFast, noEnv: pending.noEnv,
-          ...(pending.from ? { from: pending.from } : {}), idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
-      } else if (this.config.templateSnapshot) {
-        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
-          monitoring: this.config.monitoring, failFast: true, noEnv: true,
-          from: this.config.templateSnapshot, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
-      } else if (this.config.templateSourceSandboxId) {
-        response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
-          ttlSeconds: legacyTtlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("fork returned no sandbox id");
-        id = replayed;
+      if (recovered.status === "running") {
+        id = recovered.sandboxId;
       } else {
-        response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
-          monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
-        const replayed = sandboxIdOf(response);
-        if (!replayed) throw new Error("create returned no sandbox id");
-        id = replayed;
+        // Same key + same body: replay the exact persisted create body. A
+        // provider that refuses a mismatched body proves nothing about the lost
+        // create, so only the persisted body is ever resent. Placeholders that
+        // predate the persisted body fall back to the current config.
+        const pending = vm.pendingCreate;
+        const replayTtl = pending?.ttlSeconds ?? legacyTtlSeconds;
+        const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+        // Idempotency prevents duplication, not a first effect: the original
+        // request may never have reached the provider. Refuse without releasing
+        // uncertainty if current included capacity cannot fund the exact replay.
+        await ledger.revalidateReplay(this.boat, reservation, { ...this.config, operation: "create",
+          size: pending?.type ?? this.config.size, poolId: this.poolId,
+          jobSeconds: replayTtl - reservation.tailSeconds, tailSeconds: reservation.tailSeconds,
+          ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) }, replayTtl);
+        if (pending?.kind === "fork" && pending.sourceSandboxId) {
+          response = await this.boat.fork({ sandboxId: pending.sourceSandboxId, type: pending.type,
+            ttlSeconds: pending.ttlSeconds, monitoring: pending.monitoring, failFast: pending.failFast,
+            noEnv: pending.noEnv, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("fork returned no sandbox id");
+          id = replayed;
+        } else if (pending) {
+          response = await this.boat.create({ type: pending.type, ttlSeconds: pending.ttlSeconds,
+            monitoring: pending.monitoring, failFast: pending.failFast, noEnv: pending.noEnv,
+            ...(pending.from ? { from: pending.from } : {}), idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        } else if (this.config.templateSnapshot) {
+          response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+            monitoring: this.config.monitoring, failFast: true, noEnv: true,
+            from: this.config.templateSnapshot, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        } else if (this.config.templateSourceSandboxId) {
+          response = await this.boat.fork({ sandboxId: this.config.templateSourceSandboxId, type: this.config.size,
+            ttlSeconds: legacyTtlSeconds, monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("fork returned no sandbox id");
+          id = replayed;
+        } else {
+          response = await this.boat.create({ type: this.config.size, ttlSeconds: legacyTtlSeconds,
+            monitoring: this.config.monitoring, failFast: true, noEnv: true, idempotencyKey });
+          const replayed = sandboxIdOf(response);
+          if (!replayed) throw new Error("create returned no sandbox id");
+          id = replayed;
+        }
       }
     } catch (error) {
       if (!await definitiveStartRejection(error)) return null;
@@ -1350,6 +1370,15 @@ export class OffloadExecutor {
     if (pending) vm.pendingCreate = pending;
     try {
       await this.persistPool();
+      // Caller persistence can outlive the limits snapshot validated by reserve.
+      // Refresh the same retained intent before marking any provider effect attempted.
+      const observationAge = reservation.observedAt == null ? Infinity : this.now() - reservation.observedAt;
+      if (observationAge < 0 || observationAge > 5000) {
+        const monthCap = this.config.offloadMonthlyVmHourCap ?? 0;
+        await ledger.revalidate(this.boat, reservation, { ...this.config, operation, sandboxId: existing?.sandboxId,
+          poolId: this.poolId, jobSeconds, tailSeconds: reservation.tailSeconds,
+          ...(monthCap > 0 ? { monthlyCap: { companyId: command.companyId, nowMs: this.now(), capHours: monthCap } } : {}) });
+      }
       // Taken before the provider call: the provider deadline it sets is no
       // earlier than fundedFrom + ttlSeconds.
       const fundedFrom = this.now();

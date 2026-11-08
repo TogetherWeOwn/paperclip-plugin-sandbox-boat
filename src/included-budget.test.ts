@@ -3,6 +3,7 @@ import { AccountLedger } from "./account-ledger.js";
 import type { AdmissionRequest } from "./account-ledger.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { checkBudget, readBudget } from "./budget.js";
+import { OffloadPoolStore } from "./offload-pool.js";
 import { EPOCH, JsonState, advance, command, fixture, noDispatch, safeRefusal, starts } from "./test-support/account-admission.fixture.js";
 
 const END = EPOCH + 30 * 86_400_000;
@@ -117,6 +118,34 @@ describe("included account reservations", () => {
     await expect(s.ledger.reserve(s.api, { ...request, allowCachedLimits: true })).rejects.toThrow();
   });
 
+  it.each([200, 276])("checks prospective replay lifetime separately from elapsed exposure at t=%s", async (elapsed) => {
+    const s = setup(modern({ planIncluded: included(90_000, EPOCH + 500_000) }));
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await s.ledger.failed(reservation, false);
+    await advance(elapsed * 1000);
+    const recovered = new AccountLedger(s.state, "included-budget-test", Date.now);
+    const replay = recovered.revalidateReplay(s.api, reservation, req, 225);
+    if (elapsed === 200) {
+      await expect(replay).resolves.toBeUndefined();
+      const doc = JSON.parse([...s.state.rows.values()][0]!);
+      expect(doc.intents[0]).toMatchObject({ ttlSeconds: 425, compute: 425, jobSeconds: 410 });
+    } else {
+      await expect(replay).rejects.toThrow();
+      const doc = JSON.parse([...s.state.rows.values()][0]!);
+      expect(doc.intents[0]).toMatchObject({ ttlSeconds: 225, compute: 225 });
+    }
+  });
+
+  it("retains cumulative replay exposure when checking included capacity", async () => {
+    const s = setup(modern({ planIncluded: included(400, EPOCH + 500_000) }));
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await s.ledger.failed(reservation, false);
+    await advance(200_000);
+    await expect(s.ledger.revalidateReplay(s.api, reservation, req, 225)).rejects.toThrow();
+  });
+
   it("keeps the original tail when a metered resume cannot fit the included period", async () => {
     const s = setup(modern({ planIncluded: included(90_000, EPOCH + 200_000) }));
     const reservation = await s.ledger.reserve(s.api, { ...request, operation: "resume", poolId: "resume-pool" });
@@ -148,6 +177,45 @@ describe("included account reservations", () => {
 });
 
 describe("post-admission persistence boundaries", () => {
+  it.each([
+    ["exhausted", { planIncluded: included(0) }],
+    ["paid", { nextStartDollars: 0.01 }],
+    ["active-full", { activeSandboxes: 100 }],
+    ["size-unavailable", { machineTypes: [{ type: "default", available: false }] }],
+    ["funded", {}],
+  ] as const)("revalidates %s capacity after slow caller pool persistence", async (name, overrides) => {
+    const f = fixture();
+    try {
+      f.boat.limitsResponse = modern();
+      const set = f.state.set.bind(f.state);
+      let delayed = false;
+      f.state.set = async (key, value) => {
+        if (!delayed && key.namespace === "boat-offload-pool") {
+          delayed = true;
+          await advance(6000);
+          f.boat.limitsResponse = modern(overrides);
+        }
+        await set(key, value);
+      };
+      const p = f.pool();
+      (p as unknown as { poolStore: OffloadPoolStore }).poolStore = new OffloadPoolStore(f.state, f.accountId, "pool-a");
+      const result = await p.execute(command(`slow-save-${name}`));
+      expect(delayed).toBe(true);
+      if (name === "funded") {
+        expect(result).toMatchObject({ status: "completed" });
+        expect(f.boat.callsOf("create")).toHaveLength(1);
+      } else {
+        safeRefusal(result);
+        noDispatch(f);
+        expect(f.boat.callsOf("fork")).toHaveLength(0);
+        expect(f.boat.callsOf("update")).toHaveLength(0);
+        const doc = JSON.parse([...f.state.rows].find(([key]) => key.includes("boat-account"))![1]);
+        expect(doc.intents).toHaveLength(1);
+        expect(doc.intents[0]).toMatchObject({ status: "rejected", active: false });
+      }
+    } finally { await f.close(); }
+  });
+
   it("keeps the funded command when persistence consumes optional resume-tail headroom", async () => {
     const f = fixture();
     try {

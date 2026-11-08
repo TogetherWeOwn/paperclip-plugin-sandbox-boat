@@ -129,7 +129,7 @@ export interface AdmissionRequest {
   /** Monthly offload VM-hour cap: enforced atomically with admission inside the ledger lock. */
   monthlyCap?: { companyId: string; nowMs: number; capHours: number };
 }
-export interface AccountReservation { id: string; tailSeconds: number; at: number; periodEndMs?: number }
+export interface AccountReservation { id: string; tailSeconds: number; at: number; periodEndMs?: number; observedAt?: number }
 
 function number(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error("limits unreadable: invalid numeric capacity");
@@ -374,7 +374,8 @@ export class AccountLedger {
     return intent.operation !== "warm" && intent.status !== "rejected" && !intent.starts[window].reflected &&
       intent.starts[window].expiresAt > at;
   }
-  private check(doc: AccountDoc, limits: Limits, req: AdmissionRequest, tailSeconds: number, ignore?: string): void {
+  private check(doc: AccountDoc, limits: Limits, req: AdmissionRequest, tailSeconds: number, ignore?: string,
+    prospectiveTtlSeconds = Math.max(60, Math.ceil(req.jobSeconds + tailSeconds))): void {
     for (const value of [req.jobSeconds, tailSeconds, req.maxActive, req.maxStartsPerDay, req.minComputeHoursLeft]) number(value);
     const refuse = (limit: BudgetLimitName, message: string): never => { throw new BoatBudgetError({ limit, message, details: {} }); };
     const intents = doc.intents.filter((i) => i.id !== ignore && i.status !== "rejected");
@@ -393,7 +394,8 @@ export class AccountLedger {
     }
     // No allowance beyond this billing boundary is known. Fund the complete
     // preparation/command/idle envelope without assuming next period's plan.
-    if (!Number.isFinite(limits.periodEndMs) || this.now() + Math.max(60, Math.ceil(req.jobSeconds + tailSeconds)) * 1000 > limits.periodEndMs) {
+    if (!Number.isFinite(limits.periodEndMs) || !Number.isFinite(prospectiveTtlSeconds) || prospectiveTtlSeconds < 60
+      || this.now() + prospectiveTtlSeconds * 1000 > limits.periodEndMs) {
       refuse("minComputeHoursLeft", "included billing period does not fund the complete lifetime");
     }
     const machine = limits.sizes.find((s) => s.type === req.size);
@@ -551,7 +553,7 @@ export class AccountLedger {
           throw error;
         }
       }
-      return { id, tailSeconds, at, periodEndMs: limits.periodEndMs };
+      return { id, tailSeconds, at, periodEndMs: limits.periodEndMs, observedAt: limits.at };
     });
   }
 
@@ -566,12 +568,41 @@ export class AccountLedger {
   async revalidate(api: BoatApiLike, reservation: AccountReservation, req: AdmissionRequest): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
-      const limits = await this.observe(api, doc);
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || !["intent", "ambiguous"].includes(intent.status) || intent.operation !== req.operation
+        || intent.size !== req.size || intent.poolId !== (req.poolId ?? null) || intent.sandboxId !== (req.sandboxId ?? null)
+        || intent.jobSeconds < req.jobSeconds || intent.tailSeconds !== reservation.tailSeconds) {
+        throw new Error("no retained matching intent can fund dispatch");
+      }
+      const limits = await this.observe(api, doc, false, req);
       this.check(doc, limits, req, reservation.tailSeconds, reservation.id);
+      if (req.monthlyCap && req.monthlyCap.capHours > 0
+        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)) / 3600 > req.monthlyCap.capHours) {
+        throw new Error("monthly offload VM-hour cap reached before dispatch");
+      }
       await this.write(doc);
       reservation.periodEndMs = limits.periodEndMs;
+      reservation.observedAt = limits.at;
       this.assertDispatchable(reservation, Math.max(60, Math.ceil(req.jobSeconds + reservation.tailSeconds)));
       if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
+    });
+  }
+
+  /** Resolve the durable create lifecycle before considering another POST.
+   * Expiry must be committed before a caller can discard its pool placeholder. */
+  async recoverCreate(reservation: AccountReservation): Promise<{ status: "terminal" } | { status: "running"; sandboxId: string } | { status: "pending" }> {
+    return await this.locked(async () => {
+      const doc = await this.read();
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || intent.operation !== "create") throw new Error("no retained create intent can resolve placeholder");
+      this.expireStaleHolds(doc, this.now());
+      if ((intent.status === "stopped" || intent.status === "rejected") && !intent.active) {
+        await this.write(doc);
+        return { status: "terminal" };
+      }
+      if (intent.status === "running" && intent.sandboxId) return { status: "running", sandboxId: intent.sandboxId };
+      if (intent.status === "intent" || intent.status === "ambiguous") return { status: "pending" };
+      throw new Error("retained create lifecycle is unresolved");
     });
   }
 
@@ -588,7 +619,9 @@ export class AccountLedger {
       const limits = await this.observe(api, doc, false, req);
       const ttlBound = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - intent.at) / 1000) + ttlSeconds);
       const jobSeconds = ttlBound - intent.tailSeconds;
-      this.check(doc, limits, { ...req, jobSeconds }, intent.tailSeconds, intent.id);
+      // Elapsed exposure still counts against allowance and monthly holds,
+      // but only the saved body's prospective TTL must fit after now.
+      this.check(doc, limits, { ...req, jobSeconds }, intent.tailSeconds, intent.id, ttlSeconds);
       if (req.monthlyCap && req.monthlyCap.capHours > 0
         && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)
           + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
@@ -604,6 +637,7 @@ export class AccountLedger {
       }
       await this.write(doc);
       reservation.periodEndMs = limits.periodEndMs;
+      reservation.observedAt = limits.at;
       this.assertDispatchable(reservation, ttlSeconds);
       if (this.now() - limits.at > 5000) throw new Error("limits expired before create replay");
     });
