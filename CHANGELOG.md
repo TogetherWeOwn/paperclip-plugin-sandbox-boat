@@ -1,8 +1,51 @@
 # Changelog
 
-## Unreleased
+## 0.2.17
+
+Multi-toolchain shim installation, explicit Python uv test selection and
+verified included-compute admission, with cancellation and dependency-cache
+fixes. Offload and whole-run behaviour stay off by default; nothing is
+enabled by upgrading.
+
+### Added
+
+* The shim installer supports the Rust, Node and Python aliases. The
+  existing scheduled cleanup job also samples included capacity and
+  reports bounded usage history, forecasts and start/concurrency pressure
+  through the usage response, distinguishing incomplete or stale evidence
+  from an all-clear. Node browser tooling uses a fixed server-owned cache
+  path (#117).
+* An explicit numeric zero duration threshold admits otherwise eligible
+  Node/Python commands without learned duration history. Positive thresholds
+  retain duration learning, and source, budget and security gates still
+  apply (#119).
+* Python offload accepts diagnostic `--uv-extra test` or passthrough
+  `BOAT_OFFLOAD_UV_EXTRA=test` for a validated locked uv test extra, using
+  `uv sync --frozen --extra test`. Selection and source-relative working
+  directory are carried through discovery, durable command identity,
+  dependency preparation and duration learning; unsupported projects or
+  metadata refuse rather than falling back to system Python (#120, #122).
 
 ### Fixed
+
+* Budget admission requires authoritative included allowance and a bounded
+  billing-period identity, preserves outstanding weighted reservations
+  across period changes, and enforces funded lifetime before dispatch and
+  tail extensions. Unknown or paid starts are refused (#121).
+* Budget observations track their configuration and credential-source
+  provenance, invalidate replaced sources and ignore obsolete pending
+  results rather than reporting stale account evidence (#118).
+* Non-default VM sizes participate in executor pool compatibility;
+  receipt recovery leaves missing creation-policy evidence unknown (#114).
+* Diagnostic shim re-entry forwards signals to local children.
+  Cancellation preserves the first signal across asynchronous classification,
+  duration reporting, receipt reads and explicit dry-run discovery, without
+  starting fresh work or allowing a local replay (#123, #125, #126, #127).
+* Default uv dependency-cache identity includes the bounded root manifest,
+  not only the lockfile, so changed default groups cannot reuse a stale
+  environment. Missing or unsafe manifests and unavailable dependency plans
+  refuse Python preparation instead of silently changing runners (#128).
+
 
 * A source tree with an initialized submodule now keeps offloaded
   commands local, with the reason `submodules present; running local`, on
