@@ -83,14 +83,22 @@ enabled by default; add profiles explicitly:
 }
 ```
 
-Only LONG commands go remote. The plugin keeps per company + repository +
-profile + normalized-command-signature duration history (last 20 runs,
-30-day TTL) in its existing company-scoped state. A Node/Python command is a
-remote candidate only when its recorded median meets
-`offloadMinExpectedSeconds` (default 120); unknown signatures run local first
-and, when an exact-run source is registered, record, so the second identical
-long run can go remote. Unbound local runs cannot bootstrap history on the pinned
-SDK. The gate learns
+With a positive `offloadMinExpectedSeconds` (default 120), only learned LONG
+commands go remote. The plugin keeps per company + repository + profile +
+normalized-command-signature duration history (last 20 runs, 30-day TTL) in its
+existing company-scoped state. A Node/Python command is a remote candidate only
+when its recorded median meets the positive threshold; unknown signatures run
+local first and, when an exact-run source is registered, record, so the second
+identical long run can go remote. Explicit `offloadMinExpectedSeconds: 0`
+disables only this performance gate: an otherwise eligible command may bootstrap
+without history or learning storage, without creating a synthetic sample. It is
+still only a candidate, not a capacity promise. Profiles, command classification,
+source/secret checks, exact admission and fresh account limits plus reservations
+remain mandatory; funding still covers the full command timeout and lifecycle
+overhead, never an assumed zero duration. This setting does not authorize a full
+suite or CI mirror outside GitHub Actions, bypass a product's CI-only harness,
+or permit local replay of uncertain started work. Unbound local runs cannot
+bootstrap history on the pinned SDK. The gate learns
 host-measured wall time only: a completed remote run records the host-side
 elapsed interval (the guest-reported value can only shorten it, never
 lengthen it), and every sample is clamped to one day. Recordings come from

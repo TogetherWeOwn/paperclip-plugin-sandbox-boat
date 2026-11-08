@@ -220,7 +220,7 @@ export function normalizeOffloadSettings(raw: unknown): OffloadSettings {
   const profiles = Array.isArray(record.offloadProfiles)
     ? record.offloadProfiles.filter((id): id is string => typeof id === "string" && KNOWN_PROFILE_IDS.has(id))
     : [...DEFAULT_SETTINGS.offloadProfiles];
-  const min = Number(record.offloadMinExpectedSeconds);
+  const min = typeof record.offloadMinExpectedSeconds === "number" ? record.offloadMinExpectedSeconds : NaN;
   const cap = Number(record.offloadMonthlyVmHourCap);
   return {
     offloadProfiles: profiles,
@@ -537,6 +537,9 @@ async function decideRemote(
   const repoId = canonicalRepoId(workspace);
   const classification = classifyRequest(profile, tool, runner, argv);
   if (classification.mode === "local") return classification;
+  // Zero explicitly disables the performance gate, not admission or budget
+  // checks. Bootstrap without inventing a sample or forcing heavy local work.
+  if (settings.offloadMinExpectedSeconds === 0) return classification;
   if (!host.durations) {
     return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
   }
