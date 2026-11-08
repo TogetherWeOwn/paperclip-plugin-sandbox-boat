@@ -11,6 +11,15 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { probeDir, probeFileExists, readProbeFile, type ProbeRead } from "./probe-file.js";
+import { MAX_UV_EXTRA_LOCK_BYTES, MAX_UV_EXTRA_MANIFEST_BYTES, supportsLockedUvTestExtra } from "./uv-test-extra.js";
+
+/** Explicit opt-in only; callers must carry the same selection through both
+ * admission and guest installation. No inference from pytest or environment.
+ * The cwd is source-root relative and is checked for nested Python projects. */
+export interface DepSelection {
+  uvExtra: "test";
+  cwdRelative: string;
+}
 
 export interface DepInstall {
   /** Lockfile relative path, e.g. package-lock.json. */
@@ -21,7 +30,7 @@ export interface DepInstall {
 
 export interface DepPlan {
   installs: DepInstall[];
-  /** Combined sha256 over lockfile paths and bytes; the per-VM cache key. */
+  /** Combined sha256 over lockfiles and any explicit selection/manifest. */
   hash: string;
 }
 
@@ -105,7 +114,23 @@ export async function nestedLockfile(sourceRoot: string, cwdRelative: string, to
  * ambiguous competing lockfiles): the command stays local. Pass the tool so
  * ambiguity in the other ecosystem does not block this one.
  */
-export async function planDependencies(sourceRoot: string, tool?: string): Promise<DepPlan | null> {
+export async function planDependencies(sourceRoot: string, tool?: string, selection?: DepSelection): Promise<DepPlan | null> {
+  if (selection !== undefined) {
+    // Runtime inputs need the same closed shape as the typed contract. A
+    // selection cannot be ignored on another tool or fall back to pip.
+    if (tool !== "python" || !selection || typeof selection !== "object"
+      || Object.keys(selection).sort().join(",") !== "cwdRelative,uvExtra"
+      || selection.uvExtra !== "test" || typeof selection.cwdRelative !== "string"
+      || selection.cwdRelative.length > 4096 || !/^(?:\.|[A-Za-z0-9_-][A-Za-z0-9._/-]*)$/.test(selection.cwdRelative)
+      || selection.cwdRelative.split("/").some((part) => part === ".." || part === "")) return null;
+    if ((await probeDir(sourceRoot, selection.cwdRelative.split("/").filter((part) => part !== "."))).kind !== "ok") return null;
+    if (await nestedLockfile(sourceRoot, selection.cwdRelative, "python")) return null;
+    // A nested manifest without its own lock is also a separate project.
+    const segments = selection.cwdRelative.split("/").filter((part) => part !== ".");
+    for (let depth = segments.length; depth > 0; depth--) {
+      if (await probeFileExists(path.join(sourceRoot, ...segments.slice(0, depth), "pyproject.toml"))) return null;
+    }
+  }
   const tables: Array<{ kind: "node" | "python"; entries: Array<{ file: string; install: string[] }> }> = [];
   if (tool !== "python") tables.push({ kind: "node", entries: NODE_LOCKFILES });
   if (tool !== "node" && tool !== "cargo") tables.push({ kind: "python", entries: PYTHON_LOCKFILES });
@@ -115,14 +140,18 @@ export async function planDependencies(sourceRoot: string, tool?: string): Promi
   // Only tables for the selected tool are built above, so an unreadable
   // candidate in the other ecosystem is never probed and cannot block here.
   let unreadable = false;
+  let uvLock: Buffer | undefined;
   for (const table of tables) {
     let matched: { file: string; install: string[] } | null = null;
     let count = 0;
     for (const candidate of table.entries) {
-      const probe = await readIfFile(sourceRoot, candidate.file);
+      const probe = selection && candidate.file === "uv.lock"
+        ? await readProbeFile(path.join(sourceRoot, candidate.file), MAX_UV_EXTRA_LOCK_BYTES)
+        : await readIfFile(sourceRoot, candidate.file);
       if (probe.kind === "missing") continue;
       if (probe.kind === "unreadable") { unreadable = true; continue; }
       count += 1;
+      if (candidate.file === "uv.lock") uvLock = probe.bytes;
       matched = candidate;
       hash.update(candidate.file);
       hash.update("\0");
@@ -154,5 +183,13 @@ export async function planDependencies(sourceRoot: string, tool?: string): Promi
     if (matched && count === 1) found.push({ lockfile: matched.file, install: matched.install });
   }
   if (ambiguous || unreadable || found.length === 0) return null;
+  if (selection) {
+    const manifest = await readProbeFile(path.join(sourceRoot, "pyproject.toml"), MAX_UV_EXTRA_MANIFEST_BYTES);
+    if (!uvLock || manifest.kind !== "ok" || !await supportsLockedUvTestExtra(manifest.bytes, uvLock)) return null;
+    found[0] = { lockfile: "uv.lock", install: ["uv", "sync", "--frozen", "--extra", "test"] };
+    hash.update("uv-extra\0test\0pyproject.toml\0");
+    hash.update(manifest.bytes);
+    hash.update("\0");
+  }
   return { installs: found, hash: hash.digest("hex") };
 }

@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -99,6 +100,145 @@ describe("planDependencies", () => {
     expect(a?.hash).not.toBe(b?.hash);
     const again = await planDependencies(root({ "package-lock.json": "v1" }));
     expect(a?.hash).toBe(again?.hash);
+  });
+});
+
+// Same root/extra/metadata shape as a uv v1 revision 5 lock. No installation
+// or network is needed: these tests exercise the host dependency plan only.
+const uvManifest = `[project]
+name = "example"
+version = "0.1.0"
+[project.optional-dependencies]
+test = ["pytest>=7"]
+api = ["client>=1"]
+`;
+const uvLock = `version = 1
+revision = 5
+[[package]]
+name = "example"
+version = "0.1.0"
+source = { editable = "." }
+[package.optional-dependencies]
+test = [{ name = "pytest" }]
+api = [{ name = "client" }]
+[package.metadata]
+requires-dist = [
+  { name = "pytest", specifier = ">=7", marker = "extra == 'test'" },
+  { name = "client", specifier = ">=1", marker = "extra == 'api'" },
+]
+provides-extras = ["api", "test"]
+[[package]]
+name = "pytest"
+version = "9.2.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "client"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+`;
+const testSelection = { uvExtra: "test", cwdRelative: "." } as const;
+const uvFiles = () => ({ "pyproject.toml": uvManifest, "uv.lock": uvLock });
+
+describe("explicit locked uv test extra", () => {
+  it("adds only the selected test extra, with a distinct deterministic cache identity", async () => {
+    const dir = root(uvFiles());
+    const plain = await planDependencies(dir, "python");
+    const selected = await planDependencies(dir, "python", testSelection);
+    expect(plain?.installs[0]?.install).toEqual(["uv", "sync", "--frozen"]);
+    expect(selected?.installs).toEqual([{ lockfile: "uv.lock", install: ["uv", "sync", "--frozen", "--extra", "test"] }]);
+    expect(selected?.hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(selected?.hash).not.toBe(plain?.hash);
+    expect((await planDependencies(dir, "python", testSelection))?.hash).toBe(selected?.hash);
+    writeFileSync(path.join(dir, "pyproject.toml"), uvManifest + "# changed manifest\n");
+    expect((await planDependencies(dir, "python", testSelection))?.hash).not.toBe(selected?.hash);
+    expect((await planDependencies(dir, "python"))?.hash).toBe(plain?.hash);
+    writeFileSync(path.join(dir, "uv.lock"), uvLock + "# changed lock\n");
+    expect((await planDependencies(dir, "python", testSelection))?.hash).not.toBe(selected?.hash);
+  });
+
+  it("accepts a run directory inside the root project and virtual root locks", async () => {
+    const dir = root({ ...uvFiles(), "tests/unit/case.py": "" });
+    expect(await planDependencies(dir, "python", { ...testSelection, cwdRelative: "tests/unit" })).not.toBe(null);
+    writeFileSync(path.join(dir, "uv.lock"), uvLock.replace("editable", "virtual"));
+    expect(await planDependencies(dir, "python", testSelection)).not.toBe(null);
+  });
+
+  it.each([null, {}, [], { uvExtra: "api", cwdRelative: "." },
+    { uvExtra: "--all-extras", cwdRelative: "." }, { uvExtra: ["test"], cwdRelative: "." },
+    { ...testSelection, command: "anything" }, { ...testSelection, cwdRelative: "../escape" },
+    { ...testSelection, cwdRelative: "/tmp" }, { ...testSelection, cwdRelative: "tests/../../escape" },
+    { ...testSelection, cwdRelative: "" }, { ...testSelection, cwdRelative: "a".repeat(4097) },
+  ])("refuses a malformed or unsupported selection %#", async (selection) => {
+    expect(await planDependencies(root(uvFiles()), "python", selection as never)).toBe(null);
+  });
+
+  it.each([undefined, "node", "cargo"])("refuses selection on tool %s rather than ignoring it", async (tool) => {
+    expect(await planDependencies(root(uvFiles()), tool, testSelection)).toBe(null);
+  });
+
+  it("never selects pip or an ambiguous Python lock and keeps Node ambiguity scoped", async () => {
+    const pinned = "pytest==9.2.0 --hash=sha256:abc123\n";
+    expect(await planDependencies(root({ "requirements.txt": pinned }), "python", testSelection)).toBe(null);
+    expect(await planDependencies(root({ ...uvFiles(), "requirements.txt": pinned }), "python", testSelection)).toBe(null);
+    expect(await planDependencies(root({ ...uvFiles(), "requirements.txt": "pytest\n", "package-lock.json": "x", "yarn.lock": "x" }), "python", testSelection)).not.toBe(null);
+  });
+
+  it.each([
+    ["missing manifest", { "uv.lock": uvLock }],
+    ["missing lock", { "pyproject.toml": uvManifest }],
+    ["malformed manifest", { ...uvFiles(), "pyproject.toml": uvManifest + "bad = [" }],
+    ["duplicate table", { ...uvFiles(), "pyproject.toml": uvManifest + "[project.optional-dependencies]\ntest=[]" }],
+    ["undeclared test", { ...uvFiles(), "pyproject.toml": uvManifest.replace('test = ["pytest>=7"]', 'other = ["pytest>=7"]') }],
+    ["URL requirement", { ...uvFiles(), "pyproject.toml": uvManifest.replace("pytest>=7", "pytest @ https://example.com/pkg.whl") }],
+    ["nested dependency extra", { ...uvFiles(), "pyproject.toml": uvManifest.replace("pytest>=7", "pytest[more]>=7") }],
+    ["empty extra", { ...uvFiles(), "pyproject.toml": uvManifest.replace('["pytest>=7"]', "[]") }],
+    ["unlocked test", { ...uvFiles(), "uv.lock": uvLock.replace('test = [{ name = "pytest" }]', 'test = []') }],
+    ["missing target", { ...uvFiles(), "uv.lock": uvLock.replace('name = "pytest"\nversion = "9.2.0"', 'name = "other"\nversion = "9.2.0"') }],
+    ["stale requirement", { ...uvFiles(), "pyproject.toml": uvManifest.replace("pytest>=7", "pytest>=8") }],
+    ["stale project version", { ...uvFiles(), "pyproject.toml": uvManifest.replace("0.1.0", "0.2.0") }],
+    ["extra alias collision", { ...uvFiles(), "pyproject.toml": uvManifest + 'TEST = ["pytest>=7"]\n' }],
+    ["workspace", { ...uvFiles(), "pyproject.toml": uvManifest + '[tool.uv.workspace]\nmembers=["sub"]\n' }],
+    ["source override", { ...uvFiles(), "pyproject.toml": uvManifest + '[tool.uv.sources]\npytest={path="sub"}\n' }],
+    ["malformed lock", { ...uvFiles(), "uv.lock": uvLock + "broken=[" }],
+    ["wrong lock version", { ...uvFiles(), "uv.lock": uvLock.replace("version = 1\n", "version = 2\n") }],
+    ["ambiguous roots", { ...uvFiles(), "uv.lock": uvLock + '[[package]]\nname="another"\nsource={virtual="."}\n' }],
+    ["nested local project", { ...uvFiles(), "uv.lock": uvLock.replace('name = "client"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }', 'name = "client"\nversion = "1.0.0"\nsource = { editable = "sub" }') }],
+  ] satisfies Array<[string, Record<string, string>]>) ("refuses %s", async (_reason, files) => {
+    expect(await planDependencies(root(files), "python", testSelection)).toBe(null);
+  });
+
+  it.each(["uv.lock", "requirements.txt", "pyproject.toml"])("refuses a nested %s", async (file) => {
+    const dir = root({ ...uvFiles(), [`sub/${file}`]: "anything", "sub/tests/case.py": "" });
+    expect(await planDependencies(dir, "python", { ...testSelection, cwdRelative: "sub/tests" })).toBe(null);
+  });
+
+  it.each(["pyproject.toml", "uv.lock", "requirements.txt"])("refuses symlinked, directory and oversized %s", async (file) => {
+    const dir = root(uvFiles());
+    rmSync(path.join(dir, file), { force: true });
+    symlinkSync(path.join(dir, "missing"), path.join(dir, file));
+    expect(await planDependencies(dir, "python", testSelection)).toBe(null);
+    rmSync(path.join(dir, file));
+    mkdirSync(path.join(dir, file));
+    expect(await planDependencies(dir, "python", testSelection)).toBe(null);
+    rmSync(path.join(dir, file), { recursive: true });
+    writeFileSync(path.join(dir, file), "");
+    truncateSync(path.join(dir, file), 33 * 1024 * 1024);
+    expect(await planDependencies(dir, "python", testSelection)).toBe(null);
+  });
+
+  it("refuses invalid UTF-8, FIFOs, missing cwd and symlinked prefixes without following them", async () => {
+    const dir = root(uvFiles());
+    writeFileSync(path.join(dir, "pyproject.toml"), Buffer.from([0xff]));
+    expect(await planDependencies(dir, "python", testSelection)).toBe(null);
+    writeFileSync(path.join(dir, "pyproject.toml"), uvManifest);
+    rmSync(path.join(dir, "uv.lock"));
+    execFileSync("mkfifo", [path.join(dir, "uv.lock")]);
+    expect(await planDependencies(dir, "python", testSelection)).toBe(null);
+    rmSync(path.join(dir, "uv.lock"));
+    writeFileSync(path.join(dir, "uv.lock"), uvLock);
+    expect(await planDependencies(dir, "python", { ...testSelection, cwdRelative: "missing" })).toBe(null);
+    symlinkSync(root({ "unit/case.py": "" }), path.join(dir, "tests"));
+    expect(await planDependencies(dir, "python", { ...testSelection, cwdRelative: "tests/unit" })).toBe(null);
   });
 });
 
