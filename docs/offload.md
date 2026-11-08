@@ -59,6 +59,15 @@ Pool creates carry the reservation id as the `Idempotency-Key`, so a create whos
 
 ## Node and Python offload (`bin/boat-offload-node`, `bin/boat-offload-python`)
 
+The [multi-toolchain template contract](multi-toolchain-template.md) defines the
+source-free image and fresh-boot evidence required before enabling these profiles.
+`node-public-1` sets the server-owned
+`PLAYWRIGHT_BROWSERS_PATH=/opt/paperclip-boat/ms-playwright`, so browsers must be
+installed there, root-owned and non-writable by the SSH user, rather than in the
+image builder's HOME. It never forwards a host browser path; callers still cannot
+supply environment keys on Node/Python requests. The browser key is not set for
+Rust or Python. This contract is not a claim that a template is qualified.
+
 Rust offload above extends to long Node and Python commands on two more server
 profiles: `node-public-1` (npm/pnpm/yarn scripts and test binaries such as
 `vitest run`, `jest`, `playwright test`, `next build`) and `python-public-1`

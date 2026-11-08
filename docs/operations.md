@@ -284,6 +284,10 @@ The shim's own rollback and the native network-policy rollback rules are in [Car
 
 ## Delegated guest template (required for remote offload)
 
+For additional Node/browser and Python toolchains, follow the
+[multi-toolchain template contract](multi-toolchain-template.md) alongside the
+steps below; adding tools does not waive the untouched fresh-boot preflight.
+
 The stock boat image has no cgroup v2 delegation for SSH sessions: session
 scopes sit under `user-1000.slice`, systemd ignores `Delegate=` on slices,
 and the guest preflight therefore returns false. Build a template once, on one

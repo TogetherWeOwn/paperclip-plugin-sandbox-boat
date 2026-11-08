@@ -307,10 +307,11 @@ function profileForId(profileId: string): ServerProfile | null {
   return null;
 }
 
-/** Server-owned guest build env for a command's profile; Node/Python stay empty. */
+/** Server-owned guest build env; never copied from the host environment. */
 export function profileGuestEnv(command: OffloadCommand): Record<string, string> {
-  if ((command.tool ?? "cargo") !== "cargo") return {};
-  return { ...(profileForId(command.profileId)?.env ?? {}) };
+  const profile = profileForId(command.profileId);
+  if (profile?.tool !== (command.tool ?? "cargo")) return {};
+  return { ...(profile?.env ?? {}) };
 }
 
 /** Path-bearing flags whose values must resolve inside the workspace. */
