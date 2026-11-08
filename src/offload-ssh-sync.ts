@@ -9,7 +9,7 @@ import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
 import { captureSnapshot, collectAndStage, planPush, SyncError, type GuestFileState, type SourceManifest } from "./offload-sync.js";
 import { hashManifest, SshGuestStore, type MirrorVerification, type SpawnFn } from "./offload-ssh-guest-store.js";
-import type { OffloadSync } from "./offload-journal.js";
+import { commandDigest, type OffloadSync } from "./offload-journal.js";
 import type { OffloadCommand } from "./offload.js";
 import type { SshManager, SshSession } from "./ssh.js";
 
@@ -49,9 +49,15 @@ export function checkDepSelection(command: OffloadCommand, tool: string | undefi
 /** Returned artifacts outlive the one-day result retention, then the sweep reclaims them. */
 export const ARTIFACT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
+interface InstalledDependencies {
+  scope: string;
+  hash: string;
+  uv: boolean;
+}
+
 /** Delta push into a persistent per-card guest mirror, and bounded staged-only return collection. */
 export class SshOffloadSync implements OffloadSync {
-  private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string; at: number }>();
+  private readonly uploads = new Map<string, { source: string; manifest: SourceManifest; scratch: string; guestDir: string; sandboxId: string; digest: string; dependencies: InstalledDependencies | null; at: number }>();
   /** Previous manifest per (VM, card mirror): the host-side delta base. A mirror lives on one VM, so a push on another VM never moves it. Verified against the guest marker on every push. */
   private readonly mirrors = new Map<string, SourceManifest>();
   /** Serialize pushes and their installs per mirror: concurrent deltas or installs in one mirror would corrupt it. */
@@ -76,12 +82,12 @@ export class SshOffloadSync implements OffloadSync {
    * stored in the guest-writable mirror marker. Keyed like `mirrors`.
    */
   private readonly previousGuestScans = new Map<string, Map<string, GuestFileState>>();
-  /** Verified dependency installs: per-VM for global (pip), per mirror checkout for node_modules/.venv. */
-  private readonly installed = new Map<string, Set<string>>();
+  /** Only the active verified install, never historical membership or guest-writable markers. */
+  private readonly installed = new Map<string, InstalledDependencies>();
+  /** A transport failure can leave an installer writing; never reuse that scope in this worker. */
+  private readonly uncertainInstalls = new Set<string>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
   private now(): number { return (this.deps.now ?? Date.now)(); }
-  /** Guest-side content-addressed marker root for installed dependencies. */
-  depCacheDir(): string { return path.posix.join(this.deps.workRoot ?? "/tmp", "paperclip-boat-deps"); }
   private key(command: OffloadCommand): string {
     return createHash("sha256").update(JSON.stringify([command.companyId, command.runId, command.commandId])).digest("hex");
   }
@@ -98,6 +104,8 @@ export class SshOffloadSync implements OffloadSync {
     return path.posix.join(this.directory(command), relative);
   }
   async push(sandboxId: string, command: OffloadCommand): Promise<void> {
+    // A failed retry must not leave this command's previous successful identity usable.
+    await this.discard(sandboxId, command);
     const source = await this.deps.sourceRoot(command);
     if (!path.isAbsolute(source) || await realpath(source) !== source) throw new Error("Offload source is not a canonical native workspace");
     await mkdir(this.deps.artifactRoot, { recursive: true, mode: 0o700 });
@@ -117,13 +125,15 @@ export class SshOffloadSync implements OffloadSync {
       const mirrorKey = this.mirrorKey(command);
       await this.withMirrorLock(mirrorKey, async () => {
         await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
-        // Cache identity must describe the same immutable bytes just uploaded,
-        // not a live lockfile that may have changed while the push was in flight.
-        await this.installDependencies(sandboxId, command, frozen, guestDir);
+        // Plan from the exact bytes uploaded, not a live tree that can change during SSH.
+        const dependencies = await this.installDependencies(sandboxId, command, frozen, guestDir);
+        this.uploads.set(this.key(command), { source, manifest, scratch, guestDir, sandboxId,
+          digest: commandDigest(command), dependencies, at: this.now() });
       });
-      this.uploads.set(this.key(command), { source, manifest, scratch, guestDir, at: this.now() });
       await rm(frozen, { recursive: true, force: true });
     } catch (error) {
+      this.uploads.delete(this.key(command));
+      this.installed.delete(`mirror:${sandboxId}:${this.directory(command)}`);
       await rm(scratch, { recursive: true, force: true });
       throw error;
     }
@@ -246,75 +256,63 @@ export class SshOffloadSync implements OffloadSync {
     }
     this.mirrors.set(baseKey, manifest);
   }
-  /**
-   * Install Node/Python dependencies on the guest from the source lockfile.
-   * Frozen sync excludes dependency dirs, so a checkout without node_modules
-   * cannot run until this installs them. Global installs (pip) run once per
-   * lockfile hash per VM (guest-side marker plus an in-memory set); a warm
-   * pool VM reuses them across runs. Checkout-local installs (npm/pnpm/yarn,
-   * uv: node_modules/.venv live inside the persistent per-card mirror) run
-   * once per mirror checkout per lockfile hash; a worker restart reinstalls
-   * them once. Cargo checkouts skip this entirely.
-   */
-  async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
+  /** Install from frozen lockfiles; only the last successful plan is reusable.
+   * pip mutates a shared environment, not an exact isolated dependency set.
+   * A worker restart always reinstalls, ignoring historical guest markers. */
+  async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<InstalledDependencies | null> {
     const checked = checkDepSelection(command, command.tool ?? "cargo");
     if (!checked) throw new Error("Offload dependency selection is invalid for this command; refusing install");
-    if ((command.tool ?? "cargo") === "cargo") return;
+    if ((command.tool ?? "cargo") === "cargo") return null;
     const plan = await planDependencies(source, command.tool, checked.selection);
     if (!plan) {
-      // resolve() keeps lockfile-less commands local before any VM is spent;
-      // reaching here means the source changed under us. Never run unlocked.
       throw new Error("Offload node/python commands need a lockfile; refusing unlocked install");
     }
-    // node_modules/.venv are checkout-local inside the persistent per-card
-    // mirror: reinstall when the mirror or the lockfile hash changes, never
-    // once per command. Only global installs (pip) share a per-VM cache.
     const checkoutLocal = plan.installs.some((item) => item.lockfile !== "requirements.txt");
-    const installedKey = checkoutLocal ? `mirror:${sandboxId}:${guestDir}` : `vm:${sandboxId}`;
-    if (!checkoutLocal) {
-      const done = this.installed.get(installedKey);
-      if (done?.has(plan.hash)) return;
-      const session = await this.deps.session(sandboxId);
-      const marker = path.posix.join(this.depCacheDir(), `${plan.hash}.ok`);
-      const check = await this.deps.ssh.runStream(session,
-        buildRemoteCommand(`exec test -f ${shellQuote(marker)}`), { timeoutMs: 15_000 });
-      if (check.exitCode === 0 && !check.timedOut && !check.signal) {
-        this.markInstalled(installedKey, plan.hash);
-        return;
+    const userBase = guestPythonUserBase(this.deps.workRoot ?? "/tmp", sandboxId);
+    const installedKey = checkoutLocal ? `mirror:${sandboxId}:${guestDir}` : `vm:${sandboxId}:${userBase}`;
+    return this.withMirrorLock(`install:${installedKey}`, async () => {
+      if (this.uncertainInstalls.has(installedKey)) {
+        throw new Error("Offload dependency install completion unknown; refusing environment reuse");
       }
-    } else if (this.installed.get(installedKey)?.has(plan.hash)) {
-      return;
-    }
-    const session = await this.deps.session(sandboxId);
-    const steps = plan.installs
-      .map((item) => `cd ${shellQuote(guestDir)} && ${item.install.map(shellQuote).join(" ")}`)
-      .join(" && ");
-    // Global installs record the shared marker; checkout-local installs run
-    // inside the per-card guestDir and are remembered per mirror checkout.
-    // pip may fall back to a user-site install when system site-packages is
-    // not writable: pin PYTHONUSERBASE to the per-VM toolchain root the
-    // command itself runs with, not the SSH session's HOME, which the
-    // command never sees (it runs under a fresh per-command HOME).
-    const script = checkoutLocal ? steps
-      : `export PYTHONUSERBASE=${shellQuote(guestPythonUserBase(this.deps.workRoot ?? "/tmp", sandboxId))} && ${steps} && mkdir -p ${shellQuote(this.depCacheDir())} && touch ${shellQuote(path.posix.join(this.depCacheDir(), `${plan.hash}.ok`))}`;
-    // Checkout-local node_modules/.venv match only the last installed lockfile:
-    // forget it before the install mutates them, so a failed install of B never
-    // leaves A trusted, and remember the one new hash only once it succeeded.
-    if (checkoutLocal) this.installed.delete(installedKey);
-    const result = await this.deps.ssh.runStream(session,
-      buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
-    if (result.exitCode !== 0 || result.timedOut || result.signal) {
-      throw new Error("Offload dependency install failed; no command ran");
-    }
-    this.markInstalled(installedKey, plan.hash);
+      const active = this.installed.get(installedKey);
+      if (active?.hash === plan.hash) return active;
+      const session = await this.deps.session(sandboxId);
+      const steps = plan.installs
+        .map((item) => `cd ${shellQuote(guestDir)} && ${item.install.map(shellQuote).join(" ")}`)
+        .join(" && ");
+      // A user-site fallback must match the command's per-VM PYTHONUSERBASE,
+      // never the SSH session's HOME (execution has a fresh command HOME).
+      const script = checkoutLocal ? steps : `export PYTHONUSERBASE=${shellQuote(userBase)} && ${steps}`;
+      // Invalidate before any mutation, including pip. A failed B cannot leave A trusted.
+      this.installed.delete(installedKey);
+      let result: Awaited<ReturnType<SshManager["runStream"]>>;
+      try {
+        result = await this.deps.ssh.runStream(session,
+          buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
+      } catch (error) {
+        this.uncertainInstalls.add(installedKey);
+        throw error;
+      }
+      if (result.timedOut || result.signal) this.uncertainInstalls.add(installedKey);
+      if (result.exitCode !== 0 || result.timedOut || result.signal) {
+        throw new Error("Offload dependency install failed; no command ran");
+      }
+      const installed = { scope: installedKey, hash: plan.hash,
+        uv: plan.installs.some((item) => item.lockfile === "uv.lock") };
+      this.installed.set(installedKey, installed);
+      return installed;
+    });
   }
-  private markInstalled(installedKey: string, hash: string): void {
-    let done = this.installed.get(installedKey);
-    if (!done) {
-      done = new Set();
-      this.installed.set(installedKey, done);
+  /** Runtime identity belongs to a successful upload on this sandbox, not the live source. */
+  async uvVenvRoot(sandboxId: string, command: OffloadCommand): Promise<string | null> {
+    if ((command.tool ?? "cargo") !== "python") return null;
+    const upload = this.uploads.get(this.key(command));
+    if (!upload || upload.sandboxId !== sandboxId || upload.guestDir !== this.directory(command)
+      || upload.digest !== commandDigest(command) || !upload.dependencies
+      || this.installed.get(upload.dependencies.scope) !== upload.dependencies) {
+      throw new Error("Missing verified frozen Python environment; refusing guest execution");
     }
-    done.add(hash);
+    return upload.dependencies.uv ? upload.guestDir : null;
   }
   async collect(sandboxId: string, command: OffloadCommand): Promise<unknown> {
     const upload = this.uploads.get(this.key(command));

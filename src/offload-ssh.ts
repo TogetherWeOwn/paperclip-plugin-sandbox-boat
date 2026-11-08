@@ -36,8 +36,8 @@ export interface SshOffloadGuestDeps {
   /** Server-owned profile build env, applied under the validated request env. */
   profileEnv?: (command: OffloadCommand) => Record<string, string>;
   path?: string;
-  /** Guest checkout root when the source plans a uv (uv.lock) install, else null. */
-  uvVenvRoot?: (command: OffloadCommand) => Promise<string | null>;
+  /** Verified frozen upload's uv checkout root, else null; a missing identity must throw. */
+  uvVenvRoot?: (command: OffloadCommand, sandboxId: string) => Promise<string | null>;
   /** Validated leading rustup toolchain selector for cargo cache priming, else null. */
   cargoToolchain?: (command: OffloadCommand) => string | null;
   /** Guest supervisor source, default OFFLOAD_SSH_SCRIPT. Tests override it to
@@ -211,7 +211,7 @@ export class SshOffloadGuest implements GuestController {
     // checkout path plus a validated runner name; every other env key stays
     // empty and the activation applies to that command only.
     if ((command.tool ?? "cargo") === "python") {
-      const venvRoot = await this.deps.uvVenvRoot?.(command).catch(() => null);
+      const venvRoot = await this.deps.uvVenvRoot?.(command, sandboxId);
       if (command.depSelection !== undefined && (venvRoot === null || venvRoot === undefined)) {
         throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_selected_venv_gate");
       }

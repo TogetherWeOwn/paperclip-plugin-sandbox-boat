@@ -69,24 +69,130 @@ describe("installDependencies", () => {
       .rejects.toThrow(/lockfile/i);
   });
 
-  it("reuses the shared cache for global pip installs", async () => {
+  it("installs global pip deps with one RPC and no marker", async () => {
     const pinned = "pytest==7.4.2 \\\n    --hash=sha256:abc123\n";
     const root = source({ "requirements.txt": pinned });
     const py = command({ tool: "python", runner: "pytest", profileId: "python-public-1", argv: ["tests/"] });
     const { sync, ssh, calls } = setup(root);
     await sync.installDependencies("vm-1", py, root, "/guest/work");
-    expect(ssh.runStream).toHaveBeenCalledTimes(2); // marker check + install
-    expect(calls[1]).toContain("pip");
-    expect(calls[1]).toContain("--require-hashes");
+    expect(ssh.runStream).toHaveBeenCalledTimes(1); // install only, no marker read
+    expect(calls[0]).toContain("pip");
+    expect(calls[0]).toContain("--require-hashes");
+    expect(calls[0]).not.toContain("test -f");
+    expect(calls[0]).not.toContain("touch");
     // A pip user-site fallback must land where the command (fresh HOME) reads
     // it: the per-VM PYTHONUSERBASE, never the SSH session's home.
-    expect(calls[1]).toContain("PYTHONUSERBASE=");
-    expect(calls[1]).toContain(guestPythonUserBase("/tmp/boat-test", "vm-1"));
-    const before = ssh.runStream.mock.calls.length;
+    expect(calls[0]).toContain("PYTHONUSERBASE=");
+    expect(calls[0]).toContain(guestPythonUserBase("/tmp/boat-test", "vm-1"));
     await sync.installDependencies("vm-1", py, root, "/guest/work");
-    expect(ssh.runStream.mock.calls.length).toBe(before); // in-memory cache
-    await sync.installDependencies("vm-2", py, root, "/guest/work");
-    expect(ssh.runStream.mock.calls.length).toBe(before + 1); // guest marker hit only
+    expect(ssh.runStream).toHaveBeenCalledTimes(1); // same hash reuses in memory
+  });
+
+  describe("pip active environment caching", () => {
+    const pyCmd = () => command({ tool: "python", runner: "pytest", profileId: "python-public-1", argv: ["tests/"] });
+    const reqs = (name: string) => source({ "requirements.txt": `pytest==${name === "a" ? "7.4.2" : "8.0.0"} \\\n    --hash=sha256:${name}\n` });
+    type Result = { exitCode: number | null; timedOut: boolean; signal: string | null; stdout: string };
+    const ok: Result = { exitCode: 0, timedOut: false, signal: null, stdout: "" };
+
+    function build(root: string, results: Array<Result | Error> = []) {
+      const queue = [...results];
+      const ssh = {
+        runStream: vi.fn(async () => {
+          const next = queue.shift() ?? ok;
+          if (next instanceof Error) throw next;
+          return next;
+        }),
+      };
+      const make = () => new SshOffloadSync({
+        ssh: ssh as never,
+        session: async () => ({} as never),
+        sourceRoot: async () => root,
+        artifactRoot: root,
+        workRoot: "/tmp/boat-test",
+      });
+      return { ssh, make };
+    }
+
+    it("reinstalls A on a fresh worker despite historical A markers while B is active", async () => {
+      const a = reqs("a");
+      let active = "B";
+      const ssh = { runStream: vi.fn(async (_session: unknown, script: string) => {
+        // Historical A.ok exists, but B is installed. A marker check must not
+        // authorize a cache hit; only actually installing A changes this state.
+        if (script.includes("pip")) active = "A";
+        return ok;
+      }) };
+      const fresh = new SshOffloadSync({ ssh: ssh as never, session: async () => ({} as never),
+        sourceRoot: async () => a, artifactRoot: a, workRoot: "/tmp/boat-test" });
+      await fresh.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(active).toBe("A");
+      expect(ssh.runStream).toHaveBeenCalledTimes(1);
+      expect(ssh.runStream.mock.calls[0][1]).not.toContain("test -f");
+    });
+
+    it("installs A, B, A three times and reuses a repeated A", async () => {
+      const a = reqs("a");
+      const b = reqs("b");
+      const { ssh, make } = build(a);
+      const sync = make();
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      await sync.installDependencies("vm-1", pyCmd(), b, "/guest/work");
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    });
+
+    it("keeps a nonzero-exit B retryable and reinstalls A afterwards", async () => {
+      const a = reqs("a");
+      const b = reqs("b");
+      const { ssh, make } = build(a, [ok, { exitCode: 1, timedOut: false, signal: null, stdout: "boom" }]);
+      const sync = make();
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      await expect(sync.installDependencies("vm-1", pyCmd(), b, "/guest/work")).rejects.toThrow(/install failed/i);
+      expect(ssh.runStream).toHaveBeenCalledTimes(2);
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work"); // not trusted, not quarantined
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    });
+
+    const ambiguous: Array<[string, Result | Error]> = [
+      ["a timeout", { exitCode: null, timedOut: true, signal: null, stdout: "" }],
+      ["a signal", { exitCode: null, timedOut: false, signal: "SIGKILL", stdout: "" }],
+      ["a transport throw", new Error("ssh dropped")],
+    ];
+    for (const [label, outcome] of ambiguous) {
+      it(`quarantines the scope after B ends in ${label}`, async () => {
+        const a = reqs("a");
+        const b = reqs("b");
+        const { ssh, make } = build(a, [ok, outcome]);
+        const sync = make();
+        await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+        await expect(sync.installDependencies("vm-1", pyCmd(), b, "/guest/work")).rejects.toThrow();
+        expect(ssh.runStream).toHaveBeenCalledTimes(2);
+        // A is invalidated and the scope is quarantined: refused before any RPC,
+        // so a possibly still-running installer is never raced.
+        await expect(sync.installDependencies("vm-1", pyCmd(), a, "/guest/work")).rejects.toThrow();
+        expect(ssh.runStream).toHaveBeenCalledTimes(2);
+        // Another VM is a different scope and stays usable.
+        await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
+        expect(ssh.runStream).toHaveBeenCalledTimes(3);
+        await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
+        expect(ssh.runStream).toHaveBeenCalledTimes(3);
+      });
+    }
+
+    it("isolates the active hash per VM", async () => {
+      const a = reqs("a");
+      const b = reqs("b");
+      const { ssh, make } = build(a);
+      const sync = make();
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work"); // other VM installs
+      expect(ssh.runStream).toHaveBeenCalledTimes(2);
+      await sync.installDependencies("vm-2", pyCmd(), b, "/guest/work"); // B on vm-2 must not evict vm-1
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    });
   });
 
   it("reinstalls checkout-local deps per guest checkout on a warm VM", async () => {

@@ -824,15 +824,16 @@ export class SshOffloadRuntime {
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
       refreshSession });
-    const uvVenvRoot = async (cmd: OffloadCommand): Promise<string | null> => {
-      if ((cmd.tool ?? "cargo") !== "python") return null;
-      const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
-      if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) return null;
-      const checked = checkDepSelection(cmd);
-      if (!checked) return null;
-      const plan = await planDependencies(native.source, cmd.tool, checked.selection).catch(() => null);
-      if (!plan?.installs.some((item) => item.lockfile === "uv.lock")) return null;
-      return sync.directory(cmd);
+    const uvVenvRoot = async (cmd: OffloadCommand, sandboxId: string): Promise<string | null> => {
+      // Freezing the default interpreter does not waive explicit selection's
+      // live refusal gate. An invalid selected plan must fail before any RPC.
+      if (cmd.depSelection !== undefined) {
+        const checked = checkDepSelection(cmd);
+        if (!checked || !await planDependencies(await sourceRoot(cmd), cmd.tool, checked.selection)) {
+          throw new Error("Offload dependency selection is invalid; refusing guest execution");
+        }
+      }
+      return sync.uvVenvRoot(sandboxId, cmd);
     };
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, refreshSession, cgroupParent,
       closing: () => this.closing,

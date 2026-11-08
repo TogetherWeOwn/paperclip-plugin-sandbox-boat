@@ -53,6 +53,7 @@ const SELECTED = { uvExtra: "test", cwdRelative: "." } as const;
 
 const tmpdirs: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of tmpdirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -212,6 +213,7 @@ describe("runtime admission and venv agreement", () => {
     const sshStub = {
       masterAlive: () => false,
       runStream: vi.fn(async (_s: unknown, _c: string, opts: { stdin?: AsyncIterable<Uint8Array> }) => {
+        if (!opts.stdin) return { exitCode: 0, timedOut: false, signal: null, stdout: "" };
         const chunks: Buffer[] = [];
         for await (const chunk of opts.stdin ?? []) chunks.push(Buffer.from(chunk as Uint8Array));
         seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
@@ -278,16 +280,20 @@ describe("runtime admission and venv agreement", () => {
     const source = tree(uvFiles());
     const { runtime, config, seen } = backend(source);
     try {
-      const cmd = backendCommand({ depSelection: SELECTED });
+      const cmd = backendCommand({ depSelection: SELECTED, runner: "python" });
       expect(await runtime.preflight(cmd, config)).toBeNull();
       expect(await refusalOf(runtime, config, cmd)).toBeNull();
-      const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as { guest: { prepare: (vm: string, c: unknown) => Promise<unknown> } };
-      await pool.guest.prepare("vm-1", { ...cmd, runner: "python" });
+      const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as {
+        sync: SshOffloadSync; guest: { prepare: (vm: string, c: unknown) => Promise<unknown> };
+      };
+      vi.spyOn(pool.sync as unknown as { pushLocked: (...args: unknown[]) => Promise<void> }, "pushLocked").mockResolvedValue(undefined);
+      await pool.sync.push("vm-1", cmd);
+      await pool.guest.prepare("vm-1", cmd);
       expect(String((seen[0] as Record<string, unknown>).executable)).toContain(".venv/bin/python");
-      // If the selected plan stops being valid between admission/install and prepare,
-      // it must not become a system-Python command.
+      // Frozen success does not authorize a now-invalid explicit selection,
+      // even for the same uploaded command. No further guest RPC may run.
       writeFileSync(path.join(source, "pyproject.toml"), "[project]\nname = \"example\"\nversion = \"0.1.0\"\n");
-      await expect(pool.guest.prepare("vm-1", { ...cmd, commandId: randomUUID() })).rejects.toThrow();
+      await expect(pool.guest.prepare("vm-1", cmd)).rejects.toThrow();
       expect(seen).toHaveLength(1);
     } finally {
       await runtime.shutdown();
