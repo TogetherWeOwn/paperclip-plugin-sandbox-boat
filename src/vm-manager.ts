@@ -245,6 +245,24 @@ interface CachedConfig {
   seenAt: number;
 }
 
+interface BudgetObservation {
+  snapshot: BudgetSnapshot;
+  at: string;
+  provenance: {
+    environmentId: string;
+    apiBase: string;
+    credentialSource: "inline" | "host";
+  };
+}
+
+interface BudgetSource {
+  apiBase: string;
+  accountDigest: string;
+  credentialSource: "inline" | "host";
+  observation: BudgetObservation | null;
+  completedOrder: number;
+}
+
 /**
  * The key a card's VM is stored and named under, scoped to the run's
  * principal. A resumed or still-running disk keeps whatever an earlier run
@@ -462,7 +480,10 @@ export class BoatVmManager {
   private readonly sessionPolicy = new Map<string, { noEnv: boolean; environment: string | null }>();
   private lastSweepAt = 0;
   private sweeping: { scope: string | null; report: Promise<TaggedSweepReport> } | null = null;
-  private lastBudget: { snapshot: BudgetSnapshot; at: string } | null = null;
+  private lastBudgetAt: string | null = null;
+  private readonly budgetSources = new Map<string, Map<string, BudgetSource>>();
+  private budgetObservationOrder = 0;
+  private hostBudgetCredential: { apiKey: string; accountDigest: string } | null = null;
   private readonly offloadConfigFn: ((companyId: string) => Promise<Record<string, unknown>>) | null;
   /** A caller-supplied executor replaces the native gates, so dry-run preflight has no opinion. */
   private readonly hasCustomOffloadExecutor: boolean;
@@ -1082,8 +1103,24 @@ export class BoatVmManager {
   rememberConfig(companyId: string, environmentId: string, config: BoatDriverConfig): void {
     try {
       const bound = { ...config, apiKey: resolveApiKey(config), costApiKey: resolveCostApiKey(config) };
+      let sources = this.budgetSources.get(companyId);
+      if (!sources) {
+        sources = new Map();
+        this.budgetSources.set(companyId, sources);
+      }
+      const accountDigest = sweepAccountDigest(config.apiBase, bound.apiKey);
+      const credentialSource = config.apiKey == null ? "host" : "inline";
+      const previous = sources.get(environmentId);
+      if (!previous || previous.accountDigest !== accountDigest || previous.apiBase !== config.apiBase
+        || previous.credentialSource !== credentialSource) {
+        sources.set(environmentId, { apiBase: config.apiBase, accountDigest, credentialSource, observation: null, completedOrder: 0 });
+      }
+      if (credentialSource === "host") this.hostBudgetCredential = { apiKey: bound.apiKey, accountDigest };
       this.configs.set(environmentId, { companyId, environmentId, config: bound, seenAt: this.now() });
-    } catch { return; } // No credential provenance to enroll for provider upkeep.
+    } catch {
+      this.budgetSources.get(companyId)?.delete(environmentId);
+      return; // No credential provenance to enroll for provider upkeep.
+    }
     void this.persistSweepDescriptor(companyId, environmentId, config).catch((error) =>
       this.logger.warn("boat: could not persist the sweep config", { environmentId, error: errorText(error) }),
     );
@@ -1272,13 +1309,46 @@ export class BoatVmManager {
 
   // ------------------------------------------------------------ budget guard
 
+  private currentBudgetSource(companyId: string, environmentId: string): BudgetSource | null {
+    const sources = this.budgetSources.get(companyId);
+    const source = sources?.get(environmentId);
+    if (!source) return null;
+    // Inline bindings are immutable source records, replaced by configuration
+    // hooks. Only the shared host credential can change between hook calls.
+    if (source.credentialSource === "inline") return source;
+    const apiKey = process.env.BOAT_API_KEY?.trim() ?? "";
+    if (!apiKey) {
+      this.hostBudgetCredential = null;
+    } else {
+      // A separate one-entry cache prevents an inline-key LRU scan from forcing
+      // repeated host derivations. Keep the persisted scrypt format unchanged.
+      if (this.hostBudgetCredential?.apiKey !== apiKey) {
+        this.hostBudgetCredential = { apiKey, accountDigest: sweepAccountDigest(DEFAULT_API_BASE, apiKey) };
+      }
+      if (source.apiBase === DEFAULT_API_BASE && this.hostBudgetCredential.accountDigest === source.accountDigest) return source;
+    }
+    sources!.delete(environmentId);
+    return null;
+  }
+
+  /** Latest completed successful probe among this company's still-current sources.
+   * Observations are worker-local; reading usage never refreshes provider limits. */
+  private budgetObservation(companyId: string): BudgetObservation | null {
+    let latest: BudgetSource | null = null;
+    for (const environmentId of this.budgetSources.get(companyId)?.keys() ?? []) {
+      const source = this.currentBudgetSource(companyId, environmentId);
+      if (source?.observation && (!latest || source.completedOrder > latest.completedOrder)) latest = source;
+    }
+    return latest?.observation ?? null;
+  }
+
   async readBudget(config: BoatDriverConfig): Promise<BudgetSnapshot> {
     const api = this.opsApi(config);
     let lastError: BoatErrorInfo | null = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         const snapshot = readBudget(await api.limits({}));
-        this.lastBudget = { snapshot, at: this.nowIso() };
+        this.lastBudgetAt = this.nowIso();
         return snapshot;
       } catch (error) {
         lastError = await describeBoatError(error);
@@ -3006,6 +3076,7 @@ export class BoatVmManager {
       }
     }
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
     const remoteCwd =
       str(params.lease.metadata?.remoteCwd) ?? params.workspace.remotePath ?? config.remoteWorkspaceDir ?? "/home/user/paperclip-workspace";
     const sandboxId = params.lease.providerLeaseId;
@@ -3264,8 +3335,12 @@ export class BoatVmManager {
     this.rememberConfig(params.companyId, params.environmentId, config);
     const diagnostics: NonNullable<PluginEnvironmentProbeResult["diagnostics"]> = [];
     let budget: BudgetSnapshot | null = null;
+    const source = this.currentBudgetSource(params.companyId, params.environmentId);
     try {
-      budget = await this.readBudget(config);
+      // Pin the request to the same resolved key as its source, even if a host
+      // credential changes while limits is in flight. Obsolete completions do
+      // not repopulate a replaced source (including an A → B → A change).
+      budget = await this.readBudget({ ...config, apiKey: resolveApiKey(config) });
     } catch (error) {
       diagnostics.push({ severity: "error", code: "boat_limits", message: errorText(error) });
     }
@@ -3300,6 +3375,12 @@ export class BoatVmManager {
       );
     }
     const ok = !diagnostics.some((entry) => entry.severity === "error");
+    if (ok && budget && source && this.currentBudgetSource(params.companyId, params.environmentId) === source) {
+      source.observation = { snapshot: budget, at: this.nowIso(), provenance: {
+        environmentId: params.environmentId, apiBase: config.apiBase, credentialSource: source.credentialSource,
+      } };
+      source.completedOrder = ++this.budgetObservationOrder;
+    }
     return {
       ok,
       summary: ok
@@ -3463,6 +3544,7 @@ export class BoatVmManager {
     const kind = params.templateKind ?? "snapshot";
     if (kind !== "snapshot") throw new BoatProviderError("BOAT_TEMPLATE_KIND", `boat templates are named snapshots, not ${kind}.`);
     const config = parseDriverConfig(params.config);
+    this.rememberConfig(params.companyId, params.environmentId, config);
     try {
       await this.opsApi(config).deleteNamedSnapshot({ name: params.templateRef });
       return { deleted: true, metadata: { provider: "boat", reason: params.reason ?? null } };
@@ -3997,7 +4079,7 @@ export class BoatVmManager {
         runs: vms.reduce((sum, vm) => sum + vm.runs.length, 0),
         running: vms.filter((vm) => vm.status === "running" || vm.status === "starting").length,
       },
-      budget: this.lastBudget,
+      budget: this.budgetObservation(companyId),
       cards: [...cards.values()].sort((a, b) => b.dollars - a.dollars),
       vms,
     };
@@ -4009,11 +4091,14 @@ export class BoatVmManager {
       sshSessions: this.ssh.listSessions().map((session) => ({ sandboxId: session.sandboxId, tunnel: session.tunnel })),
       commandsInFlight: [...this.inflight.values()].reduce((sum, value) => sum + value, 0),
       lastSweepAt: this.lastSweepAt ? new Date(this.lastSweepAt).toISOString() : null,
-      lastBudgetAt: this.lastBudget?.at ?? null,
+      lastBudgetAt: this.lastBudgetAt,
     };
   }
 
   async shutdown(): Promise<void> {
+    this.budgetSources.clear();
+    this.hostBudgetCredential = null;
+    this.lastBudgetAt = null;
     // The digest memo is keyed by key-derived preimages: drop it so rotated
     // keys stop being recoverable from worker memory. Live keys stay in the
     // configs; the memo rebuilds on demand.
@@ -4079,7 +4164,7 @@ export interface UsageSummary {
   generatedAt: string;
   note: string;
   totals: { seconds: number; dollars: number; vms: number; runs: number; running: number };
-  budget: { snapshot: BudgetSnapshot; at: string } | null;
+  budget: BudgetObservation | null;
   cards: Array<{ issueId: string | null; vmKey: string; seconds: number; dollars: number; vms: number; runs: number }>;
   vms: Array<Record<string, unknown> & { runs: unknown[] }>;
 }
