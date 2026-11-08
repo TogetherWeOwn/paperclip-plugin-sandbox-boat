@@ -172,7 +172,7 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       offloadMinExpectedSeconds: {
         type: "number", default: 120,
-        description: "A Node/Python command is a remote candidate only when its recorded median duration meets this threshold in seconds. Unknown signatures run local first and record. Rust is not gated by this setting.",
+        description: "With a positive threshold (seconds), a Node/Python command is a remote candidate only when its recorded median meets it; unknown signatures run local first and record. Explicit 0 disables only duration gating, allowing bootstrap without history. Profile, source, command and account-budget gates still apply. Rust is not gated by this setting.",
       },
       offloadMonthlyVmHourCap: {
         type: "number", default: 0,

@@ -79,6 +79,11 @@ describe("normalizeOffloadSettings", () => {
     expect(normalizeOffloadSettings({ offloadProfiles: ["node-public-1", "nope"], offloadMinExpectedSeconds: -5 }))
       .toEqual({ offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 120, offloadMonthlyVmHourCap: 0, offloadEphemeralRepos: [] });
     expect(normalizeOffloadSettings({ offloadMinExpectedSeconds: 60 }).offloadMinExpectedSeconds).toBe(60);
+    expect(normalizeOffloadSettings({ offloadMinExpectedSeconds: 0 }).offloadMinExpectedSeconds).toBe(0);
+  });
+
+  it.each([null, false, "", "0", [], {}, NaN, Infinity, -1])("does not coerce malformed threshold %j into opt-out", (value) => {
+    expect(normalizeOffloadSettings({ offloadMinExpectedSeconds: value }).offloadMinExpectedSeconds).toBe(120);
   });
 });
 
@@ -107,6 +112,76 @@ describe("handleExec node/python gating", () => {
     const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, t.host);
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ mode: "local", profileId: "node-public-1" });
+  });
+
+  it.each([
+    { tool: "node", runner: "npx", argv: ["next", "build"], profileId: "node-public-1" },
+    { tool: "python", runner: "pytest", argv: ["tests/"], profileId: "python-public-1" },
+  ])("bootstraps $tool at an explicit zero threshold without fabricated history", async ({ profileId, ...command }) => {
+    const t = setup(new NeverDispatchBackend(), { offloadProfiles: [profileId], offloadMinExpectedSeconds: 0 });
+    // Neither absent nor unavailable learning may force a local training run
+    // when the operator has explicitly disabled the performance threshold.
+    for (const durations of [t.store, undefined]) {
+      const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody(command) }, { ...t.host, durations });
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ mode: "remote_candidate", profileId });
+    }
+    expect(t.store.data.size).toBe(0);
+  });
+
+  it("retains local-first learning when the threshold is positive", async () => {
+    const t = setup();
+    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, { ...t.host, durations: undefined });
+    expect(response.body).toMatchObject({ mode: "local", reason: "duration learning unavailable; run local first" });
+  });
+
+  it("does not consult broken learning storage with an explicit zero threshold", async () => {
+    const t = setup(new NeverDispatchBackend(), { offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 0 });
+    const response = await handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody() }, {
+      ...t.host,
+      durations: { ...t.store, get: async () => { throw new Error("learning unavailable"); }, set: async () => { throw new Error("must not fabricate a sample"); }, delete: async () => {} },
+    });
+    expect(response.body).toMatchObject({ mode: "remote_candidate" });
+    expect(t.store.data.size).toBe(0);
+  });
+
+  it("still applies profile, source, classifier and executor preflight gates at zero", async () => {
+    const t = setup(new NeverDispatchBackend(), { offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 0 });
+    const call = (body: Record<string, unknown>, host = t.host) => handleExec({ actor: ACTOR, companyId: COMPANY, body: submitBody(body) }, host);
+    expect((await call({ tool: "python", runner: "pytest", argv: ["tests/"] })).body)
+      .toMatchObject({ code: "OFFLOAD_UNAVAILABLE", fallbackSafe: true });
+    expect((await call({ argv: ["run", "dev"] })).body).toMatchObject({ mode: "local" });
+    expect((await call({ env: { DATABASE_URL: "not-forwarded" } })).status).toBe(400);
+    expect((await call({}, { ...t.host, workspaces: { get: async () => null } })).body)
+      .toMatchObject({ code: "OFFLOAD_UNAVAILABLE", fallbackSafe: true });
+    expect((await call({}, { ...t.host, preflight: async () => "included capacity unavailable" })).body)
+      .toMatchObject({ mode: "local", reason: "included capacity unavailable" });
+    expect(t.store.data.size).toBe(0);
+  });
+
+  it("submits a zero-threshold command once with its original timeout and no duration sample", async () => {
+    const started: BackendCommand[] = [];
+    const backend: OffloadBackend = {
+      start: (command, sink) => {
+        started.push(command);
+        sink.started();
+        return { done: new Promise<void>(() => {}), cancel: async () => {} };
+      },
+    };
+    const t = setup(backend, { offloadProfiles: ["node-public-1"], offloadMinExpectedSeconds: 0 });
+    const body = submitBody({ dryRun: false, timeoutMs: 1800000 });
+    const first = await handleExec({ actor: ACTOR, companyId: COMPANY, body }, t.host);
+    expect(first.status).toBe(202);
+    expect(first.body).toMatchObject({ fallbackSafe: false });
+    expect(await t.host.broker.read(CMD, { companyId: COMPANY, runId: RUN }, 0)).toMatchObject({
+      status: 200, body: { state: "running", remoteStarted: true, fallbackSafe: false },
+    });
+    const retry = await handleExec({ actor: ACTOR, companyId: COMPANY, body }, t.host);
+    expect(retry.status).toBe(200);
+    expect(retry.body).toMatchObject({ remoteStarted: true, fallbackSafe: false });
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ tool: "node", runner: "npm", timeoutMs: 1800000 });
+    expect([...t.store.data.keys()].some((key) => key === DURATION_INDEX_KEY)).toBe(false);
   });
 
   it("keeps node local below the median threshold", async () => {
