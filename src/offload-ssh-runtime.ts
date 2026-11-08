@@ -1008,11 +1008,44 @@ export class SshOffloadRuntime {
     // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
     const vmKey = (vm: PoolVm) => vm.sandboxId || vm.accountReservation?.id || "";
     const original = new Map(pool.map((vm) => [vmKey(vm), fingerprint(vm)]));
+    const keyOf = new Map(pool.map((vm) => [vm, vmKey(vm)]));
     const deletedIds = new Set<string>();
+    const deletedKeys = new Set<string>();
     let changed = false;
     let accountingFailed = false;
     for (const vm of [...pool]) {
-      if (!vm.sandboxId) continue; // a lost create reply: no provider handle until a command resolves this pool
+      if (!vm.sandboxId) {
+        // A lost create reply: only a terminal retained intent resolves here,
+        // never a POST. Pending or unreadable intents stay held.
+        if (!vm.quarantined || !vm.accountReservation || vm.busy) continue;
+        try {
+          const recovered = await ledger.recoverCreate(vm.accountReservation);
+          if (recovered.status !== "terminal") continue;
+          if (!recovered.sandboxId) {
+            pool.splice(pool.indexOf(vm), 1);
+            deletedKeys.add(keyOf.get(vm)!);
+          } else {
+            // Keep the known archived sandbox owned (and deletable) durably.
+            vm.sandboxId = recovered.sandboxId;
+            vm.pendingCreate = undefined;
+            vm.quarantined = true;
+            vm.deletePending = true;
+          }
+          changed = true;
+        } catch { /* unresolved intent: stay held */ }
+        continue;
+      }
+      if (vm.deletePending) {
+        try {
+          try { await boat.deleteSandbox({ sandboxId: vm.sandboxId, xAsciiConfirmDelete: vm.sandboxId }); }
+          catch (error) { if ((await describeBoatError(error)).status !== 404) throw error; }
+          await ledger.stopped(vm.sandboxId, now, vm.accountReservation?.id);
+          pool.splice(pool.indexOf(vm), 1);
+          deletedKeys.add(keyOf.get(vm)!);
+          changed = true;
+        } catch { /* retained quarantined with deletePending; retry next sweep */ }
+        continue;
+      }
       let state: string | null = null;
       try {
         const response = (await boat.get({ sandboxId: vm.sandboxId })) as { sandbox?: { id?: unknown; state?: unknown } };
@@ -1081,7 +1114,7 @@ export class SshOffloadRuntime {
       const merged: PoolVm[] = [];
       const seen = new Set<string>();
       for (const vm of pool) {
-        const id = vmKey(vm);
+        const id = keyOf.get(vm) ?? vmKey(vm);
         const twin = twinById.get(id);
         if (!twin || fingerprint(twin) !== original.get(id)) {
           if (twin) { merged.push(twin); seen.add(id); }
@@ -1093,7 +1126,7 @@ export class SshOffloadRuntime {
       for (const twin of fresh.vms) {
         const id = vmKey(twin);
         if (seen.has(id)) continue;
-        if (deletedIds.has(twin.sandboxId) && fingerprint(twin) === original.get(id)) continue;
+        if ((deletedIds.has(twin.sandboxId) || deletedKeys.has(id)) && fingerprint(twin) === original.get(id)) continue;
         merged.push(twin);
       }
       await poolStore.save(fresh.config, merged);

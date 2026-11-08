@@ -137,6 +137,86 @@ describe("included account reservations", () => {
     }
   });
 
+  it("renews the durable envelope when reservation persistence itself is slow", async () => {
+    const s = setup();
+    let delayed = false;
+    s.state.beforeWrite = async () => { if (!delayed) { delayed = true; await advance(830_000); } };
+    const reservation = await s.ledger.reserve(s.api, { ...request, jobSeconds: 210 });
+    await s.ledger.failed(reservation, false);
+    expect(JSON.parse([...s.state.rows.values()][0]!).intents[0])
+      .toMatchObject({ ttlSeconds: 1055, jobSeconds: 1040, compute: 1055 });
+    await expect(s.ledger.recoverCreate(reservation)).resolves.toEqual({ status: "pending" });
+  });
+
+  it("renews the durable dispatch envelope after caller persistence, including restart", async () => {
+    const s = setup();
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await advance(830_000);
+    await s.ledger.revalidate(s.api, reservation, req);
+    await s.ledger.failed(reservation, false);
+    const recovered = new AccountLedger(s.state, "included-budget-test", Date.now);
+    await expect(recovered.recoverCreate(reservation)).resolves.toEqual({ status: "pending" });
+    const doc = JSON.parse([...s.state.rows.values()][0]!);
+    expect(doc.intents[0]).toMatchObject({ ttlSeconds: 1055, compute: 1055 });
+  });
+
+  it.each(["freshness", "period"] as const)("rolls back a never-attempted replay extension after %s refusal", async (failure) => {
+    const s = setup(modern({ planIncluded: included(90_000, failure === "period" ? EPOCH + 500_000 : END) }));
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await s.ledger.failed(reservation, false);
+    const before = JSON.parse([...s.state.rows.values()][0]!).intents[0];
+    await advance(failure === "period" ? 274_000 : 200_000);
+    let delayed = false;
+    s.state.beforeWrite = async () => { if (!delayed) { delayed = true; await advance(6_000); } };
+    await expect(s.ledger.revalidateReplay(s.api, reservation, req, 225)).rejects.toThrow();
+    const intent = JSON.parse([...s.state.rows.values()][0]!).intents[0];
+    expect(intent).toEqual(before);
+  });
+
+  it("retains renewed replay holds after an actually attempted lost reply", async () => {
+    const s = setup();
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await s.ledger.failed(reservation, false);
+    await advance(200_000);
+    await s.ledger.revalidateReplay(s.api, reservation, req, 225);
+    await s.ledger.failed(reservation, false);
+    expect(JSON.parse([...s.state.rows.values()][0]!).intents[0])
+      .toMatchObject({ status: "ambiguous", ttlSeconds: 425, jobSeconds: 410, compute: 425 });
+  });
+
+  it("keeps conservative saved replay holds when rollback persistence fails", async () => {
+    const s = setup();
+    const req = { ...request, jobSeconds: 210 };
+    const reservation = await s.ledger.reserve(s.api, req);
+    await s.ledger.failed(reservation, false);
+    await advance(200_000);
+    s.state.beforeWrite = async () => {
+      await advance(6_000);
+      s.state.failWrites = true;
+    };
+    await expect(s.ledger.revalidateReplay(s.api, reservation, req, 225)).rejects.toThrow();
+    expect(JSON.parse([...s.state.rows.values()][0]!).intents[0])
+      .toMatchObject({ status: "ambiguous", ttlSeconds: 425, jobSeconds: 410, compute: 425 });
+  });
+
+  it("restores a predecessor tail on definitive pre-effect warm refusal", async () => {
+    const s = setup();
+    const req = { ...request, poolId: "warm-pool", command: { commandId: "first", runId: "r", cardId: "c", repoId: "repo" } };
+    const first = await s.ledger.reserve(s.api, req);
+    await s.ledger.started(s.api, first, "synthetic-vm");
+    await s.ledger.finished(first, false);
+    const before = JSON.parse([...s.state.rows.values()][0]!);
+    await advance(2_000);
+    const next = await s.ledger.reserve(s.api, { ...req, operation: "warm", sandboxId: "synthetic-vm", command: { ...req.command, commandId: "next" } });
+    await s.ledger.failed(next, true);
+    const after = JSON.parse([...s.state.rows.values()][0]!);
+    expect(after.intents[0]).toEqual(before.intents[0]);
+    expect(after.usage[0]).toEqual(before.usage[0]);
+  });
+
   it("retains cumulative replay exposure when checking included capacity", async () => {
     const s = setup(modern({ planIncluded: included(400, EPOCH + 500_000) }));
     const req = { ...request, jobSeconds: 210 };
@@ -177,6 +257,35 @@ describe("included account reservations", () => {
 });
 
 describe("post-admission persistence boundaries", () => {
+  it.each([false, true])("keeps a newly effective lost create fenced after an 830-second pool save (restart=%s)", async (reload) => {
+    const f = fixture();
+    try {
+      f.boat.limitsResponse = modern();
+      const set = f.state.set.bind(f.state);
+      let delayed = false;
+      f.state.set = async (key, value) => {
+        if (!delayed && key.namespace === "boat-offload-pool") {
+          delayed = true;
+          await advance(830_000);
+        }
+        await set(key, value);
+      };
+      const p = f.pool("pool-a", { maxOffloadVms: 1, maxActive: 3 });
+      (p as unknown as { poolStore: OffloadPoolStore }).poolStore = new OffloadPoolStore(f.state, f.accountId, "pool-a");
+      const create = f.boat.create.bind(f.boat);
+      f.boat.create = async (args) => { await create(args); throw new Error("lost reply after effect"); };
+      safeRefusal(await p.execute(command("aged-create", { timeoutMs: 120_000, executionWorkspaceId: "workspace-a" })));
+      f.boat.create = create;
+      const next = reload ? f.pool("pool-a", { maxOffloadVms: 1, maxActive: 3 }) : p;
+      if (reload) (next as unknown as { poolStore: OffloadPoolStore }).poolStore = new OffloadPoolStore(f.state, f.accountId, "pool-a");
+      safeRefusal(await next.execute(command("other-workspace", { executionWorkspaceId: "workspace-b" })));
+      expect(f.boat.callsOf("create")).toHaveLength(1);
+      expect(f.boat.boxes.size).toBe(1);
+      const doc = JSON.parse([...f.state.rows].find(([key]) => key.includes("boat-account"))![1]);
+      expect(doc.intents[0]).toMatchObject({ status: "ambiguous", active: true, ttlSeconds: 1055 });
+    } finally { await f.close(); }
+  });
+
   it.each([
     ["exhausted", { planIncluded: included(0) }],
     ["paid", { nextStartDollars: 0.01 }],

@@ -102,6 +102,10 @@ interface Intent {
   reserveSeconds: number;
   endedAt: number | null;
   usageId: string | null;
+  predecessor?: {
+    intents: Array<Pick<Intent, "id" | "endedAt" | "compute">>;
+    usage: Array<Pick<AccountUsageRow, "usageRecordId" | "intervals" | "tailSince">>;
+  };
 }
 interface AccountDoc {
   version: 1;
@@ -524,6 +528,14 @@ export class AccountLedger {
         compute: (req.jobSeconds + tailSeconds) * WEIGHT[req.size], computeReflected: 0, size: req.size, jobSeconds: req.jobSeconds,
         tailSeconds, ttlSeconds: Math.max(60, Math.ceil(req.jobSeconds + tailSeconds)),
         reserveSeconds: req.minComputeHoursLeft * 3600, endedAt: null, usageId: req.command ? id : null };
+      if (req.sandboxId && (req.operation === "warm" || req.operation === "resume")) {
+        intent.predecessor = {
+          intents: doc.intents.filter((i) => this.owns(i) && i.sandboxId === req.sandboxId)
+            .map(({ id, endedAt, compute }) => ({ id, endedAt, compute })),
+          usage: doc.usage.filter((r) => this.owns(r) && r.sandboxId === req.sandboxId && r.tailSince != null)
+            .map(({ usageRecordId, intervals, tailSince }) => ({ usageRecordId, intervals: structuredClone(intervals), tailSince })),
+        };
+      }
       candidate.intents.push(intent);
       if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, providerScope: this.providerScope, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
@@ -542,9 +554,17 @@ export class AccountLedger {
       if (this.now() - limits.at > 5000) {
         try {
           limits = await this.observe(api, candidate);
-          this.check(candidate, limits, req, tailSeconds, id);
+          const prospectiveTtl = Math.max(60, Math.ceil(req.jobSeconds + tailSeconds));
+          intent.ttlSeconds = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - at) / 1000) + prospectiveTtl);
+          intent.jobSeconds = intent.ttlSeconds - tailSeconds;
+          intent.compute = Math.max(intent.compute, intent.ttlSeconds * WEIGHT[intent.size]);
+          this.check(candidate, limits, { ...req, jobSeconds: intent.jobSeconds }, tailSeconds, id, prospectiveTtl);
+          if (req.monthlyCap && req.monthlyCap.capHours > 0
+            && (monthUsageSeconds(candidate, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(candidate, req.monthlyCap.companyId)) / 3600 > req.monthlyCap.capHours) {
+            throw new Error("monthly offload VM-hour cap reached while persisting admission");
+          }
           await this.write(candidate);
-          this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, intent.ttlSeconds);
+          this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, prospectiveTtl);
           if (this.now() - limits.at > 5000) throw new Error("limits expired while persisting admission");
         } catch (error) {
           // No external effect occurred. Restore the predecessor's open tail;
@@ -575,22 +595,36 @@ export class AccountLedger {
         throw new Error("no retained matching intent can fund dispatch");
       }
       const limits = await this.observe(api, doc, false, req);
-      this.check(doc, limits, req, reservation.tailSeconds, reservation.id);
+      const original = structuredClone(intent);
+      const ttl = Math.max(60, Math.ceil(req.jobSeconds + reservation.tailSeconds));
+      const ttlBound = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - intent.at) / 1000) + ttl);
+      const jobSeconds = ttlBound - intent.tailSeconds;
+      this.check(doc, limits, { ...req, jobSeconds }, reservation.tailSeconds, reservation.id, ttl);
       if (req.monthlyCap && req.monthlyCap.capHours > 0
-        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)) / 3600 > req.monthlyCap.capHours) {
+        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)
+          + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
         throw new Error("monthly offload VM-hour cap reached before dispatch");
       }
+      intent.ttlSeconds = ttlBound;
+      intent.jobSeconds = jobSeconds;
+      intent.compute = Math.max(intent.compute, ttlBound * WEIGHT[intent.size]);
       await this.write(doc);
       reservation.periodEndMs = limits.periodEndMs;
       reservation.observedAt = limits.at;
-      this.assertDispatchable(reservation, Math.max(60, Math.ceil(req.jobSeconds + reservation.tailSeconds)));
-      if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
+      try {
+        this.assertDispatchable(reservation, ttl);
+        if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
+      } catch (error) {
+        Object.assign(intent, original);
+        await this.write(doc);
+        throw error;
+      }
     });
   }
 
   /** Resolve the durable create lifecycle before considering another POST.
    * Expiry must be committed before a caller can discard its pool placeholder. */
-  async recoverCreate(reservation: AccountReservation): Promise<{ status: "terminal" } | { status: "running"; sandboxId: string } | { status: "pending" }> {
+  async recoverCreate(reservation: AccountReservation): Promise<{ status: "terminal"; sandboxId?: string } | { status: "running"; sandboxId: string } | { status: "pending" }> {
     return await this.locked(async () => {
       const doc = await this.read();
       const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
@@ -598,9 +632,9 @@ export class AccountLedger {
       this.expireStaleHolds(doc, this.now());
       if ((intent.status === "stopped" || intent.status === "rejected") && !intent.active) {
         await this.write(doc);
-        return { status: "terminal" };
+        return { status: "terminal", ...(intent.sandboxId ? { sandboxId: intent.sandboxId } : {}) };
       }
-      if (intent.status === "running" && intent.sandboxId) return { status: "running", sandboxId: intent.sandboxId };
+      if ((intent.status === "running" || intent.status === "ambiguous") && intent.sandboxId) return { status: "running", sandboxId: intent.sandboxId };
       if (intent.status === "intent" || intent.status === "ambiguous") return { status: "pending" };
       throw new Error("retained create lifecycle is unresolved");
     });
@@ -627,6 +661,7 @@ export class AccountLedger {
           + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
         throw new Error("monthly offload VM-hour cap reached during replay");
       }
+      const original = structuredClone(intent);
       intent.jobSeconds = jobSeconds;
       intent.ttlSeconds = ttlBound;
       intent.compute = Math.max(intent.compute, ttlBound * WEIGHT[intent.size]);
@@ -638,8 +673,16 @@ export class AccountLedger {
       await this.write(doc);
       reservation.periodEndMs = limits.periodEndMs;
       reservation.observedAt = limits.at;
-      this.assertDispatchable(reservation, ttlSeconds);
-      if (this.now() - limits.at > 5000) throw new Error("limits expired before create replay");
+      try {
+        this.assertDispatchable(reservation, ttlSeconds);
+        if (this.now() - limits.at > 5000) throw new Error("limits expired before create replay");
+      } catch (error) {
+        // No replay was attempted. Restore only its extension; if this write
+        // fails, the previously saved larger hold remains conservative.
+        Object.assign(intent, original);
+        await this.write(doc);
+        throw error;
+      }
     });
   }
 
@@ -658,6 +701,7 @@ export class AccountLedger {
     return await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
       intent.sandboxId = sandboxId; intent.status = "running"; intent.settledAt = this.now();
+      delete intent.predecessor;
       const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
       if (row) row.sandboxId = sandboxId;
       // Record, never assume, whether this particular resume spent a start.
@@ -704,6 +748,17 @@ export class AccountLedger {
   async failed(reservation: AccountReservation, definitive: boolean): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
+      if (definitive && intent.status === "intent" && intent.predecessor) {
+        for (const saved of intent.predecessor.intents) {
+          const prior = doc.intents.find((i) => i.id === saved.id && this.owns(i));
+          if (prior) Object.assign(prior, saved);
+        }
+        for (const saved of intent.predecessor.usage) {
+          const prior = doc.usage.find((r) => r.usageRecordId === saved.usageRecordId && this.owns(r));
+          if (prior) Object.assign(prior, saved);
+        }
+        delete intent.predecessor;
+      }
       intent.status = definitive ? "rejected" : "ambiguous";
       if (definitive) { intent.active = false; intent.compute = 0; intent.settledAt = this.now(); }
       const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);

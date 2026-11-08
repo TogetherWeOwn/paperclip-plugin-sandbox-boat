@@ -908,6 +908,44 @@ describe("sweep after a worker restart", () => {
       }
     });
 
+    it.each([false, true])("sweeps a terminal lost-create placeholder of an unloaded pool without a POST (known id=%s)", async (known) => {
+      const lostId = "bx_lostcreate0001";
+      const ledger = new AccountLedger(harness.ctx.state, accountId, () => clock);
+      const reservation = await ledger.reserve(fake as unknown as BoatApiLike, { operation: "create", size: "default" as never,
+        poolId, jobSeconds: 60, tailSeconds: 15, maxActive: 2, maxStartsPerDay: 100, minComputeHoursLeft: 0 });
+      if (known) {
+        fake.addSandbox({ id: lostId, state: "archived" });
+        await ledger.started(fake as unknown as BoatApiLike, reservation, lostId);
+      }
+      await ledger.failed(reservation, true);
+      const store = new OffloadPoolStore(harness.ctx.state, accountId, poolId);
+      await store.save({ maxOffloadVms: 1, offloadIdleStopSeconds: 15 },
+        [{ sandboxId: "", busy: false, stopped: false, stopping: false, quarantined: true, lastActiveAt: clock - 60_000,
+          generation: 1, idleHandle: null, stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null,
+          accountReservation: reservation }]);
+      await harness.ctx.state.set(
+        { scopeKind: "company", scopeId: companyId, namespace: "boat-offload", stateKey: "offload.pools" },
+        { [poolId]: { artifactRoot: "/tmp/paperclip-sweep-restart-artifacts-account", seenAt: clock - 60_000,
+          credentialDigest: poolDigestOf(keyA) } });
+      const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger,
+        ssh: {} as never, accountId, boat: () => fake as unknown as BoatApiLike });
+      try {
+        await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
+        if (known) {
+          // The first sweep durably takes the known identity; deletion follows.
+          expect(await store.load()).toMatchObject([{ sandboxId: lostId, quarantined: true, deletePending: true }]);
+          expect(fake.callsOf("deleteSandbox")).toHaveLength(0);
+          await runtime.sweep([companyId], { configsFor: () => [configFor(keyA)] });
+        }
+        expect(await store.load()).toEqual([]);
+        expect(fake.callsOf("create")).toHaveLength(0);
+        expect(fake.callsOf("fork")).toHaveLength(0);
+        expect(fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual(known ? [lostId] : []);
+      } finally {
+        await runtime.shutdown();
+      }
+    });
+
     it("never queries any account for a legacy registry entry that has no credential digest", async () => {
       const built: string[] = [];
       const store = await seed(undefined);
