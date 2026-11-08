@@ -1,5 +1,6 @@
 // Offload API v1 wire contract. Design: docs/design/adr/0001-heavy-command-offload.md.
 // Pure types, bounds and code tables shared by the broker, the shim and tests.
+import type { DepSelection } from "./deps-install.js";
 
 export const OFFLOAD_VERSION = 1;
 
@@ -75,6 +76,8 @@ export interface OffloadSubmitRequest {
   commandId: string;
   executionWorkspaceId: string;
   cwdRelative: string;
+  /** Explicit Python-only locked dependency selection, bound to this command cwd. */
+  depSelection?: DepSelection;
   /** Package runner / test binary, e.g. npm, yarn, pytest, python. Defaults per tool. */
   runner?: string;
   /** Defaults to cargo for backward compatibility. */

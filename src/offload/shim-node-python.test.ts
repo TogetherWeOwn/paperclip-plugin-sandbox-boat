@@ -95,6 +95,36 @@ describe("python shim passthrough (installed as pytest)", () => {
   });
 });
 
+describe("explicit uv extra producer", () => {
+  it.each([undefined, "test"])("carries the opt-in %s with the actual cwd and empty env", async (extra) => {
+    const t = setup(PYTHON_SHIM, "/opt/boat-offload/bin/pytest", { BOAT_OFFLOAD_UV_EXTRA: extra });
+    t.deps.cwd = () => "/work/repo/tests/unit";
+    await shimMain("/opt/boat-offload/bin/pytest", ["tests/"], t.deps, PYTHON_SHIM);
+    const { body } = t.posted[0] as { body: Record<string, unknown> };
+    expect(body).toMatchObject({ tool: "python", cwdRelative: "tests/unit", env: {} });
+    if (extra) expect(body.depSelection).toEqual({ uvExtra: "test", cwdRelative: "tests/unit" });
+    else expect(body).not.toHaveProperty("depSelection");
+  });
+
+  it("supports the explicit diagnostic flag without adding tool arguments", async () => {
+    const t = setup(PYTHON_SHIM, "/opt/boat-offload/bin/boat-offload-python");
+    expect(await shimMain("/opt/boat-offload/bin/boat-offload-python",
+      ["--dry-run", "--uv-extra", "test", "--", "tests/"], t.deps, PYTHON_SHIM)).toBe(0);
+    expect(t.posted[0]).toMatchObject({ body: { depSelection: { uvExtra: "test", cwdRelative: "." }, argv: ["tests/"], env: {} } });
+  });
+
+  it.each([
+    { tool: PYTHON_SHIM, value: "dev" }, { tool: PYTHON_SHIM, value: "" },
+    { tool: NODE_SHIM, value: "test" },
+  ])("rejects invalid or wrong-tool opt-in before any effect: $value", async ({ tool, value }) => {
+    const script = `/opt/boat-offload/bin/${tool.defaultRunner}`;
+    const t = setup(tool, script, { BOAT_OFFLOAD_UV_EXTRA: value });
+    expect(await shimMain(script, ["tests/"], t.deps, tool)).toBe(64);
+    expect(t.posted).toHaveLength(0);
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+  });
+});
+
 describe("diagnostic mode", () => {
   it("dry-runs with an explicit runner", async () => {
     const t = setup(NODE_SHIM, "/opt/boat-offload/bin/boat-offload-node");

@@ -104,7 +104,7 @@ Diagnostic (never collides with ${tool.tool} flags):
   ${tool.diagnosticName} --dry-run -- ${example}
   ${tool.diagnosticName} --dry-run --json -- ${example}
   ${tool.diagnosticName} --json -- ${example}
-
+${tool.tool === "python" ? "\nExplicit locked uv test extra (never inferred from pytest):\n  BOAT_OFFLOAD_UV_EXTRA=test pytest tests/\n  boat-offload-python --uv-extra test --dry-run -- tests/\n" : ""}
 Discovery: --dry-run classifies without a VM, sync or journal effect.
 Recovery: an ambiguous submit reconciles the same command ID for 10 s, then
 exits 75 with that ID; a durable never-started receipt falls back locally.
@@ -193,6 +193,12 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     }
     pinnedId = rawPinned.toLowerCase();
   }
+  // This opt-in selects a bounded wire field; it is never forwarded as guest env.
+  let uvExtra = deps.env.BOAT_OFFLOAD_UV_EXTRA;
+  if (uvExtra !== undefined && (tool.tool !== "python" || uvExtra !== "test")) {
+    deps.stderr(Buffer.from(`${tool.diagnosticName}: BOAT_OFFLOAD_UV_EXTRA supports only test for python; exit 64, nothing run.\n`, "utf8"));
+    return 64;
+  }
   const installedAs = path.basename(scriptPath);
   const diagnostic = !tool.exeNames.includes(installedAs);
   const diag = tool.diagnosticName;
@@ -225,7 +231,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
       const flag = flags[i]!;
       if (flag === "--dry-run") dryRun = true;
       else if (flag === "--json") json = true;
-      else if (flag === "--runner") {
+      else if (flag === "--uv-extra") {
+        const extra = flags[++i];
+        if (tool.tool !== "python" || extra !== "test") {
+          writeStderr(`${diag}: --uv-extra supports only test for python; exit 64, nothing run.\n`);
+          return 64;
+        }
+        uvExtra = extra;
+      } else if (flag === "--runner") {
         const name = flags[i + 1];
         i += 1;
         if (!name || !tool.exeNames.includes(name)) {
@@ -317,6 +330,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     runner,
     argv: toolArgv,
     cwdRelative: located.cwd,
+    ...(uvExtra === undefined ? {} : { depSelection: { uvExtra: "test", cwdRelative: located.cwd } }),
     executionWorkspaceId: workspaceId!,
     queueTimeoutMs: parseQueueTimeoutMs(deps.env.BOAT_OFFLOAD_QUEUE_TIMEOUT_MS),
     timeoutMs: parseCommandTimeoutMs(deps.env.BOAT_OFFLOAD_TIMEOUT_MS),

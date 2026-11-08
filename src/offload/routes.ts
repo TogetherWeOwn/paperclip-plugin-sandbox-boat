@@ -465,6 +465,7 @@ export async function handleExec(
           executionWorkspaceId: request.executionWorkspaceId,
           trustDomainId: principal.trustDomainId,
           cwdRelative: request.cwdRelative,
+          ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
           argv: request.argv,
           env: request.env,
           queueTimeoutMs: request.queueTimeoutMs,

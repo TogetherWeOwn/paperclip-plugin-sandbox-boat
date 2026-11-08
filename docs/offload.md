@@ -164,6 +164,52 @@ interpreter. No lockfile
 (or competing lockfiles for the same tool) means the command stays local: the
 plugin never installs from an unlocked manifest, and an unpinned
 `requirements.txt` stays local.
+### Explicit locked uv test extra
+
+Python selection is opt-in, never inferred from invoking pytest. With the Python
+profile and shim already enabled, set `BOAT_OFFLOAD_UV_EXTRA=test` for passthrough,
+or use the Python diagnostic flag:
+
+```sh
+BOAT_OFFLOAD=1 BOAT_OFFLOAD_UV_EXTRA=test pytest tests/
+boat-offload-python --uv-extra test --dry-run -- tests/
+boat-offload-python --uv-extra test --runner python -- -m pytest tests/
+```
+
+Only the literal `test` extra is supported; malformed values or a selection on
+another tool exit 64 before a spawn or broker call. Without this opt-in, dependency
+planning is unchanged (`uv sync --frozen` or the existing hash-pinned pip plan).
+The opt-in is converted into a typed request field, not forwarded as guest env:
+
+```json
+{
+  "tool": "python",
+  "runner": "pytest",
+  "cwdRelative": "tests/unit",
+  "depSelection": { "uvExtra": "test", "cwdRelative": "tests/unit" }
+}
+```
+
+This is a fragment of the existing v1 `POST /offload/exec` body; all other fields
+and admission gates still apply. Omit `depSelection` for defaults. Selection has
+exactly two keys; `uvExtra` must be `test` and its `cwdRelative` must equal the
+actual source-relative command cwd (the shim computes it from canonical paths).
+Paths are bounded to 1..1024 characters, with the planner's ASCII relative-path
+grammar and no empty or parent segments. Unknown keys, other extras, wrong tools
+and cwd mismatches are rejected, not ignored. The existing planner also refuses
+nested Python projects/locks, competing Python dependency families, or a test
+extra it cannot verify in the root manifest and uv lock. Such a refusal never
+retries the default uv/pip plan or system interpreter.
+
+Admission, frozen-source installation (`uv sync --frozen --extra test`) and venv
+resolution consume the same selection and cwd. Selected and default plans have
+different cache identities; switching a mirror's active plan reinstalls, including
+switching back. Selection is persisted in the durable command snapshot and digest:
+reusing a command ID with a changed selection or cwd conflicts instead of replaying.
+Pinned receipt recovery verifies that same payload; exits 74/75 and no-replay semantics are
+unchanged. This documents source behavior only, not template qualification,
+installation, enabled profiles or fleet coverage.
+
 Package lockfiles at the repo root are return-eligible like `Cargo.lock`.
 Registry credential files (`.npmrc`, `.yarnrc*`, `.pypirc`, `pip.conf`,
 `.netrc`) at any depth, plus `uv.toml` and `pyproject.toml` uv auth config,

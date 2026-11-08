@@ -1,8 +1,9 @@
 import { lstat, mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { planDependencies } from "./offload/deps-install.js";
+import { planDependencies, type DepSelection } from "./offload/deps-install.js";
 import { OFFLOAD_BOUNDS } from "./offload/protocol.js";
+import { depSelectionProblem } from "./offload/validate.js";
 import { guestPythonUserBase } from "./offload/guest-toolchain.js";
 import { buildRemoteCommand, shellQuote } from "./shell.js";
 import { listTrackedFiles, type TrackedFilesFn } from "./offload-secret-scan.js";
@@ -26,6 +27,23 @@ export interface SshOffloadSyncDeps {
   trackedFiles?: TrackedFilesFn;
   /** Clock for upload and artifact retention. */
   now?: () => number;
+}
+
+export type CheckedDepSelection = { selection: DepSelection | undefined } | null;
+
+/**
+ * Closed consumer check for the explicit dependency selection, shared by
+ * admission, installation and venv discovery so all three plan from the same
+ * input. Returns null (refuse; never retry with the default plan) for a
+ * malformed or unknown-key selection, a non-Python tool, or a selection whose
+ * directory is not the command directory. Backend direct calls hit the same
+ * gate as routed ones. The planner re-validates the shape and nesting.
+ */
+export function checkDepSelection(command: OffloadCommand, tool: string | undefined = command.tool): CheckedDepSelection {
+  const raw: unknown = command.depSelection;
+  if (raw === undefined) return { selection: undefined };
+  if (depSelectionProblem(raw, tool ?? "cargo", command.cwdRelative ?? ".") !== null) return null;
+  return { selection: raw as DepSelection };
 }
 
 /** Returned artifacts outlive the one-day result retention, then the sweep reclaims them. */
@@ -237,8 +255,10 @@ export class SshOffloadSync implements OffloadSync {
    * them once. Cargo checkouts skip this entirely.
    */
   async installDependencies(sandboxId: string, command: OffloadCommand, source: string, guestDir: string): Promise<void> {
+    const checked = checkDepSelection(command, command.tool ?? "cargo");
+    if (!checked) throw new Error("Offload dependency selection is invalid for this command; refusing install");
     if ((command.tool ?? "cargo") === "cargo") return;
-    const plan = await planDependencies(source, command.tool);
+    const plan = await planDependencies(source, command.tool, checked.selection);
     if (!plan) {
       // resolve() keeps lockfile-less commands local before any VM is spent;
       // reaching here means the source changed under us. Never run unlocked.

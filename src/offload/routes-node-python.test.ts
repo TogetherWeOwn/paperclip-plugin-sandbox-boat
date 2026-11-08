@@ -184,6 +184,47 @@ describe("handleExec node/python gating", () => {
     expect([...t.store.data.keys()].some((key) => key === DURATION_INDEX_KEY)).toBe(false);
   });
 
+  it.each([false, true])("preserves Python selection through preflight and backend (selected=%s)", async (selected) => {
+    const started: BackendCommand[] = [];
+    const preflight: BackendCommand[] = [];
+    const t = setup({ start: (command) => {
+      started.push(command);
+      return { done: Promise.resolve(), cancel: async () => {} };
+    } }, { offloadProfiles: ["python-public-1"], offloadMinExpectedSeconds: 0 });
+    t.host.preflight = async (command) => { preflight.push(command); return null; };
+    const depSelection = { uvExtra: "test", cwdRelative: "tests/unit" };
+    const body = submitBody({ tool: "python", runner: "pytest", argv: ["tests/"], cwdRelative: "tests/unit",
+      ...(selected ? { depSelection } : {}) });
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body }, t.host)).status).toBe(200);
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: { ...body, dryRun: false } }, t.host)).status).toBe(202);
+    expect(started).toHaveLength(1);
+    for (const command of [...preflight, ...started]) {
+      expect(command.cwdRelative).toBe("tests/unit");
+      if (selected) expect(command.depSelection).toEqual(depSelection);
+      else expect(command).not.toHaveProperty("depSelection");
+    }
+    const restarted = new OffloadBroker({ store: t.store, backend: { start: () => { throw new Error("must not replay"); } }, now: () => Date.now() });
+    const changed = { ...body, dryRun: false, ...(selected ? { depSelection: undefined } : { depSelection }) };
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: changed }, { ...t.host, broker: restarted })).body)
+      .toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT", fallbackSafe: false });
+    const moved = { ...body, dryRun: false, cwdRelative: "tests/other",
+      ...(selected ? { depSelection: { ...depSelection, cwdRelative: "tests/other" } } : {}) };
+    expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: moved }, { ...t.host, broker: restarted })).status).toBe(409);
+  });
+
+  it("refuses malformed selection at the route before preflight or dispatch", async () => {
+    const t = setup();
+    let preflightCalls = 0;
+    t.host.preflight = async () => { preflightCalls++; return null; };
+    for (const depSelection of [null, { uvExtra: "dev", cwdRelative: "." }, { uvExtra: "test", cwdRelative: "elsewhere" },
+      { uvExtra: "test", cwdRelative: ".", unknown: true }]) {
+      expect((await handleExec({ actor: ACTOR, companyId: COMPANY,
+        body: submitBody({ tool: "python", runner: "pytest", argv: ["tests/"], depSelection }) }, t.host)).status).toBe(400);
+    }
+    expect(preflightCalls).toBe(0);
+    expect(t.store.data.size).toBe(0);
+  });
+
   it("keeps node local below the median threshold", async () => {
     const t = setup();
     const repoId = canonicalRepoId({ repoUrl: "https://github.com/example/app", projectId: "proj-1" });
