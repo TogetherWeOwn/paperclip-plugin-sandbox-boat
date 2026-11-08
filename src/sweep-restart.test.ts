@@ -375,16 +375,12 @@ describe("sweep after a worker restart", () => {
       await restarted.sweep([companyId]); // compact the ended command to a tombstone
       clock += 31 * 86_400_000; // funded TTL + margin, token and tombstone retention
       vi.setSystemTime(clock);
-      // A missing or foreign credential/endpoint still cannot reap the pool.
-      for (const config of [{}, { apiKey: "wrong-account" }, { apiKey: fakeKey, apiBase: "https://other-provider.invalid" }]) {
-        delete process.env.BOAT_API_KEY;
-        await expect(restarted.sweep([companyId], { configsFor: () => [parseDriverConfig(config)] }))
-          .rejects.toThrow("Offload pool sweep unverified");
-        expect(account().intents[0]).toMatchObject({ active: false, status: "rejected" });
-        expect(await harness.ctx.state.get(registryScope)).toEqual(registry);
-      }
-      process.env.BOAT_API_KEY = fakeKey;
+      // No VM was ever attempted and all accounting is durably settled.
+      // Retention can reap this empty pool without provider credentials;
+      // unlike an uncertain start, it needs no provider deletion proof.
+      const callsBeforeRetention = [...fake.calls];
       await restarted.sweep([companyId]);
+      expect(fake.calls).toEqual(callsBeforeRetention);
       expect(account().intents[0]).toMatchObject({ active: false, status: "rejected", compute: 0 });
       expect(await harness.ctx.state.get(registryScope)).toEqual({});
       await restarted.sweep([companyId]);
