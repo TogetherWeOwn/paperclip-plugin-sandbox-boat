@@ -123,6 +123,29 @@ describe("scheduled capacity telemetry", () => {
     expect((await manager.usageSummary(COMPANY)).capacity.accounts[0].status).toBe("insufficient");
   });
 
+  it("clears a recovered discovery failure when no historical accounts need fencing", async () => {
+    const manager = currentManager();
+    await new VmStateStore(harness.ctx.state).rememberCompany(COMPANY);
+    const get = harness.ctx.state.get.bind(harness.ctx.state);
+    const failure = vi.spyOn(harness.ctx.state, "get").mockImplementation(async (input) => {
+      if (input.stateKey === "offload.pools") throw new Error(`source read error ${KEY}`);
+      return get(input);
+    });
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity).toEqual({ accounts: [], error: "sources_read_failed" });
+    expect((await manager.usageSummary("other-company")).capacity).toEqual({ accounts: [], error: null });
+
+    failure.mockRestore();
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity).toEqual({ accounts: [], error: null });
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity).toEqual({ accounts: [], error: null });
+    expect(fake.callsOf("limits")).toEqual([]);
+    expect(JSON.stringify(harness.logs)).not.toContain(KEY);
+  });
+
   it("exposes a failed sample write to usage readers until a later sample is stored", async () => {
     const manager = currentManager();
     manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));

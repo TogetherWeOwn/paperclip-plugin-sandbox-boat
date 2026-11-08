@@ -3933,7 +3933,7 @@ export class BoatVmManager {
         const stateFailure = reports.flatMap((report) => report.reasons)
           .find((reason) => reason === "state_write_failed" || reason === "state_unavailable");
         if (stateFailure) this.capacityErrors.set(companyId, stateFailure);
-        else if (reports.length > 0 && this.capacityErrors.has(companyId)) {
+        else if (this.capacityErrors.has(companyId)) {
           const replaced = new Set(reports.map((report) => report.accountId));
           const stored = await this.capacity.latest(companyId, this.now());
           // Empty discovery or a different account's success cannot revive
