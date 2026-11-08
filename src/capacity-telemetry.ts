@@ -246,11 +246,14 @@ function pruneAccounts(doc: CapacityDoc, nowMs: number): boolean {
 }
 
 /** Update the notify marker for these warning reasons; true when a log hint is due. */
-function dedup(acct: AccountDoc, warningReasons: string[], nowMs: number, clearWhenEmpty: boolean): boolean {
-  const sorted = [...warningReasons].sort();
+function dedup(acct: AccountDoc, warningReasons: string[], nowMs: number, forecastKnown: boolean): boolean {
   const prev = acct.marker;
-  if (sorted.length === 0) {
-    if (clearWhenEmpty) acct.marker = null; // an unavailable forecast is never an all-clear
+  // An ended period leaves forecast state unknown, not the valid pressure
+  // readings. Retire cleared pressure reasons while retaining that forecast.
+  const retained = !forecastKnown && prev?.reasons.includes("vm_hours_forecast") ? ["vm_hours_forecast"] : [];
+  const sorted = [...warningReasons, ...retained].sort();
+  if (warningReasons.length === 0) {
+    acct.marker = prev && sorted.length ? { ...prev, reasons: sorted } : null;
     return false;
   }
   if (prev && prev.reasons.join() === sorted.join() && nowMs - prev.lastNotifiedMs < NOTIFY_REPEAT_MS) return false;

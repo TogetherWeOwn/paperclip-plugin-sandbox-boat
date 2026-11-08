@@ -407,6 +407,34 @@ describe("CapacityTelemetry unavailable and failures", () => {
     expect(latest.warningReasons).toEqual(["start_day_pressure", "cannot_start"]);
   });
 
+  it("re-arms ended-period pressure after a known clear without repeating unchanged pressure", async () => {
+    const state = memState();
+    const ended = (used: number) => payload({ end: T0, minute: [used, 10], canStart: true });
+    const first = await new CapacityTelemetry(state).sample(CO, ACCT, ended(9), T0);
+    expect(first).toMatchObject({ status: "unavailable", forecast: null, shouldNotify: true });
+    expect(first.warningReasons).toEqual(["start_minute_pressure"]);
+    const clear = await new CapacityTelemetry(state).sample(CO, ACCT, ended(0), T0 + 5 * MIN);
+    expect(clear).toMatchObject({ status: "unavailable", forecast: null, warning: false, shouldNotify: false });
+    const renewed = await new CapacityTelemetry(state).sample(CO, ACCT, ended(9), T0 + 10 * MIN);
+    expect(renewed).toMatchObject({ status: "unavailable", forecast: null, shouldNotify: true });
+    expect(renewed.warningReasons).toEqual(["start_minute_pressure"]);
+    const unchanged = await new CapacityTelemetry(state).sample(CO, ACCT, ended(9), T0 + 15 * MIN);
+    expect(unchanged.shouldNotify).toBe(false);
+    expect(storedSamples(state)).toBe(0);
+  });
+
+  it("an ended-period pressure clear preserves an unavailable forecast marker", async () => {
+    const state = memState();
+    const t = new CapacityTelemetry(state);
+    await t.sample(CO, ACCT, payload({ rem: 3, minute: [9, 10] }), T0);
+    await t.sample(CO, ACCT, payload({ end: T0 }), T0 + 5 * MIN);
+    const doc = [...state.rows.values()][0] as { accounts: Record<string, { marker: { reasons: string[]; lastNotifiedMs: number } }> };
+    expect(Object.values(doc.accounts)[0].marker).toEqual({ reasons: ["vm_hours_forecast"], lastNotifiedMs: T0 });
+    const forecast = await new CapacityTelemetry(state).sample(CO, ACCT, payload({ rem: 3 }), T0 + 10 * MIN);
+    expect(forecast.warningReasons).toEqual(["vm_hours_forecast"]);
+    expect(forecast.shouldNotify).toBe(false);
+  });
+
   it("write failure yields unavailable without a dedup hint and persists nothing", async () => {
     const state = memState();
     const t = new CapacityTelemetry(state);

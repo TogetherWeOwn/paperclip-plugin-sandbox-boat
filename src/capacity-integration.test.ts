@@ -150,6 +150,66 @@ describe("scheduled capacity telemetry", () => {
     expect(JSON.stringify(harness.logs)).not.toContain(KEY);
   });
 
+  it("retains a failed-write fence through empty discovery and unrelated samples until the account recovers", async () => {
+    const manager = currentManager();
+    await new VmStateStore(harness.ctx.state).rememberCompany(COMPANY);
+    const poolScope = { scopeKind: "company" as const, scopeId: COMPANY, namespace: "boat-offload", stateKey: "offload.pools" };
+    const pool = { artifactRoot: "/unused", seenAt: clock, credentialDigest: ACCOUNT_DIGEST };
+    await harness.ctx.state.set(poolScope, { pool });
+    await manager.sampleCapacity();
+    const previous = (await manager.usageSummary(COMPANY)).capacity.accounts[0];
+    const stored = structuredClone(harness.state.get(`company|${COMPANY}|capacity|samples`));
+    const set = harness.ctx.state.set.bind(harness.ctx.state);
+    const failure = vi.spyOn(harness.ctx.state, "set").mockImplementation(async (input, value) => {
+      if (input.namespace === "capacity") throw new Error(`state write error ${KEY}`);
+      return set(input, value);
+    });
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect((await manager.usageSummary(COMPANY)).capacity.error).toBe("state_write_failed");
+    expect(harness.state.get(`company|${COMPANY}|capacity|samples`)).toEqual(stored);
+    failure.mockRestore();
+
+    // No cached config or live binding: rotating the host key leaves no verified source.
+    const rotatedKey = "boat_other_capacity_key_not_real";
+    process.env.BOAT_API_KEY = rotatedKey;
+    clock += 5 * 60_000;
+    await manager.sampleCapacity();
+    expect(fake.callsOf("limits")).toHaveLength(2);
+    const empty = (await manager.usageSummary(COMPANY)).capacity;
+    expect(empty.error).toBe("state_write_failed");
+    expect(empty.accounts[0]).toMatchObject({
+      status: "unavailable", observedAtMs: previous.observedAtMs, plan: previous.plan,
+      reasons: expect.arrayContaining(["state_write_failed"]), shouldNotify: false,
+    });
+    expect(empty.accounts[0].reasons).not.toContain("stale_observation");
+
+    // A successful write for a different account cannot revive the old account either.
+    const rotatedDigest = scryptSync(rotatedKey, `boat-offload-pool\u0000${DEFAULT_API_BASE}`, 32).toString("hex");
+    await harness.ctx.state.set(poolScope, { pool, other: { ...pool, credentialDigest: rotatedDigest } });
+    await manager.sampleCapacity();
+    const unrelated = (await manager.usageSummary(COMPANY)).capacity;
+    expect(unrelated.error).toBe("state_write_failed");
+    expect(unrelated.accounts.find((report) => report.accountId === previous.accountId)).toMatchObject({
+      status: "unavailable", observedAtMs: previous.observedAtMs, plan: previous.plan,
+    });
+    expect((await manager.usageSummary("other-company")).capacity).toEqual({ accounts: [], error: null });
+
+    process.env.BOAT_API_KEY = KEY;
+    manager.rememberConfig(COMPANY, "other-account", parseDriverConfig({ apiKey: rotatedKey }));
+    clock += 5 * 60_000;
+    fake.limitsResponse = { ...limits(), activeSandboxes: 90 };
+    await manager.sampleCapacity();
+    const recovered = (await manager.usageSummary(COMPANY)).capacity;
+    expect(recovered.error).toBeNull();
+    expect(recovered.accounts.find((report) => report.accountId === previous.accountId)).toMatchObject({
+      status: "insufficient", observedAtMs: clock,
+      warningReasons: expect.arrayContaining(["active_sandboxes_pressure"]),
+    });
+    expect(JSON.stringify([empty, unrelated, recovered, harness.logs])).not.toContain(KEY);
+    expect(JSON.stringify([empty, unrelated, recovered, harness.logs])).not.toContain(rotatedKey);
+  });
+
   it("labels stored reports stale if sampling stops", async () => {
     const manager = currentManager();
     manager.rememberConfig(COMPANY, "environment", parseDriverConfig({ apiKey: KEY }));
