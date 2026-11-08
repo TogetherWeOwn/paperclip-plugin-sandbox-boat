@@ -117,7 +117,9 @@ export class SshOffloadSync implements OffloadSync {
       const mirrorKey = this.mirrorKey(command);
       await this.withMirrorLock(mirrorKey, async () => {
         await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
-        await this.installDependencies(sandboxId, command, source, guestDir);
+        // Cache identity must describe the same immutable bytes just uploaded,
+        // not a live lockfile that may have changed while the push was in flight.
+        await this.installDependencies(sandboxId, command, frozen, guestDir);
       });
       this.uploads.set(this.key(command), { source, manifest, scratch, guestDir, at: this.now() });
       await rm(frozen, { recursive: true, force: true });

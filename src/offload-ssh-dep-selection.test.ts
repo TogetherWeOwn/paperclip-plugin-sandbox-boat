@@ -110,6 +110,28 @@ describe("installDependencies with an explicit selection", () => {
     expect(installs()[2]).toContain("--extra");
   });
 
+  it("plans installation from frozen uploaded bytes when the live lock reverts during push", async () => {
+    const root = tree(uvFiles());
+    const artifactRoot = tree({});
+    const installs: string[] = [];
+    const ssh = { runStream: vi.fn(async (_s: unknown, cmd: string) => {
+      installs.push(cmd);
+      return { exitCode: 0, timedOut: false, signal: null, stdout: "" };
+    }) };
+    const sync = new SshOffloadSync({ ssh: ssh as never, session: async () => ({} as never),
+      sourceRoot: async () => root, artifactRoot, trackedFiles: listAllFilesAsTracked });
+    const selected = pyCommand({ depSelection: SELECTED });
+    await sync.installDependencies("vm-1", selected, root, sync.directory(selected));
+    expect(installs).toHaveLength(1);
+    writeFileSync(path.join(root, "uv.lock"), uvLock + "# frozen state B\n");
+    // Simulate an edit after capture, while the frozen snapshot is being uploaded.
+    vi.spyOn(sync as unknown as { pushLocked: (...args: unknown[]) => Promise<void> }, "pushLocked")
+      .mockImplementation(async () => { writeFileSync(path.join(root, "uv.lock"), uvLock); });
+    await sync.push("vm-1", selected);
+    expect(installs).toHaveLength(2); // B must install even though live A is cached.
+    await sync.discard("vm-1", selected);
+  });
+
   it("reinstalls when the manifest changes under a selection", async () => {
     const root = tree(uvFiles());
     const { sync, installs } = setup(root);

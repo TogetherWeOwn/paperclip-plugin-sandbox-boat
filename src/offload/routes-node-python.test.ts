@@ -7,6 +7,7 @@ import {
   canonicalRepoId,
   handleExec,
   handleReport,
+  handleVerify,
   normalizeOffloadSettings,
   resetReportBudgets,
   type OffloadRouteHost,
@@ -204,11 +205,19 @@ describe("handleExec node/python gating", () => {
       else expect(command).not.toHaveProperty("depSelection");
     }
     const restarted = new OffloadBroker({ store: t.store, backend: { start: () => { throw new Error("must not replay"); } }, now: () => Date.now() });
+    const receiptOnlyHost: OffloadRouteHost = { ...t.host, broker: restarted, settings: normalizeOffloadSettings({}),
+      admission: undefined, workspaces: { get: async () => { throw new Error("receipt must not resolve source"); } },
+      preflight: async () => { throw new Error("receipt must not preflight"); } };
+    const verify = (payload: Record<string, unknown>) => handleVerify({ actor: ACTOR, companyId: COMPANY,
+      params: { commandId: CMD }, body: payload }, receiptOnlyHost);
+    expect((await verify({ ...body, dryRun: false })).status).toBe(200);
     const changed = { ...body, dryRun: false, ...(selected ? { depSelection: undefined } : { depSelection }) };
+    expect((await verify(changed)).status).toBe(409);
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: changed }, { ...t.host, broker: restarted })).body)
       .toMatchObject({ code: "OFFLOAD_IDEMPOTENCY_CONFLICT", fallbackSafe: false });
     const moved = { ...body, dryRun: false, cwdRelative: "tests/other",
       ...(selected ? { depSelection: { ...depSelection, cwdRelative: "tests/other" } } : {}) };
+    expect((await verify(moved)).status).toBe(409);
     expect((await handleExec({ actor: ACTOR, companyId: COMPANY, body: moved }, { ...t.host, broker: restarted })).status).toBe(409);
   });
 
