@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -84,6 +84,7 @@ describe("runtime uv venv wiring", () => {
     const source = await mkdtemp(path.join(tmpdir(), "boat-venv-src-"));
     tmpdirs.push(source);
     await writeFile(path.join(source, "uv.lock"), "x");
+    await writeFile(path.join(source, "pyproject.toml"), '[project]\nname = "example"\n');
     const { runtime, config, seen } = backend(source);
     try {
       const cmd = pyCommand();
@@ -95,6 +96,33 @@ describe("runtime uv venv wiring", () => {
       expect(String(input.executable)).toContain(".venv/bin/python");
       expect(env.VIRTUAL_ENV).toMatch(/\.venv$/);
       expect(String(input.path)).toMatch(/\.venv\/bin:/);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["missing", "symlink", "oversized"])("refuses preparation rather than selecting system Python after a %s live manifest", async (kind) => {
+    const source = await mkdtemp(path.join(tmpdir(), "boat-venv-src-"));
+    tmpdirs.push(source);
+    await writeFile(path.join(source, "uv.lock"), "x");
+    const manifest = path.join(source, "pyproject.toml");
+    await writeFile(manifest, '[project]\nname = "example"\n');
+    const { runtime, config, seen } = backend(source);
+    try {
+      const cmd = pyCommand();
+      mustResolve(await runtime.resolve(cmd, config));
+      // Model a live edit after admission/capture. No upload, installation or
+      // process is needed to prove that preparation must not switch runners.
+      await rm(manifest);
+      if (kind === "symlink") await symlink(path.join(source, "missing"), manifest);
+      if (kind === "oversized") {
+        await writeFile(manifest, "");
+        await truncate(manifest, 256 * 1024 + 1);
+      }
+      const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as { guest: { prepare: (vm: string, c: unknown) => Promise<unknown> } };
+      await expect(pool.guest.prepare("vm-1", { ...cmd, cardId: "", env: {} }))
+        .rejects.toMatchObject({ code: "OFFLOAD_GUEST_INELIGIBLE" });
+      expect(seen).toEqual([]);
     } finally {
       await runtime.shutdown();
     }

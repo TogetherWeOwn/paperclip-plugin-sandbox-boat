@@ -175,6 +175,7 @@ describe("lockfile probes (host safety)", () => {
     const root = workspace();
     symlinkSync("/dev/zero", path.join(root, "package-lock.json"));
     writeFileSync(path.join(root, "uv.lock"), "version = 1\n");
+    writeFileSync(path.join(root, "pyproject.toml"), '[project]\nname = "example"\n');
     await expect(planDependencies(root, "python")).resolves.toMatchObject({ installs: [{ lockfile: "uv.lock" }] });
   });
 });
