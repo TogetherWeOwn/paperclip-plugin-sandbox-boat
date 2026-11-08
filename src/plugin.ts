@@ -92,6 +92,8 @@ const plugin = definePlugin({
     ctx.jobs.register(SWEEP_JOB_KEY, async () => {
       // The job's own invocation has no company, so run the sweep outside it (proactive.ts).
       const report = await runOutsideInvocation(() => requireManager().sweep("schedule"));
+      // Telemetry follows cleanup, never adds a scheduler or delays a due stop.
+      await runOutsideInvocation(() => requireManager().sampleCapacity());
       if (report.stopped.length || report.deleted.length || report.errors.length) {
         ctx.logger.info("boat: idle sweep finished", { ...report });
       }

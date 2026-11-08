@@ -38,6 +38,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
 import type { BudgetSnapshot } from "./budget.js";
 import { AccountLedger, definitiveStartRejection } from "./account-ledger.js";
+import { CapacityTelemetry, type CapacityReport } from "./capacity-telemetry.js";
 import type { AccountReservation } from "./account-ledger.js";
 import { DEFAULT_API_BASE, PRICE_PER_HOUR, parseDriverConfig, remoteWorkspaceDirProblem, resolveApiKey, resolveCostApiKey } from "./config.js";
 import type { BoatDriverConfig, BoatSize } from "./config.js";
@@ -429,6 +430,7 @@ export const SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
 export class BoatVmManager {
   private readonly store: VmStateStore;
   private readonly accountState: StateClientLike;
+  private readonly capacity: CapacityTelemetry;
   private readonly accountId: string;
   private readonly accounts = new Map<string, AccountLedger>();
   private readonly ssh: SshManager;
@@ -502,6 +504,7 @@ export class BoatVmManager {
     // Without an explicit credential-free account identity, conservatively group
     // this worker's provider clients. Never persist a key or partition by company.
     this.accountState = deps.state;
+    this.capacity = new CapacityTelemetry(deps.state);
     this.accountId = deps.accountId ?? "boat-default-account";
     this.nativeOffload = new SshOffloadRuntime({ state: deps.state, logger: deps.logger, ssh: this.ssh,
       accountId: this.accountId, ...deps.offloadTransport });
@@ -3902,6 +3905,29 @@ export class BoatVmManager {
 
   // ----------------------------------------------------------------- usage
 
+  /** The existing scheduled sweep calls this after cleanup. Reads only provider
+   * limits; persisted observations and warnings are company scoped. */
+  async sampleCapacity(): Promise<void> {
+    const companies = new Set([
+      ...[...this.configs.values()].map((entry) => entry.companyId),
+      ...(await this.store.companies()),
+    ]);
+    await Promise.all([...companies].map(async (companyId) => {
+      try {
+        const sources = await withDeadline(this.nativeOffload.capacitySources(companyId, this.sweepConfigsFor(companyId)),
+          this.offloadUpkeepTimeoutMs, "capacity sources");
+        await Promise.all(sources.map(async ({ accountKey, api }) => {
+          const raw = await withDeadline(api.limits({}), 3_000, "capacity limits").catch(() => null);
+          const report = await this.capacity.sample(companyId, accountKey, raw, this.now());
+          if (report.shouldNotify) this.logger.warn("boat: capacity warning; report to owner before any plan change", { companyId, ...report });
+        }));
+      } catch {
+        // Never log provider error text, which can contain request credentials.
+        this.logger.warn("boat: capacity sampling unavailable", { companyId });
+      }
+    }));
+  }
+
   async usageSummary(companyId: string, options: { refresh?: boolean } = {}): Promise<UsageSummary> {
     let doc = await this.store.read(companyId);
     if (options.refresh) {
@@ -3986,6 +4012,9 @@ export class BoatVmManager {
       entry.runs += vm.runs.length;
       cards.set(cardKey, entry);
     }
+    const capacity = await this.capacity.latest(companyId, this.now())
+      .then((accounts) => ({ accounts, error: null }))
+      .catch(() => ({ accounts: [], error: "state_unavailable" }));
     return {
       companyId,
       generatedAt: this.nowIso(),
@@ -3998,6 +4027,7 @@ export class BoatVmManager {
         running: vms.filter((vm) => vm.status === "running" || vm.status === "starting").length,
       },
       budget: this.lastBudget,
+      capacity,
       cards: [...cards.values()].sort((a, b) => b.dollars - a.dollars),
       vms,
     };
@@ -4080,6 +4110,7 @@ export interface UsageSummary {
   note: string;
   totals: { seconds: number; dollars: number; vms: number; runs: number; running: number };
   budget: { snapshot: BudgetSnapshot; at: string } | null;
+  capacity: { accounts: CapacityReport[]; error: string | null };
   cards: Array<{ issueId: string | null; vmKey: string; seconds: number; dollars: number; vms: number; runs: number }>;
   vms: Array<Record<string, unknown> & { runs: unknown[] }>;
 }

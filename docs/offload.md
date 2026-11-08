@@ -64,7 +64,7 @@ profiles: `node-public-1` (npm/pnpm/yarn scripts and test binaries such as
 `vitest run`, `jest`, `playwright test`, `next build`) and `python-public-1`
 (`pytest` and `python -m pytest|unittest` suites). Install the shim as
 `npm`/`pytest`/etc. ahead of the real executable for opted-in runs
-(`BOAT_OFFLOAD=1`); anything else runs locally. Diagnostics work the same:
+(`BOAT_OFFLOAD=1`); anything else runs locally. `scripts/install-offload-shims.sh <staged package dir> <shim dir>` links `cargo`, `npm`/`pnpm`/`yarn`/`npx` and `pytest`/`python`/`python3` to the matching bins. It checks the whole package and every destination first, refuses a non-symlink destination, and replaces each link with one rename, so a refused run changes nothing. Diagnostics work the same:
 `boat-offload-node --dry-run -- run test`. Only profile `rust-public-1` is
 enabled by default; add profiles explicitly:
 

@@ -399,6 +399,33 @@ export class SshOffloadRuntime {
     return this.bindings.has(key(companyId, runId, workspaceId));
   }
 
+  /** Read-only account clients from trusted bindings/configs or verified pool
+   * provenance. Never resolve a company secret or invent a host-account binding. */
+  async capacitySources(companyId: string, configs: BoatDriverConfig[] = []): Promise<Array<{ accountKey: string; api: BoatApiLike }>> {
+    const sources = new Map<string, BoatApiLike>();
+    const seenCredentials = new Set<string>(); // call-local only; never persisted or logged
+    const candidates = [...configs, ...[...this.bindings.values()]
+      .filter((binding) => binding.companyId === companyId).map((binding) => binding.config)];
+    for (const config of candidates) {
+      if (sources.size >= 8) break;
+      const bound = { ...config, apiKey: resolveApiKey(config) };
+      const credential = `${bound.apiBase}\u0000${bound.apiKey}`;
+      if (seenCredentials.has(credential)) continue;
+      seenCredentials.add(credential);
+      const digest = await poolCredentialDigest(bound);
+      if (!sources.has(digest)) sources.set(digest, this.deps.boat?.(bound) ?? boatApi({ apiKey: bound.apiKey, apiBase: bound.apiBase }));
+    }
+    const registry = await this.deps.state.get(poolRegistryScope(companyId)) as PoolRegistry | null;
+    for (const entry of Object.values(registry ?? {})) {
+      if (sources.size >= 8) break;
+      const digest = entry?.credentialDigest;
+      if (typeof digest !== "string" || sources.has(digest)) continue;
+      const api = await this.poolBoatFor(companyId, digest, () => configs);
+      if (api) sources.set(digest, api);
+    }
+    return [...sources].map(([accountKey, api]) => ({ accountKey, api }));
+  }
+
   /** Drop every binding of a finished run so its commands read as permanently terminal. Returns the workspace ids dropped. */
   forgetRun(companyId: string, runId: string): string[] {
     const dropped = new Set<string>();
