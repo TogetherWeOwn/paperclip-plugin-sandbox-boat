@@ -256,6 +256,11 @@ async function readReceipt(ctx: PollContext, cursor: number): Promise<HttpResult
   return ctx.deps.http.get(`/offload/commands/${ctx.commandId}?after=${cursor}`);
 }
 
+function isVerificationRejected(response: HttpResult): boolean {
+  return isVerificationInvalid(response)
+    || (response.ok && response.status === 409 && asError(response.json)?.code === "OFFLOAD_IDEMPOTENCY_CONFLICT");
+}
+
 async function cancelBestEffort(ctx: PollContext): Promise<void> {
   try {
     await ctx.deps.http.post(`/offload/commands/${ctx.commandId}/cancel`, { reason: "client_signal" });
@@ -387,10 +392,10 @@ async function recover(ctx: PollContext): Promise<number> {
     } catch {
       response = { ok: false, error: "read failed" };
     }
-    // A signal received during the read wins over both receipts and errors.
+    // Signal exit wins, but a rejected pinned payload must not cancel that ID.
     const readSignal = ctx.pendingSignal();
     if (readSignal) {
-      await cancelBestEffort(ctx);
+      if (!ctx.verifyRequest || ctx.verified || !isVerificationRejected(response)) await cancelBestEffort(ctx);
       return signalExit(readSignal);
     }
     if (response.ok && response.status === 200) {
@@ -444,7 +449,7 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     }
     const readSignal = ctx.pendingSignal();
     if (readSignal) {
-      await cancelBestEffort(ctx);
+      if (!isVerificationRejected(receipt)) await cancelBestEffort(ctx);
       return signalExit(readSignal);
     }
     if (receipt.ok && receipt.status === 200) {
