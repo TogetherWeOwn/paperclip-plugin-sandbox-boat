@@ -163,6 +163,39 @@ describe("explicit locked uv test extra", () => {
     expect(await planDependencies(dir, "python", testSelection)).not.toBe(null);
   });
 
+  it("refuses a stale locked version even when manifest and lock metadata still match", async () => {
+    const files = { ...uvFiles(), "uv.lock": uvLock.replace('version = "9.2.0"', 'version = "6.2.5"') };
+    expect(await planDependencies(root(files), "python", testSelection)).toBe(null);
+  });
+
+  it.each([
+    [">=7", "7", true], [">=7", "9.2.0", true], [">=7", "6.2.5", false],
+    [">7", "7.0.0", false], [">7", "7.0.1", true],
+    ["<=7", "7.0.0", true], ["<=7", "7.0.1", false],
+    ["<7", "6.9", true], ["<7", "7.0", false],
+    ["==7.0", "7", true], ["==7", "7.0.1", false],
+    ["!=7", "7.0.0", false], ["!=7", "7.0.1", true],
+    [">=7, <10, !=9.1", "9.2.0", true], [">=7,<10,!=9.1", "9.1.0", false],
+    [">=7,<10", "10", false], ["", "9.2.0", true],
+    ["~=7.0", "7.1", false], ["===7", "7", false], ["==7.*", "7.1", false],
+    [">=1!7", "8", false], [">=7rc1", "8", false], [">=7.post1", "8", false],
+    [">=7.dev1", "8", false], ["==7+local", "7", false], [">=v7", "8", false],
+    [">=7", "7rc1", false], [">=7", "7.dev1", false], [">=7", "7.post1", false],
+    [">=7", "7+local", false], [">=7", "1!8", false], [">=7", "v8", false],
+    [">=7", "garbage", false], [">=7", "9.2.0.0.0.0.0.0.1", false],
+    [">=7", "9999999999", false], [">=7.0.0.0.0.0.0.0.1", "9", false],
+    [">=9999999999", "9", false],
+  ])("checks bounded specifier %s against locked release %s", async (specifier, version, accepted) => {
+    const files = {
+      "pyproject.toml": uvManifest.replace("pytest>=7", `pytest${specifier}`),
+      "uv.lock": uvLock.replace('specifier = ">=7"', `specifier = "${specifier}"`)
+        .replace('version = "9.2.0"', `version = "${version}"`),
+    };
+    const plan = await planDependencies(root(files), "python", testSelection);
+    if (accepted) expect(plan?.installs[0]?.install).toEqual(["uv", "sync", "--frozen", "--extra", "test"]);
+    else expect(plan).toBe(null);
+  });
+
   it.each([null, {}, [], { uvExtra: "api", cwdRelative: "." },
     { uvExtra: "--all-extras", cwdRelative: "." }, { uvExtra: ["test"], cwdRelative: "." },
     { ...testSelection, command: "anything" }, { ...testSelection, cwdRelative: "../escape" },
@@ -197,6 +230,10 @@ describe("explicit locked uv test extra", () => {
     ["ambiguous test target", { ...uvFiles(), "uv.lock": uvLock + '[[package]]\nname="pytest"\nversion="9.1.0"\nsource={registry="https://pypi.org/simple"}\n' }],
     ["conditional test edge", { ...uvFiles(), "uv.lock": uvLock.replace('test = [{ name = "pytest" }]', `test = [{ name = "pytest", marker = "sys_platform == 'win32'" }]`) }],
     ["malformed test edge marker", { ...uvFiles(), "uv.lock": uvLock.replace('test = [{ name = "pytest" }]', 'test = [{ name = "pytest", marker = 7 }]') }],
+    ["compound test metadata marker", { ...uvFiles(), "uv.lock": uvLock.replace("extra == 'test'", "extra == 'test' and python_version >= '3.11'") }],
+    ["missing provided test extra", { ...uvFiles(), "uv.lock": uvLock.replace('provides-extras = ["api", "test"]', 'provides-extras = ["api"]') }],
+    ["edge version mismatch", { ...uvFiles(), "uv.lock": uvLock.replace('test = [{ name = "pytest" }]', 'test = [{ name = "pytest", version = "8.0.0" }]') }],
+    ["dynamic project metadata", { ...uvFiles(), "pyproject.toml": uvManifest.replace('version = "0.1.0"', 'version = "0.1.0"\ndynamic = ["dependencies"]') }],
     ["stale requirement", { ...uvFiles(), "pyproject.toml": uvManifest.replace("pytest>=7", "pytest>=8") }],
     ["stale project version", { ...uvFiles(), "pyproject.toml": uvManifest.replace("0.1.0", "0.2.0") }],
     ["extra alias collision", { ...uvFiles(), "pyproject.toml": uvManifest + 'TEST = ["pytest>=7"]\n' }],

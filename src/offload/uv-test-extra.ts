@@ -17,6 +17,34 @@ def canonical(value):
         raise ValueError("name")
     return re.sub(r"[-_.]+", "-", value).lower()
 
+def release(value):
+    # Bounded final numeric releases only. Zero-padding implements PEP 440
+    # release ordering/equality; epochs, pre/dev/post/local forms stay local.
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){0,7}", value):
+        raise ValueError("release")
+    parts = tuple(int(part) for part in value.split("."))
+    return parts + (0,) * (8 - len(parts))
+
+def satisfies(version, specifier):
+    target = release(version)
+    if not specifier:
+        return True
+    # Do not approximate compatible-release, wildcard or arbitrary equality.
+    # Unsupported constraints fail closed rather than invoke a resolver.
+    clauses = specifier.split(",")
+    if len(clauses) > 16:
+        return False
+    for clause in clauses:
+        match = re.fullmatch(r"(==|!=|<=|>=|<|>)([0-9.]+)", clause)
+        if not match:
+            return False
+        bound = release(match[2])
+        if not {"==": target == bound, "!=": target != bound,
+                "<=": target <= bound, ">=": target >= bound,
+                "<": target < bound, ">": target > bound}[match[1]]:
+            return False
+    return True
+
 def validate(manifest, lock):
     if type(lock.get("version")) is not int or lock["version"] != 1:
         return False
@@ -78,6 +106,8 @@ def validate(manifest, lock):
                               or ("source" in edge and p.get("source") != edge["source"])
                               or set(p.get("source", {})) != {"registry"}
                               or not isinstance(p["source"]["registry"], str) for p in targets):
+            return False
+        if dep not in requirements or not satisfies(targets[0]["version"], requirements[dep]):
             return False
     if len(set(locked_names)) != len(locked_names) or set(locked_names) != set(requirements):
         return False
