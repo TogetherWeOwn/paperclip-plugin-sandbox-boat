@@ -14,7 +14,8 @@ import { OFFLOAD_BOUNDS, OFFLOAD_VERSION, type OffloadTool } from "./protocol.js
 import { classifyCargo, classifyNode, classifyPython, type CargoClassification } from "./router.js";
 import { probeDir } from "./probe-file.js";
 import { readToolchainPin, toolchainPinMismatch } from "./toolchain-file.js";
-import { bodyTooLarge, cwdProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
+import { bodyTooLarge, cwdProblem, depSelectionProblem, LONE_SURROGATE, validateSubmit } from "./validate.js";
+import type { DepSelection } from "./deps-install.js";
 
 /** The refusal path must answer the same documented 409 as submit() for a reused ID. */
 async function recordRefusalOrConflict(
@@ -449,7 +450,7 @@ export async function handleExec(
         body: { version: OFFLOAD_VERSION, commandId: request.commandId, mode: "local", reason: "execution workspace is not locally realized; cannot snapshot source", profileId: profile.id },
       };
     }
-    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
+    const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative, request.depSelection);
     if (classification.mode === "remote_candidate" && host.preflight) {
       let refusal: string | null;
       try {
@@ -498,7 +499,7 @@ export async function handleExec(
       body: offloadError("OFFLOAD_UNAVAILABLE", "execution workspace confinement is unsupported", { commandId: request.commandId, remoteStarted: false, fallbackSafe: true }),
     };
   }
-  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative);
+  const classification = await decideRemote(host, settings, workspace, profile, tool, runner, request.argv, request.cwdRelative, request.depSelection);
   if (classification.mode === "local") {
     const conflict = await recordRefusalOrConflict(host.broker, request, principal, `incompatible workload: ${classification.reason}`);
     if (conflict) return conflict;
@@ -533,6 +534,7 @@ async function decideRemote(
   runner: string,
   argv: string[],
   cwdRelative: string,
+  depSelection?: DepSelection,
 ): Promise<CargoClassification> {
   if (tool === "cargo") return classifyCargoWorkspace(profile, argv, workspace.path ?? workspace.cwd, cwdRelative);
   const repoId = canonicalRepoId(workspace);
@@ -544,7 +546,7 @@ async function decideRemote(
   if (!host.durations) {
     return { mode: "local", reason: "duration learning unavailable; run local first", profileId: profile.id, subcommand: classification.subcommand, runner };
   }
-  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv, cwdRelative));
+  const key = durationKey(repoId, profile.id, normalizeSignature(tool, runner, argv, cwdRelative, depSelection));
   const history = await readHistory(host.durations, key);
   if (history.length === 0) {
     return { mode: "local", reason: "no duration history yet; run local first and record", profileId: profile.id, subcommand: classification.subcommand, runner };
@@ -619,6 +621,9 @@ export async function handleReport(
   const cwdRelative = record.cwdRelative ?? ".";
   const cwdIssue = typeof cwdRelative === "string" ? cwdProblem(cwdRelative) : "cwdRelative must be a string";
   if (cwdIssue) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", cwdIssue, {}) };
+  const selectionIssue = depSelectionProblem(record.depSelection, tool, cwdRelative as string);
+  if (selectionIssue) return { status: 400, body: offloadError("OFFLOAD_INVALID_REQUEST", selectionIssue, {}) };
+  const depSelection = record.depSelection as DepSelection | undefined;
   if (!host.durations) {
     return { status: 503, body: offloadError("OFFLOAD_UNAVAILABLE", "duration learning unavailable", { commandId: null, remoteStarted: false, fallbackSafe: true }) };
   }
@@ -626,7 +631,7 @@ export async function handleReport(
   if (!workspace) {
     return { status: 403, body: offloadError("OFFLOAD_FORBIDDEN", "unknown execution workspace", { commandId: null }) };
   }
-  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[], cwdRelative as string));
+  const key = durationKey(canonicalRepoId(workspace), profile.id, normalizeSignature(tool, record.runner, argv as string[], cwdRelative as string, depSelection));
   await recordDuration(host.durations, key, { seconds: record.durationSeconds, at: Date.now() });
   return { status: 200, body: { version: OFFLOAD_VERSION, recorded: true } };
 }

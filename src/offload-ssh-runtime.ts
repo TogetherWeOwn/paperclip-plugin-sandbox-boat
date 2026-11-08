@@ -869,7 +869,7 @@ export class SshOffloadRuntime {
         const tool = cmd.tool ?? "cargo";
         if (tool === "cargo") return;
         const scope = { scopeKind: "company" as const, scopeId: cmd.companyId, namespace: "boat-offload", stateKey: "" };
-        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative));
+        const key = durationKey(cmd.repoId, cmd.profileId, normalizeSignature(tool, cmd.runner ?? defaultRunnerFor(tool), cmd.argv, cmd.cwdRelative, cmd.depSelection));
         try {
           await recordDuration({ get: (id) => this.deps.state.get({ ...scope, stateKey: id }),
             set: (id, value) => this.deps.state.set({ ...scope, stateKey: id }, value),

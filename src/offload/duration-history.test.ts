@@ -86,6 +86,19 @@ describe("recordDuration", () => {
     expect(normalizeSignature("node", "npm", ["test"], "packages/tiny")).not.toBe(normalizeSignature("node", "npm", ["test"]));
   });
 
+  it("isolates selected signatures while retaining legacy default encodings", () => {
+    for (const cwd of [".", "tests/unit"]) {
+      const base = normalizeSignature("python", "pytest", ["tests/"], cwd);
+      expect(base).toBe(JSON.stringify(cwd === "."
+        ? ["python", "pytest", ["tests/"]]
+        : ["python", "pytest", ["tests/"], cwd]));
+      const selected = normalizeSignature("python", "pytest", ["tests/"], cwd, { uvExtra: "test", cwdRelative: cwd });
+      expect(selected).not.toBe(base);
+      expect(selected).toBe(normalizeSignature("python", "pytest", ["tests/"], cwd,
+        { cwdRelative: cwd, uvExtra: "test" }));
+    }
+  });
+
   it("scopes keys per repo and profile", () => {
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:b", "node-public-1", "s"));
     expect(durationKey("repo:a", "node-public-1", "s")).not.toBe(durationKey("repo:a", "python-public-1", "s"));

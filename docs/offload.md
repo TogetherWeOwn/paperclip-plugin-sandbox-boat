@@ -176,9 +176,13 @@ boat-offload-python --uv-extra test --dry-run -- tests/
 boat-offload-python --uv-extra test --runner python -- -m pytest tests/
 ```
 
-Only the literal `test` extra is supported; malformed values or a selection on
-another tool exit 64 before a spawn or broker call. Without this opt-in, dependency
-planning is unchanged (`uv sync --frozen` or the existing hash-pinned pip plan).
+Only the literal `test` extra is supported. Once the shim's opt-in, re-entry and
+workspace gates permit offload, malformed values or a selection on another tool
+exit 64 before a spawn or broker call. Local passthrough paths ignore the inherited
+environment selector, including child shims re-entered during a local fallback.
+An invalid explicit diagnostic `--uv-extra` flag remains a usage error.
+Without this opt-in, dependency planning is unchanged (`uv sync --frozen` or the
+existing hash-pinned pip plan).
 The opt-in is converted into a typed request field, not forwarded as guest env:
 
 ```json
@@ -204,7 +208,10 @@ retries the default uv/pip plan or system interpreter.
 Admission, frozen-source installation (`uv sync --frozen --extra test`) and venv
 resolution consume the same selection and cwd. Selected and default plans have
 different cache identities; switching a mirror's active plan reinstalls, including
-switching back. Selection is persisted in the durable command snapshot and digest:
+switching back. Duration learning also separates selected and default commands:
+`POST /offload/report` carries the same optional, validated `depSelection` and cwd;
+dry-run, real submission and remote completion use its signature. Existing default
+duration keys remain compatible. Selection is persisted in the durable command snapshot and digest:
 reusing a command ID with a changed selection or cwd conflicts instead of replaying.
 Pinned receipt recovery verifies that same payload; exits 74/75 and no-replay semantics are
 unchanged. This documents source behavior only, not template qualification,

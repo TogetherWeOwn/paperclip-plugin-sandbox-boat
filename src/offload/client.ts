@@ -95,6 +95,7 @@ export async function reportDuration(request: ShimRequest, deps: ClientDeps, dur
       runner: request.runner ?? (tool === "node" ? "npm" : "pytest"),
       argv: request.argv,
       cwdRelative: request.cwdRelative,
+      ...(request.depSelection === undefined ? {} : { depSelection: { ...request.depSelection } }),
       durationSeconds,
     });
   } catch {

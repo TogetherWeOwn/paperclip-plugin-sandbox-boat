@@ -317,6 +317,43 @@ describe("handleReport", () => {
     expect(next.body).toMatchObject({ mode: "remote_candidate" });
   });
 
+  it.each([false, true])("isolates selected and default Python duration reports (selected=%s)", async (selected) => {
+    const t = setup();
+    const command = { tool: "python", runner: "pytest", argv: ["tests/"], cwdRelative: "." };
+    const depSelection = { uvExtra: "test", cwdRelative: "." };
+    const selection = selected ? { depSelection } : {};
+    expect((await handleReport({ actor: ACTOR, companyId: COMPANY,
+      body: { executionWorkspaceId: WS, ...command, ...selection, durationSeconds: 240 } }, t.host)).status).toBe(200);
+    for (const dryRun of [true, false]) {
+      const other = await handleExec({ actor: ACTOR, companyId: COMPANY,
+        body: submitBody({ ...command, ...(selected ? {} : { depSelection }), dryRun }) }, t.host);
+      expect(other.status).toBe(dryRun ? 200 : 503);
+      if (dryRun) expect(other.body).toMatchObject({ mode: "local", reason: "no duration history yet; run local first and record" });
+    }
+    const same = await handleExec({ actor: ACTOR, companyId: COMPANY,
+      body: submitBody({ ...command, ...selection }) }, t.host);
+    expect(same.body).toMatchObject({ mode: "remote_candidate" });
+  });
+
+  it.each([
+    null, [], { uvExtra: "dev", cwdRelative: "." }, { uvExtra: "test", cwdRelative: "other" },
+    { uvExtra: "test", cwdRelative: ".", unknown: true }, { uvExtra: "test" },
+  ])("rejects malformed report selection before storage: %j", async (depSelection) => {
+    const t = setup();
+    expect((await handleReport({ actor: ACTOR, companyId: COMPANY,
+      body: { executionWorkspaceId: WS, tool: "python", runner: "pytest", argv: ["tests/"],
+        cwdRelative: ".", depSelection, durationSeconds: 240 } }, t.host)).status).toBe(400);
+    expect(t.store.data.size).toBe(0);
+  });
+
+  it("rejects a Python selection on a Node duration report", async () => {
+    const t = setup();
+    expect((await handleReport({ actor: ACTOR, companyId: COMPANY,
+      body: { executionWorkspaceId: WS, tool: "node", runner: "npm", argv: ["run", "test"],
+        depSelection: { uvExtra: "test", cwdRelative: "." }, durationSeconds: 240 } }, t.host)).status).toBe(400);
+    expect(t.store.data.size).toBe(0);
+  });
+
   it("keeps duration history per run directory", async () => {
     const t = setup();
     const report = await handleReport({

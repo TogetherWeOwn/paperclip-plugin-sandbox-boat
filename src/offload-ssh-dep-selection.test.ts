@@ -11,6 +11,7 @@ import { listAllFilesAsTracked, noInitializedSubmodules, noUntrackedFiles } from
 import { createFakeContext } from "./test-support/harness.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import type { BoatApiLike } from "./boat-client.js";
+import { durationKey, normalizeSignature } from "./offload/duration-history.js";
 
 // Consumer wiring for the explicit uv test extra: admission (gate), guest
 // installation and venv discovery must plan from the SAME command.depSelection.
@@ -241,7 +242,7 @@ describe("runtime admission and venv agreement", () => {
       offloadCgroupParent: "/sys/fs/cgroup/", offloadArtifactRoot: path.join(workRoot, "artifacts"),
       offloadAllowedRepos: [repoId], offloadProfiles: ["rust-public-1", "python-public-1"],
     };
-    return { runtime, config, seen };
+    return { runtime, config, seen, state: harness.ctx.state };
   }
   const backendCommand = (over: Record<string, unknown> = {}): BackendCommand =>
     ({ ...pyCommand(), executionWorkspaceId, timeoutMs: 10_000, queueTimeoutMs: 0, ...over }) as BackendCommand;
@@ -249,6 +250,29 @@ describe("runtime admission and venv agreement", () => {
     const result = await runtime.resolve(cmd, config);
     return isExecutorRefusal(result) ? result.refusalReason : null;
   };
+
+  it.each([false, true])("records remote completion under the matching selection signature (selected=%s)", async (selected) => {
+    const source = tree(uvFiles());
+    const { runtime, config, state } = backend(source);
+    try {
+      const cmd = backendCommand(selected ? { depSelection: SELECTED } : {});
+      expect(await refusalOf(runtime, config, cmd)).toBeNull();
+      // Invoke the real completion hook without allocating or running a guest.
+      const pool = [...(runtime as unknown as { pools: Map<string, {
+        executor: { recordDuration: (command: OffloadCommand, seconds: number) => Promise<void> };
+      }> }).pools.values()][0]!;
+      await pool.executor.recordDuration(cmd, 240);
+      const scope = { scopeKind: "company" as const, scopeId: companyId, namespace: "boat-offload" };
+      const key = (selection: typeof SELECTED | undefined) => durationKey(repoId, "python-public-1",
+        normalizeSignature("python", "pytest", ["tests/"], ".", selection));
+      expect(await state.get({ ...scope, stateKey: key(selected ? SELECTED : undefined) })).toEqual([
+        { seconds: 240, at: expect.any(Number) },
+      ]);
+      expect(await state.get({ ...scope, stateKey: key(selected ? undefined : SELECTED) })).toBeNull();
+    } finally {
+      await runtime.shutdown();
+    }
+  });
 
   it("admits a selected uv workspace and agrees with preflight, installation and venv", async () => {
     const source = tree(uvFiles());

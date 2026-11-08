@@ -193,12 +193,7 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     }
     pinnedId = rawPinned.toLowerCase();
   }
-  // This opt-in selects a bounded wire field; it is never forwarded as guest env.
   let uvExtra = deps.env.BOAT_OFFLOAD_UV_EXTRA;
-  if (uvExtra !== undefined && (tool.tool !== "python" || uvExtra !== "test")) {
-    deps.stderr(Buffer.from(`${tool.diagnosticName}: BOAT_OFFLOAD_UV_EXTRA supports only test for python; exit 64, nothing run.\n`, "utf8"));
-    return 64;
-  }
   const installedAs = path.basename(scriptPath);
   const diagnostic = !tool.exeNames.includes(installedAs);
   const diag = tool.diagnosticName;
@@ -324,6 +319,12 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     return pinnedReal ? refusePinned(located.reason) : runLocal(toolArgv);
   }
 
+  // Validate only after local passthrough/re-entry/workspace gates. An inherited
+  // opt-in must not break local children. It is never forwarded as guest env.
+  if (uvExtra !== undefined && (tool.tool !== "python" || uvExtra !== "test")) {
+    writeStderr(`${diag}: BOAT_OFFLOAD_UV_EXTRA supports only test for python; exit 64, nothing run.\n`);
+    return 64;
+  }
   const commandId = idOrRandom();
   const request: ShimRequest = {
     tool: tool.tool,
