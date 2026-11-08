@@ -49,8 +49,8 @@ python:boat-offload-python
 python3:boat-offload-python'
 
 # Preflight: every package file and every destination, before any mutation.
-for f in dist/offload/shim-main.js dist/offload/shim-node.js \
-  bin/boat-offload-cargo bin/boat-offload-node bin/boat-offload-python; do
+for f in bin/boat-offload-cargo bin/boat-offload-node bin/boat-offload-python \
+  dist/offload/shim-main.js dist/offload/shim-node.js; do
   if [ ! -f "$pkg/$f" ]; then
     echo "install-offload-shims: $pkg has no $f; stage a package built with the shims." >&2
     exit 1

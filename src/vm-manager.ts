@@ -3909,11 +3909,13 @@ export class BoatVmManager {
    * limits; persisted observations and warnings are company scoped. */
   async sampleCapacity(): Promise<void> {
     const companies = new Set([
+      ...this.offloadBrokers.keys(),
       ...[...this.configs.values()].map((entry) => entry.companyId),
-      ...(await this.store.companies()),
+      ...(await this.store.companies().catch(() => [] as string[])),
     ]);
     await Promise.all([...companies].map(async (companyId) => {
       try {
+        await this.capacity.maintain(companyId, this.now());
         const sources = await withDeadline(this.nativeOffload.capacitySources(companyId, this.sweepConfigsFor(companyId)),
           this.offloadUpkeepTimeoutMs, "capacity sources");
         await Promise.all(sources.map(async ({ accountKey, api }) => {

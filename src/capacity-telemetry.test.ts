@@ -296,6 +296,25 @@ describe("CapacityTelemetry unavailable and failures", () => {
     expect(ok.forecast?.burn24hHours).toBe(100);
   });
 
+  it("prunes expired samples during a continuing provider outage", async () => {
+    const state = memState();
+    const t = new CapacityTelemetry(state);
+    await t.sample(CO, ACCT, payload(), T0);
+    await t.sample(CO, ACCT, null, T0 + 7 * DAY);
+    await t.sample(CO, ACCT, null, T0 + 9 * DAY);
+    expect(storedSamples(state)).toBe(0);
+    expect((await t.latest(CO, T0 + 9 * DAY))[0].status).toBe("unavailable");
+  });
+
+  it("maintenance removes accounts whose telemetry source disappeared", async () => {
+    const state = memState();
+    const t = new CapacityTelemetry(state);
+    await t.sample(CO, ACCT, payload(), T0);
+    await t.maintain(CO, T0 + 9 * DAY);
+    expect(await t.latest(CO, T0 + 9 * DAY)).toEqual([]);
+    expect(JSON.stringify([...state.rows.values()])).not.toContain(String(T0));
+  });
+
   it("rejects an ended plan period, a bad clock and clock regression", async () => {
     const t = new CapacityTelemetry(memState());
     expect((await t.sample(CO, ACCT, payload({ end: T0 }), T0)).reasons).toEqual(["plan_period_ended"]);

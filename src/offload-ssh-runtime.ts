@@ -408,6 +408,9 @@ export class SshOffloadRuntime {
       .filter((binding) => binding.companyId === companyId).map((binding) => binding.config)];
     for (const config of candidates) {
       if (sources.size >= 8) break;
+      // A keyless realization has not captured account provenance yet. A later
+      // host-key rotation must not enroll its company in the new account.
+      if (typeof config.apiKey !== "string" || !config.apiKey.trim()) continue;
       const bound = { ...config, apiKey: resolveApiKey(config) };
       const credential = `${bound.apiBase}\u0000${bound.apiKey}`;
       if (seenCredentials.has(credential)) continue;

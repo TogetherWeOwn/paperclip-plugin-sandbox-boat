@@ -125,6 +125,25 @@ describe("scheduled capacity telemetry", () => {
     expect((await currentManager().usageSummary("foreign-company")).capacity.accounts).toEqual([]);
   });
 
+  it("does not enroll a keyless live binding under a rotated host credential", async () => {
+    const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: {} as never, accountId: "test-account" });
+    const realization = (apiKey: string | null) => ({
+      companyId: COMPANY, environmentId: "local-environment", config: { apiKey },
+      workspace: { localPath: "/tmp/native-source", metadata: { workspaceRealizationRequest: {
+        version: 1, companyId: COMPANY, environmentId: "local-environment",
+        heartbeatRunId: "native-run", executionWorkspaceId: "native-workspace",
+        source: { localPath: "/tmp/native-source", repoUrl: "https://github.com/example/source" },
+      } } },
+    });
+    runtime.remember(realization(null) as never);
+    process.env.BOAT_API_KEY = "boat_rotated_other_account_not_real";
+    expect(await runtime.capacitySources(COMPANY)).toEqual([]);
+    runtime.remember(realization(KEY) as never);
+    expect(await runtime.capacitySources(COMPANY)).toHaveLength(1);
+    expect(await runtime.capacitySources("other-company")).toEqual([]);
+    await runtime.shutdown();
+  });
+
   it("does not infer an account from an unmarked legacy pool or another company", async () => {
     const runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: {} as never, accountId: "test-account" });
     await harness.ctx.state.set({ scopeKind: "company", scopeId: COMPANY, namespace: "boat-offload", stateKey: "offload.pools" }, {

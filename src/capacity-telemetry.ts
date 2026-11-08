@@ -219,6 +219,23 @@ function markStale(r: CapacityReport, nowMs: number): CapacityReport {
   return { ...r, status: "unavailable", reasons: ["stale_observation", ...r.reasons.filter((x) => x !== "stale_observation")], shouldNotify: false };
 }
 
+function pruneAccounts(doc: CapacityDoc, nowMs: number): boolean {
+  let changed = false;
+  for (const [id, account] of Object.entries(doc.accounts)) {
+    if (nowMs - account.seenAt > RETENTION_MS) {
+      delete doc.accounts[id];
+      changed = true;
+      continue;
+    }
+    const samples = account.samples.filter((sample) => nowMs - sample[0] <= RETENTION_MS).slice(-MAX_SAMPLES);
+    if (samples.length !== account.samples.length) {
+      account.samples = samples;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 export class CapacityTelemetry {
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -252,7 +269,7 @@ export class CapacityTelemetry {
 
   private async sampleLocked(companyId: string, accountId: string, rawLimits: unknown, nowMs: number): Promise<CapacityReport> {
     const doc = readDoc(await this.state.get(this.key(companyId)));
-    for (const [id, a] of Object.entries(doc.accounts)) if (nowMs - a.seenAt > RETENTION_MS) delete doc.accounts[id];
+    pruneAccounts(doc, nowMs);
     let acct = doc.accounts[accountId];
     const parsed = parseLimits(rawLimits);
     let report: CapacityReport;
@@ -319,6 +336,14 @@ export class CapacityTelemetry {
       return { ...unavailable(accountId, "state_write_failed", nowMs) };
     }
     return report;
+  }
+
+  /** Scheduled maintenance still expires history when no verified source remains. */
+  async maintain(companyId: string, nowMs: number): Promise<void> {
+    await this.serialize(async () => {
+      const doc = readDoc(await this.state.get(this.key(companyId)));
+      if (pruneAccounts(doc, nowMs)) await this.state.set(this.key(companyId), doc);
+    });
   }
 
   /** Last stored report per account (most recently seen first); reports older than 15 min are returned unavailable/stale_observation with their old evidence and observation time. */
