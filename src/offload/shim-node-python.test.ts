@@ -166,7 +166,14 @@ describe.each([CARGO_SHIM, NODE_SHIM, PYTHON_SHIM])("$tool shim re-entry", (tool
       const t = setup(tool, script, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
       expect(await shimMain(script, ["--dry-run", ...diagnosticArgs], t.deps, tool)).toBe(0);
       expect(t.deps.spawn).not.toHaveBeenCalled();
-      expect(t.deps.http.post).toHaveBeenCalledExactlyOnceWith("/offload/exec", expect.objectContaining({ dryRun: true, runner }));
+      expect(t.deps.http.post).toHaveBeenCalledExactlyOnceWith("/offload/exec", expect.objectContaining({
+        dryRun: true, argv, ...(tool.tool === "cargo" ? {} : { tool: tool.tool, runner }),
+      }));
+      if (tool.tool === "cargo") {
+        const { body } = t.posted[0] as { body: Record<string, unknown> };
+        expect(body).not.toHaveProperty("tool");
+        expect(body).not.toHaveProperty("runner");
+      }
     });
 
     it("reports a missing real runner without spawning", async () => {
