@@ -285,7 +285,7 @@ export class OffloadExecutor {
   private closed = false;
   private shutdownTask: Promise<void> | null = null;
 
-  constructor(deps: OffloadDeps | OffloadLifecycleDeps) {
+  constructor(private readonly deps: OffloadDeps | OffloadLifecycleDeps) {
     this.boat = deps.boat;
     this.logger = deps.logger;
     this.now = deps.now;
@@ -312,7 +312,24 @@ export class OffloadExecutor {
     }
     this.lifecycle = deps.guest ? new OffloadLifecycle(deps.guest, this.now, this.timers,
       (command) => this.fundedWindows.get(commandKey(command)) ?? null) : null;
-    this.durable = hasDurableDeps ? new OffloadJournal(deps as OffloadDurableDeps, this.now, {
+    this.durable = hasDurableDeps ? new OffloadJournal({ ...(deps as OffloadDurableDeps), sync: {
+      push: async (sandboxId, command) => {
+        const vm = this.pool.find((entry) => entry.sandboxId === sandboxId);
+        if (!vm || vm.syncInFlight) throw new Error("OFFLOAD_SYNC_OWNERSHIP_UNVERIFIED");
+        // The previous command's cgroup says nothing about a sync installer.
+        // Commit ownership before any guest mutation; leave it fenced on error.
+        vm.syncInFlight = true;
+        await this.persistPool();
+        await deps.sync!.push(sandboxId, command);
+        vm.syncInFlight = false;
+        try { await this.persistPool(); }
+        catch (error) { vm.syncInFlight = true; throw error; }
+      },
+      collect: (vm, cmd) => deps.sync!.collect(vm, cmd),
+      stage: (vm, cmd, collected) => deps.sync!.stage(vm, cmd, collected),
+      discard: (vm, cmd) => deps.sync!.discard?.(vm, cmd) ?? Promise.resolve(),
+      markSuspect: (vm, cmd) => deps.sync!.markSuspect(vm, cmd),
+    } }, this.now, {
       hold: (identity, command) => this.restoreHold(identity, command),
       release: (identity) => this.releaseHold(identity),
       bind: (identity) => this.bindIdentity(identity),
@@ -376,6 +393,7 @@ export class OffloadExecutor {
     }
     if (state === null) return; // unreadable: stay fenced, retry next sweep
     if (["archived", "cancelled", "deleted"].includes(state)) {
+      this.deps.sync?.sandboxStopped?.(vm.sandboxId);
       vm.stopObservedAt ??= this.now();
       await this.persistStopTelemetry(vm).catch(() => {
         this.logger.error("boat offload terminal receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
@@ -396,12 +414,19 @@ export class OffloadExecutor {
         vm.stopping = false;
         vm.stopped = true;
         vm.quarantined = false;
+        vm.syncInFlight = false;
         vm.workspaceKey = null;
       }
       await this.persistPool().catch(() => undefined);
       return;
     }
     if (!["ready", "idle", "running"].includes(state)) return; // archiving and the like: stay fenced
+    if (vm.syncInFlight) {
+      // Sync work is outside the previous command's cgroup. Only stopping the
+      // whole boot can fence it, including after worker recovery.
+      await this.stopVm(vm, true, true).catch(() => undefined);
+      return;
+    }
     if (this.lifecycle && vm.identity) {
       try {
         // Unknown workspace ownership stays fenced even when the guest looks
@@ -447,7 +472,7 @@ export class OffloadExecutor {
         for (const vm of [...this.pool]) {
           // An in-flight allocation (including an unknown create ID) or guest
           // reservation cannot become idle just because its worker disappeared.
-          if (vm.busy || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
+          if (vm.busy || vm.syncInFlight || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
           // Provider state first: an archived VM is stopped, not quarantined,
           // and no SSH observe runs against a gone guest.
           if (vm.quarantined && vm.sandboxId) await this.reconcileQuarantined(vm).catch(() => undefined);
@@ -485,6 +510,7 @@ export class OffloadExecutor {
     if (!["archived", "cancelled", "deleted"].includes(state ?? "")) {
       return ["ready", "idle", "running"].includes(state ?? "");
     }
+    this.deps.sync?.sandboxStopped?.(vm.sandboxId);
     vm.stopObservedAt ??= this.now();
     try { await this.persistStopTelemetry(vm); }
     catch {
@@ -664,6 +690,7 @@ export class OffloadExecutor {
     // A verified old result permits capacity again, but not an assumption that
     // the VM survived a restart in running state. Resume under the budget gate.
     await this.withAdmission(async () => {
+      if (vm.syncInFlight) return; // an old command receipt cannot fence sync work
       vm.quarantined = false;
       vm.busy = false;
       vm.workspaceKey = null;
@@ -1709,6 +1736,18 @@ export class OffloadExecutor {
       const workspaceKey = vm.workspaceKey;
       vm.lastActiveAt = this.now();
       vm.busy = false;
+      if (vm.syncInFlight) {
+        vm.quarantined = true;
+        vm.generation += 1;
+        this.clearIdleTimer(vm);
+        await this.persistPool().catch(() => {
+          this.logger.error("boat offload sync fence persistence failed; stop still required", { sandboxId: vm.sandboxId });
+        });
+        // A never-started command may still have a live sync installer.
+        // Keep the durable fence until terminal provider reconciliation.
+        await this.stopVm(vm, true, true);
+        return;
+      }
       // Only completed/never-started paths release, after terminal accounting.
       // Clear the ledger-outage fence before dispatch; unknown stays quarantined.
       vm.quarantined = false;
@@ -1807,6 +1846,7 @@ export class OffloadExecutor {
   private async retryPendingDelete(vm: PoolVm): Promise<boolean> {
     try {
       await this.deleteAtProvider(vm.sandboxId);
+      this.deps.sync?.sandboxStopped?.(vm.sandboxId);
       await this.ledger.stopped(vm.sandboxId, this.now(), vm.accountReservation?.id);
     } catch {
       vm.quarantined = true;
@@ -1894,7 +1934,10 @@ export class OffloadExecutor {
     vm.stopping = !vm.stopped;
     vm.stopObservedAt = vm.stopped ? this.now() : null;
     // A stopped VM resumes under a new boot id: its old watchdog paths are dead.
-    if (vm.stopped) this.lifecycle?.releaseSandbox(vm.sandboxId);
+    if (vm.stopped) {
+      this.lifecycle?.releaseSandbox(vm.sandboxId);
+      this.deps.sync?.sandboxStopped?.(vm.sandboxId);
+    }
     await this.persistStopTelemetry(vm).catch(() => {
       this.logger.error("boat offload stop receipt persistence failed; reconcile will converge", { sandboxId: vm.sandboxId });
     });

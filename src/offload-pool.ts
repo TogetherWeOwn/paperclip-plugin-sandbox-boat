@@ -13,6 +13,9 @@ export interface PoolVm {
   stopped: boolean;
   stopping: boolean;
   quarantined: boolean;
+  // Persisted before sync can start receivers/installers outside the command
+  // cgroup. A crash or failure requires a terminal provider fence before reuse.
+  syncInFlight?: boolean;
   // Ephemeral VM whose provider delete (or its ledger receipt) failed:
   // quarantined against reuse, retried by sweep and shutdown until retired.
   deletePending?: boolean;
@@ -51,6 +54,7 @@ const timestamp = (value: unknown) => value === null || Number.isSafeInteger(val
 
 export class OffloadPoolStore {
   private readonly key;
+  private saving: Promise<void> = Promise.resolve();
   constructor(private readonly state: StateClientLike, accountId: string, poolId: string) {
     this.key = { scopeKind: "instance" as const, namespace: "boat-offload-pool",
       stateKey: createHash("sha256").update(JSON.stringify([accountId, poolId])).digest("hex") };
@@ -81,6 +85,7 @@ export class OffloadPoolStore {
         || (vm.sandboxId === "" && !vm.accountReservation?.id)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
         || (vm.deletePending !== undefined && typeof vm.deletePending !== "boolean")
+        || (vm.syncInFlight !== undefined && typeof vm.syncInFlight !== "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0
@@ -113,6 +118,12 @@ export class OffloadPoolStore {
   async save(config: OffloadExecutorConfig, vms: readonly PoolVm[]): Promise<void> {
     const doc: PoolDoc = { version: 1, config: structuredClone(config),
       vms: vms.map(({ idleHandle: _timer, ...vm }) => structuredClone(vm)) };
-    await this.state.set(this.key, doc);
+    // Whole-document saves can originate outside admission (notably sync).
+    // Keep invocation snapshots ordered so an older write cannot erase a fence
+    // after its save has completed and authorized guest mutation. Never hold
+    // admission or this queue across the guest work itself.
+    const saved = this.saving.then(() => this.state.set(this.key, doc));
+    this.saving = saved.catch(() => undefined); // one failure must not poison later saves
+    await saved;
   }
 }

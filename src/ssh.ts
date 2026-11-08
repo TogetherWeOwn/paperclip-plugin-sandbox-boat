@@ -58,6 +58,12 @@ export interface SshExecutionResult {
   timedOut: boolean;
   stdout: string;
   stderr: string;
+  /**
+   * Set by supervised ssh runs: true only when remote cancel/finalize completed
+   * cleanly (no timeout, signal, nonzero or null exit). false means cleanup
+   * failed and was suppressed. Optional for compatibility with other producers.
+   */
+  cleanupVerified?: boolean;
 }
 
 export interface SshLogger {
@@ -410,9 +416,9 @@ export class SshManager {
     // revocation nor group cancellation depends on receiving a stderr marker.
     const runId = randomUUID().replace(/-/g, "");
     let result: SshExecutionResult | undefined;
+    let cleanupVerified = false;
     try {
       result = await runStreamProcess("ssh", slave(wrapRemoteCommand(remoteCommand, runId, true, this.runRecordDir)), options);
-      return { ...result, stderr: stripRunMarker(result.stderr, runId) };
     } finally {
       // Local pipe/cap errors throw, while timeouts return a result. Both must
       // finish bounded remote cleanup BEFORE releasing activity/rejecting. On
@@ -430,9 +436,10 @@ export class SshManager {
         : cancelRemoteCommand(runId, this.runRecordDir);
       try {
         const cleanup = await runStreamProcess("ssh", slave(cleanupCommand), { timeoutMs: REMOTE_CANCEL_TIMEOUT_MS });
-        if (cleanup.timedOut || cleanup.exitCode !== 0) {
+        if (cleanup.timedOut || cleanup.signal !== null || cleanup.exitCode !== 0) {
           throw new Error(`Remote command cleanup failed: ${cleanup.stderr.trim() || "timeout or nonzero exit"}`);
         }
+        cleanupVerified = true;
       } catch (error) {
         this.logger.warn("boat: remote command cleanup failed; remote work may still be running", {
           sandboxId: session.sandboxId, reason: (error as Error).message,
@@ -440,6 +447,8 @@ export class SshManager {
         if (cleanupFailureThrows && result && !result.timedOut && result.exitCode === 0) throw error;
       }
     }
+    // Built after cleanup so the result reflects verified cleanup state.
+    return { ...result, stderr: stripRunMarker(result.stderr, runId), cleanupVerified };
   }
 
   async closeSession(sandboxId: string): Promise<void> {

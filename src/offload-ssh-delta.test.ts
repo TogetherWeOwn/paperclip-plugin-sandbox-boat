@@ -189,7 +189,7 @@ function setup(root: string, guest: StubGuest = stubGuest(), now?: () => number)
     guest.installs.push(remoteCommand);
     if (guest.failNext?.install) {
       guest.failNext = null;
-      return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "npm ERR! test stub" };
+      return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "npm ERR! test stub", cleanupVerified: true };
     }
     return { exitCode: 0, timedOut: false, signal: null, stdout: "", stderr: "" };
   });
@@ -590,6 +590,59 @@ describe("delta push over stub SSH", () => {
     guest.markers.delete(guestKey("vm-1", sync.directory(node()))); // /tmp is not in the boat snapshot
     await sync.push("vm-1", node());
     expect(installs()).toBe(2);
+  });
+
+  it("reinstalls pip after same-sandbox stop/resume loses the shared /tmp environment", async () => {
+    const root = source({ "requirements.txt": "pytest==7.4.2 \\\n    --hash=sha256:abc123\n" });
+    const py = () => command({ tool: "python", runner: "pytest", argv: ["tests/"] });
+    const { sync, guest } = setup(root);
+    await sync.push("vm-1", py());
+    await sync.push("vm-1", py());
+    expect(guest.installs).toHaveLength(1);
+    // Even a lost mirror discovered before an explicit lifecycle callback
+    // cannot leave the old shared pip hash trusted on the same sandbox ID.
+    guest.markers.delete(guestKey("vm-1", sync.directory(py())));
+    await sync.push("vm-1", py());
+    expect(guest.installs).toHaveLength(2);
+    await sync.push("vm-1", py());
+    expect(guest.installs).toHaveLength(2);
+    sync.sandboxStopped("vm-1");
+    await sync.push("vm-1", py());
+    expect(guest.installs).toHaveLength(3);
+  });
+
+  it.each(["node", "python"] as const)("fences uncertain %s installers before any next mirror RPC and recovers only after a proven stop", async (tool) => {
+    const lock = tool === "node" ? "package-lock.json" : "uv.lock";
+    const root = source({ [lock]: "{}", "old.txt": "old",
+      ...(tool === "python" ? { "pyproject.toml": '[project]\nname = "example"\n' } : {}) });
+    const cmd = () => command({ tool, runner: tool === "node" ? "npm" : "pytest" });
+    const { sync, ssh, guest, spawn } = setup(root);
+    const original = ssh.runStream.getMockImplementation()! as (session: unknown, script: string, opts: unknown) => Promise<unknown>;
+    let fail = false;
+    ssh.runStream.mockImplementation(async (session: unknown, script: string, opts: unknown) => {
+      if (fail && script.includes(tool === "node" ? "npm" : "--frozen")) {
+        return { exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "cleanup unverified", cleanupVerified: false };
+      }
+      return original(session, script, opts);
+    });
+    await sync.push("vm-1", cmd());
+    fail = true;
+    writeFileSync(path.join(root, lock), "{\"version\":2}");
+    await expect(sync.push("vm-1", cmd())).rejects.toThrow(/install failed/);
+    const calls = ssh.runStream.mock.calls.length;
+    const transfers = spawn.mock.calls.length;
+    rmSync(path.join(root, "old.txt"));
+    writeFileSync(path.join(root, "new.txt"), "new");
+    guest.suspect.set(guestKey("vm-1", sync.directory(cmd())), "force-wipe");
+    sync.invalidateSandbox("vm-1");
+    await expect(sync.push("vm-1", cmd())).rejects.toThrow(/completion unknown/);
+    expect(ssh.runStream).toHaveBeenCalledTimes(calls); // no verify/write/prune/wipe
+    expect(spawn).toHaveBeenCalledTimes(transfers); // no upload
+    sync.sandboxStopped("vm-1");
+    fail = false;
+    await sync.push("vm-1", cmd());
+    expect(spawn.mock.calls.length).toBeGreaterThan(transfers);
+    expect(guest.wipes).not.toEqual([]);
   });
 
   it("reinstalls on a lockfile rollback A to B to A", async () => {

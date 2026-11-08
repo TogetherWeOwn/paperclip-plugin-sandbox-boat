@@ -235,12 +235,12 @@ describe("journal names the failed pre-start step", () => {
   });
 });
 
-describe("executor logs and releases on a pre-start failure", () => {
+describe("executor logs and settles a pre-start failure", () => {
   let s: Fixture;
   beforeEach(async () => { s = await fixture(); });
   afterEach(async () => { await s.dispose(); });
 
-  it("sync push failure: named reason end to end, warn with command/sandbox identity, VM released for reuse", async () => {
+  it("sync push failure: named reason end to end, warn with command/sandbox identity, VM fenced until terminal reconciliation", async () => {
     const cmd = lifecycleCommand("exec-push-fail");
     s.fail.add(`push:${cmd.commandId}`);
     const result = await s.execute(cmd);
@@ -257,11 +257,18 @@ describe("executor logs and releases on a pre-start failure", () => {
     // The read view carries the same reason the shim announces.
     expect(await s.executor.readOutput(cmd.companyId, cmd.runId, cmd.commandId)).toMatchObject({ state: "not_started",
       fallbackReason: "sync push failed before the command could start" });
-    // Released, not quarantined: the next command reuses the same VM.
+    // A known non-start of the command does not prove sync work has stopped.
+    // The provider stop is requested, but reuse waits for terminal reconciliation.
+    const sandboxId = warn!.meta!.sandboxId as string;
+    expect(s.boat.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([sandboxId]);
+    expect(s.boat.boxes.get(sandboxId)?.state).toBe("archived");
+    expect(await s.execute(lifecycleCommand("exec-before-reconcile"))).toMatchObject({ status: "unavailable" });
+    expect(s.starts).toEqual([]);
+    await s.executor.sweep();
     const second = await s.execute(lifecycleCommand("exec-after-fail"));
-    expect(second).toMatchObject({ status: "completed" });
+    expect(second).toMatchObject({ status: "completed", sandboxId });
     expect(s.starts).toHaveLength(1);
-    expect(s.starts[0]?.sandboxId).toBe(warn?.meta?.sandboxId);
+    expect(s.boat.callsOf("resume").map((call) => call.args.sandboxId)).toEqual([sandboxId]);
   });
 
   it("guest ineligible at lifecycle prepare: named step and code in result and log", async () => {

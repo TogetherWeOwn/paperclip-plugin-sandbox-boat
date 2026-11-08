@@ -824,18 +824,16 @@ export class SshOffloadRuntime {
     const sync = new SshOffloadSync({ ssh: this.deps.ssh, session, sourceRoot, trackedFiles: this.deps.trackedFiles, artifactRoot,
       workRoot: this.deps.guestOptions?.stateRoot,
       refreshSession });
-    const uvVenvRoot = async (cmd: OffloadCommand): Promise<string | null> => {
-      if ((cmd.tool ?? "cargo") !== "python") return null;
-      const native = this.bindings.get(key(cmd.companyId, cmd.runId, cmd.executionWorkspaceId ?? ""));
-      if (!native || native.repoId !== cmd.repoId || native.environmentId !== binding.environmentId) return null;
-      const checked = checkDepSelection(cmd);
-      if (!checked) return null;
-      const plan = await planDependencies(native.source, cmd.tool, checked.selection).catch(() => null);
-      // A refused live probe is not evidence of a pip plan. In particular,
-      // losing a uv manifest after capture must not select system Python.
-      if (!plan) throw offloadError("OFFLOAD_GUEST_INELIGIBLE", "python_dependency_plan_gate");
-      if (!plan.installs.some((item) => item.lockfile === "uv.lock")) return null;
-      return sync.directory(cmd);
+    const uvVenvRoot = async (cmd: OffloadCommand, sandboxId: string): Promise<string | null> => {
+      // Freezing the default interpreter does not waive explicit selection's
+      // live refusal gate. An invalid selected plan must fail before any RPC.
+      if (cmd.depSelection !== undefined) {
+        const checked = checkDepSelection(cmd);
+        if (!checked || !await planDependencies(await sourceRoot(cmd), cmd.tool, checked.selection)) {
+          throw new Error("Offload dependency selection is invalid; refusing guest execution");
+        }
+      }
+      return sync.uvVenvRoot(sandboxId, cmd);
     };
     const guest = new SshOffloadGuest({ ssh: this.deps.ssh, session, refreshSession, cgroupParent,
       closing: () => this.closing,
@@ -862,6 +860,7 @@ export class SshOffloadRuntime {
       // A plain dep, not persisted config, so pool snapshots stay
       // structured-cloneable. Never throws: cleanup must not lose a receipt.
       onVmReleased: async (sandboxId: string) => {
+        sync.invalidateSandbox(sandboxId);
         sessions.delete(sandboxId);
         await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
       },
@@ -886,7 +885,7 @@ export class SshOffloadRuntime {
       resolveRunState: async (companyId, runId) => ({
         permanentlyTerminal: this.runEnded(companyId, runId), terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
       }),
-      sync: { push: (vm, cmd) => sync.push(vm, cmd),
+      sync: { push: (vm, cmd) => sync.push(vm, cmd), sandboxStopped: (vm) => sync.sandboxStopped(vm),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
@@ -1015,7 +1014,7 @@ export class SshOffloadRuntime {
     // Fields a concurrent claim changes; compared against a reload before
     // saving so the sweep never overwrites a reservation made from a snapshot
     // taken before this upkeep's fence existed.
-    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined,
+    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.syncInFlight,
       vm.stopDueAt, vm.accountReservation?.id, vm.deletePending, vm.pendingCreate]);
     // Placeholders without a provider ID key on their durable reservation,
     // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
@@ -1101,6 +1100,7 @@ export class SshOffloadRuntime {
           vm.stopping = false;
           vm.stopped = true;
           vm.quarantined = false;
+          vm.syncInFlight = false;
           vm.workspaceKey = null;
         }
         changed = true;
@@ -1113,8 +1113,8 @@ export class SshOffloadRuntime {
       // while it stays fenced, and the terminal observation above releases its
       // slot once Boat archives it. VMs with an identity need a guest observe
       // this path cannot do, so they wait for a loaded executor.
-      if (!vm.stopping && !pastDue) continue;
-      if (vm.quarantined && vm.identity) continue;
+      if (!vm.stopping && !pastDue && !vm.syncInFlight) continue;
+      if (vm.quarantined && vm.identity && !vm.syncInFlight) continue;
       try {
         await boat.stop({ sandboxId: vm.sandboxId });
       } catch { continue; }
