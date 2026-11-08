@@ -543,8 +543,10 @@ hold capacity only until their provider TTL plus 10 minutes, then retire as
   * per card;
   * per VM;
   * per run, in seconds and dollars;
-  * the last budget snapshot.
-* `refresh=0` skips the live re-read. By default, run windows read right at a stop are read again, because the meter can lag.
+  * `budget`: a cached successful environment-probe observation for this company, or `null`.
+* The budget observation includes `snapshot`, the completion time `at`, and `provenance` (`environmentId`, `apiBase`, and `credentialSource`, either `inline` or `host`). It reports account-level provider limits, not a company allocation. The latest completed successful probe among eligible environments is selected, even when completion timestamps tie; another eligible environment can supply the observation if the latest source is invalidated. Credential values and account digests are never returned.
+* Observations are worker-local and start empty after restart. A changed operations credential, API base or credential source invalidates the environment's observation when its config is next seen; a missing or changed host credential is also checked on usage reads. A pending result from a replaced source is not retained. An unsuccessful probe on an unchanged source keeps the earlier successful observation and its original timestamp. There is no age-based expiry: `at` describes freshness, not a promise of current provider capacity. Usage reads do not fetch provider limits; run an environment probe to update them. The account-wide admission ledger remains independent of these observations.
+* `refresh=0` skips the live usage-meter re-read, not the provenance checks above. By default, run windows read right at a stop are read again, because the meter can lag.
 * `POST .../api/sweep` runs the sweep now.
 
 ### Included-capacity telemetry
