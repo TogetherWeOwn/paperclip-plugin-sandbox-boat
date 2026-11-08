@@ -400,10 +400,41 @@ describe.each(["poll", "submit recovery", "initial verify", "verify recovery", "
       if (response) t.response.resolve(response);
       else t.response.reject(new Error("read lost"));
       expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
-      expectOriginalIdOnly(t, true);
+      const verificationRejected = (path === "initial verify" || path === "verify recovery") && response?.ok
+        && (response.status === 409 || (response.status === 400 && (response.json as { detail?: string }).detail === "invalid argv"));
+      expectOriginalIdOnly(t, !verificationRejected);
       expect(t.sleeps).toEqual([]);
     }
   });
+
+  if (path === "initial verify" || path === "verify recovery") {
+    const rejections: HttpResult[] = [
+      { ok: true, status: 409, json: errorBody("OFFLOAD_IDEMPOTENCY_CONFLICT") },
+      { ok: true, status: 400, json: errorBody("OFFLOAD_INVALID_REQUEST", { detail: "invalid argv" }) },
+    ];
+
+    it.each(["SIGINT", "SIGTERM"] as const)("exits on the first %s without cancelling a rejected payload", async (signal) => {
+      for (const response of rejections) {
+        const t = pendingRead();
+        await t.entered;
+        t.fireSignal(signal);
+        t.fireSignal(signal === "SIGINT" ? "SIGTERM" : "SIGINT");
+        t.response.resolve(response);
+        expect(await t.run).toBe(signal === "SIGINT" ? 130 : 143);
+        expectOriginalIdOnly(t, false);
+        expect(t.sleeps).toEqual([]);
+      }
+    });
+
+    it.each(rejections)("retains payload rejection HTTP $status without a signal", async (response) => {
+      const t = pendingRead();
+      await t.entered;
+      t.response.resolve(response);
+      expect(await t.run).toBe(64);
+      expectOriginalIdOnly(t, false);
+      expect(t.sleeps).toEqual([]);
+    });
+  }
 
   it.each([0, 101])("retains terminal exit %s without a signal", async (exitCode) => {
     const t = pendingRead();
