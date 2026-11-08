@@ -30,7 +30,7 @@ export interface DepInstall {
 
 export interface DepPlan {
   installs: DepInstall[];
-  /** Combined sha256 over lockfiles and any explicit selection/manifest. */
+  /** Combined sha256 over lockfiles, uv manifest bytes and explicit selection. */
   hash: string;
 }
 
@@ -183,11 +183,21 @@ export async function planDependencies(sourceRoot: string, tool?: string, select
     if (matched && count === 1) found.push({ lockfile: matched.file, install: matched.install });
   }
   if (ambiguous || unreadable || found.length === 0) return null;
-  if (selection) {
+  if (selection && !uvLock) return null;
+  if (uvLock) {
+    // Frozen sync still reads manifest settings such as default-groups. Hash
+    // all bytes conservatively, using the same bounded no-follow probe as
+    // explicit extras. uv sync needs a project manifest: missing or unsafe
+    // inputs stay local rather than reuse a previously trusted identity.
     const manifest = await readProbeFile(path.join(sourceRoot, "pyproject.toml"), MAX_UV_EXTRA_MANIFEST_BYTES);
-    if (!uvLock || manifest.kind !== "ok" || !await supportsLockedUvTestExtra(manifest.bytes, uvLock)) return null;
-    found[0] = { lockfile: "uv.lock", install: ["uv", "sync", "--frozen", "--extra", "test"] };
-    hash.update("uv-extra\0test\0pyproject.toml\0");
+    if (manifest.kind !== "ok") return null;
+    if (selection) {
+      if (!await supportsLockedUvTestExtra(manifest.bytes, uvLock)) return null;
+      found[0] = { lockfile: "uv.lock", install: ["uv", "sync", "--frozen", "--extra", "test"] };
+      hash.update("uv-extra\0test\0pyproject.toml\0");
+    } else {
+      hash.update("uv-default\0pyproject.toml\0");
+    }
     hash.update(manifest.bytes);
     hash.update("\0");
   }
