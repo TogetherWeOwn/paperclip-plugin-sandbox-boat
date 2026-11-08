@@ -91,7 +91,7 @@ describe("installDependencies", () => {
   describe("pip active environment caching", () => {
     const pyCmd = () => command({ tool: "python", runner: "pytest", profileId: "python-public-1", argv: ["tests/"] });
     const reqs = (name: string) => source({ "requirements.txt": `pytest==${name === "a" ? "7.4.2" : "8.0.0"} \\\n    --hash=sha256:${name}\n` });
-    type Result = { exitCode: number | null; timedOut: boolean; signal: string | null; stdout: string };
+    type Result = { exitCode: number | null; timedOut: boolean; signal: string | null; stdout: string; cleanupVerified?: boolean };
     const ok: Result = { exitCode: 0, timedOut: false, signal: null, stdout: "" };
 
     function build(root: string, results: Array<Result | Error> = []) {
@@ -146,7 +146,7 @@ describe("installDependencies", () => {
     it("keeps a nonzero-exit B retryable and reinstalls A afterwards", async () => {
       const a = reqs("a");
       const b = reqs("b");
-      const { ssh, make } = build(a, [ok, { exitCode: 1, timedOut: false, signal: null, stdout: "boom" }]);
+      const { ssh, make } = build(a, [ok, { exitCode: 1, timedOut: false, signal: null, stdout: "boom", cleanupVerified: true }]);
       const sync = make();
       await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
       await expect(sync.installDependencies("vm-1", pyCmd(), b, "/guest/work")).rejects.toThrow(/install failed/i);
@@ -155,7 +155,32 @@ describe("installDependencies", () => {
       expect(ssh.runStream).toHaveBeenCalledTimes(3);
     });
 
+    it("retries after verified timeout cleanup without retaining the previous active plan", async () => {
+      const a = reqs("a");
+      const { ssh, make } = build(a, [ok, { exitCode: null, timedOut: true, signal: "SIGTERM", stdout: "", cleanupVerified: true }]);
+      const sync = make();
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      await expect(sync.installDependencies("vm-1", pyCmd(), reqs("b"), "/guest/work")).rejects.toThrow(/install failed/i);
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    });
+
+    it("invalidates active pip identity on a proven stop of only that sandbox", async () => {
+      const a = reqs("a");
+      const { ssh, make } = build(a);
+      const sync = make();
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
+      sync.sandboxStopped("vm-1");
+      await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(2);
+      await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+      expect(ssh.runStream).toHaveBeenCalledTimes(3);
+    });
+
     const ambiguous: Array<[string, Result | Error]> = [
+      ["exit 1 with unverified cleanup", { exitCode: 1, timedOut: false, signal: null, stdout: "", cleanupVerified: false }],
+      ["exit 1 without cleanup proof", { exitCode: 1, timedOut: false, signal: null, stdout: "" }],
       ["SSH exit 255", { exitCode: 255, timedOut: false, signal: null, stdout: "" }],
       ["a missing exit status", { exitCode: null, timedOut: false, signal: null, stdout: "" }],
       ["a timeout", { exitCode: null, timedOut: true, signal: null, stdout: "" }],
@@ -175,11 +200,17 @@ describe("installDependencies", () => {
         // so a possibly still-running installer is never raced.
         await expect(sync.installDependencies("vm-1", pyCmd(), a, "/guest/work")).rejects.toThrow();
         expect(ssh.runStream).toHaveBeenCalledTimes(2);
+        sync.invalidateSandbox("vm-1"); // closing SSH is not proof of cancellation
+        await expect(sync.installDependencies("vm-1", pyCmd(), a, "/guest/work")).rejects.toThrow(/completion unknown/);
+        expect(ssh.runStream).toHaveBeenCalledTimes(2);
         // Another VM is a different scope and stays usable.
         await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
         expect(ssh.runStream).toHaveBeenCalledTimes(3);
         await sync.installDependencies("vm-2", pyCmd(), a, "/guest/work");
         expect(ssh.runStream).toHaveBeenCalledTimes(3);
+        sync.sandboxStopped("vm-1"); // terminal provider proof permits a safe new boot
+        await sync.installDependencies("vm-1", pyCmd(), a, "/guest/work");
+        expect(ssh.runStream).toHaveBeenCalledTimes(4);
       });
     }
 

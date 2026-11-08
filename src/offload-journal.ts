@@ -69,6 +69,8 @@ export interface OffloadRunState {
 
 export interface OffloadSync {
   push(sandboxId: string, command: OffloadCommand): Promise<void>;
+  // Only a provider-confirmed stop/delete proves all sync-side work is gone.
+  sandboxStopped?(sandboxId: string): void;
   // Collection is adapter-owned data; orchestration passes it to stage intact.
   collect(sandboxId: string, command: OffloadCommand): Promise<unknown>;
   stage(sandboxId: string, command: OffloadCommand, collected: unknown): Promise<OffloadSyncBack | void>;

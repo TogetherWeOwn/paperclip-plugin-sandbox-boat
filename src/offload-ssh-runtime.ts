@@ -860,6 +860,7 @@ export class SshOffloadRuntime {
       // A plain dep, not persisted config, so pool snapshots stay
       // structured-cloneable. Never throws: cleanup must not lose a receipt.
       onVmReleased: async (sandboxId: string) => {
+        sync.invalidateSandbox(sandboxId);
         sessions.delete(sandboxId);
         await this.deps.ssh.closeSession(sandboxId).catch(() => undefined);
       },
@@ -884,7 +885,7 @@ export class SshOffloadRuntime {
       resolveRunState: async (companyId, runId) => ({
         permanentlyTerminal: this.runEnded(companyId, runId), terminatedAt: null, tokenExpiresAt: binding.seenAt + 24 * 60 * 60_000,
       }),
-      sync: { push: (vm, cmd) => sync.push(vm, cmd),
+      sync: { push: (vm, cmd) => sync.push(vm, cmd), sandboxStopped: (vm) => sync.sandboxStopped(vm),
         collect: (vm, cmd) => sync.collect(vm, cmd), stage: (vm, cmd, collected) => sync.stage(vm, cmd, collected),
         discard: (vm, cmd) => sync.discard(vm, cmd), markSuspect: (vm, cmd) => sync.markSuspect(vm, cmd) },
     });
@@ -1013,7 +1014,7 @@ export class SshOffloadRuntime {
     // Fields a concurrent claim changes; compared against a reload before
     // saving so the sweep never overwrites a reservation made from a snapshot
     // taken before this upkeep's fence existed.
-    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.stopDueAt]);
+    const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.syncInFlight, vm.stopDueAt]);
     // Placeholders without a provider ID key on their durable reservation,
     // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
     const vmKey = (vm: PoolVm) => vm.sandboxId || vm.accountReservation?.id || "";
@@ -1059,6 +1060,7 @@ export class SshOffloadRuntime {
           vm.stopping = false;
           vm.stopped = true;
           vm.quarantined = false;
+          vm.syncInFlight = false;
           vm.workspaceKey = null;
         }
         changed = true;
@@ -1071,8 +1073,8 @@ export class SshOffloadRuntime {
       // while it stays fenced, and the terminal observation above releases its
       // slot once Boat archives it. VMs with an identity need a guest observe
       // this path cannot do, so they wait for a loaded executor.
-      if (!vm.stopping && !pastDue) continue;
-      if (vm.quarantined && vm.identity) continue;
+      if (!vm.stopping && !pastDue && !vm.syncInFlight) continue;
+      if (vm.quarantined && vm.identity && !vm.syncInFlight) continue;
       try {
         await boat.stop({ sandboxId: vm.sandboxId });
       } catch { continue; }

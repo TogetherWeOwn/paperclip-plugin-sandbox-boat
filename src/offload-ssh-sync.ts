@@ -84,7 +84,7 @@ export class SshOffloadSync implements OffloadSync {
   private readonly previousGuestScans = new Map<string, Map<string, GuestFileState>>();
   /** Only the active verified install, never historical membership or guest-writable markers. */
   private readonly installed = new Map<string, InstalledDependencies>();
-  /** A transport failure can leave an installer writing; never reuse that scope in this worker. */
+  /** Unverified installer cleanup fences the whole VM until a proven stop. */
   private readonly uncertainInstalls = new Set<string>();
   constructor(private readonly deps: SshOffloadSyncDeps) {}
   private now(): number { return (this.deps.now ?? Date.now)(); }
@@ -124,6 +124,9 @@ export class SshOffloadSync implements OffloadSync {
       const guestDir = this.directory(command);
       const mirrorKey = this.mirrorKey(command);
       await this.withMirrorLock(mirrorKey, async () => {
+        // Fence before verification can lead to upload/prune/wipe, not merely
+        // before the replacement install. Session refresh is not a VM fence.
+        this.requireFencedInstaller(sandboxId);
         await this.pushLocked(sandboxId, guestDir, mirrorKey, manifest, frozen);
         // Plan from the exact bytes uploaded, not a live tree that can change during SSH.
         const dependencies = await this.installDependencies(sandboxId, command, frozen, guestDir);
@@ -217,9 +220,11 @@ export class SshOffloadSync implements OffloadSync {
     const trusted = stored !== null && marker !== null
       && marker.mirrorKey === key && marker.manifestHash === hashManifest(stored);
     // The wipe, or a lost mirror (no marker: new machine, /tmp not in the boat
-    // snapshot), removed checkout-local installs too; the install must run again.
+    // snapshot), may have removed the shared /tmp Python user base as well.
+    // Invalidate reuse without clearing any installer uncertainty.
     // It also removed every guest-only output the stored scan remembers.
     if (marker === null) {
+      this.installed.delete(`vm:${sandboxId}:${guestPythonUserBase(this.deps.workRoot ?? "/tmp", sandboxId)}`);
       this.installed.delete(`mirror:${sandboxId}:${guestDir}`);
       this.previousGuestScans.delete(baseKey);
     }
@@ -271,9 +276,7 @@ export class SshOffloadSync implements OffloadSync {
     const userBase = guestPythonUserBase(this.deps.workRoot ?? "/tmp", sandboxId);
     const installedKey = checkoutLocal ? `mirror:${sandboxId}:${guestDir}` : `vm:${sandboxId}:${userBase}`;
     return this.withMirrorLock(`install:${installedKey}`, async () => {
-      if (this.uncertainInstalls.has(installedKey)) {
-        throw new Error("Offload dependency install completion unknown; refusing environment reuse");
-      }
+      this.requireFencedInstaller(sandboxId);
       const active = this.installed.get(installedKey);
       if (active?.hash === plan.hash) return active;
       const session = await this.deps.session(sandboxId);
@@ -290,13 +293,13 @@ export class SshOffloadSync implements OffloadSync {
         result = await this.deps.ssh.runStream(session,
           buildRemoteCommand(`exec sh -c ${shellQuote(script)}`), { timeoutMs: 600_000, maxOutputBytes: 1_048_576 });
       } catch (error) {
-        this.uncertainInstalls.add(installedKey);
+        this.uncertainInstalls.add(sandboxId);
         throw error;
       }
-      if (result.timedOut || result.signal || result.exitCode === 255 || result.exitCode === null) {
-        this.uncertainInstalls.add(installedKey);
-      }
-      if (result.exitCode !== 0 || result.timedOut || result.signal) {
+      if (result.exitCode !== 0 || result.timedOut || result.signal || result.cleanupVerified === false) {
+        // A nonzero payload status does not prove its detached children died.
+        // Only the supervised transport's verified cancellation permits retry.
+        if (result.cleanupVerified !== true) this.uncertainInstalls.add(sandboxId);
         throw new Error("Offload dependency install failed; no command ran");
       }
       const installed = { scope: installedKey, hash: plan.hash,
@@ -304,6 +307,22 @@ export class SshOffloadSync implements OffloadSync {
       this.installed.set(installedKey, installed);
       return installed;
     });
+  }
+  private requireFencedInstaller(sandboxId: string): void {
+    if (this.uncertainInstalls.has(sandboxId)) {
+      throw new Error("Offload dependency install completion unknown; refusing environment reuse");
+    }
+  }
+  /** Session closure invalidates reuse, but cannot prove an installer is dead. */
+  invalidateSandbox(sandboxId: string): void {
+    for (const key of this.installed.keys()) {
+      if (key.startsWith(`mirror:${sandboxId}:`) || key.startsWith(`vm:${sandboxId}:`)) this.installed.delete(key);
+    }
+  }
+  /** Called only after the provider proves the old boot stopped or was deleted. */
+  sandboxStopped(sandboxId: string): void {
+    this.invalidateSandbox(sandboxId);
+    this.uncertainInstalls.delete(sandboxId);
   }
   /** Runtime identity belongs to a successful upload on this sandbox, not the live source. */
   async uvVenvRoot(sandboxId: string, command: OffloadCommand): Promise<string | null> {

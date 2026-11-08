@@ -13,6 +13,9 @@ export interface PoolVm {
   stopped: boolean;
   stopping: boolean;
   quarantined: boolean;
+  // Persisted before sync can start receivers/installers outside the command
+  // cgroup. A crash or failure requires a terminal provider fence before reuse.
+  syncInFlight?: boolean;
   // Ephemeral VM whose provider delete (or its ledger receipt) failed:
   // quarantined against reuse, retried by sweep and shutdown until retired.
   deletePending?: boolean;
@@ -81,6 +84,7 @@ export class OffloadPoolStore {
         || (vm.sandboxId === "" && !vm.accountReservation?.id)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
         || (vm.deletePending !== undefined && typeof vm.deletePending !== "boolean")
+        || (vm.syncInFlight !== undefined && typeof vm.syncInFlight !== "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
         || !Number.isSafeInteger(vm.generation) || vm.generation < 0 || !Number.isSafeInteger(vm.stopAttempts) || vm.stopAttempts < 0
