@@ -280,7 +280,7 @@ describe("runtime admission and venv agreement", () => {
     const source = tree(uvFiles());
     const { runtime, config, seen } = backend(source);
     try {
-      const cmd = backendCommand({ depSelection: SELECTED, runner: "python" });
+      const cmd = backendCommand({ depSelection: SELECTED, runner: "python", argv: ["-m", "pytest", "tests/"] });
       expect(await runtime.preflight(cmd, config)).toBeNull();
       expect(await refusalOf(runtime, config, cmd)).toBeNull();
       const pool = [...(runtime as unknown as { pools: Map<string, never> }).pools.values()][0] as unknown as {
