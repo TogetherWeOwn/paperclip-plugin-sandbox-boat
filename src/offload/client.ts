@@ -450,6 +450,9 @@ export async function runOffload(request: ShimRequest, deps: ClientDeps): Promis
     if (pending) return signalExit(pending);
   }
 
+  // A replayed signal must stop before any fresh submit or local fallback.
+  // Existing pinned receipts above still use original-ID cancellation/recovery.
+  if (pending) return signalExit(pending);
   const env = buildEnv(request.processEnv, tool);
   if (env.local) {
     if (request.allowLocalFallback === false) return refuseLocal(request, deps, env.reason);

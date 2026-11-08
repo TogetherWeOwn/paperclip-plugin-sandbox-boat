@@ -273,11 +273,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // with 128+N; recording it for later would let the build finish and exit 0.
   let pendingSignal: "SIGINT" | "SIGTERM" | null = null;
   let killChild: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
+  let clientSignalHandler: ((signal: "SIGINT" | "SIGTERM") => void) | null = null;
   deps.onSignal((signal) => {
     pendingSignal ??= signal;
     killChild?.(signal);
+    clientSignalHandler?.(signal);
   });
   const spawnLocal = async (exe: string, argv: string[], env: Record<string, string>): Promise<number> => {
+    if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     const result = await deps.spawn(exe, argv, env, {
       onSpawn: (kill) => {
         killChild = kill;
@@ -344,7 +347,11 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     sleep: deps.sleep,
     stdout: deps.stdout,
     stderr: deps.stderr,
-    onSignal: deps.onSignal,
+    onSignal: (handler) => {
+      // Classification may have observed cancellation before the client existed.
+      clientSignalHandler = handler;
+      if (pendingSignal) handler(pendingSignal);
+    },
     randomId: () => commandId,
     runLocal: (argv) => (pinnedReal ? Promise.resolve(refusePinned("local run")) : runLocalMeasured(argv)),
     reportStaged: (syncBack) => {
@@ -363,14 +370,17 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
   // A remote-candidate command that ends up running locally teaches the
   // server duration gate. Cargo never reports; pre-opt-in runs never report.
   const runLocalMeasured = async (argv: string[]): Promise<number> => {
+    if (pendingSignal) return SIGNAL_EXIT[pendingSignal]!;
     if (tool.tool === "cargo") return runLocal(argv);
     const startedAt = deps.now();
+    let exit: number;
     try {
-      return await runLocal(argv);
+      exit = await runLocal(argv);
     } finally {
       const seconds = Math.max(0, (deps.now() - startedAt) / 1000);
       await reportDuration(request, clientDeps, seconds);
     }
+    return pendingSignal ? SIGNAL_EXIT[pendingSignal]! : exit;
   };
 
   if (diagnostic && dryRun) {
