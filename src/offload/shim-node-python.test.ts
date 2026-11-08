@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HttpResult } from "./client.js";
-import { NODE_SHIM, PYTHON_SHIM, shimMain, type ShimDeps } from "./shim-main.js";
+import { CARGO_SHIM, NODE_SHIM, PYTHON_SHIM, shimMain, type ShimDeps } from "./shim-main.js";
 
 const CMD = "7d82278c-2ba7-4e68-96ab-a2cc10b697af";
 const WS = "b9d0e6ac-a14e-4440-a324-7dcdd758be08";
@@ -91,6 +91,100 @@ describe("python shim passthrough (installed as pytest)", () => {
     const exit = await shimMain(asPytest, ["tests/test_a.py::test_x"], t.deps, PYTHON_SHIM);
     expect(exit).toBe(0);
     // Prefilter-local (node id): no server round trip at all.
+    expect(t.deps.http.post).not.toHaveBeenCalled();
+  });
+});
+
+describe.each([CARGO_SHIM, NODE_SHIM, PYTHON_SHIM])("$tool shim re-entry", (tool) => {
+  describe.each(tool.exeNames)("runner %s", (runner) => {
+    const script = `/opt/boat-offload/bin/${tool.diagnosticName}`;
+    const argv = ["test"];
+    const diagnosticArgs = ["--runner", runner, "--", ...argv];
+
+    describe.each(["diagnostic", "passthrough"])("%s", (mode) => {
+      const entry = mode === "diagnostic" ? script : `/opt/boat-offload/bin/${runner}`;
+      const args = mode === "diagnostic" ? diagnosticArgs : argv;
+
+      it.each(["SIGINT", "SIGTERM"] as const)("forwards %s before and after onSpawn, and waits for child completion", async (signal) => {
+        for (const beforeSpawn of [true, false]) {
+          const t = setup(tool, entry, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
+          let handler: ((signal: "SIGINT" | "SIGTERM") => void) | undefined;
+          t.deps.onSignal = (h) => { handler = h; };
+          const kill = vi.fn();
+          let finish!: (result: { code: number; signal: null }) => void;
+          const child = new Promise<{ code: number; signal: null }>((resolve) => { finish = resolve; });
+          t.deps.spawn = vi.fn((_exe, _argv, _env, options) => {
+            expect(handler).toBeTypeOf("function");
+            if (beforeSpawn) handler!(signal);
+            options?.onSpawn?.(kill);
+            if (!beforeSpawn) handler!(signal);
+            return child;
+          });
+          let settled = false;
+          const result = shimMain(entry, args, t.deps, tool).then((exit) => {
+            settled = true;
+            return exit;
+          });
+          expect(kill).toHaveBeenCalledExactlyOnceWith(signal);
+          await Promise.resolve();
+          expect(settled).toBe(false);
+          finish({ code: 0, signal: null });
+          expect(await result).toBe(signal === "SIGINT" ? 130 : 143);
+          expect(t.deps.spawn).toHaveBeenCalledExactlyOnceWith(`/usr/local/bin/${runner}`, argv,
+            expect.objectContaining({ PATH: "/usr/local/bin:/usr/bin", BOAT_OFFLOAD_SHIM_ACTIVE: "1" }),
+            expect.objectContaining({ onSpawn: expect.any(Function) }));
+          handler!(signal);
+          expect(kill).toHaveBeenCalledTimes(1);
+          expect(t.deps.http.post).not.toHaveBeenCalled();
+          expect(t.deps.http.get).not.toHaveBeenCalled();
+        }
+      });
+
+      it("refuses a pinned command without spawning or calling the broker", async () => {
+        const t = setup(tool, entry, { BOAT_OFFLOAD_SHIM_ACTIVE: "1", BOAT_OFFLOAD_COMMAND_ID: CMD });
+        expect(await shimMain(entry, args, t.deps, tool)).toBe(75);
+        expect(t.stderrText()).toContain("shim re-entry");
+        expect(t.deps.spawn).not.toHaveBeenCalled();
+        expect(t.deps.http.post).not.toHaveBeenCalled();
+        expect(t.deps.http.get).not.toHaveBeenCalled();
+      });
+    });
+
+    it.each([
+      { code: 23, signal: null, expected: 23 },
+      { code: null, signal: "SIGINT", expected: 130 },
+      { code: null, signal: "SIGTERM", expected: 143 },
+    ])("preserves child exit $expected without a parent signal", async ({ code, signal, expected }) => {
+      const t = setup(tool, script, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
+      t.deps.spawn = vi.fn(async () => ({ code, signal }));
+      expect(await shimMain(script, diagnosticArgs, t.deps, tool)).toBe(expected);
+      expect(t.deps.spawn).toHaveBeenCalledOnce();
+      expect(t.deps.http.post).not.toHaveBeenCalled();
+    });
+
+    it("keeps diagnostic dry-run as discovery while active", async () => {
+      const t = setup(tool, script, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
+      expect(await shimMain(script, ["--dry-run", ...diagnosticArgs], t.deps, tool)).toBe(0);
+      expect(t.deps.spawn).not.toHaveBeenCalled();
+      expect(t.deps.http.post).toHaveBeenCalledExactlyOnceWith("/offload/exec", expect.objectContaining({ dryRun: true, runner }));
+    });
+
+    it("reports a missing real runner without spawning", async () => {
+      const t = setup(tool, script, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
+      t.deps.findExecutable = () => null;
+      expect(await shimMain(script, diagnosticArgs, t.deps, tool)).toBe(127);
+      expect(t.stderrText()).toContain(`no real ${runner} on PATH`);
+      expect(t.deps.spawn).not.toHaveBeenCalled();
+      expect(t.deps.http.post).not.toHaveBeenCalled();
+    });
+  });
+
+  it("keeps help side-effect free while active", async () => {
+    const script = `/opt/boat-offload/bin/${tool.diagnosticName}`;
+    const t = setup(tool, script, { BOAT_OFFLOAD_SHIM_ACTIVE: "1" });
+    expect(await shimMain(script, ["--help"], t.deps, tool)).toBe(0);
+    expect(t.stdoutText()).toContain(tool.diagnosticName);
+    expect(t.deps.spawn).not.toHaveBeenCalled();
     expect(t.deps.http.post).not.toHaveBeenCalled();
   });
 });

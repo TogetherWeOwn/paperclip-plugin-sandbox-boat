@@ -239,17 +239,6 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
       }
     }
     toolArgv = dash >= 0 ? args.slice(dash + 1) : [];
-    // Explicit diagnostic invocation bypasses BOAT_OFFLOAD, but re-entry still
-    // short-circuits: a fallbacked command must never route back into the shim.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) {
-      if (pinnedId) return refusePinned("shim re-entry");
-      const real = resolveRealExe(shimDir, scriptPath, deps.env.PATH ?? "", runner, deps);
-      if (!real) {
-        writeStderr(`${diag}: no real ${runner} on PATH\n`);
-        return 127;
-      }
-      return spawnExit(await deps.spawn(real, toolArgv, fallbackEnv(deps.env, shimDir)));
-    }
   } else {
     toolArgv = args;
   }
@@ -285,10 +274,14 @@ export async function shimMain(scriptPath: string, args: string[], deps: ShimDep
     return spawnLocal(realExe, argv, localEnv);
   };
 
+  // Diagnostic execution bypasses BOAT_OFFLOAD, but both entry modes must
+  // short-circuit re-entry through the signal-aware local path. Dry-run still
+  // performs discovery without spawning.
+  if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1" && !dryRun) return pinnedReal ? refusePinned("shim re-entry") : runLocal(toolArgv);
+
   const workspaceId = deps.env.PAPERCLIP_WORKSPACE_ID;
   if (!diagnostic) {
-    // Passthrough gating: strict opt-in, re-entry guard, workspace binding.
-    if (deps.env.BOAT_OFFLOAD_SHIM_ACTIVE === "1") return pinnedReal ? refusePinned("shim re-entry") : runLocal(toolArgv);
+    // Passthrough gating: strict opt-in, workspace binding.
     if (deps.env.BOAT_OFFLOAD !== "1") return pinnedReal ? refusePinned("BOAT_OFFLOAD is not 1") : runLocal(toolArgv);
     if (!workspaceId) return pinnedReal ? refusePinned("no workspace binding") : runLocal(toolArgv);
   } else if (!workspaceId) {
