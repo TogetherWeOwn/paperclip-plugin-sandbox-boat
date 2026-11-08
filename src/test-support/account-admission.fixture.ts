@@ -8,6 +8,7 @@ import type { BoatApiLike } from "../boat-client.js";
 import type { StateClientLike } from "../state.js";
 import { FakeBoat, trialLimits } from "./fake-boat.js";
 import { FakeSsh } from "./harness.js";
+export { includedPlan } from "./fake-boat.js";
 
 const spawnMock = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", async () => {

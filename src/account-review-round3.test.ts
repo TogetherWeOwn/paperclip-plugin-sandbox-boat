@@ -4,7 +4,7 @@ import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { parseDriverConfig } from "./config.js";
-import { COMPANY, EPOCH, advance, fixture, limits } from "./test-support/account-admission.fixture.js";
+import { COMPANY, EPOCH, advance, fixture, includedPlan, limits } from "./test-support/account-admission.fixture.js";
 
 let f: ReturnType<typeof fixture>;
 beforeEach(() => {
@@ -84,10 +84,10 @@ describe("credential-bound reconciliation", () => {
   it("does not reflect one account's counters against the other account's hold", async () => {
     const { other, manager, b } = await twoAccounts();
     await advance(6_000);
-    f.boat.limitsResponse = limits({ activeSandboxes: 1, creditUsedSeconds: 6 });
+    f.boat.limitsResponse = limits({ activeSandboxes: 1, planIncluded: includedPlan(90_000 - 6) });
     // Different keys may alias the same provider account. Identical cumulative
     // deltas must never refund two separate holds for the same six paid seconds.
-    other.limitsResponse = limits({ activeSandboxes: 1, creditUsedSeconds: 6 });
+    other.limitsResponse = limits({ activeSandboxes: 1, planIncluded: includedPlan(90_000 - 6) });
     await manager.sweep("credential-counters", { force: true });
     expect(other.boxes.get(b)?.state).toBe("ready");
     expect(journal().intents.find((i) => i.sandboxId === b)).toMatchObject({ active: true, activeReflected: false, computeReflected: 0 });

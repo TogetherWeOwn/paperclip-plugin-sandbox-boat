@@ -5,7 +5,7 @@ import type { BoatApiLike } from "./boat-client.js";
 import type { BoatSize } from "./config.js";
 import { BoatProviderError, describeBoatError } from "./errors.js";
 import type { StateClientLike } from "./state.js";
-import { BoatBudgetError, checkBudget, readBudget } from "./budget.js";
+import { BoatBudgetError, checkBudget, readBudget, readIncludedAllowance } from "./budget.js";
 import type { BudgetLimitName } from "./budget.js";
 
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 } as const;
@@ -74,6 +74,9 @@ interface Limits {
   canStart: boolean;
   available: number;
   used: number;
+  includedHours: number;
+  periodEndMs: number;
+  nextStartDollars: number;
   windows: Record<Window, StartWindow | null>;
   sizes: Array<{ type: string; available: boolean }>;
 }
@@ -99,6 +102,10 @@ interface Intent {
   reserveSeconds: number;
   endedAt: number | null;
   usageId: string | null;
+  predecessor?: {
+    intents: Array<Pick<Intent, "id" | "endedAt" | "compute">>;
+    usage: Array<Pick<AccountUsageRow, "usageRecordId" | "intervals" | "tailSince">>;
+  };
 }
 interface AccountDoc {
   version: 1;
@@ -126,7 +133,7 @@ export interface AdmissionRequest {
   /** Monthly offload VM-hour cap: enforced atomically with admission inside the ledger lock. */
   monthlyCap?: { companyId: string; nowMs: number; capHours: number };
 }
-export interface AccountReservation { id: string; tailSeconds: number; at: number }
+export interface AccountReservation { id: string; tailSeconds: number; at: number; periodEndMs?: number; observedAt?: number }
 
 function number(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error("limits unreadable: invalid numeric capacity");
@@ -143,11 +150,12 @@ function parseLimits(raw: unknown, at: number): Limits {
   if (!root || root.ok !== true) throw new Error("limits unreadable: invalid response");
   const nested = (root.upgradeEffects ?? {}) as Record<string, unknown>;
   const pkg = (root._package ?? nested._package ?? {}) as Record<string, unknown>;
-  const field = (key: string) => root[key] ?? nested[key] ?? pkg[key];
-  const used = number(field("creditUsedSeconds"));
-  const balance = number(field("creditBalanceSeconds"));
-  const trial = field("trialComputeCapSeconds");
-  const available = trial == null || trial === 0 ? balance : Math.min(balance, Math.max(0, number(trial) - used));
+  const field = (key: string) => root[key] !== undefined ? root[key] : nested[key] !== undefined ? nested[key] : pkg[key];
+  const included = readIncludedAllowance(field("planIncluded"));
+  if (!included || included.periodEndMs <= at) throw new Error("limits unreadable: missing current included allowance");
+  const available = included.remaining * 3600;
+  const used = (included.hours - included.remaining) * 3600;
+  const nextStartDollars = number(field("nextStartDollars"));
   const starts = field("starts") as Record<string, unknown> | undefined;
   if (!starts || typeof starts.unlimited !== "boolean" || typeof field("canStart") !== "boolean") throw new Error("limits unreadable: missing start capacity");
   const windows = {} as Limits["windows"];
@@ -160,7 +168,7 @@ function parseLimits(raw: unknown, at: number): Limits {
   const sizes = field("machineTypes");
   if (!Array.isArray(sizes)) throw new Error("limits unreadable: missing machine types");
   return { at, active: number(field("activeSandboxes")), activeCap: number(field("maxActiveSandboxes")), canStart: field("canStart") === true,
-    available, used, windows, sizes: sizes as Limits["sizes"] };
+    available, used, includedHours: included.hours, periodEndMs: included.periodEndMs, nextStartDollars, windows, sizes: sizes as Limits["sizes"] };
 }
 
 async function bounded<T>(fn: () => Promise<T>): Promise<T> {
@@ -308,15 +316,16 @@ export class AccountLedger {
   private async observe(api: BoatApiLike, doc: AccountDoc, allowCached = false, request?: AdmissionRequest): Promise<Limits> {
     const prior = this.observation(doc);
     const age = prior ? this.now() - prior.at : Infinity;
-    if (allowCached && age >= 0 && age <= 5000) return prior!;
+    if (allowCached && age >= 0 && age <= 5000 && prior!.periodEndMs > this.now()
+      && Number.isFinite(prior!.includedHours) && prior!.nextStartDollars === 0) return prior!;
     let current: Limits;
     try {
       const raw = await bounded(() => api.limits({}));
       // Preserve an actionable refusal even for a partial exhausted response.
-      // This legacy projection can only REFUSE; every admission still requires
-      // the complete, finite strict snapshot below.
+      // This projection can only REFUSE; every admission still requires the
+      // complete, finite strict snapshot below.
       if (request && request.operation !== "warm") {
-        const refusal = checkBudget(readBudget(raw), request, request.size);
+        const refusal = checkBudget(readBudget(raw), request, request.size, this.now());
         if (refusal) throw new BoatBudgetError(refusal);
       }
       current = parseLimits(raw, this.now());
@@ -331,7 +340,10 @@ export class AccountLedger {
     doc.observationOwner ??= doc.observation ? "unscoped" : scope;
     if (prior && doc.observationOwner === scope) {
       let activeDelta = Math.max(0, current.active - prior.active);
-      let computeDelta = Math.max(0, current.used - prior.used, prior.available - current.available);
+      // Rollover, plan changes and legacy observations cannot attribute a
+      // balance change to these holds. Retain their unreflected reservations.
+      const samePeriod = current.periodEndMs === prior.periodEndMs && current.includedHours === prior.includedHours;
+      let computeDelta = samePeriod ? Math.max(0, current.used - prior.used, prior.available - current.available) : 0;
       for (const intent of doc.intents) {
         if (intent.providerScope !== this.providerScope || intent.status === "rejected" || intent.settledAt == null) continue;
         if (activeDelta > 0 && intent.active && !intent.activeReflected) { intent.activeReflected = true; activeDelta--; }
@@ -366,12 +378,13 @@ export class AccountLedger {
     return intent.operation !== "warm" && intent.status !== "rejected" && !intent.starts[window].reflected &&
       intent.starts[window].expiresAt > at;
   }
-  private check(doc: AccountDoc, limits: Limits, req: AdmissionRequest, tailSeconds: number, ignore?: string): void {
+  private check(doc: AccountDoc, limits: Limits, req: AdmissionRequest, tailSeconds: number, ignore?: string,
+    prospectiveTtlSeconds = Math.max(60, Math.ceil(req.jobSeconds + tailSeconds))): void {
     for (const value of [req.jobSeconds, tailSeconds, req.maxActive, req.maxStartsPerDay, req.minComputeHoursLeft]) number(value);
     const refuse = (limit: BudgetLimitName, message: string): never => { throw new BoatBudgetError({ limit, message, details: {} }); };
     const intents = doc.intents.filter((i) => i.id !== ignore && i.status !== "rejected");
     if (req.operation !== "warm") {
-      if (!limits.canStart) refuse("boat_cannot_start", "provider refused admission");
+      if (!limits.canStart || limits.nextStartDollars !== 0) refuse("boat_cannot_start", "provider did not verify a zero-cost start");
       const active = limits.active + intents.filter((i) => i.active && !i.activeReflected).length;
       if (active + 1 > Math.min(req.maxActive, limits.activeCap)) refuse("maxActive", "account active capacity exhausted");
       for (const name of Object.keys(WINDOWS) as Window[]) {
@@ -382,6 +395,12 @@ export class AccountLedger {
           refuse(name === "day" ? "maxStartsPerDay" : name === "hour" ? "boatStartsPerHour" : "boatStartsPerMinute", `account ${name} start capacity exhausted`);
         }
       }
+    }
+    // No allowance beyond this billing boundary is known. Fund the complete
+    // preparation/command/idle envelope without assuming next period's plan.
+    if (!Number.isFinite(limits.periodEndMs) || !Number.isFinite(prospectiveTtlSeconds) || prospectiveTtlSeconds < 60
+      || this.now() + prospectiveTtlSeconds * 1000 > limits.periodEndMs) {
+      refuse("minComputeHoursLeft", "included billing period does not fund the complete lifetime");
     }
     const machine = limits.sizes.find((s) => s.type === req.size);
     if (!machine?.available) refuse("machineType", "unavailable size");
@@ -509,6 +528,14 @@ export class AccountLedger {
         compute: (req.jobSeconds + tailSeconds) * WEIGHT[req.size], computeReflected: 0, size: req.size, jobSeconds: req.jobSeconds,
         tailSeconds, ttlSeconds: Math.max(60, Math.ceil(req.jobSeconds + tailSeconds)),
         reserveSeconds: req.minComputeHoursLeft * 3600, endedAt: null, usageId: req.command ? id : null };
+      if (req.sandboxId && (req.operation === "warm" || req.operation === "resume")) {
+        intent.predecessor = {
+          intents: doc.intents.filter((i) => this.owns(i) && i.sandboxId === req.sandboxId)
+            .map(({ id, endedAt, compute }) => ({ id, endedAt, compute })),
+          usage: doc.usage.filter((r) => this.owns(r) && r.sandboxId === req.sandboxId && r.tailSince != null)
+            .map(({ usageRecordId, intervals, tailSince }) => ({ usageRecordId, intervals: structuredClone(intervals), tailSince })),
+        };
+      }
       candidate.intents.push(intent);
       if (req.command && req.poolId) candidate.usage.push({ usageRecordId: id, providerScope: this.providerScope, poolId: req.poolId, kind: "command",
         commandId: req.command.commandId, runId: req.command.runId, cardId: req.command.cardId, repoId: req.command.repoId,
@@ -518,11 +545,26 @@ export class AccountLedger {
       await this.write(candidate);
       // Persistence may itself have waited for the store. Revalidate the exact
       // intent before any external effect if its observation aged out.
+      try {
+        this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, intent.ttlSeconds);
+      } catch (error) {
+        await this.write(doc);
+        throw error;
+      }
       if (this.now() - limits.at > 5000) {
         try {
           limits = await this.observe(api, candidate);
-          this.check(candidate, limits, req, tailSeconds, id);
+          const prospectiveTtl = Math.max(60, Math.ceil(req.jobSeconds + tailSeconds));
+          intent.ttlSeconds = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - at) / 1000) + prospectiveTtl);
+          intent.jobSeconds = intent.ttlSeconds - tailSeconds;
+          intent.compute = Math.max(intent.compute, intent.ttlSeconds * WEIGHT[intent.size]);
+          this.check(candidate, limits, { ...req, jobSeconds: intent.jobSeconds }, tailSeconds, id, prospectiveTtl);
+          if (req.monthlyCap && req.monthlyCap.capHours > 0
+            && (monthUsageSeconds(candidate, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(candidate, req.monthlyCap.companyId)) / 3600 > req.monthlyCap.capHours) {
+            throw new Error("monthly offload VM-hour cap reached while persisting admission");
+          }
           await this.write(candidate);
+          this.assertDispatchable({ id, tailSeconds, at, periodEndMs: limits.periodEndMs }, prospectiveTtl);
           if (this.now() - limits.at > 5000) throw new Error("limits expired while persisting admission");
         } catch (error) {
           // No external effect occurred. Restore the predecessor's open tail;
@@ -531,17 +573,127 @@ export class AccountLedger {
           throw error;
         }
       }
-      return { id, tailSeconds, at };
+      return { id, tailSeconds, at, periodEndMs: limits.periodEndMs, observedAt: limits.at };
     });
+  }
+
+  /** Synchronous final check: caller persistence must not outlive the funded period. */
+  assertDispatchable(reservation: AccountReservation, ttlSeconds: number): void {
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds < 60 || !Number.isFinite(reservation.periodEndMs)
+      || this.now() + ttlSeconds * 1000 > reservation.periodEndMs!) {
+      throw new BoatBudgetError({ limit: "minComputeHoursLeft", message: "included billing period no longer funds dispatch", details: {} });
+    }
   }
 
   async revalidate(api: BoatApiLike, reservation: AccountReservation, req: AdmissionRequest): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read();
-      const limits = await this.observe(api, doc);
-      this.check(doc, limits, req, reservation.tailSeconds, reservation.id);
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || !["intent", "ambiguous"].includes(intent.status) || intent.operation !== req.operation
+        || intent.size !== req.size || intent.poolId !== (req.poolId ?? null) || intent.sandboxId !== (req.sandboxId ?? null)
+        || intent.jobSeconds < req.jobSeconds || intent.tailSeconds !== reservation.tailSeconds) {
+        throw new Error("no retained matching intent can fund dispatch");
+      }
+      const limits = await this.observe(api, doc, false, req);
+      const original = structuredClone(intent);
+      const ttl = Math.max(60, Math.ceil(req.jobSeconds + reservation.tailSeconds));
+      const ttlBound = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - intent.at) / 1000) + ttl);
+      const jobSeconds = ttlBound - intent.tailSeconds;
+      this.check(doc, limits, { ...req, jobSeconds }, reservation.tailSeconds, reservation.id, ttl);
+      if (req.monthlyCap && req.monthlyCap.capHours > 0
+        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)
+          + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
+        throw new Error("monthly offload VM-hour cap reached before dispatch");
+      }
+      intent.ttlSeconds = ttlBound;
+      intent.jobSeconds = jobSeconds;
+      intent.compute = Math.max(intent.compute, ttlBound * WEIGHT[intent.size]);
       await this.write(doc);
-      if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
+      reservation.periodEndMs = limits.periodEndMs;
+      reservation.observedAt = limits.at;
+      try {
+        this.assertDispatchable(reservation, ttl);
+        if (this.now() - limits.at > 5000) throw new Error("limits expired before retry");
+      } catch (error) {
+        Object.assign(intent, original);
+        await this.write(doc);
+        throw error;
+      }
+    });
+  }
+
+  /** Resolve the durable create lifecycle before considering another POST.
+   * Expiry must be committed before a caller can discard its pool placeholder. */
+  async recoverCreate(reservation: AccountReservation): Promise<{ status: "terminal"; sandboxId?: string } | { status: "running"; sandboxId: string } | { status: "pending" }> {
+    return await this.locked(async () => {
+      const doc = await this.read();
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || intent.operation !== "create") throw new Error("no retained create intent can resolve placeholder");
+      this.expireStaleHolds(doc, this.now());
+      if ((intent.status === "stopped" || intent.status === "rejected") && !intent.active) {
+        await this.write(doc);
+        return { status: "terminal", ...(intent.sandboxId ? { sandboxId: intent.sandboxId } : {}) };
+      }
+      if ((intent.status === "running" || intent.status === "ambiguous") && intent.sandboxId) return { status: "running", sandboxId: intent.sandboxId };
+      if (intent.status === "intent" || intent.status === "ambiguous") return { status: "pending" };
+      throw new Error("retained create lifecycle is unresolved");
+    });
+  }
+
+  /** A same-key replay may be the first effective create. Fund it before POST,
+   * retaining the old elapsed exposure and renewing all unreflected holds. */
+  async revalidateReplay(api: BoatApiLike, reservation: AccountReservation, req: AdmissionRequest, ttlSeconds: number): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read();
+      const intent = doc.intents.find((i) => i.id === reservation.id && this.owns(i));
+      if (!intent || intent.operation !== "create" || intent.size !== req.size
+        || !["intent", "ambiguous"].includes(intent.status) || !Number.isFinite(ttlSeconds) || ttlSeconds < 60) {
+        throw new Error("no retained create intent can fund replay");
+      }
+      const limits = await this.observe(api, doc, false, req);
+      const ttlBound = Math.max(intent.ttlSeconds, Math.ceil(Math.max(0, this.now() - intent.at) / 1000) + ttlSeconds);
+      const jobSeconds = ttlBound - intent.tailSeconds;
+      // Elapsed exposure still counts against allowance and monthly holds,
+      // but only the saved body's prospective TTL must fit after now.
+      this.check(doc, limits, { ...req, jobSeconds }, intent.tailSeconds, intent.id, ttlSeconds);
+      if (req.monthlyCap && req.monthlyCap.capHours > 0
+        && (monthUsageSeconds(doc, req.monthlyCap.companyId, this.now()) + pendingCapSeconds(doc, req.monthlyCap.companyId)
+          + Math.max(0, jobSeconds - intent.jobSeconds)) / 3600 > req.monthlyCap.capHours) {
+        throw new Error("monthly offload VM-hour cap reached during replay");
+      }
+      const original = structuredClone(intent);
+      intent.jobSeconds = jobSeconds;
+      intent.ttlSeconds = ttlBound;
+      intent.compute = Math.max(intent.compute, ttlBound * WEIGHT[intent.size]);
+      intent.active = true;
+      intent.activeReflected = false;
+      for (const name of Object.keys(WINDOWS) as Window[]) {
+        intent.starts[name] = { reflected: false, expiresAt: limits.windows[name]?.resetAt ?? this.now() + WINDOWS[name] };
+      }
+      await this.write(doc);
+      reservation.periodEndMs = limits.periodEndMs;
+      reservation.observedAt = limits.at;
+      try {
+        this.assertDispatchable(reservation, ttlSeconds);
+        if (this.now() - limits.at > 5000) throw new Error("limits expired before create replay");
+      } catch (error) {
+        // No replay was attempted. Restore only its extension; if this write
+        // fails, the previously saved larger hold remains conservative.
+        Object.assign(intent, original);
+        await this.write(doc);
+        throw error;
+      }
+    });
+  }
+
+  /** Undo an optional extension only before its provider update was attempted. */
+  async restoreTail(reservation: AccountReservation): Promise<void> {
+    await this.locked(async () => {
+      const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
+      const released = Math.max(0, intent.tailSeconds - reservation.tailSeconds) * WEIGHT[intent.size];
+      intent.compute = Math.max(intent.computeReflected, intent.compute - released);
+      intent.tailSeconds = reservation.tailSeconds;
+      await this.write(doc);
     });
   }
 
@@ -549,6 +701,7 @@ export class AccountLedger {
     return await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
       intent.sandboxId = sandboxId; intent.status = "running"; intent.settledAt = this.now();
+      delete intent.predecessor;
       const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);
       if (row) row.sandboxId = sandboxId;
       // Record, never assume, whether this particular resume spent a start.
@@ -561,6 +714,7 @@ export class AccountLedger {
           if (delta != null && delta > 0) {
             doc.countedResumeUntil = limits.windows.day?.resetAt ?? this.now() + WINDOWS.day;
             if (intent.poolId && intent.tailSeconds < 300) {
+              this.assertDispatchable({ ...reservation, periodEndMs: limits.periodEndMs }, Math.max(60, Math.ceil(intent.jobSeconds + 300)));
               const extra = (300 - intent.tailSeconds) * WEIGHT[intent.size];
               const outstanding = doc.intents.reduce((n, i) => n + Math.max(0, i.compute - i.computeReflected), 0);
               if (limits.available - outstanding < extra + intent.reserveSeconds) throw new Error("insufficient compute for metered-resume tail");
@@ -594,6 +748,17 @@ export class AccountLedger {
   async failed(reservation: AccountReservation, definitive: boolean): Promise<void> {
     await this.locked(async () => {
       const doc = await this.read(), intent = doc.intents.find((i) => i.id === reservation.id)!;
+      if (definitive && intent.status === "intent" && intent.predecessor) {
+        for (const saved of intent.predecessor.intents) {
+          const prior = doc.intents.find((i) => i.id === saved.id && this.owns(i));
+          if (prior) Object.assign(prior, saved);
+        }
+        for (const saved of intent.predecessor.usage) {
+          const prior = doc.usage.find((r) => r.usageRecordId === saved.usageRecordId && this.owns(r));
+          if (prior) Object.assign(prior, saved);
+        }
+        delete intent.predecessor;
+      }
       intent.status = definitive ? "rejected" : "ambiguous";
       if (definitive) { intent.active = false; intent.compute = 0; intent.settledAt = this.now(); }
       const row = doc.usage.find((r) => r.usageRecordId === intent.usageId);

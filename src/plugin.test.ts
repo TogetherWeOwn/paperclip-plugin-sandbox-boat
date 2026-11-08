@@ -429,7 +429,7 @@ describe("budget guard", () => {
     ["maxActive", { activeSandboxes: 2 }, /maxActive/],
     ["maxStartsPerDay", { starts: { day: { limit: 75, remaining: 5, used: 70 }, hour: { remaining: 10 }, minute: { remaining: 5 } } }, /maxStartsPerDay/],
     ["boatStartsPerMinute", { starts: { day: { limit: 75, used: 3 }, hour: { remaining: 10 }, minute: { remaining: 0 } } }, /boatStartsPerMinute/],
-    ["minComputeHoursLeft", { creditUsedSeconds: 89_000 }, /minComputeHoursLeft/],
+    ["minComputeHoursLeft", { planIncluded: { vmHours: 25, vmHoursRemaining: 1000 / 3600, periodEnd: new Date("2100-01-01T00:00:00Z") } }, /minComputeHoursLeft/],
     ["boat_cannot_start", { canStart: false, startBlockedReason: "trial ended" }, /boat_cannot_start/],
   ];
   for (const [limit, overrides, pattern] of cases) {
