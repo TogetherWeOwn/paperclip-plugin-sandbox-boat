@@ -2,7 +2,7 @@
 
 Maintainer: Product Lead · Last reviewed: 2026-11-09
 
-This is the repository's public entry point for product direction and non-goals. It describes intentions, not a delivery schedule, an installation record or a promise that a capability is enabled. Priorities, live work status and forecast dates remain in the maintainers' Paperclip planning workspace; they are not mirrored here. For shipped changes, use the [changelog](../CHANGELOG.md) and [tagged releases](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/releases).
+This is the repository's public entry point for product direction and non-goals. It describes intentions, not a delivery schedule, an installation record or a promise that a capability is enabled. Priorities, live work status and forecast dates remain in the maintainers' Paperclip planning workspace; they are not mirrored here. For shipped changes, use the [changelog](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/CHANGELOG.md) and [tagged releases](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/releases).
 
 ## Direction
 
@@ -31,9 +31,9 @@ This page owns the public direction and non-goals. Existing material is retained
 | Source | Role |
 | --- | --- |
 | [README](../README.md) | User entry point and links, not a separate plan. |
-| [Changelog](../CHANGELOG.md) and tagged releases | Historical record of shipped software, not evidence of a live installation. |
+| [Changelog](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/CHANGELOG.md) and tagged releases | Historical record of shipped software, not evidence of a live installation. |
 | [Heavy-command offload ADR](design/adr/0001-heavy-command-offload.md) | Accepted design rationale and historical implementation/pilot contracts. Its projections and sequencing are not a current roadmap, CI policy or rollout authorization. |
-| [Execution vocabulary](../CONTEXT.md) and [design references](../README.md#documentation) | Terminology and technical contracts, not priority or delivery trackers. |
+| [Execution vocabulary](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/CONTEXT.md) and [design references](../README.md#documentation) | Terminology and technical contracts, not priority or delivery trackers. |
 | [Operations](operations.md), [configuration](configuration.md) and [release procedure](releasing.md) | Procedures and prerequisites. Future or deferred procedures do not establish enabled capability or scheduled work. |
 
 ## Feedback and maintenance
