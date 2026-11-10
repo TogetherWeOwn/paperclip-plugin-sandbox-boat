@@ -11,6 +11,10 @@ It started as a copy of Paperclip's bundled `exe-dev` provider. All boat calls g
 * **Per-run cost accounting** from boat's own usage meter, through a board-authenticated route. See [Usage accounting](docs/operations.md#usage-accounting).
 * **Optional heavy-command offload** (Cargo, Node, Python) to a shared VM pool while the agent stays on the host. Default OFF. See [Offload](docs/offload.md).
 
+## Roadmap
+
+See the [product roadmap](docs/roadmap.md) for sandbox execution and command-offload direction, non-goals and how to give feedback. It describes intentions, not deployment status or delivery commitments.
+
 ## Safety defaults
 
 * **Default-deny run env.** Only names on the [env allowlist](docs/security.md#run-env-allowlist) reach the VM. Secret families (`PLANETSCALE_`, `CLOUDFLARE_`, `GITHUB_`, `BOAT_`...), values holding a JWT and database URLs that leave the VM are never sent. Dropped keys are logged by name, never by value.
