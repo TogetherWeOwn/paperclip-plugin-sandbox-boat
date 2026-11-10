@@ -19,6 +19,9 @@ export interface PoolVm {
   // Ephemeral VM whose provider delete (or its ledger receipt) failed:
   // quarantined against reuse, retried by sweep and shutdown until retired.
   deletePending?: boolean;
+  // Saved before ephemeral source/command execution, so completion-time pool
+  // write failure cannot lose the disk's deletion policy across restart.
+  deleteOnRelease?: boolean;
   lastActiveAt: number;
   generation: number;
   idleHandle: unknown | null;
@@ -85,6 +88,7 @@ export class OffloadPoolStore {
         || (vm.sandboxId === "" && !vm.accountReservation?.id)
         || ![vm.busy, vm.stopped, vm.stopping, vm.quarantined].every((v) => typeof v === "boolean")
         || (vm.deletePending !== undefined && typeof vm.deletePending !== "boolean")
+        || (vm.deleteOnRelease !== undefined && typeof vm.deleteOnRelease !== "boolean")
         || (vm.syncInFlight !== undefined && typeof vm.syncInFlight !== "boolean")
         || !timestamp(vm.lastActiveAt) || vm.lastActiveAt === null || !timestamp(vm.stopDueAt) || !timestamp(vm.stopRequestedAt)
         || (vm.stopObservedAt !== undefined && !timestamp(vm.stopObservedAt))
