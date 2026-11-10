@@ -36,7 +36,7 @@ describe("retirement requires observed provider termination", () => {
   it("keeps an incompatible replay tracked when its stop is unconfirmed", async () => {
     const account = testAccount();
     const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
-    const { executor } = h.openExecutor({ ...account, config: { maxOffloadVms: 1, maxActive: 1, queueLimit: 0 } });
+    const { executor } = h.openExecutor(account);
     (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
     h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
     expect(await executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
