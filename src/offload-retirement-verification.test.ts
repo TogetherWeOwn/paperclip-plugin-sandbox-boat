@@ -33,6 +33,40 @@ async function replayReleasedVm() {
 const incompatible = (id: string) => command(id, { repoId: "another-repository" });
 
 describe("retirement requires observed provider termination", () => {
+  it("keeps an incompatible replay tracked when its stop is unconfirmed", async () => {
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    const { executor } = h.openExecutor({ ...account, config: { maxOffloadVms: 1, maxActive: 1, queueLimit: 0 } });
+    (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    expect(await executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
+    const [vm] = [...h.boat.boxes.keys()];
+
+    // A failed replay stop retains deletion ownership, not a reusable cache.
+    h.boat.failNext("stop", () => responseError(500, { code: "internal" }));
+    expect(await executor.execute(incompatible("cmd-2"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.boxes.size).toBe(1);
+    expect(h.boat.callsOf("create")).toHaveLength(2);
+    expect(h.boat.callsOf("stop")).toHaveLength(1);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    expect(await executor.execute(command("cmd-compatible"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.callsOf("resume")).toHaveLength(0);
+    expect(h.attempts).toHaveLength(0);
+
+    // Sweep owns the pending delete even when the stop reply was lost. Only
+    // confirmed deletion frees the slot for a command on a fresh VM.
+    await executor.sweep();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm]);
+    expect(h.boat.boxes.has(vm!)).toBe(false);
+    expect(await poolStore.load()).toEqual([]);
+    const third = await executor.execute(incompatible("cmd-3"));
+    expect(third).toMatchObject({ status: "completed" });
+    expect(h.boat.callsOf("stop")).toHaveLength(1);
+    expect(h.boat.boxes.size).toBe(1);
+    expect(third).toMatchObject({ sandboxId: [...h.boat.boxes.keys()][0] });
+    expect(h.attempts).toHaveLength(1);
+  });
+
   it("sweeps a failed incompatible lost-create delete after worker restart without replaying work", async () => {
     const account = testAccount();
     const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
