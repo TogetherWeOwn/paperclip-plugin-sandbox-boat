@@ -1223,7 +1223,10 @@ export class SshOffloadRuntime {
               if (error instanceof Error && error.message === "OFFLOAD_POOL_ABSENT") return [];
               throw error;
             });
-            if (vms.every((vm) => vm.stopped && !vm.busy && !vm.stopping && !vm.quarantined)) {
+            // A stopped (archived) VM is still a provider allocation the pool
+            // owns; its registry entry is the only way discovery reaches it
+            // after a restart. Drop the entry only once no VM remains.
+            if (vms.length === 0) {
               const ledger = new AccountLedger(this.deps.state, this.deps.accountId, Date.now);
               if (await ledger.poolAccountingSettled(poolId)) delete registry[poolId];
               else failed = true;

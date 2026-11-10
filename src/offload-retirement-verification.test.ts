@@ -32,6 +32,29 @@ async function replayReleasedVm() {
 const incompatible = (id: string) => command(id, { repoId: "another-repository" });
 
 describe("retirement requires observed provider termination", () => {
+  it("sweeps a failed incompatible lost-create delete after worker restart without replaying work", async () => {
+    const first = h.openExecutor().executor;
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    expect(await first.execute(command("lost-create"))).toMatchObject({ status: "unavailable" });
+    const [vm] = [...h.boat.boxes.keys()];
+    h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    expect(await first.execute(incompatible("delete-pending"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.boxes.get(vm!)?.state).toBe("archived");
+    expect(h.boat.callsOf("create")).toHaveLength(2); // lost reply and same-key recovery
+    expect(h.attempts).toHaveLength(0);
+
+    h.crash();
+    const recovered = h.openExecutor().executor;
+    await recovered.sweep();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
+    expect(h.boat.boxes.has(vm!)).toBe(false);
+    expect(h.boat.callsOf("create")).toHaveLength(2);
+    expect(h.attempts).toHaveLength(0);
+    expect(await recovered.execute(incompatible("replacement"))).toMatchObject({ status: "completed" });
+    expect(h.boat.callsOf("create")).toHaveLength(3);
+    expect(h.attempts).toHaveLength(1);
+  });
+
   it("stops a replay-released running VM before replacing its pool slot", async () => {
     const { executor, vm } = await replayReleasedVm();
     expect(h.boat.boxes.get(vm)?.state).toBe("ready");

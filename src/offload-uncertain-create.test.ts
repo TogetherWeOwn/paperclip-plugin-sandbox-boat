@@ -1,6 +1,6 @@
 // B13: a pool create whose reply is lost must not bill a second VM. The retry
 // reuses the same idempotency key: a compatible retry adopts the replayed VM,
-// an incompatible one stops it and frees the slot. Uses fakes only.
+// an incompatible one stops and deletes it before freeing the slot. Uses fakes only.
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { BoatApiLike } from "./boat-client.js";
@@ -122,30 +122,73 @@ describe("offload uncertain create", () => {
     expect(s.fake.callsOf("create")[1]!.args).toEqual(s.fake.callsOf("create")[0]!.args);
   });
 
-  it("an incompatible retry stops the replayed VM and frees the slot", async () => {
-    // One VM of account capacity: the retained hold must be released before a
-    // fresh create is admitted, or the slot leaks quarantined forever.
+  it("an incompatible retry deletes the replayed VM before creating a replacement", async () => {
+    // One VM of account capacity: settle the retained hold, but do not free
+    // pool ownership while the stopped disk still exists.
     const s = setup(undefined, { maxActive: 1 });
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
+    const [oldId] = [...s.fake.boxes.keys()];
 
     const second = await s.executor.execute(command("cmd-2", "other-profile"));
     expect(second).toMatchObject({ status: "completed" });
 
-    // The retry replays the lost create under the same key, then the freed
-    // slot creates fresh under a new key.
     const creates = s.fake.callsOf("create");
     expect(creates).toHaveLength(3);
     expect(creates[1]!.args.idempotencyKey).toBe(creates[0]!.args.idempotencyKey);
     expect(creates[2]!.args.idempotencyKey).not.toBe(creates[0]!.args.idempotencyKey);
+    expect(s.fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([oldId]);
+    expect(s.fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([oldId]);
+    expect(s.fake.calls.indexOf(s.fake.callsOf("deleteSandbox")[0]!)).toBeLessThan(s.fake.calls.indexOf(creates[2]!));
+    expect(s.fake.boxes.has(oldId!)).toBe(false);
+    expect(s.fake.boxes.size).toBe(1);
+    expect(second).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
+  });
 
-    // The replayed VM was stopped exactly once and never adopted: two boxes,
-    // one archived, the other running the command.
-    const ids = [...s.fake.boxes.keys()];
-    expect(ids).toHaveLength(2);
-    const stoppedId = ids.find((id) => s.fake.boxes.get(id)?.state === "archived")!;
-    expect(s.fake.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([stoppedId]);
-    expect(second).toMatchObject({ sandboxId: ids.find((id) => id !== stoppedId) });
+  it.each([false, true])("retains failed incompatible replay deletion for shutdown retry (restart=%s)", async (restart) => {
+    const s = setup(undefined, { maxActive: 1 });
+    const first = s.open(true);
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    expect(await first.execute(command("cmd-lost"))).toMatchObject({ status: "unavailable" });
+    const [oldId] = [...s.fake.boxes.keys()];
+    s.fake.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    expect(await first.execute(command("cmd-incompatible", "other-profile"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.boxes.get(oldId!)?.state).toBe("archived");
+    expect(await new OffloadPoolStore(s.account.state, s.account.accountId, s.account.poolId).load()).toMatchObject([
+      { sandboxId: oldId, deletePending: true, quarantined: true },
+    ]);
+    expect(s.fake.callsOf("create")).toHaveLength(2); // same-key replay only, no replacement
+
+    const executor = restart ? s.open(true) : first;
+    // Neither a compatible nor an incompatible caller may reuse the pending disk.
+    expect(await executor.execute(command("cmd-pending"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("resume")).toHaveLength(0);
+    expect(s.fake.callsOf("create")).toHaveLength(2);
+    await executor.shutdown();
+    expect(s.fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([oldId, oldId]);
+    expect(s.fake.boxes.has(oldId!)).toBe(false);
+    expect(await new OffloadPoolStore(s.account.state, s.account.accountId, s.account.poolId).load()).toEqual([]);
+
+    const after = s.open(true);
+    expect(await after.execute(command("cmd-after", "other-profile"))).toMatchObject({ status: "completed" });
+    expect(s.fake.callsOf("create")).toHaveLength(3);
+    expect(s.fake.boxes.size).toBe(1);
+    await after.shutdown();
+  });
+
+  it("accepts provider 404 as confirmed deletion of an incompatible replay", async () => {
+    const s = setup();
+    s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
+    await s.executor.execute(command("cmd-lost"));
+    const [oldId] = [...s.fake.boxes.keys()];
+    s.fake.failNext("deleteSandbox", () => {
+      s.fake.boxes.delete(oldId!);
+      return responseError(404, { code: "not_found" });
+    });
+    expect(await s.executor.execute(command("cmd-after", "other-profile"))).toMatchObject({ status: "completed" });
+    expect(s.fake.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([oldId]);
+    expect(s.fake.boxes.has(oldId!)).toBe(false);
+    expect(s.fake.boxes.size).toBe(1);
   });
 
   it("replays the exact original body, not the new command's timeout or config", async () => {

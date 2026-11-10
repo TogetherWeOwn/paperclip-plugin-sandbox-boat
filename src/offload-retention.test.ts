@@ -7,6 +7,7 @@ import { LoopbackSsh } from "./test-support/loopback-sshd.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { SshOffloadRuntime } from "./offload-ssh-runtime.js";
+import { OffloadPoolStore, type PoolVm } from "./offload-pool.js";
 import type { OffloadExecutor } from "./offload.js";
 import { isExecutorRefusal, type ExecutorRefusal } from "./offload/broker.js";
 
@@ -174,6 +175,7 @@ describe("stock runtime journal retention", () => {
     const staged = path.join(config.offloadArtifactRoot as string, "command-left-behind");
     await mkdir(staged, { recursive: true });
     await runtime.shutdown();
+    await setPool(() => []);
 
     // A fresh worker: the run's binding and every in-memory pool are gone.
     runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only" });
@@ -184,7 +186,54 @@ describe("stock runtime journal retention", () => {
     await runtime.sweep([companyId]);
     expect(journalKeys()).toEqual([]);
     expect(await stat(staged).catch((error: NodeJS.ErrnoException) => error.code)).toBe("ENOENT");
-    // Nothing of the pool is left to expire: the registry forgets it.
+    // Nothing of the pool is left to expire (its VM list is empty): the registry forgets it.
+    expect(await harness.ctx.state.get(registryScope)).toEqual({});
+  }, 30_000);
+
+  /** Run one command to completion, restart the worker, and replace the pool document with `vms`. */
+  async function restartWithPool(vms: () => PoolVm[]): Promise<string> {
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() });
+    const executor = mustResolve(await runtime.resolve(command(), config));
+    const cmd = command();
+    await executor.start(cmd);
+    await expect.poll(async () => (await executor.readOutput(companyId, runId, cmd.commandId)).state,
+      { timeout: 15_000 }).toMatch(/^(completed|not_started)$/);
+    await runtime.shutdown();
+    const poolId = await setPool(vms);
+    runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only" });
+    return poolId;
+  }
+  /** Replace the single registered pool's VMs with a deterministic fixture; its saved config must exist. */
+  async function setPool(vms: () => PoolVm[]): Promise<string> {
+    const registered = Object.keys(await harness.ctx.state.get(registryScope) as Record<string, unknown>).filter((id) => id !== "bad");
+    expect(registered).toHaveLength(1);
+    const store = new OffloadPoolStore(harness.ctx.state, "test-only", registered[0]!);
+    const doc = await store.loadDoc();
+    await store.save(doc.config, vms());
+    return registered[0]!;
+  }
+  const poolVms = (poolId: string) => new OffloadPoolStore(harness.ctx.state, "test-only", poolId).loadDoc().then((doc) => doc.vms);
+  const stoppedVm = (): PoolVm => ({ sandboxId: "sbx-archived-owned", busy: false, stopped: true, stopping: false, quarantined: false,
+    lastActiveAt: Date.now(), generation: 0, idleHandle: null, stopDueAt: null, stopRequestedAt: null, stopAttempts: 0, identity: null });
+
+  it("keeps an aged unloaded pool registered while it still owns a stopped provider VM", async () => {
+    const poolId = await restartWithPool(() => [stoppedVm()]);
+    vi.setSystemTime(Date.now() + 2 * DAY);
+    await runtime.sweep([companyId]);
+    vi.setSystemTime(Date.now() + 90 * DAY);
+    await runtime.sweep([companyId]);
+    expect(Object.keys(await harness.ctx.state.get(registryScope) as Record<string, unknown>)).toEqual([poolId]);
+    expect((await poolVms(poolId)).map((vm) => [vm.sandboxId, vm.stopped])).toEqual([["sbx-archived-owned", true]]);
+    expect(journalKeys()).toEqual([]);
+  }, 30_000);
+
+  it("removes an aged unloaded pool from the registry once no provider allocation remains", async () => {
+    const poolId = await restartWithPool(() => []);
+    expect(await poolVms(poolId)).toEqual([]);
+    vi.setSystemTime(Date.now() + 2 * DAY);
+    await runtime.sweep([companyId]);
+    vi.setSystemTime(Date.now() + 90 * DAY);
+    await runtime.sweep([companyId]);
     expect(await harness.ctx.state.get(registryScope)).toEqual({});
   }, 30_000);
 
@@ -220,13 +269,17 @@ describe("stock runtime journal retention", () => {
     await harness.ctx.state.set(registryScope, { bad: { artifactRoot: config.offloadArtifactRoot, seenAt: Date.now() }, ...registered });
     await harness.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "boat-executor-bad", stateKey: "index" }, "corrupt");
     await runtime.shutdown();
+    await setPool(() => [stoppedVm()]);
     runtime = stockRuntime();
+    runtime.remember(native()); // matching credential provenance permits fake-provider upkeep
     vi.setSystemTime(Date.now() + 2 * DAY);
     await expect(runtime.sweep([companyId])).rejects.toThrow("Offload pool sweep unverified");
     expect(harness.state.get(journalKeys()[0]!)).toMatchObject({ tombstone: true, runTerminalSeenAt: expect.any(Number) });
     vi.setSystemTime(Date.now() + 31 * DAY);
     await expect(runtime.sweep([companyId])).rejects.toThrow("Offload pool sweep unverified");
     expect(journalKeys()).toEqual([]);
+    // This worker has provider access: 404 confirms the fixture disk is gone.
+    expect(await poolVms(Object.keys(registered)[0]!)).toEqual([]);
     expect(Object.keys(await harness.ctx.state.get(registryScope) as Record<string, unknown>)).toEqual(["bad"]);
   }, 30_000);
 });

@@ -1342,8 +1342,8 @@ export class OffloadExecutor {
     }
     // Another trust domain must not adopt the replayed VM: settle the
     // reservation against it first (so stopped() can match it), then stop it.
-    // The VM stays tracked until the stop is confirmed; only then is the slot
-    // freed. A failing receipt or an unconfirmed stop keeps it for the sweep.
+    // A confirmed stop ends compute, not disk ownership. Only provider deletion
+    // frees the slot; failed deletion stays durably pending for sweep/shutdown.
     try {
       await ledger.started(this.boat, reservation, id);
     } catch {
@@ -1361,9 +1361,7 @@ export class OffloadExecutor {
       this.scheduleIdleStop(vm, vm.generation, 1000);
       return null;
     }
-    this.retireVm(vm);
-    await this.persistPool().catch(() => undefined);
-    return { kind: "freed" };
+    return await this.settleTerminalPlaceholder(vm, id) ? { kind: "freed" } : null;
   }
 
   // One admission path for first creates and for adopters of a replayed VM:
