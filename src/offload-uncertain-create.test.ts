@@ -444,20 +444,22 @@ describe("offload uncertain create", () => {
     s.fake.failNext("create", (args) => s.fake.loseCreateReply(args));
     expect(await s.executor.execute(command("cmd-1"))).toMatchObject({ status: "unavailable" });
 
-    // Both the replay stop and the synchronous retirement retry fail: the
-    // command stays local, but the VM is tracked, not retired.
-    s.fake.failNext("stop", () => responseError(500, { code: "internal" }));
+    // A failed replay stop retains deletion ownership, not a reusable cache.
     s.fake.failNext("stop", () => responseError(500, { code: "internal" }));
     expect(await s.executor.execute(command("cmd-2", "other-profile"))).toMatchObject({ status: "unavailable" });
     expect(s.fake.boxes.size).toBe(1);
     expect(s.fake.callsOf("create")).toHaveLength(2);
-    expect(s.fake.callsOf("stop")).toHaveLength(2);
+    expect(s.fake.callsOf("stop")).toHaveLength(1);
+    expect(await s.executor.execute(command("cmd-compatible"))).toMatchObject({ status: "unavailable" });
+    expect(s.fake.callsOf("resume")).toHaveLength(0);
 
-    // The next incompatible command retries the pending stop, frees the slot,
-    // and runs on a fresh VM: the lost box is deleted, exactly one new box runs.
+    // Sweep owns the pending delete even when the stop reply was lost. Only
+    // confirmed deletion frees the slot for a command on a fresh VM.
+    await s.executor.sweep();
+    expect(s.fake.callsOf("deleteSandbox")).toHaveLength(1);
     const third = await s.executor.execute(command("cmd-3", "other-profile"));
     expect(third).toMatchObject({ status: "completed" });
-    expect(s.fake.callsOf("stop")).toHaveLength(3);
+    expect(s.fake.callsOf("stop")).toHaveLength(1);
     expect(s.fake.boxes.size).toBe(1);
     expect(third).toMatchObject({ sandboxId: [...s.fake.boxes.keys()][0] });
   });

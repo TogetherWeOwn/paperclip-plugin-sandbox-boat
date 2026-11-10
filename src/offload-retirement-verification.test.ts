@@ -69,6 +69,93 @@ describe("retirement requires observed provider termination", () => {
     expect(h.attempts).toHaveLength(1);
   });
 
+  it.each(["sweep", "shutdown"] as const)("preserves recovered delete ownership through pool-write failures and %s restart", async (cleanup) => {
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    const open = () => {
+      const executor = h.openExecutor(account).executor;
+      (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+      return executor;
+    };
+    const first = open();
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    expect(await first.execute(command("lost-create"))).toMatchObject({ status: "unavailable" });
+    const [vm] = [...h.boat.boxes.keys()];
+
+    // Allow the recovered and confirmed-stopped snapshots, then fail the
+    // pending-delete write and every later pool write, without losing journals.
+    const set = account.state.set.bind(account.state);
+    let failPool = false;
+    let savedStopped = false;
+    account.state.set = async (key, value) => {
+      if (key.namespace === "boat-offload-pool") {
+        if (failPool) throw new Error("synthetic pool write failure");
+        await set(key, value);
+        const doc = value as { vms: Array<{ sandboxId: string; stopped: boolean }> };
+        if (doc.vms.some((entry) => entry.sandboxId === vm && entry.stopped)) {
+          savedStopped = true;
+          failPool = true;
+        }
+        return;
+      }
+      return set(key, value);
+    };
+    h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    expect(await first.execute(incompatible("delete-pending"))).toMatchObject({ status: "unavailable" });
+    expect(savedStopped).toBe(true);
+    expect(h.boat.boxes.get(vm!)?.state).toBe("archived");
+    expect(await poolStore.load()).toMatchObject([
+      { sandboxId: vm, stopped: true, deletePending: true, quarantined: true },
+    ]);
+    // No retry may outrun durable intent while pool writes remain unavailable.
+    await expect(first[cleanup]()).rejects.toThrow("synthetic pool write failure");
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(0);
+
+    h.crash();
+    const recovered = open();
+    expect(await recovered.execute(command("compatible-after-crash"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.callsOf("resume")).toHaveLength(0);
+    expect(h.boat.callsOf("create")).toHaveLength(2);
+    expect(h.attempts).toHaveLength(0);
+    await expect(recovered.sweep()).rejects.toThrow("synthetic pool write failure");
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(0);
+
+    account.state.set = set;
+    await recovered.sweep(); // storage is healthy, but the queued DELETE fails
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm]);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    h.crash();
+    await open()[cleanup]();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
+    expect(h.boat.boxes.has(vm!)).toBe(false);
+    expect(await poolStore.load()).toEqual([]);
+    expect(h.attempts).toHaveLength(0);
+  });
+
+  it("does not stop or delete a recovered VM before its first deletion fence is saved", async () => {
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    const executor = h.openExecutor(account).executor;
+    (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    await executor.execute(command("lost-create"));
+    const [vm] = [...h.boat.boxes.keys()];
+    const set = account.state.set.bind(account.state);
+    account.state.set = async (key, value) => {
+      if (key.namespace === "boat-offload-pool") throw new Error("synthetic pool write failure");
+      return set(key, value);
+    };
+    expect(await executor.execute(incompatible("delete-pending"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.callsOf("stop")).toHaveLength(0);
+    await expect(executor.sweep()).rejects.toThrow("synthetic pool write failure");
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: "", quarantined: true }]);
+    account.state.set = set;
+    await executor.sweep();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm]);
+    expect(await poolStore.load()).toEqual([]);
+  });
+
   it("stops a replay-released running VM before replacing its pool slot", async () => {
     const { executor, vm } = await replayReleasedVm();
     expect(h.boat.boxes.get(vm)?.state).toBe("ready");

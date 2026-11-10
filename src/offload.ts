@@ -1351,11 +1351,15 @@ export class OffloadExecutor {
     }
     vm.pendingCreate = undefined;
     vm.sandboxId = id;
-    vm.quarantined = false;
+    vm.quarantined = true;
+    vm.deletePending = true;
     vm.stopped = false;
     vm.lastActiveAt = this.now();
-    await this.persistPool().catch(() => undefined);
-    const stopOk = await this.stopVm(vm);
+    // Every known-ID snapshot, including stopVm's intermediate receipts, must
+    // retain deletion ownership. If this first fence cannot be saved, do not
+    // stop: restart still owns the original lost-create placeholder.
+    try { await this.persistPool(); } catch { return null; }
+    const stopOk = await this.stopVm(vm, false, true);
     if (!stopOk || vm.stopping || !vm.stopped || vm.stopObservedAt == null) {
       await this.persistPool().catch(() => undefined);
       this.scheduleIdleStop(vm, vm.generation, 1000);
@@ -1842,6 +1846,11 @@ export class OffloadExecutor {
    * (404 included) and the terminal ledger receipt both succeed; otherwise
    * marks it quarantined + deletePending for a later sweep/shutdown retry. */
   private async retryPendingDelete(vm: PoolVm): Promise<boolean> {
+    vm.quarantined = true;
+    vm.deletePending = true;
+    // All callers, including sweep and shutdown after a failed fence save,
+    // must commit ownership before a provider delete can have an effect.
+    try { await this.persistPool(); } catch { return false; }
     try {
       await this.deleteAtProvider(vm.sandboxId);
       this.deps.sync?.sandboxStopped?.(vm.sandboxId);
@@ -1893,9 +1902,9 @@ export class OffloadExecutor {
   }
 
   private async stopVm(vm: PoolVm, retryPending = false, forceQuarantined = false): Promise<boolean> {
-    // forceQuarantined is only for quarantine reconciliation of a running VM
-    // with no verifiable identity: the stop halts billing while the fence
-    // stays, and the terminal observation releases the slot once archived.
+    // forceQuarantined halts billing while retaining a reconciliation or
+    // pending-delete fence. Only reconciliation or confirmed deletion can
+    // release that quarantined ownership.
     if ((vm.stopping && !retryPending) || vm.stopped || (vm.quarantined && !forceQuarantined) || vm.busy) return true;
     vm.stopAttempts += 1;
     vm.stopRequestedAt ??= this.now();
