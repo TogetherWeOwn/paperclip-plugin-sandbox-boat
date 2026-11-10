@@ -125,7 +125,9 @@ describe("retirement requires observed provider termination", () => {
     expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm]);
     expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
     h.crash();
-    await open()[cleanup]();
+    const restarted = open();
+    await restarted.recover();
+    await restarted[cleanup]();
     expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
     expect(h.boat.boxes.has(vm!)).toBe(false);
     expect(await poolStore.load()).toEqual([]);
