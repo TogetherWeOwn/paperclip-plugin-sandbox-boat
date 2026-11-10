@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { OffloadPoolStore } from "./offload-pool.js";
 import { responseError } from "./test-support/fake-boat.js";
-import { command, harness, hostKey, receipt, testAccount, type RecordV1 } from "./test-support/durable-offload.js";
+import { command, harness, settled, hostKey, receipt, testAccount, type RecordV1 } from "./test-support/durable-offload.js";
 
 let root: string;
 let h: ReturnType<typeof harness>;
@@ -277,6 +277,51 @@ describe("retirement requires observed provider termination", () => {
     expect(h.boat.callsOf("deleteSandbox")).toHaveLength(2);
     expect(await poolStore.load()).toEqual([]);
     expect(h.attempts).toHaveLength(0);
+  });
+
+  describe("ephemeral delete failure stop attempts", () => {
+    const ephemeralConfig = { maxOffloadVms: 1, offloadIdleStopSeconds: 15, queueLimit: 0, queueTimeoutMs: 0, ephemeralRepos: ["repo-1"] };
+
+    it("issues one stop and a bounded timer retry when DELETE and the first stop both fail", async () => {
+      const account = testAccount();
+      const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+      const { executor } = h.openExecutor({ ...account, config: ephemeralConfig });
+      (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+      h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+      h.boat.failNext("stop", responseError(500, { code: "internal" }));
+      expect(await executor.execute(command("ephemeral-1"))).toMatchObject({ status: "completed" });
+      const [vm] = [...h.boat.boxes.keys()];
+      expect(h.boat.callsOf("deleteSandbox")).toHaveLength(1);
+      expect(h.boat.callsOf("stop")).toHaveLength(1);
+      expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+      await h.advance(1000);
+      await drainTimerAdmission(executor);
+      expect(h.boat.callsOf("stop")).toHaveLength(2);
+      expect(h.boat.callsOf("deleteSandbox")).toHaveLength(1);
+      expect(h.boat.boxes.get(vm!)?.state).toBe("archived");
+    });
+
+    it("still stops once when the first deletion fence cannot be saved", async () => {
+      const account = testAccount();
+      const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+      const set = account.state.set.bind(account.state);
+      const { executor } = h.openExecutor({
+        ...account, config: ephemeralConfig,
+        sync: {
+          push: async () => {}, stage: async () => {}, markSuspect: async () => {},
+          collect: async () => {
+            account.state.set = async (key, value) => {
+              if (key.namespace === "boat-offload-pool") throw new Error("synthetic pool write failure");
+              return set(key, value);
+            };
+          },
+        },
+      });
+      (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+      await settled(executor.execute(command("ephemeral-fence")));
+      expect(h.boat.callsOf("deleteSandbox")).toHaveLength(0);
+      expect(h.boat.callsOf("stop")).toHaveLength(1);
+    });
   });
 
   it("does not stop or delete a recovered VM before its first deletion fence is saved", async () => {

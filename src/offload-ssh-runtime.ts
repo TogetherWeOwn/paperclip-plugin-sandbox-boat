@@ -1015,7 +1015,7 @@ export class SshOffloadRuntime {
     // saving so the sweep never overwrites a reservation made from a snapshot
     // taken before this upkeep's fence existed.
     const fingerprint = (vm: PoolVm) => JSON.stringify([vm.busy, vm.generation, vm.stopping, vm.stopped, vm.quarantined, vm.syncInFlight,
-      vm.stopDueAt, vm.accountReservation?.id, vm.deletePending, vm.pendingCreate]);
+      vm.stopDueAt, vm.accountReservation?.id, vm.deletePending, vm.deleteOnRelease, vm.pendingCreate]);
     // Placeholders without a provider ID key on their durable reservation,
     // which loadDoc guarantees unique; every other VM keys on its sandbox ID.
     const vmKey = (vm: PoolVm) => vm.sandboxId || vm.accountReservation?.id || "";
@@ -1025,6 +1025,28 @@ export class SshOffloadRuntime {
     const deletedKeys = new Set<string>();
     let changed = false;
     let accountingFailed = false;
+    const deleteVm = async (vm: PoolVm): Promise<void> => {
+      // Commit the cleanup owner before DELETE, including reconstructed policy
+      // and retries. Merge just this VM into a fresh snapshot: a claim that
+      // predates the unloaded fence wins, as it does in the final save below.
+      const id = keyOf.get(vm)!;
+      const fresh = await poolStore.loadDoc();
+      const twin = fresh.vms.find((entry) => vmKey(entry) === id);
+      if (!twin || fingerprint(twin) !== original.get(id)) return;
+      const pending = { ...vm, busy: false, quarantined: true, deletePending: true };
+      await poolStore.save(fresh.config, fresh.vms.map((entry) => entry === twin ? pending : entry));
+      Object.assign(vm, pending);
+      original.set(id, fingerprint(vm));
+      try { await boat.deleteSandbox({ sandboxId: vm.sandboxId, xAsciiConfirmDelete: vm.sandboxId }); }
+      catch (error) { if ((await describeBoatError(error)).status !== 404) throw error; }
+      // DELETE/404 ends the guest, not its durable obligations. Keep the saved
+      // pending owner until both journal settlement and accounting succeed.
+      await journal.settleSandboxUnknown(vm.sandboxId);
+      await ledger.stopped(vm.sandboxId, vm.stopObservedAt ?? now, vm.accountReservation?.id);
+      pool.splice(pool.indexOf(vm), 1);
+      deletedKeys.add(id);
+      changed = true;
+    };
     for (const vm of [...pool]) {
       if (!vm.sandboxId) {
         // A lost create reply: only a terminal retained intent resolves here,
@@ -1053,15 +1075,16 @@ export class SshOffloadRuntime {
         } catch { /* unresolved intent: stay held */ }
         continue;
       }
-      if (vm.deletePending) {
-        try {
-          try { await boat.deleteSandbox({ sandboxId: vm.sandboxId, xAsciiConfirmDelete: vm.sandboxId }); }
-          catch (error) { if ((await describeBoatError(error)).status !== 404) throw error; }
-          await ledger.stopped(vm.sandboxId, now, vm.accountReservation?.id);
-          pool.splice(pool.indexOf(vm), 1);
-          deletedKeys.add(keyOf.get(vm)!);
-          changed = true;
-        } catch { /* retained quarantined with deletePending; retry next sweep */ }
+      // Policy is not completion evidence. Reuse the loaded executor's journal
+      // check; unreadable receipts cannot authorize deletion or a forced stop.
+      let completedEphemeral = false;
+      if (vm.deleteOnRelease && !vm.deletePending) {
+        try { completedEphemeral = !await journal.hasUnsettled(vm.sandboxId); }
+        catch { continue; }
+      }
+      if (vm.deletePending || completedEphemeral) {
+        try { await deleteVm(vm); }
+        catch { /* durable policy/pending owner remains for the next sweep */ }
         continue;
       }
       let state: string | null = null;
@@ -1092,6 +1115,13 @@ export class SshOffloadRuntime {
         // slot fenced for retry, never freed on an unsettled receipt.
         if (!await journal.settleSandboxUnknown(vm.sandboxId).then(() => true, () => false)) {
           if (!vm.quarantined) { vm.quarantined = true; changed = true; }
+          continue;
+        }
+        if (vm.deleteOnRelease) {
+          // Terminal provider evidence can settle unknown work, never replay
+          // it. The archived ephemeral disk still needs a durable delete owner.
+          try { await deleteVm(vm); }
+          catch { /* policy or pending intent retains discovery and settlement */ }
           continue;
         }
         if (state === "deleted") { pool.splice(pool.indexOf(vm), 1); deletedIds.add(vm.sandboxId); }

@@ -1856,13 +1856,10 @@ export class OffloadExecutor {
       vm.workspaceKey = null;
       vm.generation += 1;
       this.clearIdleTimer(vm);
-      if (!await this.retryPendingDelete(vm)) {
-        // Halt billing while deletion is pending; the command already
-        // finished and collected, so stopping cannot kill live work. A stop
-        // closes compute accounting but never releases deletion ownership.
-        await this.stopVm(vm, true, true);
-        this.scheduleStopRetry(vm, vm.generation);
-      }
+      // A failed DELETE already forced one stop and armed the retry timer inside
+      // retryPendingDelete; a failed first fence save stops there too. Never
+      // issue a second immediate stop here.
+      await this.retryPendingDelete(vm, true);
       await this.persistPool();
       if (!this.closed) await this.dispatchQueued();
     });
@@ -1871,12 +1868,20 @@ export class OffloadExecutor {
   /** Admission must be held. Retires the VM only after the provider delete
    * (404 included) and the terminal ledger receipt both succeed; otherwise
    * marks it quarantined + deletePending for a later sweep/shutdown retry. */
-  private async retryPendingDelete(vm: PoolVm): Promise<boolean> {
+  private async retryPendingDelete(vm: PoolVm, haltOnUnsavedFence = false): Promise<boolean> {
     vm.quarantined = true;
     vm.deletePending = true;
     // All callers, including sweep and shutdown after a failed fence save,
     // must commit ownership before a provider delete can have an effect.
-    try { await this.persistPool(); } catch { return false; }
+    try { await this.persistPool(); } catch {
+      if (haltOnUnsavedFence) {
+        // No DELETE ran; the finished command's VM must still stop billing.
+        // The stop never releases deletion ownership.
+        await this.stopVm(vm, true, true);
+        this.scheduleStopRetry(vm, vm.generation);
+      }
+      return false;
+    }
     try {
       await this.deleteAtProvider(vm.sandboxId);
       this.deps.sync?.sandboxStopped?.(vm.sandboxId);
