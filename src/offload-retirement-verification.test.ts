@@ -2,8 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { OffloadPoolStore } from "./offload-pool.js";
 import { responseError } from "./test-support/fake-boat.js";
-import { command, harness, hostKey, receipt, type RecordV1 } from "./test-support/durable-offload.js";
+import { command, harness, hostKey, receipt, testAccount, type RecordV1 } from "./test-support/durable-offload.js";
 
 let root: string;
 let h: ReturnType<typeof harness>;
@@ -33,7 +34,16 @@ const incompatible = (id: string) => command(id, { repoId: "another-repository" 
 
 describe("retirement requires observed provider termination", () => {
   it("sweeps a failed incompatible lost-create delete after worker restart without replaying work", async () => {
-    const first = h.openExecutor().executor;
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    // The journal harness has no guest adapter, so wire pool persistence too:
+    // reopening the journal alone does not model recovery of owned VMs.
+    const open = () => {
+      const executor = h.openExecutor(account).executor;
+      (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+      return executor;
+    };
+    const first = open();
     h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
     expect(await first.execute(command("lost-create"))).toMatchObject({ status: "unavailable" });
     const [vm] = [...h.boat.boxes.keys()];
@@ -42,12 +52,16 @@ describe("retirement requires observed provider termination", () => {
     expect(h.boat.boxes.get(vm!)?.state).toBe("archived");
     expect(h.boat.callsOf("create")).toHaveLength(2); // lost reply and same-key recovery
     expect(h.attempts).toHaveLength(0);
+    expect(await poolStore.load()).toMatchObject([
+      { sandboxId: vm, deletePending: true, quarantined: true },
+    ]);
 
     h.crash();
-    const recovered = h.openExecutor().executor;
+    const recovered = open();
     await recovered.sweep();
     expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
     expect(h.boat.boxes.has(vm!)).toBe(false);
+    expect(await poolStore.load()).toEqual([]);
     expect(h.boat.callsOf("create")).toHaveLength(2);
     expect(h.attempts).toHaveLength(0);
     expect(await recovered.execute(incompatible("replacement"))).toMatchObject({ status: "completed" });

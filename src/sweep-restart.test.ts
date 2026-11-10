@@ -444,7 +444,13 @@ describe("sweep after a worker restart", () => {
       ssh: {} as never, accountId, boat: () => api });
     vi.useFakeTimers({ toFake: ["Date"], now: clock + 33 * 86_400_000 });
     try {
-      await expect(runtime.sweep([companyId])).rejects.toThrow("Offload pool sweep unverified");
+      // An archived VM stays in the pool store, so its registry entry is the
+      // retained ownership anchor and the sweep has nothing unverified to
+      // report for prior-loss (no account write is attempted). Every other
+      // case still fails closed on the account-write outage.
+      const sweeping = expect(runtime.sweep([companyId]));
+      if (phase === "prior-loss" && providerState === "archived") await sweeping.resolves.toBeUndefined();
+      else await sweeping.rejects.toThrow("Offload pool sweep unverified");
       expect(Object.keys(await harness.ctx.state.get(registryScope) as object)).toContain(poolId);
       if (phase === "prior-loss") expect(accountWrites).toBe(0);
       else expect(accountWrites).toBeGreaterThan(0);
@@ -467,9 +473,16 @@ describe("sweep after a worker restart", () => {
           intents: Array<{ id: string; active: boolean; status: string }>;
         };
         expect(account.intents.find((intent) => intent.id === reservation.id)).toMatchObject({ active: false, status: "stopped" });
-        expect(await harness.ctx.state.get(registryScope)).toEqual({});
-        if (providerState === "deleted") expect(await store.load()).toEqual([]);
-        else expect((await store.load())[0]).toMatchObject({ stopped: true, stopping: false });
+        // Accounting is settled either way; the registry entry is dropped only
+        // once no VM remains. A deleted VM is removed from the pool, an
+        // archived one stays owned so discovery still reaches it.
+        if (providerState === "deleted") {
+          expect(await harness.ctx.state.get(registryScope)).toEqual({});
+          expect(await store.load()).toEqual([]);
+        } else {
+          expect(Object.keys(await harness.ctx.state.get(registryScope) as object)).toContain(poolId);
+          expect((await store.load())[0]).toMatchObject({ stopped: true, stopping: false });
+        }
         expect(fake.callsOf("create")).toEqual([]);
         expect(fake.callsOf("resume")).toEqual([]);
       } finally { await restarted.shutdown(); }
@@ -541,7 +554,9 @@ describe("sweep after a worker restart", () => {
         await restarted.sweep([companyId]);
         await ledger.load();
         expect(ledger.usage(poolId)[0]).toMatchObject({ tailSince: null, stoppedAt: expect.any(Number) });
-        expect(await harness.ctx.state.get(registryScope)).toEqual({});
+        // The other overdue VMs are stopped but still owned, so the registry
+        // entry is retained for provider discovery.
+        expect(Object.keys(await harness.ctx.state.get(registryScope) as object)).toContain(poolId);
         expect(fake.callsOf("create")).toEqual([]);
         expect(fake.callsOf("resume")).toEqual([]);
       } finally { await restarted.shutdown(); }
