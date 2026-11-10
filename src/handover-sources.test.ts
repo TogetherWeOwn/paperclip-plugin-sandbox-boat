@@ -7,10 +7,36 @@ import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 import { describe, expect, it, vi } from "vitest";
-import { openHandoverSources } from "./test-support/handover-sources.js";
+import { isHandoverSourceOrigin, openHandoverSources } from "./test-support/handover-sources.js";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 describe("handover fixture containment", () => {
+  it.each([
+    "https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat",
+    "https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "git@github.com:TogetherWeOwn/paperclip-plugin-sandbox-boat",
+    "git@github.com:TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "ssh://git@github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat",
+    "ssh://git@github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+  ])("accepts equivalent official source transports: %s", (origin) => {
+    expect(isHandoverSourceOrigin(origin)).toBe(true);
+  });
+
+  it.each([
+    "https://github.com/foreign/paperclip-plugin-sandbox-boat.git",
+    "git@github.com:foreign/paperclip-plugin-sandbox-boat.git",
+    "ssh://git@github.com/foreign/paperclip-plugin-sandbox-boat.git",
+    "https://github.com/TogetherWeOwn/other.git",
+    "https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat.git/extra",
+    "https://github.com.invalid.example/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "https://github.com@invalid.example/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "ssh://git@invalid.example/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "http://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+    "file:///TogetherWeOwn/paperclip-plugin-sandbox-boat.git",
+  ])("refuses foreign or noncanonical source origins: %s", (origin) => {
+    expect(isHandoverSourceOrigin(origin)).toBe(false);
+  });
+
   it("denies fetch, HTTP and socket entrypoints before pinned provider code loads", async () => {
     const sources = await openHandoverSources();
     try {

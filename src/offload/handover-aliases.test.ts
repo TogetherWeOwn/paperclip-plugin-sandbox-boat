@@ -43,7 +43,8 @@ export async function shimMain(script, args, deps, tool = "cargo") {
   return pkg;
 }
 function install(pkg: string, shimDir: string, env: Record<string, string> = {}) {
-  return spawnSync("sh", [join(sources.candidate.root, "scripts/install-offload-shims.sh"), pkg, shimDir], {
+  // Pin the characterized EXIT/TERM behavior, not the host's /bin/sh choice.
+  return spawnSync("dash", [join(sources.candidate.root, "scripts/install-offload-shims.sh"), pkg, shimDir], {
     encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin", ...env },
   });
 }
@@ -125,7 +126,7 @@ describe("eight aliases with actual pinned bins and publisher", () => {
 /usr/bin/mv "$@" || exit $?
 if [ ! -e "$MARKER" ]; then
   : > "$MARKER"
-  PATH=/usr/bin:/bin sh "$PUBLISHER" "$OTHER_PACKAGE" "$SHIMS" >/dev/null || exit $?
+  PATH=/usr/bin:/bin dash "$PUBLISHER" "$OTHER_PACKAGE" "$SHIMS" >/dev/null || exit $?
 fi
 `, { mode: 0o755 });
     expect(install(candidate, shims, { PATH: `${bin}:/usr/bin:/bin`, MARKER: marker,

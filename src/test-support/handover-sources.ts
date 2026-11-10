@@ -14,6 +14,10 @@ export const HANDOVER_SOURCES = {
   candidate: { commit: "6250c7a6e1ad0cc0f496f11367c956f2aa7f5428", tree: "9ead7c773ed3fa78289fd39052a8db37336449af" },
 } as const;
 
+export function isHandoverSourceOrigin(origin: string): boolean {
+  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)TogetherWeOwn\/paperclip-plugin-sandbox-boat(?:\.git)?$/.test(origin);
+}
+
 // Export only tracked source objects, never the installed package or host state.
 // CI fetches the pinned objects before running tests; this helper never fetches.
 export async function openHandoverSources() {
@@ -27,7 +31,7 @@ export async function openHandoverSources() {
   if (!sourceRepo) throw new Error("pinned handover objects require a verified source checkout");
   const git = (...args: string[]) => execFileSync("git", args, { cwd: sourceRepo, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   if (resolve(git("rev-parse", "--show-toplevel").trim()) !== sourceRepo
-    || !/^https:\/\/github\.com\/TogetherWeOwn\/paperclip-plugin-sandbox-boat(?:\.git)?$/.test(git("config", "--get", "remote.origin.url").trim())) {
+    || !isHandoverSourceOrigin(git("config", "--get", "remote.origin.url").trim())) {
     throw new Error("handover source repository mismatch");
   }
   const base = await mkdtemp(resolve(repo, ".handover-fixture-"));

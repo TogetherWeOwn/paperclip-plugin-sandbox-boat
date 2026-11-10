@@ -112,7 +112,6 @@ describe("pinned account-state operations, not version acceptance", () => {
     await boundary();
     const foreign = await ledger(to, "scope-b");
     await expect(foreign.reserve(boat, request("scope-b-refused", { maxActive: 1 }))).rejects.toThrow(/capacity|maxActive/);
-    await foreign.reconcile(boat, [{ id: "vm-synthetic", state: "archived" }]);
     expect(state.doc().intents[0]).toMatchObject({ providerScope: "scope-a", status: "intent", active: true, compute: 660 });
     expect(boat.callsOf("create")).toHaveLength(0);
   });
@@ -168,7 +167,7 @@ describe("pinned account-state operations, not version acceptance", () => {
     expect(state.doc().intents[0].computeReflected).toBeCloseTo(10);
   });
 
-  it.each(pairs)("%s → %s settles a matching delayed terminal receipt once without erasing its reservation", async (from, to) => {
+  it.each(pairs)("%s → %s preserves a foreign-scope terminal hold and settles the same-scope control once", async (from, to) => {
     const first = await ledger(from, "scope-a");
     boat.addSandbox({ id: "vm-synthetic", state: "ready", noEnv: true });
     const reservation = await first.reserve(boat, request("bound-unknown"));
@@ -178,9 +177,22 @@ describe("pinned account-state operations, not version acceptance", () => {
     await boundary();
     clock += 120_000;
     boat.boxes.get("vm-synthetic")!.state = "archived";
+    const held = state.doc();
+    expect(held.intents[0]).toMatchObject({ id: reservation.id, sandboxId: "vm-synthetic",
+      providerScope: "scope-a", status: "ambiguous", active: true });
+    expect(held.intents[0].settledAt).toBe(EPOCH);
+    const reads = boat.callsOf("get").length;
+    const foreign = await ledger(to, "scope-b");
+    await foreign.reconcile(boat, [{ id: "vm-synthetic", state: "archived" }]);
+    expect(state.doc().intents).toEqual(held.intents);
+    expect(state.doc().usage).toEqual(held.usage);
+    expect(boat.callsOf("get")).toHaveLength(reads);
+    await boundary();
+    // Identical matching evidence must retire the same hold in its own scope.
     const next = await ledger(to, "scope-a");
     await next.reconcile(boat, [{ id: "vm-synthetic", state: "archived" }]);
     const settled = state.doc().intents[0];
+    expect(boat.callsOf("get").slice(reads).map((call) => call.args)).toEqual([{ sandboxId: "vm-synthetic" }]);
     expect(settled).toMatchObject({ id: reservation.id, sandboxId: "vm-synthetic", status: "stopped", active: false, providerScope: "scope-a" });
     expect(settled.endedAt).toBe(clock);
     expect(await next.poolAccountingSettled("synthetic-pool")).toBe(true);

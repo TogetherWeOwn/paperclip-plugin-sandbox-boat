@@ -22,7 +22,10 @@ and dependencies remain in the archive. Containment regressions cover both
 layouts, missing/invalid source refusal and the stager's environment wiring with
 sentinel commands (no actual staging build or installation). This is test-source
 plumbing only: no package hook, admission guard, installation or publication
-behavior changes. An archive without a verified source checkout fails closed.
+behavior changes. Equivalent official HTTPS, scp-style SSH and `ssh://git@`
+origins are accepted; foreign repositories and hosts remain refused. Root and
+exact commit/tree validation apply regardless of transport. An archive without
+a verified source checkout fails closed.
 The PR base may include later repairs; that does not change this pair.
 Each persistence handoff reopens JSON state or actual files and uses new module
 roots. No installed-state paths, credentials, provider SDK clients or host state
@@ -35,8 +38,10 @@ modules, not provider code.
 
 `src/handover-state.test.ts` operates the actual pinned account ledgers in both
 directions: ambiguous reservations and expiry; uncommitted write refusal; scoped
-holds; warm/resume reservation failure and predecessor restoration; terminal
-settlement; legacy observation transition; candidate rollover and repeated
+holds; warm/resume reservation failure and predecessor restoration; matching
+terminal evidence that preserves a bound, settled foreign-scope hold before the
+same-scope positive control retires it in both pinned directions; legacy
+observation transition; candidate rollover and repeated
 observations; lifetime and cached-allowance expiry refusal. Provider calls use
 `FakeBoat` only. Ledger-level cases deliberately never start a VM.
 
@@ -86,6 +91,7 @@ shim/client logic is tested separately. This is **not** compiled release tarball
 qualification. Already-resolved old bin paths remain present after publication.
 Interrupted renames, publication failure, failed restore and restart resolution
 leave visible old/new mixtures; no claim of eight-rename atomicity is made.
+The fixture explicitly invokes dash rather than the host's generic `sh`.
 On dash, SIGTERM can also retain the interrupted staging directory because the
 pinned installer traps only EXIT. Alias restoration does not imply its cleanup;
 this existing installer behavior is characterized, not repaired or certified.
