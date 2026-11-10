@@ -410,6 +410,13 @@ export class OffloadExecutor {
       }
       if (state === "deleted") {
         this.retireVm(vm);
+      } else if (vm.deleteOnRelease) {
+        // Terminal-provider evidence settled the unfinished receipt above.
+        // The archived ephemeral disk still belongs to deletion cleanup.
+        vm.stopping = false;
+        vm.stopped = true;
+        vm.quarantined = true;
+        vm.deletePending = true;
       } else {
         vm.stopping = false;
         vm.stopped = true;
@@ -473,9 +480,10 @@ export class OffloadExecutor {
           // An in-flight allocation (including an unknown create ID) or guest
           // reservation cannot become idle just because its worker disappeared.
           if (vm.busy || vm.syncInFlight || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
-          // Ephemeral policy is saved before execution, not just at completion.
-          // A disappeared worker cannot turn that source-bearing disk into cache.
-          if (vm.deleteOnRelease && vm.sandboxId) {
+          // Policy is not completion authority: an unfinished guest may still
+          // be running or awaiting collection. Keep its normal receipt fence.
+          if (vm.deleteOnRelease && vm.sandboxId && this.durable
+            && !await this.durable.hasUnsettled(vm.sandboxId).catch(() => true)) {
             vm.busy = false;
             vm.quarantined = true;
             vm.deletePending = true;
@@ -697,7 +705,16 @@ export class OffloadExecutor {
     // A verified old result permits capacity again, but not an assumption that
     // the VM survived a restart in running state. Resume under the budget gate.
     await this.withAdmission(async () => {
-      if (vm.syncInFlight || vm.deletePending || vm.deleteOnRelease) return; // an old receipt cannot release cleanup ownership
+      if (vm.syncInFlight || vm.deletePending) return; // an old receipt cannot release cleanup ownership
+      if (vm.deleteOnRelease) {
+        // Replay collected a terminal receipt; only now can policy become a
+        // deletion obligation. Sweep persists that fence before any DELETE.
+        vm.busy = false;
+        vm.quarantined = true;
+        vm.deletePending = true;
+        await this.persistPool();
+        return;
+      }
       vm.quarantined = false;
       vm.busy = false;
       vm.workspaceKey = null;
@@ -1863,6 +1880,9 @@ export class OffloadExecutor {
     try {
       await this.deleteAtProvider(vm.sandboxId);
       this.deps.sync?.sandboxStopped?.(vm.sandboxId);
+      // Keep the last cleanup owner if a recovered unfinished journal cannot
+      // record authoritative termination yet; later DELETE/404 retries settle it.
+      await this.durable?.settleSandboxUnknown(vm.sandboxId);
       await this.ledger.stopped(vm.sandboxId, this.now(), vm.accountReservation?.id);
     } catch {
       vm.quarantined = true;
