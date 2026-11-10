@@ -473,6 +473,13 @@ export class OffloadExecutor {
           // An in-flight allocation (including an unknown create ID) or guest
           // reservation cannot become idle just because its worker disappeared.
           if (vm.busy || vm.syncInFlight || !vm.sandboxId) { vm.busy = false; vm.quarantined = true; }
+          // Ephemeral policy is saved before execution, not just at completion.
+          // A disappeared worker cannot turn that source-bearing disk into cache.
+          if (vm.deleteOnRelease && vm.sandboxId) {
+            vm.busy = false;
+            vm.quarantined = true;
+            vm.deletePending = true;
+          }
           // Provider state first: an archived VM is stopped, not quarantined,
           // and no SSH observe runs against a gone guest.
           if (vm.quarantined && vm.sandboxId) await this.reconcileQuarantined(vm).catch(() => undefined);
@@ -690,7 +697,7 @@ export class OffloadExecutor {
     // A verified old result permits capacity again, but not an assumption that
     // the VM survived a restart in running state. Resume under the budget gate.
     await this.withAdmission(async () => {
-      if (vm.syncInFlight) return; // an old command receipt cannot fence sync work
+      if (vm.syncInFlight || vm.deletePending || vm.deleteOnRelease) return; // an old receipt cannot release cleanup ownership
       vm.quarantined = false;
       vm.busy = false;
       vm.workspaceKey = null;
@@ -1414,7 +1421,8 @@ export class OffloadExecutor {
     const reservation = admitted;
     const jobSeconds = this.fundedJobSeconds(command);
     const vm = existing ?? { sandboxId: "", busy: true, stopped: false, quarantined: false, lastActiveAt: this.now(), generation: 0, idleHandle: null, stopDueAt: null, stopAttempts: 0,
-      stopping: false, stopRequestedAt: null, identity: null, compatibilityKey: this.compatibilityKey(command) };
+      stopping: false, stopRequestedAt: null, identity: null, compatibilityKey: this.compatibilityKey(command),
+      deleteOnRelease: this.isEphemeral(command) };
     // reserveVm clears the idle deadline/timer and the ledger reservation
     // supersedes the predecessor's tail. Keep what a definitive pre-effect
     // refusal must put back; failed(reservation, true) restores the ledger side.
@@ -1833,9 +1841,10 @@ export class OffloadExecutor {
       this.clearIdleTimer(vm);
       if (!await this.retryPendingDelete(vm)) {
         // Halt billing while deletion is pending; the command already
-        // finished and collected, so stopping cannot kill live work. The
-        // pending-delete retry, not this stop, owns terminal accounting.
-        await this.boat.stop({ sandboxId: vm.sandboxId }).catch(() => undefined);
+        // finished and collected, so stopping cannot kill live work. A stop
+        // closes compute accounting but never releases deletion ownership.
+        await this.stopVm(vm, true, true);
+        this.scheduleStopRetry(vm, vm.generation);
       }
       await this.persistPool();
       if (!this.closed) await this.dispatchQueued();
@@ -1862,6 +1871,10 @@ export class OffloadExecutor {
       // The delete stays pending for a later sweep, but the VM is already
       // quarantined against reuse: its SSH session can go now.
       await this.notifyReleased(vm);
+      // DELETE may remain unavailable after stop service recovers. Halt
+      // compute independently, retaining the durable disk-deletion fence.
+      await this.stopVm(vm, true, true);
+      this.scheduleStopRetry(vm, vm.generation);
       return false;
     }
     this.retireVm(vm);
@@ -1871,7 +1884,7 @@ export class OffloadExecutor {
   private scheduleIdleStop(vm: PoolVm, generation: number, delayMs: number): void {
     vm.idleHandle = this.timers.set(() => {
       void this.withAdmission(async () => {
-        if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || vm.quarantined || this.closed) return;
+        if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || (vm.quarantined && !vm.deletePending) || this.closed) return;
         vm.idleHandle = null;
         let pending: boolean;
         if (vm.stopping && !await this.observeStop(vm)) {
@@ -1881,7 +1894,7 @@ export class OffloadExecutor {
           if (pending) vm.stopAttempts += 1;
           await this.persistPool();
         } else {
-          pending = !await this.stopVm(vm, vm.stopping) || vm.stopping;
+          pending = !await this.stopVm(vm, vm.stopping, vm.deletePending) || vm.stopping;
         }
         if (pending) this.scheduleStopRetry(vm, generation);
       }).catch(() => {
@@ -1896,7 +1909,7 @@ export class OffloadExecutor {
   private scheduleStopRetry(vm: PoolVm, generation: number): void {
     // Recheck after awaits/rejection: retirement, reuse or shutdown may have
     // superseded this callback. Never overwrite a newer generation's timer.
-    if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || vm.quarantined || this.closed || vm.idleHandle != null) return;
+    if (!this.pool.includes(vm) || vm.generation !== generation || vm.busy || vm.stopped || (vm.quarantined && !vm.deletePending) || this.closed || vm.idleHandle != null) return;
     const retryMs = Math.min(30_000, 1000 * 2 ** Math.min(Math.max(0, vm.stopAttempts - 1), 5));
     this.scheduleIdleStop(vm, generation, retryMs);
   }

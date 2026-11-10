@@ -168,6 +168,117 @@ describe("retirement requires observed provider termination", () => {
     expect(h.attempts).toHaveLength(0);
   });
 
+  // Queue behind the timer callback's admission section without sweeping:
+  // scheduleIdleStop invokes withAdmission synchronously from the timer, so an
+  // empty section enqueued afterwards completes only once that callback has.
+  async function drainTimerAdmission(executor: object) {
+    await (executor as unknown as { withAdmission(fn: () => Promise<void>): Promise<void> }).withAdmission(async () => {});
+  }
+  async function pendingDeleteAfterFailedStop() {
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    const { executor } = h.openExecutor(account);
+    (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    expect(await executor.execute(command("lost-create"))).toMatchObject({ status: "unavailable" });
+    const [vm] = [...h.boat.boxes.keys()];
+    h.boat.failNext("stop", responseError(500, { code: "internal" }));
+    expect(await executor.execute(incompatible("replay"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.boxes.get(vm!)?.state).toBe("ready");
+    expect(h.boat.callsOf("stop")).toHaveLength(1);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    return { executor, poolStore, vm: vm! };
+  }
+  function expectNoNewWork(createCalls: number) {
+    expect(h.boat.callsOf("create")).toHaveLength(createCalls);
+    expect(h.boat.callsOf("resume")).toHaveLength(0);
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(0);
+    expect(h.attempts).toHaveLength(0);
+  }
+
+  it("force-stops a pending-delete quarantined VM from the 1s timer without sweep or new work, retaining ownership", async () => {
+    const { executor, poolStore, vm } = await pendingDeleteAfterFailedStop();
+    await h.advance(1000);
+    await drainTimerAdmission(executor);
+    expect(h.boat.callsOf("stop").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
+    expect(h.boat.boxes.get(vm)?.state).toBe("archived");
+    expectNoNewWork(2);
+    // A confirmed stop ends compute only: only confirmed deletion releases it.
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    expect(await executor.execute(command("compatible"))).toMatchObject({ status: "unavailable" });
+    expectNoNewWork(2);
+    await executor.sweep();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm]);
+    expect(h.boat.callsOf("stop")).toHaveLength(2);
+    expect(await poolStore.load()).toEqual([]);
+  });
+
+  it("keeps retrying the forced stop from timers while it fails, without sweep, and retains pending delete", async () => {
+    const account = testAccount();
+    const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
+    const { executor } = h.openExecutor(account);
+    (executor as unknown as { poolStore: OffloadPoolStore }).poolStore = poolStore;
+    h.boat.failNext("create", (args) => h.boat.loseCreateReply(args));
+    await executor.execute(command("lost-create"));
+    const [vm] = [...h.boat.boxes.keys()];
+    h.boat.failNext("stop", responseError(500, { code: "internal" }));
+    h.boat.failNext("stop", responseError(500, { code: "internal" }));
+    await executor.execute(incompatible("replay"));
+    await h.advance(1000);
+    await drainTimerAdmission(executor);
+    expect(h.boat.callsOf("stop")).toHaveLength(2);
+    expect(h.boat.boxes.get(vm!)?.state).toBe("ready");
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    await h.advance(30_000); // covers the bounded backoff, whatever its first step
+    await drainTimerAdmission(executor);
+    expect(h.boat.callsOf("stop")).toHaveLength(3);
+    expect(h.boat.boxes.get(vm!)?.state).toBe("archived");
+    expectNoNewWork(2);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+  });
+
+  it("retains pending-delete quarantine when the timer stop recovers but sweep deletion keeps failing", async () => {
+    const { executor, poolStore, vm } = await pendingDeleteAfterFailedStop();
+    await h.advance(1000);
+    await drainTimerAdmission(executor);
+    expect(h.boat.boxes.get(vm)?.state).toBe("archived");
+    h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    await executor.sweep();
+    await executor.sweep();
+    expect(h.boat.callsOf("deleteSandbox").map((call) => call.args.sandboxId)).toEqual([vm, vm]);
+    expect(h.boat.boxes.has(vm)).toBe(true);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    expect(await executor.execute(incompatible("blocked"))).toMatchObject({ status: "unavailable" });
+    expect(h.boat.callsOf("create")).toHaveLength(2);
+    expect(h.attempts).toHaveLength(0);
+    await executor.sweep(); // provider recovers: only now is the slot freed
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(3);
+    expect(h.boat.boxes.has(vm)).toBe(false);
+    expect(await poolStore.load()).toEqual([]);
+    expect(await executor.execute(incompatible("replacement"))).toMatchObject({ status: "completed" });
+  });
+
+  it("retains ownership when both the first stop and sweep deletion fail, then converges via timer stop and later delete", async () => {
+    const { executor, poolStore, vm } = await pendingDeleteAfterFailedStop();
+    h.boat.failNext("deleteSandbox", responseError(500, { code: "internal" }));
+    h.boat.failNext("stop", responseError(500, { code: "internal" }));
+    await executor.sweep(); // both cleanup endpoints still fail
+    expect(h.boat.boxes.get(vm)?.state).toBe("ready");
+    expect(h.boat.callsOf("create")).toHaveLength(2);
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    await h.advance(30_000);
+    await drainTimerAdmission(executor);
+    expect(h.boat.callsOf("stop").length).toBeGreaterThanOrEqual(2);
+    expect(h.boat.boxes.get(vm)?.state).toBe("archived");
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(1); // timer never deletes
+    expect(await poolStore.load()).toMatchObject([{ sandboxId: vm, deletePending: true, quarantined: true }]);
+    await executor.sweep();
+    expect(h.boat.callsOf("deleteSandbox")).toHaveLength(2);
+    expect(await poolStore.load()).toEqual([]);
+    expect(h.attempts).toHaveLength(0);
+  });
+
   it("does not stop or delete a recovered VM before its first deletion fence is saved", async () => {
     const account = testAccount();
     const poolStore = new OffloadPoolStore(account.state, account.accountId, account.poolId);
