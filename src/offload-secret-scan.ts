@@ -21,7 +21,7 @@ import { X509Certificate } from "node:crypto";
 import { lstat, open, opendir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { containsJwt } from "./env-policy.js";
+import { containsJwt, WELL_KNOWN_CREDENTIAL_PREFIXES } from "./env-policy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -166,6 +166,17 @@ export async function listTrackedFiles(sourceRoot: string): Promise<Set<string> 
   return files;
 }
 
+/**
+ * Patterns for the well-known credential prefixes WELL_KNOWN_CREDENTIAL_PREFIXES
+ * shares with the env policy, each with a length guard so a bare prefix
+ * mention (docs, a comment) or a short placeholder is not a hit. The guard
+ * is uniform across prefixes; the env policy matches the bare prefix, which
+ * is stricter for an env value and still safe for a source file.
+ */
+const WELL_KNOWN_CREDENTIAL_CONTENT_RES: readonly RegExp[] = WELL_KNOWN_CREDENTIAL_PREFIXES.map((prefix) =>
+  new RegExp(`\\b${prefix.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}[A-Za-z0-9_-]{16,}\\b`),
+);
+
 /** Known credential shapes. Each pattern is linear in the scanned text. */
 const SECRET_CONTENT_RES: readonly RegExp[] = [
   // AWS access key ids (long-term, temporary and account-scoped prefixes).
@@ -181,6 +192,7 @@ const SECRET_CONTENT_RES: readonly RegExp[] = [
   /\bAIza[0-9A-Za-z_-]{35}\b/,
   // Stripe live secret/restricted keys.
   /\b[sr]k_live_[A-Za-z0-9]{16,}\b/,
+  ...WELL_KNOWN_CREDENTIAL_CONTENT_RES,
 ];
 
 /** True when the content carries a known credential shape or a JWT anywhere in it. */

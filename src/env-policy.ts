@@ -165,6 +165,21 @@ const DENIED_NAME_PREFIXES = ["PLANETSCALE_", "CLOUDFLARE_", "CF_", "DISCORD_", 
 
 const SECRET_NAME_RE =
   /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|(?:^|_)PWD(?:_|$)|(?:^|_)PASS(?:_|$)|PRIVATE_?KEY|PRIVKEY|API_?KEY|ACCESS_?KEY|CRED(?:S|ENTIALS?)?(?:_|$)|CREDENTIAL|COOKIE|(?:^|_)KEYS?$|SIGNING|HMAC|SALT|SEED|MNEMONIC|CONN(?:ECTION)?_?STR(?:ING)?|WEBHOOK|(?:^|_)DSN(?:_|$)|_AUTH$|_PAT$/i;
+/**
+ * Well-known credential prefixes. The tracked-file content scan in
+ * offload-secret-scan.ts derives its patterns from this list, so the env
+ * policy and the tracked-file policy cannot drift: a prefix added here is a
+ * secret in both. Ordered most-specific first, so the `sk-ant-`/`sk-or-`
+ * forms win over the bare `sk-` prefix in an alternation. Entries are
+ * literal prefixes, matched as bare prefixes by the env policy below and
+ * with a length guard by the tracked-file scan.
+ */
+export const WELL_KNOWN_CREDENTIAL_PREFIXES = ["sk-ant-", "sk-or-", "sk-", "glpat-"] as const;
+
+const WELL_KNOWN_CREDENTIAL_PREFIX_SRC = WELL_KNOWN_CREDENTIAL_PREFIXES.map((prefix) =>
+  prefix.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&"),
+).join("|");
+
 // A value that is a secret whatever its name says. Applied to prefix matches
 // only (an exact entry is the operator naming that one variable on purpose);
 // each pattern is linear in the value.
@@ -181,7 +196,7 @@ const SECRET_VALUE_RES: readonly RegExp[] = [
   // when no assignment follows).
   /(?:private_key|client_secret|password|passwd|passphrase|pwd)\s*(?:["']\s*)?[:=]/i,
   /(?:AccountKey|SharedAccessKey)=/i,
-  /(?:^|[^A-Za-z0-9])(?:sk-ant-|sk-or-|sk-|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[abpr]-|glpat-)/,
+  new RegExp(`(?:^|[^A-Za-z0-9])(?:${WELL_KNOWN_CREDENTIAL_PREFIX_SRC}|gh[pousr]_|github_pat_|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|xox[abpr]-)`),
 ];
 
 export function looksLikeSecretValue(value: string): boolean {
