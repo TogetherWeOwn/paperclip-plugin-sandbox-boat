@@ -222,17 +222,70 @@ describe("secret content scan", () => {
     ["private key header", "-----BEGIN OPENSSH PRIVATE KEY-----\n"],
     ["GitHub token", `token = "ghp_${"a".repeat(36)}"\n`],
     ["JWT", "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature\n"],
-  ])("flags a tracked file with a %s", async (_label, content) => {
+    ["Anthropic key", `key = "sk-ant-api03-${"a".repeat(30)}"\n`],
+    ["OpenAI-style key", `key = "sk-${"a".repeat(32)}"\n`],
+    ["OpenRouter key", `key = "sk-or-v1-${"a".repeat(30)}"\n`],
+    ["GitLab token", `token = "glpat-${"a".repeat(20)}"\n`],
+  ])("flags a tracked file with a %s at admission", async (_label, content) => {
     const root = gitRepo({ "src/secret.rs": content });
     const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
     expect(await hasSecretInFiles(root, tracked)).toBe(true);
     expect(containsSecretContent(content)).toBe(true);
   });
 
+  it.each([
+    ["Anthropic key", `key = "foo_sk-ant-api03-${"a".repeat(30)}"\n`],
+    ["OpenAI-style key", `key = "foo_sk-${"a".repeat(32)}"\n`],
+    ["OpenRouter key", `key = "foo_sk-or-v1-${"a".repeat(30)}"\n`],
+    ["GitLab token", `token = "token_glpat-${"a".repeat(20)}"\n`],
+  ])("flags an underscore-adjacent %s at admission", async (_label, content) => {
+    const root = gitRepo({ "src/secret.rs": content });
+    const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
+    expect(await hasSecretInFiles(root, tracked)).toBe(true);
+    expect(containsSecretContent(content)).toBe(true);
+  });
+
+  it.each([
+    ["an underscore-adjacent bare prefix", "foo_sk-test foo_glpat-short\n"],
+    ["an alphanumeric-glued long token", `const T = "task-${"a".repeat(32)} myglpat-${"a".repeat(20)}"\n`],
+    ["an underscore config name", "const my_token_prefix = \"sk-\";\n"],
+  ])("passes ordinary source with %s", async (_label, content) => {
+    expect(containsSecretContent(content)).toBe(false);
+    const root = gitRepo({ "src/ordinary.rs": content });
+    const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
+    expect(await hasSecretInFiles(root, tracked)).toBe(false);
+  });
+
+  it.each([
+    ["Anthropic key", `key = "sk-ant-api03-${"a".repeat(30)}"\n`],
+    ["OpenAI-style key", `key = "sk-${"a".repeat(32)}"\n`],
+    ["OpenRouter key", `key = "sk-or-v1-${"a".repeat(30)}"\n`],
+    ["GitLab token", `token = "glpat-${"a".repeat(20)}"\n`],
+  ])("aborts the capture when a tracked file carries a fake %s (push-time rescan)", async (_label, content) => {
+    const root = gitRepo({ "src/config.rs": content });
+    const tracked = await listTrackedFiles(root);
+    await expect(captureManifest(root, { onlyPaths: tracked!, scanForSecrets: true }))
+      .rejects.toMatchObject({ code: "SYNC_SECRET_CONTENT" });
+  });
+
   it("passes a clean tracked tree", async () => {
     const root = gitRepo();
     const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
     expect(await hasSecretInFiles(root, tracked)).toBe(false);
+  });
+
+  it.each([
+    ["bare prefixes in prose", "Keys use the sk-ant-, sk-or-, sk- and glpat- prefixes.\n"],
+    ["a short placeholder", "const PLACEHOLDER = \"sk-test\";\n"],
+    ["an unrelated hyphenated word", "// task-settled handler\n"],
+    ["an ordinary config key", "const NAME = \"config\";\n"],
+  ])("passes ordinary source with %s", async (_label, content) => {
+    const root = gitRepo({ "src/ordinary.rs": content });
+    const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
+    expect(await hasSecretInFiles(root, tracked)).toBe(false);
+    expect(containsSecretContent(content)).toBe(false);
+    const trackedSet = await listTrackedFiles(root);
+    await expect(captureManifest(root, { onlyPaths: trackedSet!, scanForSecrets: true })).resolves.toBeDefined();
   });
 
   it("does not scan sync-excluded names, which never leave the host", async () => {
