@@ -137,9 +137,26 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/assets"
           test -f notes.md
-          test "$(find . -maxdepth 1 -name '*.tgz' | wc -l)" -eq 1
-          test "$(find . -maxdepth 1 -name '*.tgz.sha256' | wc -l)" -eq 1
-          sha256sum -c *.tgz.sha256
+          shopt -s nullglob
+          tarballs=( *.tgz )
+          checksums=( *.tgz.sha256 )
+          test "${#tarballs[@]}" -eq 1
+          test "${#checksums[@]}" -eq 1
+          tarball="${tarballs[0]}"
+          # The checksum filename must be the tarball's own .sha256, so a
+          # checksum for some other file cannot stand in for this tarball.
+          test "${checksums[0]}" = "$tarball.sha256"
+          # Exactly one entry, naming exactly this tarball by basename:
+          # sha256sum -c alone would trust whatever filename the checksum
+          # file lists and could pass for notes.md while the tarball that
+          # is published went unchecked. The entry filename is everything
+          # after the 64-char digest and its two-char separator, taken
+          # whole: taking only the second whitespace field would let an
+          # entry naming "pkg.tgz decoy" pass for pkg.tgz while sha256sum
+          # -c checked the decoy file instead.
+          test "$(wc -l < "${checksums[0]}")" -eq 1
+          test "$(cut -c67- "${checksums[0]}")" = "$tarball"
+          sha256sum -c "${checksums[0]}"
 
       - name: Publish the GitHub Release
         env:
