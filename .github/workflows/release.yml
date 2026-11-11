@@ -8,7 +8,9 @@ name: release
 # source and runs no build, test or install step.
 # workflow_dispatch releases a tag that already exists, for a tag whose commit
 # predates this workflow (a tag push runs the workflow file at the tagged
-# commit). See docs/releasing.md.
+# commit). It only runs from main: the steps below execute scripts from the
+# checkout with the release write token, so a manual run from any other
+# branch would run that branch's scripts. See docs/releasing.md.
 on:
   push:
     tags: ['v*']
@@ -40,9 +42,24 @@ jobs:
         # Explicit bash adds pipefail, so a failed build cannot hide behind a pipe.
         shell: bash
     steps:
+      # A manual run's checkout is the ref it was dispatched from, so refuse
+      # any dispatch that is not from main before checking anything out or
+      # running a script. Tag pushes are unaffected: they run at the tagged
+      # commit, which the build step requires to be on main.
+      - name: Require main for manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Refusing manual release from $GITHUB_REF: run the release workflow from refs/heads/main."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Manual dispatch checks out main (guarded above), never the
+          # dispatched-from branch, so the release scripts are main's. A tag
+          # push checks out the tagged commit, whose history the build needs.
           # stage-package.sh needs origin/main and the tag's history.
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}
           fetch-depth: 0
           # npm ci runs dependency scripts; keep the read token out of .git/config.
           persist-credentials: false
