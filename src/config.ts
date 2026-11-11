@@ -34,6 +34,10 @@ export interface BoatDriverConfig {
   noReadyMachineRetries: number;
   namePrefix: string;
   timeoutMs: number;
+  /** Whole-run execute cap per output stream, in bytes. A command that writes
+   * past it runs to its own exit but its returned output is truncated to this
+   * many bytes per stream and flagged in the result. */
+  executeMaxOutputBytes: number;
   stopConfirmTimeoutMs: number;
   cliproxyTunnel: boolean;
   tunnelRemotePort: number;
@@ -102,6 +106,10 @@ export const CONFIG_DEFAULTS = {
   noReadyMachineRetries: 2,
   namePrefix: "paperclip",
   timeoutMs: 300_000,
+  // 8 MiB per stream bounds the host worker's per-run heap while covering
+  // legitimate agent/build output; past it the run keeps its exit code and
+  // the excess is discarded and flagged (see execute in vm-manager.ts).
+  executeMaxOutputBytes: 8 * 1024 * 1024,
   stopConfirmTimeoutMs: 120_000,
   cliproxyTunnel: true,
   managedGithub: false,
@@ -180,6 +188,7 @@ export function parseDriverConfig(raw: Record<string, unknown>): BoatDriverConfi
     noReadyMachineRetries: Math.max(0, Math.trunc(num(raw.noReadyMachineRetries, CONFIG_DEFAULTS.noReadyMachineRetries))),
     namePrefix: normalizeNamePrefix(str(raw.namePrefix)),
     timeoutMs: Math.trunc(num(raw.timeoutMs, CONFIG_DEFAULTS.timeoutMs)),
+    executeMaxOutputBytes: Math.trunc(num(raw.executeMaxOutputBytes, CONFIG_DEFAULTS.executeMaxOutputBytes)),
     stopConfirmTimeoutMs: Math.trunc(num(raw.stopConfirmTimeoutMs, CONFIG_DEFAULTS.stopConfirmTimeoutMs)),
     cliproxyTunnel: bool(raw.cliproxyTunnel, CONFIG_DEFAULTS.cliproxyTunnel),
     managedGithub: bool(raw.managedGithub, CONFIG_DEFAULTS.managedGithub),
@@ -323,6 +332,11 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
   if (config.minComputeHoursLeft < 0) errors.push("minComputeHoursLeft cannot be negative.");
   if (config.timeoutMs < 10_000 || config.timeoutMs > 86_400_000) {
     errors.push("timeoutMs must be between 10000 and 86400000.");
+  }
+  // The cap is itself the bound: the worker heap must stay flat at this size,
+  // so no "unlimited" escape exists, and the floor keeps agent output usable.
+  if (config.executeMaxOutputBytes < 65_536 || config.executeMaxOutputBytes > 67_108_864) {
+    errors.push("executeMaxOutputBytes must be between 65536 (64 KiB) and 67108864 (64 MiB).");
   }
   if (config.stopConfirmTimeoutMs < 5_000 || config.stopConfirmTimeoutMs > 1_800_000) {
     errors.push("stopConfirmTimeoutMs must be between 5000 and 1800000.");

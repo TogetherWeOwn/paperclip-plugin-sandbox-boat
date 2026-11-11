@@ -54,6 +54,9 @@ describe("validateDriverConfig limits", () => {
     ["syncOutMaxFiles below 1", { syncOutMaxFiles: 0 }, /^syncOutMaxFiles must be between 1 and 1000000\.$/],
     ["syncOutMaxFiles above the hard bound", { syncOutMaxFiles: 1_000_001 }, /^syncOutMaxFiles must be between 1 and 1000000\.$/],
     ["a negative syncOutDiskReserveBytes", { syncOutDiskReserveBytes: -1 }, /^syncOutDiskReserveBytes must be between/],
+    ["executeMaxOutputBytes below the 64 KiB floor", { executeMaxOutputBytes: 65_535 }, /^executeMaxOutputBytes must be between 65536 \(64 KiB\) and 67108864 \(64 MiB\)\.$/],
+    ["executeMaxOutputBytes above the 64 MiB ceiling", { executeMaxOutputBytes: 67_108_865 }, /^executeMaxOutputBytes must be between 65536 \(64 KiB\) and 67108864 \(64 MiB\)\.$/],
+    ["executeMaxOutputBytes of 0", { executeMaxOutputBytes: 0 }, /^executeMaxOutputBytes must be between 65536 \(64 KiB\) and 67108864 \(64 MiB\)\.$/],
   ];
   for (const [name, raw, message] of cases) {
     it(`refuses ${name}`, () => {
