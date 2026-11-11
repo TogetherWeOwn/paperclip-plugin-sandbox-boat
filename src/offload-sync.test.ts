@@ -184,6 +184,103 @@ describe("captureManifest", () => {
   });
 });
 
+describe("captureManifest size bounds", () => {
+  it("refuses a file already past the cap at capture time, before opening it", async () => {
+    const root = makeTemp();
+    writeTree(root, { "big.bin": "x".repeat(2048) });
+    let opens = 0;
+    const realOpen = fsp.open;
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        opens += 1;
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+    };
+    await expect(captureManifest(root, { maxBytes: 1024, fs })).rejects.toMatchObject({ code: "SYNC_SOURCE_TOO_LARGE" });
+    expect(opens).toBe(0);
+  });
+
+  it("refuses without buffering a file that grows past the cap between the lstat and the open", async () => {
+    const root = makeTemp();
+    writeTree(root, { "data.bin": "small\n" });
+    const maxBytes = 1024;
+    let reads = 0;
+    const realOpen = fsp.open;
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        if (p !== path.join(root, "data.bin")) return realOpen(p, flags);
+        // The file grows after the walk's lstat but before the open: the
+        // handle stat must refuse it before any byte is read.
+        writeFileSync(p, "x".repeat(maxBytes + 1));
+        const handle = await realOpen(p, flags);
+        return {
+          stat: () => handle.stat(),
+          close: () => handle.close(),
+          read: async (...args: unknown[]) => {
+            reads += 1;
+            return (handle.read as (...a: unknown[]) => Promise<unknown>)(...args);
+          },
+        } as unknown as fsp.FileHandle;
+      }) as typeof fsp.open,
+    };
+    await expect(captureManifest(root, { maxBytes, fs })).rejects.toMatchObject({ code: "SYNC_SOURCE_TOO_LARGE" });
+    expect(reads).toBe(0);
+  });
+
+  it("refuses a file that outgrows the cap during its read", async () => {
+    const root = makeTemp();
+    writeTree(root, { "data.bin": "small\n" });
+    const pre = lstatSync(path.join(root, "data.bin"));
+    // Stat matches the lstat exactly, but the read yields more than the cap
+    // (a file grown after the stat): the capped read must refuse instead of
+    // buffering it all.
+    const grown = Buffer.alloc(2048);
+    let offset = 0;
+    const handle = {
+      stat: async () => ({ isFile: () => true, size: pre.size, mtimeMs: pre.mtimeMs }),
+      read: async (buf: Buffer, _off: number, len: number) => {
+        const count = Math.min(len, grown.length - offset);
+        grown.copy(buf, 0, offset, offset + count);
+        offset += count;
+        return { bytesRead: count, buffer: buf };
+      },
+      close: async () => {},
+    };
+    const fs = {
+      ...fsp,
+      open: (async () => handle) as unknown as typeof fsp.open,
+    };
+    await expect(captureManifest(root, { maxBytes: 1024, fs })).rejects.toMatchObject({ code: "SYNC_SOURCE_TOO_LARGE" });
+  });
+
+  it("refuses the file that tips the cumulative cap before opening it", async () => {
+    const root = makeTemp();
+    writeTree(root, { "a.bin": "x".repeat(600), "b.bin": "y".repeat(600) });
+    let opens = 0;
+    const realOpen = fsp.open;
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        opens += 1;
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+    };
+    await expect(captureManifest(root, { maxBytes: 1024, fs })).rejects.toMatchObject({ code: "SYNC_SOURCE_TOO_LARGE" });
+    // Only the first file was opened; the tipping file refused on its lstat size.
+    expect(opens).toBe(1);
+  });
+
+  it("captures a file exactly at the cap", async () => {
+    const root = makeTemp();
+    writeTree(root, { "exact.bin": "y".repeat(1024) });
+    const { manifest } = await captureManifest(root, { maxBytes: 1024 });
+    expect(manifest.files.map((f) => f.path)).toEqual(["exact.bin"]);
+    expect(manifest.files[0]!.size).toBe(1024);
+  });
+});
+
 describe("captureSnapshot", () => {
   it("freezes an immutable copy that a later live symlink swap cannot poison", async () => {
     const root = makeTemp();

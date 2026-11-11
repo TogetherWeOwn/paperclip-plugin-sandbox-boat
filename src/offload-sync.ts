@@ -317,14 +317,43 @@ export async function resolveContained(root: string, rel: string): Promise<strin
   return abs;
 }
 
-async function hashOpenFile(handle: fsp.FileHandle, preSize: number, preMtimeMs: number): Promise<{ bytes: Buffer; size: number; mtimeMs: number }> {
+/**
+ * Read and hash one open file under a byte allowance (`maxBytes` is the
+ * remaining capture budget for this file). The handle stat gates the read:
+ * a file past the allowance refuses with SYNC_SOURCE_TOO_LARGE before a
+ * single byte is buffered, and the read itself is capped at the same
+ * allowance so a file that grows mid-read never buffers more than the
+ * budget plus one chunk.
+ */
+async function hashOpenFile(handle: fsp.FileHandle, preSize: number, preMtimeMs: number, maxBytes: number): Promise<{ bytes: Buffer; size: number; mtimeMs: number }> {
   const before = await handle.stat();
   // A file swapped for a FIFO/device/dir between the lstat and the open is a
   // structural race, not content to hash: size/mtime alone cannot see it (a
   // FIFO reports size 0), and reading it could block or drain a device.
   if (!before.isFile()) throw new ConcurrentEdit();
+  // Size precondition before any read: a file grown past the budget between
+  // the lstat and the open refuses here instead of being buffered whole.
+  if (before.size > maxBytes) {
+    throw new SyncError("SYNC_SOURCE_TOO_LARGE", `source exceeds the ${maxBytes}-byte cap.`);
+  }
   if (before.size !== preSize || before.mtimeMs !== preMtimeMs) throw new ConcurrentEdit();
-  const bytes = await handle.readFile();
+  // Capped chunked read (the liveHash pattern): a file grown past the
+  // allowance after the stat refuses on length, never buffering more than
+  // the allowance plus one chunk. Unlike readFile, this keeps the handle
+  // open for the after-stat below.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const chunk = Buffer.alloc(64 * 1024);
+  for (;;) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+    if (total > maxBytes) {
+      throw new SyncError("SYNC_SOURCE_TOO_LARGE", `source exceeds the ${maxBytes}-byte cap.`);
+    }
+    chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+  }
+  const bytes = Buffer.concat(chunks);
   const after = await handle.stat();
   if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new ConcurrentEdit();
   return { bytes, size: after.size, mtimeMs: after.mtimeMs };
@@ -448,6 +477,12 @@ async function walkAndHash(
         if (entry.name.endsWith(".pem") && pre.size > MAX_CERTIFICATE_PEM_BYTES) {
           throw new SyncError("SYNC_SECRET_CONTENT", `refusing to sync ${entryRel}: it exceeds the certificate-only .pem size bound; the command stays local.`);
         }
+        // Bound this file by the remaining budget before it is even opened: a
+        // file grown past the cap since admission refuses on its lstat size
+        // instead of being buffered whole for the post-read total check.
+        if (bytes + pre.size > maxBytes) {
+          throw new SyncError("SYNC_SOURCE_TOO_LARGE", `source under ${root} exceeds the ${maxBytes}-byte cap.`);
+        }
         // Deleted, swapped for a link, or file<->dir exchanged anywhere between
         // readdir and read: retry the capture instead of throwing a raw errno.
         // O_NONBLOCK so a file-to-FIFO swap after the lstat cannot park the
@@ -455,7 +490,7 @@ async function walkAndHash(
         // for not being a regular file (O_NONBLOCK is a no-op for those).
         const handle = await raceToRetry(() => io.open(entryAbs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK));
         try {
-          const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs));
+          const { bytes: content, size, mtimeMs } = await raceToRetry(() => hashOpenFile(handle, pre.size, pre.mtimeMs, maxBytes - bytes));
           // Any .pem bound for a manifest — via the tracked exception or a
           // caller's own excludes — must prove certificate-only on the
           // exact frozen bytes, so a swap between admission and capture
