@@ -1,7 +1,8 @@
 // Whole-run execute must bound the output the host worker holds: a guest
 // that floods stdout/stderr for the whole timeout grows the worker heap
 // until it takes down every company/lease the worker serves. These tests
-// pin the contract: truncate mode keeps exactly the cap-sized byte prefix,
+// pin the contract: truncate mode keeps the cap-sized byte prefix of the
+// collected wire stream (the supervised stderr marker shares that stream),
 // flags the cut, and preserves the command's own exit; fail mode (control
 // plane) rejects instead; output within the cap is byte-identical.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +18,7 @@ vi.mock("node:child_process", async () => {
 import { setBoatApiFactoryForTests } from "./boat-client.js";
 import type { BoatApiLike } from "./boat-client.js";
 import plugin, { setManagerOverridesForTests } from "./plugin.js";
+import { stripRunMarker } from "./shell.js";
 import { runProcess, runStreamProcess } from "./ssh.js";
 import { FakeBoat } from "./test-support/fake-boat.js";
 import { FakeSsh, createFakeContext } from "./test-support/harness.js";
@@ -62,6 +64,51 @@ describe("runStreamProcess output cap", () => {
     expect(result.stderrTruncated).toBe(true);
     expect(result.stdout).toHaveLength(CAP);
     expect(result.stderr).toHaveLength(CAP);
+  }, 15_000);
+
+  it("counts the supervisor marker against the wire stderr cap and strips it", async () => {
+    // runSupervised composition (ssh.ts): the guest supervisor writes its
+    // PCSYNC marker as the first stderr line and stripRunMarker removes it,
+    // so the marker's bytes count against the wire cap. A guest at exactly
+    // the cap overflows the wire stream, the flag is set, and stripping
+    // leaves the guest prefix with no marker bytes and nothing past the
+    // cap in the heap.
+    const runId = "a".repeat(32);
+    const marker = `PCSYNC:${runId}:12345\n`;
+    const script = [
+      "import os",
+      `os.write(2, ${"b" + JSON.stringify(marker)})`,
+      `os.write(2, b"e" * ${CAP})`,
+      "",
+    ].join("\n");
+    const result = await runStreamProcess("python3", ["-c", script], {
+      timeoutMs: 10_000,
+      maxOutputBytes: CAP,
+      outputLimitBehavior: "truncate",
+    });
+    expect(result.stderrTruncated).toBe(true);
+    const stripped = stripRunMarker(result.stderr, runId);
+    expect(stripped).toBe("e".repeat(CAP - Buffer.byteLength(marker)));
+    expect(stripped).not.toContain("PCSYNC");
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(CAP);
+  }, 15_000);
+
+  it("strips the marker and keeps small stderr byte-identical", async () => {
+    const runId = "b".repeat(32);
+    const marker = `PCSYNC:${runId}:7\n`;
+    const script = [
+      "import os",
+      `os.write(2, ${"b" + JSON.stringify(marker)})`,
+      "os.write(2, b'e' * 100)",
+      "",
+    ].join("\n");
+    const result = await runStreamProcess("python3", ["-c", script], {
+      timeoutMs: 10_000,
+      maxOutputBytes: CAP,
+      outputLimitBehavior: "truncate",
+    });
+    expect(result.stderrTruncated).toBeUndefined();
+    expect(stripRunMarker(result.stderr, runId)).toBe("e".repeat(100));
   }, 15_000);
 
   it("passes output exactly at the cap through with no truncation flag", async () => {
@@ -171,6 +218,30 @@ describe("execute output cap", () => {
       maxOutputBytes: CAP,
     });
     expect(result.stderr).toContain(`boat: stdout and stderr exceeded ${CAP} bytes and was truncated`);
+  });
+
+  it("preserves guest stderr byte-exact when only stdout is cut", async () => {
+    // Regression: the truncation note must not alter guest stderr. The note
+    // is appended after a separator, never by trimming the whole string —
+    // trimming would eat the guest's leading whitespace whenever stdout
+    // alone overflows.
+    const lease = await acquire();
+    const guestStderr = "  indented diagnostic\n";
+    ssh.handler = (remoteCommand) =>
+      remoteCommand.includes("review-indent-command")
+        ? { code: 0, stdout: "x".repeat(3 * CAP), stderr: guestStderr }
+        : undefined;
+    const result = await plugin.definition.onEnvironmentExecute!({
+      companyId, environmentId, driverKey: "boat", config: baseConfig, lease,
+      command: "review-indent-command", args: [], env: {},
+    });
+    expect(result.stdout).toBe("x".repeat(CAP));
+    expect(result.metadata).toMatchObject({
+      outputTruncated: true, stdoutTruncated: true, stderrTruncated: false, maxOutputBytes: CAP,
+    });
+    expect(result.stderr).toBe(
+      `${guestStderr}\nboat: stdout exceeded ${CAP} bytes and was truncated; the command's exit reflects the full run, this output is a prefix.`,
+    );
   });
 
   it("returns output within the cap byte-identical with no truncation fields", async () => {

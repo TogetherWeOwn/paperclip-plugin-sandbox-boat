@@ -3292,17 +3292,20 @@ export class BoatVmManager {
         outputLimitBehavior: "truncate",
       });
       let stderr = result.stderr;
-      // The returned stdout/stderr are the cap-sized byte prefixes. Name the
-      // cut in both places a caller can see it: stderr (a line, never out
-      // content) and structured metadata. A run that fit the cap keeps its
-      // output byte-identical and adds no fields.
+      // The cap bounds the collected wire stream per stream, and the
+      // supervisor's PCSYNC marker shares the stderr stream: a cut stderr
+      // prefix can be up to that marker's bytes shorter than the cap, and
+      // stderrTruncated is set whenever the wire stream overflowed. Name
+      // the cut in both places a caller can see it: stderr (a line, never
+      // out content) and structured metadata. A run that fit the cap keeps
+      // its output byte-identical and adds no fields.
       const outputTruncated = result.stdoutTruncated === true || result.stderrTruncated === true;
       if (outputTruncated) {
         const streams = [
           ...(result.stdoutTruncated ? ["stdout"] : []),
           ...(result.stderrTruncated ? ["stderr"] : []),
         ].join(" and ");
-        stderr = `${stderr}\nboat: ${streams} exceeded ${config.executeMaxOutputBytes} bytes and was truncated; the command's exit reflects the full run, this output is a prefix.`.trim();
+        stderr = `${stderr}${stderr ? "\n" : ""}boat: ${streams} exceeded ${config.executeMaxOutputBytes} bytes and was truncated; the command's exit reflects the full run, this output is a prefix.`;
       }
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
