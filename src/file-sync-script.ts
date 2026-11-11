@@ -270,6 +270,10 @@ def receive(confine):
                     if not parts:
                         if not member.isdir():
                             raise ValueError('invalid tar root')
+                        count_entry()
+                        count_directory(())
+                        if len(directories) >= MAX_DIRECTORIES:
+                            raise ValueError('too many tar directories')
                         directories.append(([], directory_mode(member)))
                         continue
                     # Every member costs one entry, created or dropped, so the
