@@ -60,6 +60,7 @@ beforeEach(async () => {
   boat = new FakeBoat({ now: Date.now });
   const harness = createFakeContext();
   runtime = new SshOffloadRuntime({ state: harness.ctx.state, logger: harness.ctx.logger, ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles, submodules: noInitializedSubmodules,
+    authenticateRepo: async () => true,
     boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session,
     guestOptions: { stateRoot: ssh.root, executable: "/bin/sh", path: "/usr/bin:/bin", args: () => ["-c", "set -e; printf 'from guest'; test ! -e .env; printf returned > Cargo.lock"] } });
   runtime.remember(native());
@@ -262,6 +263,24 @@ describe("stock concrete executor factory", () => {
     expect(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: ["/nonexistent-root"] })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
     expect(boat.calls).toHaveLength(0);
   });
+  it("re-validates remote authentication on every resolve: a spoofed local-run binding stays local", async () => {
+    await mkdir(path.join(source, ".git"));
+    await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
+    // A runtime whose remote check fails (unreachable or unauthenticated
+    // remote) must refuse even though roots and origin agree.
+    const spoofed = new SshOffloadRuntime({ state: createFakeContext().ctx.state, logger: createFakeContext().ctx.logger,
+      ssh: ssh.manager, accountId: "test-only", trackedFiles: listAllFilesAsTracked, untrackedFiles: noUntrackedFiles,
+      submodules: noInitializedSubmodules, authenticateRepo: async () => false,
+      boat: () => boat as unknown as BoatApiLike, session: async () => ssh.session });
+    const localNative = native();
+    (localNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    spoofed.remember(localNative);
+    const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
+    expect(await spoofed.resolve(command(), rooted)).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));
+    expect(await spoofed.preflight(command(), rooted)).toEqual(expect.any(String));
+    expect(boat.calls).toHaveLength(0);
+    await spoofed.shutdown();
+  }, 15_000);
   it("refuses a queued local-run upload when the origin flips or the roots drop after resolve", async () => {
     await mkdir(path.join(source, ".git"));
     const origin = (url: string) => writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);

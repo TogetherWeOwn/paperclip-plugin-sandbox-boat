@@ -12,6 +12,7 @@ import { SWEEP_JOB_KEY } from "./manifest.js";
 import { offloadError } from "./offload/errors.js";
 import type { RouteActor } from "./offload/routes.js";
 import { fsCanonicalPath, localRunRealization, localRunSettings, readGitOriginUrl, type LocalRunHost } from "./local-run-binding.js";
+import { authenticateRepo } from "./repo-auth.js";
 import { runOutsideInvocation } from "./proactive.js";
 import { BoatVmManager } from "./vm-manager.js";
 import type { ManagerDeps } from "./vm-manager.js";
@@ -114,6 +115,7 @@ const plugin = definePlugin({
       workspace: async (workspaceId, company) => await ctx.executionWorkspaces.get(workspaceId, company),
       canonicalPath: fsCanonicalPath,
       onDiskRepoUrl: readGitOriginUrl,
+      authenticateRepo,
     };
     // Local runs bind only after admission on an offload request: any request on
     // the broad (null-policy) path, only the real submit of an exact grant. Start

@@ -282,7 +282,7 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
     expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
   }, TIMEOUT);
 
-  it("(6) with no exact grant configured, a stock host keeps the v0.2.14 path: an owned run binds and is admitted", async () => {
+  it("(6) with no exact grant configured, a stock host keeps the v0.2.14 path: an unauthenticatable checkout stays local", async () => {
     const saved = config.offloadAdmission;
     (config as Record<string, unknown>).offloadAdmission = null;
     try {
@@ -290,11 +290,16 @@ describe("stock Paperclip 2026.1023.0 local-run offload contract", () => {
       await host.initialize();
       const actor = { agentId, companyId, runId };
       await host.call("onEvent", { event: runStartedEvent({ companyId, runId, agentId, issueId }) }, companyId);
-      // No authenticated run identity or atomic create is needed: the dry-run
-      // binds the run's own allowlisted workspace and is answered, not denied.
+      // The bare .git/config fixture has no HEAD advertised by any remote, so
+      // the authenticated-identity gate keeps the run local: the shim gets a
+      // fallback-safe 503 for an unknown workspace, never an offload binding.
+      // (A genuine allowlisted checkout with an advertised HEAD still binds;
+      // that case is covered by the unit suites with an injected remote.)
       const reply = await untilOwned(actor);
-      expect(reply.status).toBe(200);
-      expect(host.logs).toContain("boat: bound local run for offload");
+      expect(reply.status).toBe(503);
+      expect(reply.body.code).toBe("OFFLOAD_UNAVAILABLE");
+      expect(reply.body.detail).not.toBe(NOT_OWNER);
+      expect(host.logs).not.toContain("boat: bound local run for offload");
       expect((await execAs({ ...actor, runId: randomUUID() })).status).toBe(403);
       expect([...host.state.keys()].filter((key) => key.includes("boat-offload-admission"))).toEqual([]);
     } finally {

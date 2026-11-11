@@ -8,12 +8,17 @@
 // The workspace row itself is NOT authority: an agent with runtime access can
 // rewrite its cwd/repoUrl, so the row only nominates a candidate source. The
 // bind stands only when the operator-owned facts agree: realpath(source) lies
-// inside an `offloadLocalSourceRoots` entry, and the checkout's own on-disk
+// inside an `offloadLocalSourceRoots` entry, the checkout's own on-disk
 // `remote.origin.url` canonicalizes to the same repo id as the row's repoUrl
-// (the payload then carries the on-disk URL). Both facts are re-checked on
-// every executor resolve (offload-ssh-runtime). These current-workspace facts
-// do not prove where a run started, so unbound reports must not use them. For
-// an admitted bind, the Boat secret is resolved last, after every check.
+// (the payload then carries the on-disk URL), and that repo identity is
+// authenticated against its remote: unauthenticated `ls-remote` must
+// advertise the checkout's HEAD, and the tracked tree must match it. The
+// on-disk origin alone is agent-writable, so without the remote proof two
+// rewritten strings could spoof the allowlist. All facts are re-checked on
+// every executor resolve (offload-ssh-runtime). These current-workspace
+// facts do not prove where a run started, so unbound reports must not use
+// them. For an admitted bind, the Boat secret is resolved last, after every
+// check.
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -47,6 +52,13 @@ export interface LocalRunHost {
   canonicalPath(localPath: string): Promise<string | null>;
   /** The checkout's own remote.origin.url, read from disk, or null when unreadable/absent. */
   onDiskRepoUrl(localPath: string): Promise<string | null>;
+  /**
+   * Authenticated remote proof: the claimed remote advertises the checkout's
+   * HEAD and the tracked tree matches it. The on-disk origin alone is
+   * agent-writable, so this remote fact is load-bearing. Fails closed
+   * (false) on any unreachable or unauthenticated remote.
+   */
+  authenticateRepo(repoUrl: string, canonicalSource: string): Promise<boolean>;
   apiKey(secretRef: unknown, companyId: string): Promise<string | null>;
 }
 
@@ -144,6 +156,8 @@ export async function localRunWorkspace(
   if (!onDiskRepoUrl) return refuse("checkout has no on-disk origin");
   const repoId = canonicalRepoId({ repoUrl: source.repoUrl, projectId: source.projectId });
   if (!repoId.startsWith("repo:") || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: source.projectId }) !== repoId) return refuse("on-disk origin does not match the workspace repoUrl");
+  const authenticated = await host.authenticateRepo(onDiskRepoUrl, canonical).catch(() => false);
+  if (!authenticated) return refuse("repository identity cannot be authenticated against its remote");
   return { workspaceId, source: { ...source, localPath: canonical, repoUrl: onDiskRepoUrl } };
 }
 
