@@ -288,6 +288,14 @@ describe("secret content scan", () => {
     await expect(captureManifest(root, { onlyPaths: trackedSet!, scanForSecrets: true })).resolves.toBeDefined();
   });
 
+  it("fails closed on a tracked file past the scan size bound", async () => {
+    const root = gitRepo({ "src/big.bin": "x\n" });
+    // Sparse 65 MiB file: past the 64 MiB per-file scan bound, so admission
+    // stays local without reading its contents.
+    execFileSync("truncate", ["-s", "65M", path.join(root, "src/big.bin")]);
+    expect(await hasSecretInFiles(root, ["src/big.bin"])).toBe(true);
+  });
+
   it("does not scan sync-excluded names, which never leave the host", async () => {
     // A tracked .env is excluded from sync by name, so admission does not
     // read it: the resolve() gate filters with isDefaultSyncExcluded first.

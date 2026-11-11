@@ -359,15 +359,37 @@ export async function hasSecretInFiles(root: string, relPaths: readonly string[]
     if (total > MAX_SCAN_TOTAL_BYTES) return true;
     let handle;
     try {
-      handle = await open(abs, O_RDONLY | O_NOFOLLOW);
+      // O_NONBLOCK so a regular-file-to-FIFO swap after the lstat cannot
+      // park admission waiting for a writer; the handle stat then refuses
+      // anything that is not a regular file.
+      handle = await open(abs, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException)?.code;
       if (code === "ENOENT" || code === "ENOTDIR") continue;
       return true;
     }
     try {
-      const content = await handle.readFile();
-      if (containsSecretContent(content)) return true;
+      // Re-check the opened file against both budgets before reading: the
+      // lstat sizes above cannot see a swap or growth between them and the
+      // open, and an unbound readFile would buffer such a file whole.
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.size > MAX_SCAN_FILE_BYTES || total + opened.size > MAX_SCAN_TOTAL_BYTES) return true;
+      // Capped chunked read: a file grown past either budget after the
+      // stat fails closed on length, never buffering more than the budget
+      // plus one chunk.
+      const cap = Math.min(MAX_SCAN_FILE_BYTES, MAX_SCAN_TOTAL_BYTES - total);
+      const chunks: Buffer[] = [];
+      let fileBytes = 0;
+      const chunk = Buffer.alloc(64 * 1024);
+      for (;;) {
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+        if (bytesRead === 0) break;
+        fileBytes += bytesRead;
+        if (fileBytes > cap) return true;
+        chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+      }
+      total += fileBytes;
+      if (containsSecretContent(Buffer.concat(chunks))) return true;
     } catch {
       return true;
     } finally {

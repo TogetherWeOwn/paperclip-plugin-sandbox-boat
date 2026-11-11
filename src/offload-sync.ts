@@ -626,6 +626,10 @@ async function freezeAndVerify(root: string, snapshotDir: string, manifest: Sour
     // write through the link (or fail on the dir), so only files survive.
     const destSt = await io.lstat(dest).catch(() => null);
     if (destSt && !destSt.isFile()) await io.rm(dest, { recursive: true, force: true });
+    // Size precondition before the copy: a source grown since hashing is
+    // recaptured instead of copying an oversized frozen file to disk.
+    const srcSt = await io.lstat(src).catch(() => null);
+    if (!srcSt || !srcSt.isFile() || srcSt.size !== entry.size) return false;
     try {
       await io.copyFile(src, dest);
     } catch (error) {
@@ -635,10 +639,53 @@ async function freezeAndVerify(root: string, snapshotDir: string, manifest: Sour
     await io.chmod(dest, entry.mode);
     // Node sets whole milliseconds only; the rsync production path preserves full precision.
     await io.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
-    const frozen = await io.readFile(dest);
-    if (sha256Hex(frozen) !== entry.sha256) return false;
+    // Size precondition before buffering: a frozen copy larger (or smaller)
+    // than its manifest entry is a hashing-to-copy race, never bytes to hash.
+    const frozenSt = await io.lstat(dest).catch(() => null);
+    if (!frozenSt || !frozenSt.isFile() || frozenSt.size !== entry.size) return false;
+    if ((await hashFrozenCopy(io, dest, entry.size)) !== entry.sha256) return false;
   }
   return true;
+}
+
+/**
+ * Stream-hash one frozen copy under its manifest size: the handle stat gates
+ * the read and the chunked hash stops at the expected size, so a copy that
+ * grows during the read is refused without ever buffering it whole. Returns
+ * null for any size, type or race mismatch (the caller recaptures).
+ */
+async function hashFrozenCopy(io: ManifestFs, dest: string, expectedSize: number): Promise<string | null> {
+  let handle: fsp.FileHandle;
+  try {
+    // O_NONBLOCK so a file-to-FIFO swap after the lstat cannot park the open
+    // waiting for a writer; the handle stat then refuses non-regular files.
+    handle = await io.open(dest, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (error) {
+    if (isRaceError(error)) return null;
+    throw error;
+  }
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.size !== expectedSize) return null;
+    const hash = createHash("sha256");
+    const chunk = Buffer.alloc(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > expectedSize) return null;
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    const after = await handle.stat();
+    if (!after.isFile() || after.size !== before.size) return null;
+    return hash.digest("hex");
+  } catch (error) {
+    if (isRaceError(error)) return null;
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 export interface PushPlan {

@@ -1101,6 +1101,77 @@ describe("captureManifest open race", () => {
 });
 
 describe("captureSnapshot freeze races", () => {
+  it("rejects a frozen copy larger than its manifest entry without buffering it", async () => {
+    const root = makeTemp();
+    const snapDir = makeTemp();
+    writeTree(root, { "src/a.rs": "v1\n" });
+    const realCopyFile = fsp.copyFile;
+    const realOpen = fsp.open;
+    let copies = 0;
+    let readFiles = 0;
+    let destOpens = 0;
+    const fs = {
+      ...fsp,
+      readFile: (async (...args: unknown[]) => {
+        readFiles += 1;
+        return (fsp.readFile as (...a: unknown[]) => Promise<Buffer>)(...args);
+      }) as typeof fsp.readFile,
+      open: (async (p: string, flags: number) => {
+        if (p === path.join(snapDir, "src/a.rs")) destOpens += 1;
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+      copyFile: (async (src: string, dest: string) => {
+        if (src === path.join(root, "src/a.rs")) {
+          copies += 1;
+          // The source grows between hashing and copying on every attempt,
+          // so each frozen copy is larger than the entry it is checked
+          // against and the capture must refuse instead of buffering it.
+          writeFileSync(src, "x".repeat(1024 + copies * 1024));
+        }
+        return realCopyFile(src, dest);
+      }) as typeof fsp.copyFile,
+    };
+    await expect(captureSnapshot(root, snapDir, { fs })).rejects.toMatchObject({ code: "SYNC_CONCURRENT_EDIT" });
+    // Refused on the frozen-copy size before any byte was read for the
+    // hash: no whole-file readFile, and not even an open of the copy.
+    expect(readFiles).toBe(0);
+    expect(destOpens).toBe(0);
+  });
+
+  it("refuses a frozen copy that streams past its manifest size during the verify read", async () => {
+    const root = makeTemp();
+    const snapDir = makeTemp();
+    writeTree(root, { "src/a.rs": "v1\n" });
+    const entrySize = lstatSync(path.join(root, "src/a.rs")).size;
+    const realOpen = fsp.open;
+    const grown = Buffer.alloc(1024 * 1024, 1);
+    let reads = 0;
+    let offset = 0;
+    const destHandle = {
+      stat: async () => ({ isFile: () => true, size: entrySize }),
+      read: async (buf: Buffer, off: number, len: number) => {
+        reads += 1;
+        const count = Math.min(len, grown.length - offset);
+        grown.copy(buf, off, offset, offset + count);
+        offset += count;
+        return { bytesRead: count, buffer: buf };
+      },
+      close: async () => {},
+    };
+    const fs = {
+      ...fsp,
+      open: (async (p: string, flags: number) => {
+        if (p === path.join(snapDir, "src/a.rs")) return destHandle as unknown as fsp.FileHandle;
+        return realOpen(p, flags);
+      }) as typeof fsp.open,
+    };
+    await expect(captureSnapshot(root, snapDir, { fs })).rejects.toMatchObject({ code: "SYNC_CONCURRENT_EDIT" });
+    // One capped chunk per attempt: the 1 MiB stream was refused after the
+    // first chunk exceeded the 3-byte entry, never buffered whole.
+    expect(reads).toBe(2);
+    expect(offset).toBeLessThanOrEqual(2 * 64 * 1024);
+  });
+
   it("recaptures when a source file vanishes between hashing and copying", async () => {
     const root = makeTemp();
     const snapDir = makeTemp();
