@@ -19,7 +19,7 @@ Releases are git tags with a GitHub Release. Each release has the staged package
    * fails if the built tarball holds any symlink or hardlink (`scripts/check-tarball-links.sh`). Before 0.2.6 the tarball carried the SDK as an absolute symlink to the build host's path and could not load anywhere else;
    * attaches `sandbox-boat-X.Y.Z-<short sha>.tgz` and `.tgz.sha256` to a new GitHub Release, with that `CHANGELOG.md` section as its notes. A release that already exists is never overwritten.
 
-A tag push runs the workflow file at the tagged commit. To release a tag whose commit predates the workflow (as with the `v0.2.3` backfill), push the tag and then run the workflow from `main` by hand: `gh workflow run release.yml -f tag=vX.Y.Z`.
+A tag push runs the workflow file at the tagged commit. To release a tag whose commit predates the workflow (as with the `v0.2.3` backfill), push the tag and then run the workflow from `main` by hand: `gh workflow run release.yml --ref main -f tag=vX.Y.Z`. The workflow refuses a manual run dispatched from any other ref, because its steps execute the checked-out release scripts with the release write token; the package itself is still built from the tagged commit.
 
 ## Install a release
 
