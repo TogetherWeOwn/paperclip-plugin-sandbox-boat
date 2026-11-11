@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.18
+
+Security and reliability fixes for credential delivery, offload admission,
+state recovery and bounded reads. Upgrading does not enable offload.
+
+### Fixed
+
+* Model credentials are withheld unless the configured proxy-key fingerprint
+  matches, including when the fingerprint is missing or blank (#134).
+* Whole-run command output and offload capture, freeze-verification and
+  guest-mirror comparison reads are bounded before buffering (#138, #139,
+  #147).
+* Local offload authenticates repository identity against its remote and
+  applies the task network policy (#143, #142).
+* Sync receiver budgets include root-directory members (#141).
+* Recovery retains VM ownership until provider deletion, and active frozen
+  dependency identity is retained (#132, #124).
+
+### Changed
+
+* Release CI separates the build and publish jobs, binds the tarball to its
+  checksum, and restricts manual release dispatch to main (#140, #144,
+  #136). CI pins and repository checks were updated (#135, #137, #146).
+* Handover fixtures characterize state semantics and compiled aliases; they
+  do not by themselves authorize an installation or downgrade (#130).
+* Added the public product roadmap entry point (#131).
+
 ## 0.2.17
 
 Multi-toolchain shim installation, explicit Python uv test selection and
