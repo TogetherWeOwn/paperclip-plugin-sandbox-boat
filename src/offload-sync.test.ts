@@ -446,19 +446,14 @@ describe("LocalGuestStore.push", () => {
     // Stat reports the manifest size, but the first chunk already exceeds it.
     // A compare that drains the stream before rejecting would resume it again.
     let reads = 0;
-    let destroyed = false;
     let closed = false;
     const handle = {
       stat: async () => ({ isFile: () => true, size: 2 }),
-      createReadStream: () => ({
-        async *[Symbol.asyncIterator]() {
-          reads += 1;
-          yield Buffer.alloc(8, 1);
-          reads += 1;
-          yield Buffer.alloc(8, 2);
-        },
-        destroy() { destroyed = true; },
-      }),
+      read: async (buffer: Buffer) => {
+        reads += 1;
+        buffer.fill(1, 0, 8);
+        return { bytesRead: 8, buffer };
+      },
       close: async () => { closed = true; },
     };
     const growing = new LocalGuestStore({ open: (async () => handle) as unknown as typeof fsp.open });
@@ -467,7 +462,6 @@ describe("LocalGuestStore.push", () => {
     expect(result.bytes).toBe(2);
     expect(result.skipped).toBe(0);
     expect(reads).toBe(1);
-    expect(destroyed).toBe(true);
     expect(closed).toBe(true);
     expect(readFileSync(path.join(guest, "src/a.rs"), "utf8")).toBe("a\n");
   });
@@ -1337,6 +1331,31 @@ describe("planPush metadata changes", () => {
 });
 
 describe("LocalGuestStore.push metadata-only sync", () => {
+  it("does not change an unrelated file when the destination leaf is replaced", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    const outside = path.join(makeTemp(), "outside");
+    writeTree(live, { "a.txt": "same bytes" });
+    writeFileSync(outside, "untouched");
+    chmodSync(outside, 0o600);
+    const originalTime = new Date(1_600_000_000_000);
+    utimesSync(outside, originalTime, originalTime);
+    const first = await captureSnapshot(live, snapDir);
+    await new LocalGuestStore().push(snapDir, first.manifest.files, guest);
+    chmodSync(path.join(live, "a.txt"), 0o755);
+    const second = await captureSnapshot(live, snapDir);
+    const store = new LocalGuestStore({ beforeCopy: () => {
+      rmSync(path.join(guest, "a.txt"));
+      symlinkSync(outside, path.join(guest, "a.txt"));
+    } });
+    await expect(store.push(snapDir, second.manifest.files, guest)).rejects.toThrow(/destination changed/);
+    const st = lstatSync(outside);
+    expect(st.mode & 0o777).toBe(0o600);
+    expect(Math.floor(st.mtimeMs)).toBe(originalTime.getTime());
+    expect(readFileSync(outside, "utf8")).toBe("untouched");
+  });
+
   it("applies a mode change without rewriting bytes", async () => {
     const live = makeTemp();
     const snapDir = makeTemp();

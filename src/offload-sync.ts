@@ -779,9 +779,13 @@ export class LocalGuestStore implements GuestStore {
     let skipped = 0;
     for (const entry of entries) {
       const dest = await resolveContained(guest, entry.path);
-      const match = await matchGuestEntry(dest, entry, this.opts.open ?? fsp.open);
+      const match = await matchGuestEntry(dest, entry, this.opts.open ?? fsp.open, this.opts.beforeCopy);
       if (match === "identical") {
         skipped += 1;
+        continue;
+      }
+      if (match === "metadata-only") {
+        files += 1;
         continue;
       }
       this.opts.beforeCopy?.(entry);
@@ -790,10 +794,6 @@ export class LocalGuestStore implements GuestStore {
       if (entry.symlink !== undefined) {
         await fsp.rm(dest, { recursive: true, force: true });
         await fsp.symlink(entry.symlink, dest);
-      } else if (match === "metadata-only") {
-        // Same bytes: fix the mode/mtime in place without rewriting the file.
-        await fsp.chmod(dest, entry.mode);
-        await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
       } else {
         const st = await fsp.lstat(dest).catch(() => null);
         if (st && (st.isSymbolicLink() || st.isDirectory())) await fsp.rm(dest, { recursive: true, force: true });
@@ -803,7 +803,7 @@ export class LocalGuestStore implements GuestStore {
         await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
       }
       files += 1;
-      bytes += match === "metadata-only" ? 0 : entry.size;
+      bytes += entry.size;
     }
     return { files, bytes, skipped };
   }
@@ -995,7 +995,7 @@ type GuestMatch = "identical" | "metadata-only" | "different";
  * buffering at most one chunk instead of the whole grown file. The open is
  * injected so tests can stream more bytes than stat reported.
  */
-async function matchGuestEntry(dest: string, entry: SyncFileEntry, open: typeof fsp.open = fsp.open): Promise<GuestMatch> {
+async function matchGuestEntry(dest: string, entry: SyncFileEntry, open: typeof fsp.open = fsp.open, beforeCopy?: (entry: SyncFileEntry) => void): Promise<GuestMatch> {
   const st = await fsp.lstat(dest).catch(() => null);
   if (!st) return "different";
   if (entry.symlink !== undefined) {
@@ -1020,26 +1020,32 @@ async function matchGuestEntry(dest: string, entry: SyncFileEntry, open: typeof 
     const hst = await handle.stat();
     if (!hst.isFile() || hst.size !== entry.size) return "different";
     const hash = createHash("sha256");
-    const stream = handle.createReadStream();
+    const chunk = Buffer.alloc(64 * 1024);
     let total = 0;
-    try {
-      for await (const chunk of stream) {
-        const buf = chunk as Buffer;
-        total += buf.length;
-        if (total > entry.size) return "different";
-        hash.update(buf);
-      }
-    } finally {
-      stream.destroy();
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > entry.size) return "different";
+      hash.update(chunk.subarray(0, bytesRead));
     }
     if (total !== entry.size) return "different";
     if (hash.digest("hex") !== entry.sha256) return "different";
+    const modeOk = (hst.mode & 0o777) === (entry.mode & 0o777);
+    const mtimeOk = Math.floor(hst.mtimeMs) === Math.floor(entry.mtimeMs);
+    if (modeOk && mtimeOk) return "identical";
+    beforeCopy?.(entry);
+    await handle.chmod(entry.mode);
+    const time = new Date(Math.floor(entry.mtimeMs));
+    await handle.utimes(time, time);
+    const current = await fsp.lstat(dest).catch(() => null);
+    if (!current?.isFile() || current.dev !== hst.dev || current.ino !== hst.ino) {
+      throw new Error(`mirror destination changed during metadata repair: ${entry.path}`);
+    }
+    return "metadata-only";
   } finally {
     await handle.close().catch(() => undefined);
   }
-  const modeOk = (st.mode & 0o777) === (entry.mode & 0o777);
-  const mtimeOk = Math.floor(st.mtimeMs) === Math.floor(entry.mtimeMs);
-  return modeOk && mtimeOk ? "identical" : "metadata-only";
 }
 
 export interface RsyncPushSpec {
