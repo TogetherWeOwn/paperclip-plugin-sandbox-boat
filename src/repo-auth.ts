@@ -359,16 +359,23 @@ async function worktreeBlobBytes(root: string, entry: TreeEntry): Promise<number
  */
 async function isPinnedWorktreeRoot(localPath: string, runGit: GitRunner): Promise<boolean> {
   let top: { stdout: string; exit: number };
+  let prefixOut: { stdout: string; exit: number };
   try {
-    top = await runGit(gitArgs("-C", localPath, "rev-parse", "--show-toplevel", "--show-prefix"), {});
+    top = await runGit(gitArgs("-C", localPath, "rev-parse", "--show-toplevel"), {});
+    prefixOut = await runGit(gitArgs("-C", localPath, "rev-parse", "--show-prefix"), {});
   } catch {
     return false;
   }
-  if (top.exit !== 0) return false;
-  const lines = top.stdout.split("\n");
-  const claimedTop = (lines[0] ?? "").trim();
-  const prefix = lines[1] ?? "";
-  if (claimedTop === "" || prefix !== "") return false;
+  if (top.exit !== 0 || prefixOut.exit !== 0) return false;
+  // The prefix must be exactly the empty record. Querying it separately and
+  // rejecting anything but that record keeps a newline inside the top-level
+  // path from shifting fields and forging an apparently empty prefix.
+  if (prefixOut.stdout !== "\n" && prefixOut.stdout !== "") return false;
+  // Strip only git's terminating newline (never trim): a top-level root
+  // ending in spaces stays valid, while any embedded newline makes the
+  // output ambiguous and fails closed.
+  const claimedTop = top.stdout.endsWith("\n") ? top.stdout.slice(0, -1) : top.stdout;
+  if (claimedTop === "" || claimedTop.includes("\n")) return false;
   const [canonicalLocal, canonicalTop] = await Promise.all([
     realpath(localPath).catch(() => null),
     realpath(claimedTop).catch(() => null),

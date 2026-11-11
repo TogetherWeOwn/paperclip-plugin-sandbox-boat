@@ -58,9 +58,12 @@ function fakeRunners(opts: FakeOpts): { runGit: GitRunner; runGitRaw: GitRunnerR
     if (args.includes("ls-remote")) return { stdout: opts.remote ?? "", exit: opts.remoteExit ?? 0 };
     if (args.includes("--show-toplevel")) {
       if ((opts.topExit ?? 0) !== 0) return { stdout: "", exit: opts.topExit! };
-      // Default to a pinned worktree root at the `-C` path with an empty prefix.
+      // Default to a pinned worktree root at the `-C` path.
       const dir = args[args.indexOf("-C") + 1] ?? "";
-      return { stdout: `${opts.topLevel ?? dir}\n${opts.prefix ?? ""}\n`, exit: 0 };
+      return { stdout: `${opts.topLevel ?? dir}\n`, exit: 0 };
+    }
+    if (args.includes("--show-prefix")) {
+      return { stdout: `${opts.prefix ?? ""}\n`, exit: 0 };
     }
     if (args.includes("rev-parse")) return { stdout: opts.head ?? "", exit: opts.headExit ?? 0 };
     if (args.includes("ls-files")) return { stdout: opts.index ?? "", exit: opts.indexExit ?? 0 };
@@ -242,6 +245,48 @@ describe("authenticateRepoInner", () => {
         treeRawByOid: new Map([[c.treeOid, c.treeRaw]]),
         index: "file.txt\0",
         prefix: "pkg/",
+      });
+      expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the claimed top level carries embedded newlines", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "boat-repo-auth-"));
+    try {
+      const content = "hello\n";
+      await writeFile(path.join(dir, "file.txt"), content);
+      const c = genuineChain(content);
+      const runners = fakeRunners({
+        remote: `${c.head}\tHEAD\n`,
+        head: `${c.head}\n`,
+        commitRaw: c.commitRaw,
+        treeRawByOid: new Map([[c.treeOid, c.treeRaw]]),
+        index: "file.txt\0",
+        // A crafted top-level ending in newlines forges an empty-looking
+        // prefix when the two rev-parse records are concatenated.
+        topLevel: "/srv/allowed/alias\n\n",
+      });
+      expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the worktree probe fails", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "boat-repo-auth-"));
+    try {
+      const content = "hello\n";
+      await writeFile(path.join(dir, "file.txt"), content);
+      const c = genuineChain(content);
+      const runners = fakeRunners({
+        remote: `${c.head}\tHEAD\n`,
+        head: `${c.head}\n`,
+        commitRaw: c.commitRaw,
+        treeRawByOid: new Map([[c.treeOid, c.treeRaw]]),
+        index: "file.txt\0",
+        topExit: 128,
       });
       expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(false);
     } finally {
