@@ -182,6 +182,29 @@ print(json.dumps({"code": proc.returncode, "stderr": stderr.decode("utf8", "repl
     expect(existsSync(target)).toBe(false);
   }, 30_000);
 
+  it("counts root-directory members against the entry budget", async () => {
+    const roots: Buffer[] = [];
+    for (let i = 0; i < 2000; i++) roots.push(member({ name: "./", type: "5" }));
+    const { code, stderr } = await run({ maxFiles: 1000, maxBytes: 1024 * 1024 * 1024 },
+      Buffer.concat([...roots, END]));
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("tar entry budget exceeded");
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("accepts a normal archive with a single root-directory member", async () => {
+    const archive = Buffer.concat([
+      member({ name: "./", type: "5" }),
+      member({ name: "sub/file", body: Buffer.from("hi") }),
+      END,
+    ]);
+    const { code, stderr } = await run({}, archive);
+    expect(code, stderr).toBe(0);
+    expect(existsSync(path.join(target, "sub/file"))).toBe(true);
+    await rm(target, { recursive: true, force: true });
+    expect(existsSync(target)).toBe(false);
+  });
+
   it("refuses a member that would breach the disk reserve", async () => {
     const { code, stderr } = await run({ diskReserveBytes: 2 ** 50 },
       Buffer.concat([member({ name: "x", body: Buffer.from("x") }), END]));
