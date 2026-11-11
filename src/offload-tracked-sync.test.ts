@@ -288,6 +288,25 @@ describe("secret content scan", () => {
     await expect(captureManifest(root, { onlyPaths: trackedSet!, scanForSecrets: true })).resolves.toBeDefined();
   });
 
+  it("fails closed on a tracked file past the scan size bound", async () => {
+    const root = gitRepo({ "src/big.bin": "x\n" });
+    // Sparse 65 MiB file: past the 64 MiB per-file scan bound, so admission
+    // stays local without reading its contents.
+    execFileSync("truncate", ["-s", "65M", path.join(root, "src/big.bin")]);
+    expect(await hasSecretInFiles(root, ["src/big.bin"])).toBe(true);
+  });
+
+  it("counts each scanned file once against the aggregate budget", async () => {
+    const root = gitRepo({ "src/a.bin": "", "src/b.bin": "", "src/c.bin": "" });
+    // Three sparse 64 MiB files: each at the per-file bound, 192 MiB in
+    // aggregate, under the 256 MiB total. They must scan clean; counting a
+    // file twice would refuse the third.
+    for (const name of ["src/a.bin", "src/b.bin", "src/c.bin"]) {
+      execFileSync("truncate", ["-s", "64M", path.join(root, name)]);
+    }
+    expect(await hasSecretInFiles(root, ["src/a.bin", "src/b.bin", "src/c.bin"])).toBe(false);
+  }, 30000);
+
   it("does not scan sync-excluded names, which never leave the host", async () => {
     // A tracked .env is excluded from sync by name, so admission does not
     // read it: the resolve() gate filters with isDefaultSyncExcluded first.
