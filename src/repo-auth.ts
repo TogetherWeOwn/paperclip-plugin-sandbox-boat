@@ -22,6 +22,17 @@
 // the mutable `HEAD` name, so a replaced or moved ref cannot substitute
 // a different tree under the advertised id.
 //
+// Git itself does not hash-verify every object the proof trusts (`cat-file
+// -t` reports only the type string, and byte verification behavior differs
+// by command and git version), so the commit and every traversed tree are
+// fetched raw and hash-verified here: sha1("<type> <len>\0"+content) must
+// equal the referenced oid. The tree walk is the source of truth for blob
+// oids; `ls-tree` is never used. Repositories whose advertised commit
+// contains a gitlink (mode 160000, e.g. a submodule) stay local: a gitlink
+// path contributes no bytes to verify, and its index path alone cannot
+// prove the synced file at that path is the advertised commit's tree.
+// Submodule checkouts therefore never bind.
+//
 // Any failure — unreachable remote, private/invalid remote, missing HEAD,
 // dirty tree, timeout — fails closed: the caller stays local and never
 // syncs. Only `https:` remotes are accepted: a local path or `file:` URL
@@ -30,9 +41,13 @@
 //
 // The git invocations run with the agent checkout's configuration ignored
 // (global/system config to /dev/null, hooks/fsmonitor off, terminal
-// prompts off, protocols pinned to https, replace objects disabled), and
-// `ls-remote` runs from the filesystem root so no checkout config is
-// read for the network contact either.
+// prompts off, protocols pinned to https, replace objects disabled), lazy
+// fetching disabled (`GIT_NO_LAZY_FETCH=1` so a missing object cannot
+// trigger a promisor fetch), askpass helpers emptied (`core.askPass=`),
+// and an isolated empty `HOME` per invocation so neither `~/.netrc` nor
+// ambient credential helpers can authenticate the supposedly unauthenticated
+// `ls-remote`. `ls-remote` runs from the filesystem root so no checkout
+// config is read for the network contact either.
 //
 // Raw-byte equality is intentionally strict: a checkout whose tracked
 // files differ from the blob bytes by clean-filter attributes (line-ending
@@ -41,13 +56,16 @@
 // local as well (only 40-hex sha1 bids verify).
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { lstat, open, readlink } from "node:fs/promises";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 const GIT_TIMEOUT_MS = 20_000;
 const GIT_MAX_BUFFER = 16 * 1024 * 1024;
 const MAX_ENTRIES = 100_000;
+const MAX_TREES = 10_000;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
@@ -56,25 +74,46 @@ export type GitRunner = (
   opts: { cwd?: string },
 ) => Promise<{ stdout: string; exit: number }>;
 
-function hardenedGitEnv(): NodeJS.ProcessEnv {
+export type GitRunnerRaw = (
+  args: string[],
+  opts: { cwd?: string },
+) => Promise<{ stdout: Buffer; exit: number }>;
+
+export function hardenedGitEnv(isolatedHome?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const name of Object.keys(env)) {
     if (name.startsWith("GIT_")) delete env[name];
   }
+  // Ambient credentials must not authenticate a supposedly unauthenticated
+  // contact: `~/.netrc` (libcurl) and askpass programs are credential
+  // channels the hardcoded `credential.helper=` cannot disable.
+  delete env.SSH_ASKPASS;
+  delete env.SSH_ASKPASS_REQUIRE;
+  delete env.SUDO_ASKPASS;
+  delete env.XDG_CONFIG_HOME;
+  delete env.XDG_CACHE_HOME;
+  delete env.XDG_DATA_HOME;
+  delete env.CURL_HOME;
+  if (isolatedHome !== undefined) env.HOME = isolatedHome;
   env.GIT_OPTIONAL_LOCKS = "0";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
   env.GIT_CONFIG_SYSTEM = "/dev/null";
   env.GIT_TERMINAL_PROMPT = "0";
   env.GIT_ALLOW_PROTOCOL = "https";
   env.GIT_NO_REPLACE_OBJECTS = "1";
+  // A missing object must never lazy-fetch from a promisor remote: the
+  // fetch could run checkout-configured askpass/credential helpers and
+  // leak a network contact the proof does not account for.
+  env.GIT_NO_LAZY_FETCH = "1";
   env.GIT_PAGER = "cat";
   return env;
 }
 
-const HARDENED_GIT_CONFIG = [
+export const HARDENED_GIT_CONFIG = [
   "core.fsmonitor=false",
   "core.hooksPath=/dev/null",
   "core.pager=cat",
+  "core.askPass=",
   "credential.helper=",
 ];
 
@@ -82,7 +121,24 @@ function gitArgs(...rest: string[]): string[] {
   return ["--no-replace-objects", ...HARDENED_GIT_CONFIG.flatMap((item) => ["-c", item]), ...rest];
 }
 
+function makeIsolatedHome(): string {
+  try {
+    return mkdtempSync(path.join(tmpdir(), "boat-git-home-"));
+  } catch {
+    return path.parse(tmpdir()).root;
+  }
+}
+
+function cleanupHome(home: string): void {
+  try {
+    rmSync(home, { recursive: true, force: true });
+  } catch {
+    // best effort: an empty directory in the temp area is harmless
+  }
+}
+
 function runGitReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: string; exit: number }> {
+  const home = makeIsolatedHome();
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: { stdout: string; exit: number }) => {
@@ -90,9 +146,10 @@ function runGitReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: s
       settled = true;
       clearTimeout(timer);
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      cleanupHome(home);
       resolve(value);
     };
-    const child = spawn("git", args, { env: hardenedGitEnv(), cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("git", args, { env: hardenedGitEnv(home), cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"] });
     const timer = setTimeout(() => finish({ stdout: "", exit: 124 }), GIT_TIMEOUT_MS);
     let stdout = "";
     let bytes = 0;
@@ -106,6 +163,35 @@ function runGitReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: s
     });
     child.on("error", () => finish({ stdout: "", exit: 128 }));
     child.on("close", (code, signal) => finish({ stdout, exit: code ?? (signal ? 128 : 0) }));
+  });
+}
+
+function runGitRawReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: Buffer; exit: number }> {
+  const home = makeIsolatedHome();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: { stdout: Buffer; exit: number }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      cleanupHome(home);
+      resolve(value);
+    };
+    const child = spawn("git", args, { env: hardenedGitEnv(home), cwd: opts.cwd, stdio: ["ignore", "pipe", "ignore"] });
+    const timer = setTimeout(() => finish({ stdout: Buffer.alloc(0), exit: 124 }), GIT_TIMEOUT_MS);
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > GIT_MAX_BUFFER) {
+        finish({ stdout: Buffer.alloc(0), exit: 124 });
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.on("error", () => finish({ stdout: Buffer.alloc(0), exit: 128 }));
+    child.on("close", (code, signal) => finish({ stdout: Buffer.concat(chunks), exit: code ?? (signal ? 128 : 0) }));
   });
 }
 
@@ -144,6 +230,11 @@ function gitBlobHash(content: Buffer): string {
   return createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
 }
 
+/** Git object id (sha1) of a raw commit/tree object: "<type> <len>\0"+content. */
+function gitObjectHash(type: "commit" | "tree", content: Buffer): string {
+  return createHash("sha1").update(`${type} ${content.length}\0`).update(content).digest("hex");
+}
+
 interface TreeEntry { mode: string; type: string; oid: string; rel: string }
 
 function isSafeRelativePath(rel: string): boolean {
@@ -151,20 +242,44 @@ function isSafeRelativePath(rel: string): boolean {
   return rel.split("/").every((part) => part !== "" && part !== "..");
 }
 
-/** Parse `git ls-tree -r -z` output; null on any malformed entry. */
-function parseTreeEntries(stdout: string): TreeEntry[] | null {
-  const entries: TreeEntry[] = [];
-  for (const chunk of stdout.split("\0")) {
-    if (chunk === "") continue;
-    if (entries.length >= MAX_ENTRIES) return null;
-    const match = /^(\d+) (blob|commit|tree) ([0-9a-f]{40})\t(.*)$/.exec(chunk);
-    if (!match) return null;
-    const [, mode, type, oid, rel] = match;
-    if (type === "tree") return null;
-    if (!isSafeRelativePath(rel)) return null;
-    entries.push({ mode, type, oid, rel });
+/** Tree oid (40-hex) from a raw commit's header, else null. */
+function parseCommitTreeOid(raw: Buffer): string | null {
+  if (raw.length < 48) return null;
+  const newline = raw.indexOf(0x0a);
+  if (newline < 0) return null;
+  const firstLine = raw.subarray(0, newline).toString("utf8");
+  const match = /^tree ([0-9a-f]{40})$/.exec(firstLine);
+  return match ? match[1]! : null;
+}
+
+interface RawTreeChild {
+  mode: string;
+  name: string;
+  oid: string;
+}
+
+/** Parse a raw tree object (binary "<mode> <name>\0<20-byte oid>" entries). */
+function parseRawTree(raw: Buffer): RawTreeChild[] | null {
+  const children: RawTreeChild[] = [];
+  let off = 0;
+  while (off < raw.length) {
+    const space = raw.indexOf(0x20, off);
+    if (space < 0) return null;
+    const mode = raw.subarray(off, space).toString("ascii");
+    if (!/^(100644|100755|120000|160000|40000|040000)$/.test(mode)) return null;
+    const nul = raw.indexOf(0x00, space + 1);
+    if (nul < 0) return null;
+    const nameBytes = raw.subarray(space + 1, nul);
+    if (nameBytes.length === 0) return null;
+    const name = nameBytes.toString("utf8");
+    if (name === "." || name === ".." || name.includes("/") || name.includes("\\") || name.includes("\0")) return null;
+    if (nul + 21 > raw.length) return null;
+    const oid = raw.subarray(nul + 1, nul + 21).toString("hex");
+    if (!/^[0-9a-f]{40}$/.test(oid)) return null;
+    children.push({ mode, name, oid });
+    off = nul + 21;
   }
-  return entries;
+  return children;
 }
 
 /** Parse `git ls-files -z --cached --full-name` output; null when malformed. */
@@ -233,13 +348,14 @@ async function worktreeBlobBytes(root: string, entry: TreeEntry): Promise<number
 /**
  * Totally unauthenticated proof that the checkout's HEAD is served by the
  * claimed remote and the synced bytes are exactly that commit's blobs.
- * Test seam: inject `runGit`; production uses the real git runner. Every
- * failure returns false — the caller must stay local.
+ * Test seam: inject `runGit`/`runGitRaw`; production uses the real git
+ * runners. Every failure returns false — the caller must stay local.
  */
 export async function authenticateRepoInner(
   repoUrl: string,
   localPath: string,
   runGit: GitRunner = runGitReal,
+  runGitRaw: GitRunnerRaw = runGitRawReal,
 ): Promise<boolean> {
   if (!isAuthenticatableRemoteUrl(repoUrl)) return false;
   const claimed = repoUrl.trim().replace(/\/+$/, "").replace(/\.git$/, "");
@@ -253,27 +369,56 @@ export async function authenticateRepoInner(
   }
   const headOid = head.exit === 0 ? parseHeadOid(head.stdout) : null;
   if (!headOid) return false;
-  // HEAD must be a genuine commit object: a tree (or a tag that
-  // rev-parse resolved to a non-commit) cannot carry the advertised
-  // identity this proof binds to.
-  let type: { stdout: string; exit: number };
+  // Verify the commit object itself: git reports only its type string on
+  // `cat-file -t`, which a forged loose object stored under the advertised
+  // oid satisfies. Hash the raw commit and require it to equal the oid.
+  let commit: { stdout: Buffer; exit: number };
   try {
-    type = await runGit(gitArgs("-C", localPath, "cat-file", "-t", headOid), {});
+    commit = await runGitRaw(gitArgs("-C", localPath, "cat-file", "commit", headOid), {});
   } catch {
     return false;
   }
-  if (type.exit !== 0 || type.stdout.trim() !== "commit") return false;
-  // The pinned commit's tree, read from objects (never the index and
-  // never through attribute conversions): no clean filter can run here.
-  let tree: { stdout: string; exit: number };
-  try {
-    tree = await runGit(gitArgs("-C", localPath, "ls-tree", "-r", "-z", headOid), {});
-  } catch {
-    return false;
+  if (commit.exit !== 0) return false;
+  if (gitObjectHash("commit", commit.stdout) !== headOid) return false;
+  const rootTreeOid = parseCommitTreeOid(commit.stdout);
+  if (!rootTreeOid) return false;
+  // Walk the commit's trees from raw objects, verifying each tree's hash
+  // before trusting its entries. This is the source of truth for blob
+  // oids — `ls-tree` is not used. A gitlink (mode 160000) cannot be
+  // byte-verified, so any commit containing one stays local.
+  const entries: TreeEntry[] = [];
+  const seenPaths = new Set<string>();
+  const stack: { oid: string; prefix: string }[] = [{ oid: rootTreeOid, prefix: "" }];
+  let treeCount = 0;
+  while (stack.length > 0) {
+    const { oid, prefix } = stack.pop()!;
+    treeCount += 1;
+    if (treeCount > MAX_TREES) return false;
+    let tree: { stdout: Buffer; exit: number };
+    try {
+      tree = await runGitRaw(gitArgs("-C", localPath, "cat-file", "tree", oid), {});
+    } catch {
+      return false;
+    }
+    if (tree.exit !== 0) return false;
+    if (gitObjectHash("tree", tree.stdout) !== oid) return false;
+    const children = parseRawTree(tree.stdout);
+    if (children === null) return false;
+    for (const child of children) {
+      const rel = prefix ? `${prefix}/${child.name}` : child.name;
+      if (!isSafeRelativePath(rel)) return false;
+      if (child.mode === "160000") return false;
+      if (child.mode === "40000" || child.mode === "040000") {
+        if (stack.length + treeCount > MAX_TREES) return false;
+        stack.push({ oid: child.oid, prefix: rel });
+        continue;
+      }
+      if (entries.length >= MAX_ENTRIES) return false;
+      if (seenPaths.has(rel)) return false;
+      seenPaths.add(rel);
+      entries.push({ mode: child.mode, type: "blob", oid: child.oid, rel });
+    }
   }
-  if (tree.exit !== 0) return false;
-  const entries = parseTreeEntries(tree.stdout);
-  if (entries === null) return false;
   // The index must name exactly the HEAD tree's paths: staged extras
   // would be synced without being part of the advertised commit, and
   // staged deletions would hide part of it. The index flags themselves
@@ -309,7 +454,6 @@ export async function authenticateRepoInner(
   // leak. Require every entry's raw bytes to hash to its blob.
   let total = 0;
   for (const entry of entries) {
-    if (entry.type === "commit") continue;
     const bytes = await worktreeBlobBytes(localPath, entry);
     if (bytes === null) return false;
     total += bytes;
