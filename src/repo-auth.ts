@@ -57,7 +57,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { lstat, open, readlink } from "node:fs/promises";
+import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -348,6 +348,36 @@ async function worktreeBlobBytes(root: string, entry: TreeEntry): Promise<number
 }
 
 /**
+ * Git's effective worktree root must be exactly the bound source and the
+ * bound source must be that root (not a subdirectory of it). On-disk
+ * `core.worktree` is checkout-controlled: if it relocates the effective
+ * root, `ls-files --full-name` entries and worktree bytes are resolved in
+ * different coordinates than the sync (which lists relative to the bound
+ * source via plain `ls-files`), so agreement can be an artifact of path
+ * translation rather than the advertised tree. Fail closed unless the
+ * coordinates are pinned to the bound source.
+ */
+async function isPinnedWorktreeRoot(localPath: string, runGit: GitRunner): Promise<boolean> {
+  let top: { stdout: string; exit: number };
+  try {
+    top = await runGit(gitArgs("-C", localPath, "rev-parse", "--show-toplevel", "--show-prefix"), {});
+  } catch {
+    return false;
+  }
+  if (top.exit !== 0) return false;
+  const lines = top.stdout.split("\n");
+  const claimedTop = (lines[0] ?? "").trim();
+  const prefix = lines[1] ?? "";
+  if (claimedTop === "" || prefix !== "") return false;
+  const [canonicalLocal, canonicalTop] = await Promise.all([
+    realpath(localPath).catch(() => null),
+    realpath(claimedTop).catch(() => null),
+  ]);
+  if (canonicalLocal === null || canonicalTop === null) return false;
+  return canonicalTop === canonicalLocal;
+}
+
+/**
  * Totally unauthenticated proof that the checkout's HEAD is served by the
  * claimed remote and the synced bytes are exactly that commit's blobs.
  * Test seam: inject `runGit`/`runGitRaw`; production uses the real git
@@ -360,6 +390,7 @@ export async function authenticateRepoInner(
   runGitRaw: GitRunnerRaw = runGitRawReal,
 ): Promise<boolean> {
   if (!isAuthenticatableRemoteUrl(repoUrl)) return false;
+  if (!await isPinnedWorktreeRoot(localPath, runGit)) return false;
   const claimed = repoUrl.trim().replace(/\/+$/, "").replace(/\.git$/, "");
   // Local identity first so a non-repository fails fast without any
   // network contact; the remote only confirms a HEAD the checkout has.

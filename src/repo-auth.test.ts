@@ -48,11 +48,20 @@ interface FakeOpts {
   indexExit?: number;
   remote?: string;
   remoteExit?: number;
+  topLevel?: string;
+  prefix?: string;
+  topExit?: number;
 }
 
 function fakeRunners(opts: FakeOpts): { runGit: GitRunner; runGitRaw: GitRunnerRaw } {
   const runGit: GitRunner = async (args) => {
     if (args.includes("ls-remote")) return { stdout: opts.remote ?? "", exit: opts.remoteExit ?? 0 };
+    if (args.includes("--show-toplevel")) {
+      if ((opts.topExit ?? 0) !== 0) return { stdout: "", exit: opts.topExit! };
+      // Default to a pinned worktree root at the `-C` path with an empty prefix.
+      const dir = args[args.indexOf("-C") + 1] ?? "";
+      return { stdout: `${opts.topLevel ?? dir}\n${opts.prefix ?? ""}\n`, exit: 0 };
+    }
     if (args.includes("rev-parse")) return { stdout: opts.head ?? "", exit: opts.headExit ?? 0 };
     if (args.includes("ls-files")) return { stdout: opts.index ?? "", exit: opts.indexExit ?? 0 };
     return { stdout: "", exit: 128 };
@@ -192,6 +201,49 @@ describe("authenticateRepoInner", () => {
         index: "sub/file.txt\0",
       });
       expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the effective worktree root is relocated from the bound source", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "boat-repo-auth-"));
+    try {
+      const content = "hello\n";
+      await writeFile(path.join(dir, "file.txt"), content);
+      const c = genuineChain(content);
+      const runners = fakeRunners({
+        remote: `${c.head}\tHEAD\n`,
+        head: `${c.head}\n`,
+        commitRaw: c.commitRaw,
+        treeRawByOid: new Map([[c.treeOid, c.treeRaw]]),
+        index: "file.txt\0",
+        // On-disk core.worktree relocates git's effective worktree root while
+        // the bound source stays put: authenticate must fail closed rather
+        // than compare paths in two different coordinate systems.
+        topLevel: path.dirname(dir),
+      });
+      expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the bound source is not the worktree root", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "boat-repo-auth-"));
+    try {
+      const content = "hello\n";
+      await writeFile(path.join(dir, "file.txt"), content);
+      const c = genuineChain(content);
+      const runners = fakeRunners({
+        remote: `${c.head}\tHEAD\n`,
+        head: `${c.head}\n`,
+        commitRaw: c.commitRaw,
+        treeRawByOid: new Map([[c.treeOid, c.treeRaw]]),
+        index: "file.txt\0",
+        prefix: "pkg/",
+      });
+      expect(await authenticateRepoInner(PUBLIC, dir, runners.runGit, runners.runGitRaw)).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -438,6 +490,23 @@ describe("authenticateRepoInner with real local git", () => {
       const head = initRepo(repo, "file.txt", "hello\n");
       const r = realRunners(head);
       expect(await authenticateRepoInner(PUBLIC, repo, r.runGit, r.runGitRaw)).toBe(true);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when on-disk core.worktree relocates the effective worktree root", async () => {
+    const base = await mkdtemp(path.join(tmpdir(), "boat-repo-auth-real-"));
+    const repo = path.join(base, "repo");
+    await mkdir(path.join(repo, "pkg"), { recursive: true });
+    try {
+      const head = initRepo(repo, "pkg/file.txt", "public decoy\n");
+      // Agent-writable relocation: git's effective worktree root becomes the
+      // parent, so --full-name entries and sync listings are translated
+      // against different roots. Authentication must stay local.
+      git(repo, "config", "core.worktree", base);
+      const r = realRunners(head);
+      expect(await authenticateRepoInner(PUBLIC, repo, r.runGit, r.runGitRaw)).toBe(false);
     } finally {
       await rm(base, { recursive: true, force: true });
     }
