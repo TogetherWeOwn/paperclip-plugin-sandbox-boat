@@ -135,7 +135,7 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       offloadLocalRunsEnabled: {
         type: "boolean", default: false,
-        description: "Bind otherwise-local runs for heavy-command offload. On each agent.run.started event the plugin reads the run's issue and its execution workspace from Paperclip. The workspace row only nominates a source: the bind stands only when the source sits under offloadLocalSourceRoots and the checkout's own origin matches its repo URL, re-checked on every resolve. Off by default.",
+        description: "Bind otherwise-local runs for heavy-command offload. The workspace row only nominates a source: the bind stands only when the source sits under offloadLocalSourceRoots, the checkout's own origin matches its repo URL, and that identity is authenticated against its remote (unauthenticated ls-remote advertises the checkout HEAD and the tracked tree matches it), re-checked on every resolve. The bind runs on the run's first admitted offload request (agent.run.started only records ownership); an unauthenticated or unreachable remote stays local. Off by default.",
       },
       offloadLocalSourceRoots: {
         type: "array", items: { type: "string" }, default: [],

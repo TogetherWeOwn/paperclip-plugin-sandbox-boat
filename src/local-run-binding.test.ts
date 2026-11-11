@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFakeContext } from "./test-support/harness.js";
 import { localRunRealization, localRunSettings, readGitOriginUrl, type LocalRunHost } from "./local-run-binding.js";
+import { setRepoAuthForTests } from "./repo-auth.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 
 const companyId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
@@ -28,6 +29,7 @@ function host(overrides: Partial<LocalRunHost> = {}): LocalRunHost {
     workspace: async () => ({ projectId: "project", projectWorkspaceId: null, path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
     canonicalPath: async (localPath) => localPath,
     onDiskRepoUrl: async () => "https://github.com/example/public",
+    authenticateRepo: async () => true,
     apiKey: async () => "scoped-key",
     ...overrides,
   };
@@ -205,6 +207,26 @@ describe("local-run offload binding", () => {
     expect(await localRunRealization(started, localRunSettings(settings), fakeHost)).toBe(null);
   });
 
+  it("refuses a spoofed origin+row that cannot be authenticated against its remote, resolving no secret", async () => {
+    // Both agent-writable strings agree on the allowlisted public repo, but
+    // the remote does not advertise this checkout's HEAD: the bind must fail.
+    const apiKey = vi.fn(async () => "scoped-key");
+    const reasons: string[] = [];
+    const params = await localRunRealization(started, localRunSettings(enabled), host({ apiKey,
+      authenticateRepo: async () => false,
+    }), { onRefuse: (reason) => reasons.push(reason) });
+    expect(params).toBe(null);
+    expect(apiKey).not.toHaveBeenCalled();
+    expect(reasons).toEqual(["repository identity cannot be authenticated against its remote"]);
+  });
+
+  it("stays local when remote authentication throws (unreachable remote)", async () => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      authenticateRepo: async () => { throw new Error("remote unreachable"); },
+    }));
+    expect(params).toBe(null);
+  });
+
   it("reads the origin from a linked worktree's common git config, and refuses a symlinked config", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "boat-origin-"));
     try {
@@ -238,6 +260,7 @@ describe("plugin wiring", () => {
   let dir: string | null = null;
   afterEach(async () => {
     await plugin.definition.onShutdown?.(); setManagerOverridesForTests({});
+    setRepoAuthForTests(null);
     if (dir) await rm(dir, { recursive: true, force: true });
     dir = null;
   });
@@ -247,6 +270,7 @@ describe("plugin wiring", () => {
   // operator policy by mutating this object; the host-owned claim is never cleared.
   let current: Record<string, unknown> = {};
   async function setup(config: Record<string, unknown>, configGet?: () => Promise<Record<string, unknown>>) {
+    setRepoAuthForTests(async () => true);
     current = { offloadExecutorEnabled: true, ...config };
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-run-"));
     await mkdir(path.join(dir, ".git"));
@@ -943,6 +967,16 @@ describe("plugin wiring", () => {
   it("a checkout whose on-disk origin differs from the workspace repoUrl gets no binding", async () => {
     const harness = await setup(enabled);
     await writeFile(path.join(dir!, ".git", "config"), gitOrigin("https://github.com/example/private"));
+    await harness.emit("agent.run.started", started);
+    expect(refusedAfterBind(await admittedBind())).toBe(false);
+    expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
+    expect((await import("./plugin.js")).currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+    expect([403, 503]).toContain((await exec(runId)).status);
+  });
+
+  it("a spoofed origin+row that fails remote authentication gets no binding", async () => {
+    const harness = await setup(enabled);
+    setRepoAuthForTests(async () => false);
     await harness.emit("agent.run.started", started);
     expect(refusedAfterBind(await admittedBind())).toBe(false);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);

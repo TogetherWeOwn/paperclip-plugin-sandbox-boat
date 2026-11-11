@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
+import { setRepoAuthForTests } from "./repo-auth.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { durationKey, medianSeconds, normalizeSignature, readHistory } from "./offload/duration-history.js";
 import { resetReportBudgets } from "./offload/routes.js";
@@ -33,6 +34,7 @@ describe("local-run duration learning through plugin dispatch", () => {
   let effects: ReturnType<typeof vi.spyOn>[];
 
   beforeEach(async () => {
+    setRepoAuthForTests(async () => true);
     resetReportBudgets();
     dir = await mkdtemp(path.join(tmpdir(), "boat-local-duration-"));
     await mkdir(path.join(dir, ".git"));
@@ -68,6 +70,7 @@ describe("local-run duration learning through plugin dispatch", () => {
       || key.includes("boat-offload-admission") || key.startsWith("instance|"))).toEqual([]);
     await plugin.definition.onShutdown?.();
     setManagerOverridesForTests({});
+    setRepoAuthForTests(null);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     await rm(dir, { recursive: true, force: true });
@@ -187,6 +190,7 @@ describe("local duration reports with registered workspace refusals", () => {
   afterEach(async () => {
     await plugin.definition.onShutdown?.();
     setManagerOverridesForTests({});
+    setRepoAuthForTests(null);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     await rm(dir, { recursive: true, force: true });
@@ -195,6 +199,9 @@ describe("local duration reports with registered workspace refusals", () => {
   it.each(commands.flatMap((command) => [true, false].map((withdrawn) => ({ ...command, withdrawn }))))(
     "honors registrations without host workspace reads for $tool (withdrawn=$withdrawn)", async (command) => {
       resetReportBudgets();
+      // Bare .git/config fixtures have no HEAD to authenticate; fail closed
+      // without contacting a remote so start stays unbound.
+      setRepoAuthForTests(async () => false);
       dir = await mkdtemp(path.join(tmpdir(), "boat-duration-inflight-"));
       const sources = [
         { id: workspaceId, root: path.join(dir, "a"), repo: repoUrl },
@@ -283,6 +290,7 @@ describe("local duration reports with registered workspace refusals", () => {
 
   it.each(commands)("rejects a withdrawn alias without training either repository for $tool, but accepts primary IDs", async (command) => {
     resetReportBudgets();
+    setRepoAuthForTests(async () => false);
     dir = await mkdtemp(path.join(tmpdir(), "boat-duration-alias-"));
     const otherWorkspaceId = randomUUID();
     const sources = [

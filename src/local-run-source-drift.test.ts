@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
+import { setRepoAuthForTests } from "./repo-auth.js";
 import { createFakeContext } from "./test-support/harness.js";
 import { durationKey, normalizeSignature } from "./offload/duration-history.js";
 import { resetReportBudgets } from "./offload/routes.js";
@@ -31,6 +32,9 @@ describe("unbound exact-run duration source refusals", () => {
 
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
+    // These fixtures are bare .git/config shells with no HEAD to authenticate;
+    // force the fail-closed branch so start never contacts a remote.
+    setRepoAuthForTests(async () => false);
     resetReportBudgets();
     dir = await mkdtemp(path.join(tmpdir(), "boat-duration-source-"));
     sources = [
@@ -74,6 +78,7 @@ describe("unbound exact-run duration source refusals", () => {
       || key.includes("boat-offload-admission") || key.startsWith("instance|"))).toEqual([]);
     await plugin.definition.onShutdown?.();
     setManagerOverridesForTests({});
+    setRepoAuthForTests(null);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();

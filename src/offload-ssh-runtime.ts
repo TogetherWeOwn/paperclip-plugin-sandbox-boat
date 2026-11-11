@@ -28,6 +28,7 @@ import { hasInitializedSubmodule, hasSecretInFiles, hasUntrackedFiles, listTrack
   type SubmodulesFn, type TrackedFilesFn, type UntrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
+import { authenticateRepo } from "./repo-auth.js";
 import { NETWORK_POLICY_UNAVAILABLE_REASON, networkPolicyRefusal } from "./network-policy.js";
 import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
 
@@ -105,6 +106,11 @@ export interface SshOffloadRuntimeDeps {
   untrackedFiles?: UntrackedFilesFn;
   /** Initialized-submodule check for admission; defaults to the real git listing. Test seam for non-git fixtures. */
   submodules?: SubmodulesFn;
+  /**
+   * Authenticated remote proof for local-run revalidation; defaults to the
+   * real unauthenticated `ls-remote` check. Test seam for non-network fixtures.
+   */
+  authenticateRepo?: (repoUrl: string, localPath: string) => Promise<boolean>;
 }
 /** Named stay-local reason when the source has untracked, non-ignored files. */
 export const UNTRACKED_FILES_REASON = "untracked files present; running local";
@@ -509,8 +515,10 @@ export class SshOffloadRuntime {
   }
 
   /** Re-prove a local-run binding's operator-owned facts: the source still sits
-   * under a configured root (and was not swapped for a symlink), and the
-   * checkout's own origin still names the bound repo. */
+   * under a configured root (and was not swapped for a symlink), the checkout's
+   * own origin still names the bound repo, and that identity is still
+   * authenticated against its remote. The on-disk origin alone is
+   * agent-writable, so revalidation never re-reads only that string. */
   private async revalidateLocalRun(binding: Binding, roots: string[]): Promise<boolean> {
     if (roots.length === 0) return false;
     const canonical = await realpath(binding.source).catch(() => null);
@@ -519,7 +527,8 @@ export class SshOffloadRuntime {
       .filter((root): root is string => root !== null);
     if (!withinRoots(canonical, canonicalRoots)) return false;
     const onDiskRepoUrl = await readGitOriginUrl(canonical).catch(() => null);
-    return !!onDiskRepoUrl && canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) === binding.repoId;
+    if (!onDiskRepoUrl || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: "" }) !== binding.repoId) return false;
+    return await (this.deps.authenticateRepo ?? authenticateRepo)(onDiskRepoUrl, canonical).catch(() => false);
   }
 
   /**
