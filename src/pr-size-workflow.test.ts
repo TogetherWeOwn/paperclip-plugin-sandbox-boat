@@ -18,7 +18,9 @@ function jobBlock(name: string): string {
 }
 
 function usesRef(block: string): string {
-  const match = block.match(/uses:\s*TogetherWeOwn\/\.github\/(\S+)@([0-9a-f]{40})/);
+  // Anchor to the start of a line (after optional indentation) so a
+  // commented-out `uses:` line (`# uses: ...`) cannot satisfy the guard.
+  const match = block.match(/^\s*uses:\s*TogetherWeOwn\/\.github\/(\S+)@([0-9a-f]{40})/m);
   expect(match, `job must call an org reusable pinned to a full SHA: ${block}`).not.toBeNull();
   return match![1] + "@" + match![2];
 }
