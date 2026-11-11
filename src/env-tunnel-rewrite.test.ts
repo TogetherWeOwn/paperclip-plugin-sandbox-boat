@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_ENV_ALLOWLIST, filterRunEnv, routeModelProxyThroughTunnel } from "./env-policy.js";
+import { DEFAULT_ENV_ALLOWLIST, filterRunEnv, modelProxyKeyFingerprintOf, routeModelProxyThroughTunnel } from "./env-policy.js";
 
 // An agent's own adapter env (e.g. ANTHROPIC_BASE_URL=http://cliproxy:8317,
 // the host-side docker name) overrides the environment's tunnel address, and
@@ -27,7 +27,7 @@ describe("routeModelProxyThroughTunnel", () => {
       .toEqual([["ANTHROPIC_BASE_URL", "http://127.0.0.1:8317"]]);
   });
   it("full flow: an uppercase target that vouches for the token also gets its base URL rewritten", () => {
-    const upper = { ...tunnel, tunnelTargetHost: "CLIProxy" };
+    const upper = { ...tunnel, tunnelTargetHost: "CLIProxy", modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated") };
     const { kept } = filterRunEnv(
       { ANTHROPIC_BASE_URL: "http://cliproxy:8317", ANTHROPIC_AUTH_TOKEN: "sk-dedicated" },
       DEFAULT_ENV_ALLOWLIST,

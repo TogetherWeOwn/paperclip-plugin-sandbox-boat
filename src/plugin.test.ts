@@ -12,6 +12,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { setBoatApiFactoryForTests } from "./boat-client.js";
+import { modelProxyKeyFingerprintOf } from "./env-policy.js";
 import manifest, { DRIVER_KEY, SWEEP_JOB_KEY } from "./manifest.js";
 import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 import { cliEngineCalls, largeEnvelopeAcpLaunch } from "./test-support/acp-process-session.js";
@@ -31,7 +32,7 @@ const SECRET = "sk-super-secret-value-9f8e7d";
 /** The principal-scoped state key of the card VM acquire() creates (agent-1 on WORKSPACE). */
 const VM_KEY = resolveVmKey({ executionWorkspaceId: WORKSPACE, issueId: ISSUE, runId: "key", agentId: "agent-1" }).key;
 
-const baseConfig = { apiKey: "boat_test_key_not_real", tunnelTargetHost: "cliproxy" };
+const baseConfig = { apiKey: "boat_test_key_not_real", tunnelTargetHost: "cliproxy", modelProxyKeyFingerprint: modelProxyKeyFingerprintOf(SECRET) };
 
 function base(config: Record<string, unknown> = {}) {
   return { driverKey: DRIVER_KEY, companyId: COMPANY, environmentId: ENV, config: { ...baseConfig, ...config } };
