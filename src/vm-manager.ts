@@ -46,6 +46,7 @@ import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
+import { NETWORK_POLICY_UNAVAILABLE, NETWORK_POLICY_UNAVAILABLE_MESSAGE, networkPolicyRefusal } from "./network-policy.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
   RUNTIME_DIR_RESULT_RE,
@@ -190,16 +191,13 @@ export interface IssueReader {
 }
 
 function networkPolicyUnavailable(): BoatProviderError {
-  return new BoatProviderError("BOAT_NETWORK_POLICY_UNAVAILABLE", "Current task network policy is unavailable; Boat admission refused.");
+  return new BoatProviderError(NETWORK_POLICY_UNAVAILABLE, NETWORK_POLICY_UNAVAILABLE_MESSAGE);
 }
 
 /** Boat cannot enforce a native network grant. Never echo its values or silently discard it. */
 function assertSupportedNetworkPolicy(settings: unknown): void {
-  if (settings == null) return;
-  if (typeof settings !== "object" || Array.isArray(settings)) throw networkPolicyUnavailable();
-  if ((settings as Record<string, unknown>).networkEgress != null) {
-    throw new BoatProviderError("BOAT_NETWORK_EGRESS_UNSUPPORTED", "Boat cannot enforce the requested network policy; admission refused.");
-  }
+  const refusal = networkPolicyRefusal(settings);
+  if (refusal) throw new BoatProviderError(refusal.code, refusal.message);
 }
 
 export interface ManagerDeps {

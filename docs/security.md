@@ -163,8 +163,9 @@ hostile and bounds it before anything is written:
 Boat VMs have outbound internet and a guest user with passwordless sudo. This
 plugin does **not** implement default-deny egress, an allowlist firewall, guest
 root/Docker separation or runtime policy revocation. Environment filtering is not
-network containment. The command-level offload transport below is a separate
-boundary and is not certified by this native lease check.
+network containment. The command-level offload transport below enforces this
+same task network policy at its own admission points (below), so no offload
+path runs a task carrying an enforceable grant on an unrestricted pool VM.
 
 * **AcquireLease:** before config caches, provider calls, state writes or SSH,
   reject every non-null `executionWorkspaceSettings.networkEgress` with
@@ -185,6 +186,16 @@ boundary and is not certified by this native lease check.
   strip the policy and retry unrestricted or locally. Ordinary stop/release/destroy
   recovery remains separate; this check grants no authority to delete retained
   data or start a VM for export.
+* **Local-run offload:** a run that stays on the host has no lease admission, so
+  its bind fetches the task's current `executionWorkspaceSettings` alongside the
+  workspace id and applies this same check before the bind's secret is resolved.
+  The validated snapshot rides the realization payload, and the executor gate
+  re-checks it before any pool/VM effect: a non-null grant stays local with a
+  named reason (`task network egress policy is not supported by Boat; running
+  local`), an unreadable or absent policy fails closed the same way, and a null
+  policy keeps the unrestricted compatibility. Whole-run offload needs no
+  snapshot: its run already passed this lease check. Policy values are never
+  echoed in reasons, logs or receipts.
 
 **Activation remains held until the deployed host contract is verified.** Pin the
 actual host revision and demonstrate that acquire forwards current task settings,
