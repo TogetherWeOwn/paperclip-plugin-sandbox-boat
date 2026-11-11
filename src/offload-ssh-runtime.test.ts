@@ -251,7 +251,9 @@ describe("stock concrete executor factory", () => {
     await origin("https://github.com/example/public");
     runtime.forgetRun(companyId, runId);
     const localRunNative = native();
-    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    const localRequest = localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>;
+    localRequest.localRun = true;
+    localRequest.executionWorkspaceSettings = null;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
     mustResolve(await runtime.resolve(command(), rooted));
@@ -268,7 +270,9 @@ describe("stock concrete executor factory", () => {
     await origin("https://github.com/example/public");
     runtime.forgetRun(companyId, runId);
     const localRunNative = native();
-    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    const localRequest = localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>;
+    localRequest.localRun = true;
+    localRequest.executionWorkspaceSettings = null;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
     const executor = mustResolve(await runtime.resolve(command(), rooted));
@@ -303,7 +307,9 @@ describe("stock concrete executor factory", () => {
     await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
     runtime.forgetRun(companyId, runId);
     const localRunNative = native();
-    (localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+    const localRequest = localRunNative.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>;
+    localRequest.localRun = true;
+    localRequest.executionWorkspaceSettings = null;
     runtime.remember(localRunNative);
     const rooted = { ...config, offloadLocalSourceRoots: [ssh.root] };
     const executor = mustResolve(await runtime.resolve(command(), rooted));
@@ -322,6 +328,57 @@ describe("stock concrete executor factory", () => {
     await expect(sync.push("sandbox-queued", command())).rejects.toThrow(/no longer passes roots\/origin validation/);
     expect(boat.calls).toHaveLength(0);
   }, 20_000);
+  describe("task network policy gate", () => {
+    const withPolicy = (settings: unknown, localRun = false) => {
+      runtime.forgetRun(companyId, runId);
+      const params = native();
+      const request = params.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>;
+      request.localRun = localRun;
+      request.executionWorkspaceSettings = settings;
+      runtime.remember(params);
+    };
+    it.each([
+      ["FQDN grant", { networkEgress: { allowFqdns: ["private-policy.example.test"] } }],
+      ["empty grant", { networkEgress: {} }],
+      ["malformed settings container", "synthetic-policy-payload-do-not-emit"],
+    ])("refuses a binding with a snapshotted %s before any pool or VM effect", async (_name, settings) => {
+      withPolicy(settings, true);
+      const refused = await runtime.resolve(command(), config);
+      expect(isExecutorRefusal(refused)).toBe(true);
+      if (isExecutorRefusal(refused)) {
+        expect(refused.refusalReason).toContain(_name === "malformed settings container" ? "unavailable" : "network egress");
+        expect(refused.refusalReason).not.toContain("private-policy.example.test");
+        expect(refused.refusalReason).not.toContain("synthetic-policy-payload-do-not-emit");
+      }
+      // The dry-run preflight verdict is predictive of the real submit.
+      expect(await runtime.preflight(command(), config)).toContain("running local");
+      expect(boat.calls).toHaveLength(0);
+    });
+    it.each([
+      ["null settings", null],
+      ["omitted policy", {}],
+      ["null policy", { networkEgress: null }],
+    ])("admits a binding whose task policy is %s (unrestricted compatibility)", async (_name, settings) => {
+      await mkdir(path.join(source, ".git"));
+      await writeFile(path.join(source, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/example/public\n`);
+      withPolicy(settings, true);
+      mustResolve(await runtime.resolve(command(), { ...config, offloadLocalSourceRoots: [ssh.root] }));
+    });
+    it("fails a local-run binding without a policy snapshot closed", async () => {
+      runtime.forgetRun(companyId, runId);
+      const params = native();
+      (params.workspace.metadata!.workspaceRealizationRequest as Record<string, unknown>).localRun = true;
+      runtime.remember(params);
+      expect(await runtime.resolve(command(), config))
+        .toEqual({ refusalReason: "task network policy is unavailable; running local" });
+      expect(boat.calls).toHaveLength(0);
+    });
+    it("keeps a snapshot-free whole-run binding on the lease-checked path", async () => {
+      // native() carries no settings field and localRun is false: the lease
+      // admission already checked this run's policy.
+      mustResolve(await runtime.resolve(command(), config));
+    });
+  });
   it.each(["offloadExecutorEnabled", "offloadGuestTransportEnabled"])("requires boolean true for %s even with every other prerequisite", async (setting) => {
     for (const value of [false, undefined, "true", 1]) {
       expect(await runtime.resolve(command(), { ...config, [setting]: value })).toEqual(expect.objectContaining({ refusalReason: expect.any(String) }));

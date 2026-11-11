@@ -28,6 +28,7 @@ import { hasInitializedSubmodule, hasSecretInFiles, hasUntrackedFiles, listTrack
   type SubmodulesFn, type TrackedFilesFn, type UntrackedFilesFn } from "./offload-secret-scan.js";
 import { DEFAULT_SYNC_EXCLUDES, isCertificatePemSyncCandidate, isDefaultSyncExcluded, snapshotHasDirectory } from "./offload-sync.js";
 import { localSourceRoots, readGitOriginUrl, withinRoots } from "./local-run-binding.js";
+import { NETWORK_POLICY_UNAVAILABLE_REASON, networkPolicyRefusal } from "./network-policy.js";
 import { SCRUB_BASHRC_ASCII_TOKEN, shellQuote } from "./shell.js";
 
 /**
@@ -44,6 +45,11 @@ type Binding = { companyId: string; runId: string; workspaceId: string; repoId: 
   config: BoatDriverConfig; environmentId: string; seenAt: number;
   /** Built by local-run binding from an agent-mutable workspace row: roots and repo identity re-validate per resolve. */
   localRun: boolean;
+  /** Bind-time snapshot of the task's execution workspace settings. `present`
+   * marks a snapshotted policy (a null value is the unrestricted
+   * compatibility); absent means the binding carried no snapshot, which only
+   * whole-run realizations do — their lease admission already checked it. */
+  networkPolicy: { present: boolean; settings: unknown };
   /** Memoized KDF digest of the bind-time credential (memory only). A binding's
    * credential never changes mid-run, so the digest is computed once. */
   credentialDigest?: Promise<string> };
@@ -455,6 +461,8 @@ export class SshOffloadRuntime {
       source: source.localPath, repoId: canonicalRepoId({ repoUrl: plain(source.repoUrl) ? source.repoUrl : null,
         projectId: plain(source.projectId) ? source.projectId : request.executionWorkspaceId }),
       config, environmentId: params.environmentId, seenAt: Date.now(), localRun: request.localRun === true,
+      networkPolicy: { present: Object.prototype.hasOwnProperty.call(request, "executionWorkspaceSettings"),
+        settings: request.executionWorkspaceSettings },
     };
     const primaryKey = key(params.companyId, binding.runId, binding.workspaceId);
     const existingPrimary = this.bindings.get(primaryKey);
@@ -542,6 +550,16 @@ export class SshOffloadRuntime {
     if (!binding) return refuse("no offload binding for this run and workspace");
     if (Date.now() - binding.seenAt > 24 * 60 * 60_000) return refuse("offload binding for this run has expired");
     if (binding.repoId !== command.repoId) return refuse("offload binding repo does not match the workspace repo");
+    // The pool VM has unrestricted egress, so a snapshotted non-null network
+    // grant is refused here exactly as at lease admission. A local-run
+    // binding without a snapshot is unknown policy and fails closed; a
+    // whole-run binding without one already passed the lease check.
+    if (binding.networkPolicy.present) {
+      const refusal = networkPolicyRefusal(binding.networkPolicy.settings);
+      if (refusal) return refuse(refusal.reason);
+    } else if (binding.localRun) {
+      return refuse(NETWORK_POLICY_UNAVAILABLE_REASON);
+    }
     // The workspace row behind a local-run binding is agent-mutable, so the
     // operator-owned facts are re-proven on every resolve, not only at bind.
     if (binding.localRun && !await this.revalidateLocalRun(binding, this.localRunRootsByCompany.get(command.companyId) ?? [])) {

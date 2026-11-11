@@ -18,6 +18,7 @@ import { O_NOFOLLOW, O_NONBLOCK, O_RDONLY } from "node:constants";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginEnvironmentRealizeWorkspaceParams } from "@paperclipai/plugin-sdk";
+import { NETWORK_POLICY_UNAVAILABLE_REASON, networkPolicyRefusal } from "./network-policy.js";
 import { canonicalRepoId } from "./offload/routes.js";
 
 export interface LocalRunSettings {
@@ -39,6 +40,10 @@ export interface LocalRunProjectWorkspace {
 
 export interface LocalRunHost {
   issueWorkspaceId(issueId: string, companyId: string): Promise<string | null>;
+  /** Current task execution workspace settings: field presence plus its value.
+   * Presence mirrors the resume-lease reader contract: an absent field or an
+   * undefined value is unknown policy (fail closed), never unrestricted. */
+  issueExecutionWorkspaceSettings(issueId: string, companyId: string): Promise<{ present: boolean; settings: unknown }>;
   issueProjectWorkspace(issueId: string, companyId: string): Promise<LocalRunProjectWorkspace | null>;
   workspace(workspaceId: string, companyId: string): Promise<{
     projectId: string; projectWorkspaceId: string | null; path: string | null; cwd?: string | null; repoUrl: string | null;
@@ -84,6 +89,10 @@ export function localRunSettings(raw: unknown): LocalRunSettings {
 export interface LocalRunWorkspace {
   workspaceId: string;
   source: { localPath: string; repoUrl: string; projectId: string; projectWorkspaceId: string | null };
+  /** The task's current execution workspace settings at bind time (null policy
+   * is the unrestricted compatibility). Carried into the realization payload
+   * so the executor gate re-checks the same snapshot before admission. */
+  executionWorkspaceSettings: unknown;
 }
 
 /** Validate the current workspace candidate for an admitted bind, not run-start
@@ -144,7 +153,20 @@ export async function localRunWorkspace(
   if (!onDiskRepoUrl) return refuse("checkout has no on-disk origin");
   const repoId = canonicalRepoId({ repoUrl: source.repoUrl, projectId: source.projectId });
   if (!repoId.startsWith("repo:") || canonicalRepoId({ repoUrl: onDiskRepoUrl, projectId: source.projectId }) !== repoId) return refuse("on-disk origin does not match the workspace repoUrl");
-  return { workspaceId, source: { ...source, localPath: canonical, repoUrl: onDiskRepoUrl } };
+  // The task's current network policy gates the bind before any secret is
+  // resolved, exactly as the whole-run lease admission does. An unreadable or
+  // absent policy fails closed; a refused grant is never stripped and retried.
+  let policy: { present: boolean; settings: unknown } | null = null;
+  try {
+    policy = await host.issueExecutionWorkspaceSettings(payload.issueId, companyId);
+  } catch {
+    return refuse(NETWORK_POLICY_UNAVAILABLE_REASON);
+  }
+  if (!policy.present || policy.settings === undefined) return refuse(NETWORK_POLICY_UNAVAILABLE_REASON);
+  const refusal = networkPolicyRefusal(policy.settings);
+  if (refusal) return refuse(refusal.reason);
+  return { workspaceId, source: { ...source, localPath: canonical, repoUrl: onDiskRepoUrl },
+    executionWorkspaceSettings: policy.settings };
 }
 
 /** Returns the realization payload only for a fully configured, admitted bind.
@@ -176,6 +198,10 @@ export async function localRunRealization(
         workspaceRealizationRequest: {
           version: 1, companyId, environmentId: settings.environmentId,
           heartbeatRunId: runId, executionWorkspaceId: workspaceId, localRun: true,
+          // Bind-time policy snapshot: the executor gate re-checks it before
+          // admission. Field presence marks a snapshotted policy (null value
+          // included); an absent field is an unsnapshotted binding.
+          executionWorkspaceSettings: workspace.executionWorkspaceSettings,
           source,
         },
       },
