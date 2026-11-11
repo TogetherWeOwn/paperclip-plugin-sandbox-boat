@@ -443,29 +443,32 @@ describe("LocalGuestStore.push", () => {
     writeTree(live, { "src/a.rs": "a\n" });
     const snap = await captureSnapshot(live, snapDir);
     await new LocalGuestStore().push(snapDir, planPush(null, snap.manifest).toSend, guest);
-    // The mirror file grew between the lstat and the read: stat reports
-    // the manifest size (2) but the stream yields 24 bytes. The compare
-    // must return "different" (re-copy) the moment the stream exceeds the
-    // entry size instead of buffering the grown file and hash-matching
-    // the old lstat bytes. A whole-file read would skip this push as
-    // identical, so this fails before the bounded stream-hash and passes
-    // after it.
+    // Stat reports the manifest size, but the first chunk already exceeds it.
+    // A compare that drains the stream before rejecting would resume it again.
+    let reads = 0;
+    let destroyed = false;
+    let closed = false;
     const handle = {
       stat: async () => ({ isFile: () => true, size: 2 }),
       createReadStream: () => ({
         async *[Symbol.asyncIterator]() {
+          reads += 1;
           yield Buffer.alloc(8, 1);
+          reads += 1;
           yield Buffer.alloc(8, 2);
-          yield Buffer.alloc(8, 3);
         },
-        destroy() {},
+        destroy() { destroyed = true; },
       }),
-      close: async () => {},
+      close: async () => { closed = true; },
     };
     const growing = new LocalGuestStore({ open: (async () => handle) as unknown as typeof fsp.open });
     const result = await growing.push(snapDir, planPush(null, snap.manifest).toSend, guest);
     expect(result.files).toBe(1);
+    expect(result.bytes).toBe(2);
     expect(result.skipped).toBe(0);
+    expect(reads).toBe(1);
+    expect(destroyed).toBe(true);
+    expect(closed).toBe(true);
     expect(readFileSync(path.join(guest, "src/a.rs"), "utf8")).toBe("a\n");
   });
 
