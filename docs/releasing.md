@@ -13,11 +13,11 @@ Releases are git tags with a GitHub Release. Each release has the staged package
    git push origin vX.Y.Z
    ```
 
-3. The tag push runs the [release workflow](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/.github/workflows/release.yml), which uses only `GITHUB_TOKEN`. The workflow:
-   * fails unless the tag, `package.json` `version` and `PLUGIN_VERSION` agree at the tagged commit (`scripts/check-release-version.sh`), and unless `CHANGELOG.md` has a section for the version (`scripts/release-notes.sh`);
-   * builds the commit with `scripts/stage-package.sh`, which refuses a commit that is not on `main`, runs `npm run check`, and stages a self-contained package (real copies of the runtime dependencies, the pinned `@paperclipai/plugin-sdk` included; no symlinks);
-   * fails if the built tarball holds any symlink or hardlink (`scripts/check-tarball-links.sh`). Before 0.2.6 the tarball carried the SDK as an absolute symlink to the build host's path and could not load anywhere else;
-   * attaches `sandbox-boat-X.Y.Z-<short sha>.tgz` and `.tgz.sha256` to a new GitHub Release, with that `CHANGELOG.md` section as its notes. A release that already exists is never overwritten.
+3. The tag push runs the [release workflow](https://github.com/TogetherWeOwn/paperclip-plugin-sandbox-boat/blob/main/.github/workflows/release.yml), which uses only `GITHUB_TOKEN`. The workflow runs in two jobs: a read-only `build` job that produces the release assets, and a `publish` job that holds the write token, verifies the build job's artifact and creates the release without checking out source or running any build step. The workflow:
+   * fails in the `build` job unless the tag, `package.json` `version` and `PLUGIN_VERSION` agree at the tagged commit (`scripts/check-release-version.sh`), and unless `CHANGELOG.md` has a section for the version (`scripts/release-notes.sh`);
+   * builds the commit in the `build` job with `scripts/stage-package.sh`, which refuses a commit that is not on `main`, runs `npm run check`, and stages a self-contained package (real copies of the runtime dependencies, the pinned `@paperclipai/plugin-sdk` included; no symlinks);
+   * fails in the `build` job if the built tarball holds any symlink or hardlink (`scripts/check-tarball-links.sh`). Before 0.2.6 the tarball carried the SDK as an absolute symlink to the build host's path and could not load anywhere else;
+   * hands the tarball, its `.sha256` and the changelog notes from the `build` job to the `publish` job as a workflow artifact, and the `publish` job attaches `sandbox-boat-X.Y.Z-<short sha>.tgz` and `.tgz.sha256` to a new GitHub Release, with that `CHANGELOG.md` section as its notes, after verifying the artifact's checksum. A release that already exists is never overwritten.
 
 A tag push runs the workflow file at the tagged commit. To release a tag whose commit predates the workflow (as with the `v0.2.3` backfill), push the tag and then run the workflow from `main` by hand: `gh workflow run release.yml -f tag=vX.Y.Z`.
 
