@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 
 // Guard for the pr-size caller workflow: all logic lives in the org
 // .github repository, and this repo keeps only a thin caller pinned to
@@ -26,6 +27,24 @@ function usesRef(block: string): string {
 }
 
 describe("pr-size caller workflow", () => {
+  it("re-evaluates pull requests on edits, label changes and review changes", () => {
+    const caller = parse(workflow);
+    expect(caller.on.pull_request.types).toEqual([
+      "opened", "synchronize", "reopened", "ready_for_review", "labeled", "unlabeled", "edited",
+    ]);
+    expect(caller.on.pull_request_review.types).toEqual(["submitted", "dismissed"]);
+  });
+
+  it("isolates manual dispatch from PR-associated concurrency without promising required checks", () => {
+    const caller = parse(workflow);
+    expect(caller.concurrency.group).toBe(
+      "${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}" +
+      "${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}",
+    );
+    expect(caller.concurrency["cancel-in-progress"]).toBe("${{ github.event_name == 'pull_request' }}");
+    expect(caller.on.workflow_dispatch.inputs.pr_number.description).toContain("does not refresh required checks");
+  });
+
   it("calls all three org reusables pinned to the same full commit SHA", () => {
     const refs = ["pr-size", "pr-size-gate", "pr-size-weekly"].map((name) => usesRef(jobBlock(name)));
     expect(refs[0].startsWith(".github/workflows/pr-size.yml@")).toBe(true);

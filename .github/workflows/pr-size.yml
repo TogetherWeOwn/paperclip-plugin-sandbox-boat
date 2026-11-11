@@ -39,7 +39,7 @@ name: pr-size
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
   pull_request_review:
     types: [submitted, dismissed]
   schedule:
@@ -47,7 +47,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Optional PR number to label and gate now (blank runs the weekly tally)"
+        description: "Optional PR number to label and evaluate now; does not refresh required checks (blank runs the weekly tally)"
         required: false
         type: string
 
@@ -55,7 +55,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}${{ github.event_name == 'workflow_dispatch' && '-dispatch' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -66,7 +66,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # This repo's generated paths, excluded on top of the script's
@@ -84,7 +84,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       exclude-extra: ""
@@ -96,4 +96,4 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@0a82874b4cbb9a01075426b955ec5095dc89935f
