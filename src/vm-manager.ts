@@ -46,6 +46,7 @@ import { parseTaskClass, requireBoatSize, selectSize } from "./size-policy.js";
 import { effectiveEnvAllowlist, filterRunEnv, isAcpProcessSessionCommand, routeModelProxyThroughTunnel } from "./env-policy.js";
 import type { EnvDrop } from "./env-policy.js";
 import { BoatProviderError, describeBoatError, formatBoatError } from "./errors.js";
+import { NETWORK_POLICY_UNAVAILABLE, NETWORK_POLICY_UNAVAILABLE_MESSAGE, networkPolicyRefusal } from "./network-policy.js";
 import type { BoatErrorInfo } from "./errors.js";
 import {
   RUNTIME_DIR_RESULT_RE,
@@ -190,16 +191,13 @@ export interface IssueReader {
 }
 
 function networkPolicyUnavailable(): BoatProviderError {
-  return new BoatProviderError("BOAT_NETWORK_POLICY_UNAVAILABLE", "Current task network policy is unavailable; Boat admission refused.");
+  return new BoatProviderError(NETWORK_POLICY_UNAVAILABLE, NETWORK_POLICY_UNAVAILABLE_MESSAGE);
 }
 
 /** Boat cannot enforce a native network grant. Never echo its values or silently discard it. */
 function assertSupportedNetworkPolicy(settings: unknown): void {
-  if (settings == null) return;
-  if (typeof settings !== "object" || Array.isArray(settings)) throw networkPolicyUnavailable();
-  if ((settings as Record<string, unknown>).networkEgress != null) {
-    throw new BoatProviderError("BOAT_NETWORK_EGRESS_UNSUPPORTED", "Boat cannot enforce the requested network policy; admission refused.");
-  }
+  const refusal = networkPolicyRefusal(settings);
+  if (refusal) throw new BoatProviderError(refusal.code, refusal.message);
 }
 
 export interface ManagerDeps {
@@ -3281,8 +3279,32 @@ export class BoatVmManager {
       // which execs `env -u ASCII_TOKEN -u BOAT_ID sh -c <script>`: the shell
       // above the payload never had boat's credentials in its environment,
       // and it exits with the payload's status (128+n for a signal, not 255).
-      const result = await this.ssh.run(session, buildRemoteCommand(script), { stdin: params.stdin, timeoutMs });
+      // The whole-run cap (config.ts): the command runs to its own exit, its
+      // output is bounded per stream at executeMaxOutputBytes, and any cut is
+      // flagged below. A flooding guest then costs this worker at most the
+      // cap, not the whole timeout.
+      const result = await this.ssh.run(session, buildRemoteCommand(script), {
+        stdin: params.stdin,
+        timeoutMs,
+        maxOutputBytes: config.executeMaxOutputBytes,
+        outputLimitBehavior: "truncate",
+      });
       let stderr = result.stderr;
+      // The cap bounds the collected wire stream per stream, and the
+      // supervisor's PCSYNC marker shares the stderr stream: a cut stderr
+      // prefix can be up to that marker's bytes shorter than the cap, and
+      // stderrTruncated is set whenever the wire stream overflowed. Name
+      // the cut in both places a caller can see it: stderr (a line, never
+      // out content) and structured metadata. A run that fit the cap keeps
+      // its output byte-identical and adds no fields.
+      const outputTruncated = result.stdoutTruncated === true || result.stderrTruncated === true;
+      if (outputTruncated) {
+        const streams = [
+          ...(result.stdoutTruncated ? ["stdout"] : []),
+          ...(result.stderrTruncated ? ["stderr"] : []),
+        ].join(" and ");
+        stderr = `${stderr}${stderr ? "\n" : ""}boat: ${streams} exceeded ${config.executeMaxOutputBytes} bytes and was truncated; the command's exit reflects the full run, this output is a prefix.`;
+      }
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
           // A stopped VM loses /tmp, so the env file is gone with it.
@@ -3298,7 +3320,19 @@ export class BoatVmManager {
         timedOut: result.timedOut,
         stdout: result.stdout,
         stderr,
-        metadata: { provider: "boat", sandboxId, tunnel: session.tunnel },
+        metadata: {
+          provider: "boat",
+          sandboxId,
+          tunnel: session.tunnel,
+          ...(outputTruncated
+            ? {
+              outputTruncated: true,
+              stdoutTruncated: result.stdoutTruncated === true,
+              stderrTruncated: result.stderrTruncated === true,
+              maxOutputBytes: config.executeMaxOutputBytes,
+            }
+            : {}),
+        },
       };
     } finally {
       await this.endActivity(params.companyId, sandboxId);

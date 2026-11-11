@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { createFakeContext } from "./test-support/harness.js";
 import { localRunRealization, localRunSettings, readGitOriginUrl, type LocalRunHost } from "./local-run-binding.js";
 import { setRepoAuthForTests } from "./repo-auth.js";
-import plugin, { setManagerOverridesForTests } from "./plugin.js";
+import plugin, { currentManager, setManagerOverridesForTests } from "./plugin.js";
 
 const companyId = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 const runId = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb";
@@ -24,6 +24,7 @@ const started = { companyId, payload: { runId, issueId, agentId, status: "runnin
 function host(overrides: Partial<LocalRunHost> = {}): LocalRunHost {
   return {
     issueWorkspaceId: async () => workspaceId,
+    issueExecutionWorkspaceSettings: async () => ({ present: true, settings: null }),
     issueProjectWorkspace: async () => null,
     workspace: async () => ({ projectId: "project", projectWorkspaceId: null, path: "/srv/work/repo", repoUrl: "https://github.com/example/public" }),
     canonicalPath: async (localPath) => localPath,
@@ -72,6 +73,60 @@ describe("local-run offload binding", () => {
     const options = name === "expected workspace differs" ? { expectedWorkspaceId: projectWorkspaceId } : {};
     expect(await localRunRealization(started, localRunSettings(enabled), { ...fakeHost, apiKey }, options)).toBe(null);
     expect(apiKey).not.toHaveBeenCalled();
+  });
+
+  it("carries the snapshotted task settings into the realization payload for the executor gate", async () => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      issueExecutionWorkspaceSettings: async () => ({ present: true, settings: { networkEgress: null } }),
+    }));
+    expect(params).toMatchObject({
+      workspace: { metadata: { workspaceRealizationRequest: {
+        localRun: true, executionWorkspaceSettings: { networkEgress: null },
+      } } },
+    });
+  });
+
+  it.each([
+    ["non-null grant", { present: true, settings: { networkEgress: { allowFqdns: ["private-policy.example.test"] } } }, "network egress"],
+    ["empty grant", { present: true, settings: { networkEgress: {} } }, "network egress"],
+    ["malformed settings container", { present: true, settings: "synthetic-policy-payload-do-not-emit" }, "unavailable"],
+    ["absent settings field", { present: false, settings: undefined }, "unavailable"],
+    ["undefined settings", { present: true, settings: undefined }, "unavailable"],
+  ])("refuses the bind before resolving a secret when the task policy is %s", async (_name, policy, reason) => {
+    const apiKey = vi.fn(async () => "scoped-key");
+    const reasons: string[] = [];
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      issueExecutionWorkspaceSettings: async () => policy, apiKey,
+    }), { onRefuse: (r) => reasons.push(r) });
+    expect(params).toBe(null);
+    expect(apiKey).not.toHaveBeenCalled();
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain(reason);
+    // Policy values never reach a refusal reason.
+    expect(reasons[0]).not.toContain("private-policy.example.test");
+    expect(reasons[0]).not.toContain("synthetic-policy-payload-do-not-emit");
+  });
+
+  it("fails closed when the task policy cannot be read", async () => {
+    const apiKey = vi.fn(async () => "scoped-key");
+    const reasons: string[] = [];
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      issueExecutionWorkspaceSettings: async () => { throw new Error("issue lookup failed"); }, apiKey,
+    }), { onRefuse: (r) => reasons.push(r) });
+    expect(params).toBe(null);
+    expect(apiKey).not.toHaveBeenCalled();
+    expect(reasons).toEqual(["task network policy is unavailable; running local"]);
+  });
+
+  it.each([
+    ["null settings", null],
+    ["omitted policy", {}],
+    ["null policy", { networkEgress: null }],
+  ])("binds when the task policy is %s (unrestricted compatibility)", async (_name, settings) => {
+    const params = await localRunRealization(started, localRunSettings(enabled), host({
+      issueExecutionWorkspaceSettings: async () => ({ present: true, settings }),
+    }));
+    expect(params).not.toBe(null);
   });
 
   it("accepts the project workspace id the shim reports for an execution-branch bind", async () => {
@@ -221,7 +276,7 @@ describe("plugin wiring", () => {
     await mkdir(path.join(dir, ".git"));
     await writeFile(path.join(dir, ".git", "config"), gitOrigin("https://github.com/example/public"));
     const harness = createFakeContext({
-      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId }]]),
+      issues: new Map([[issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId, executionWorkspaceSettings: {} }]]),
       workspaces: new Map([[workspaceId, { repoUrl: "https://github.com/example/public", projectId: "project", projectWorkspaceId: null, path: dir, cwd: dir }]]),
     });
     harness.secrets.set(secretId, "scoped-key");
@@ -269,6 +324,34 @@ describe("plugin wiring", () => {
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(true);
     // Binding and dry-run classification never consumed a grant.
     expect(noClaims(harness)).toEqual([]);
+  });
+
+  it.each([
+    ["non-null grant", { networkEgress: { allowFqdns: ["private-policy.example.test"] } }, "network egress"],
+    ["malformed settings", "synthetic-policy-payload-do-not-emit", "unavailable"],
+  ])("keeps the command local with a named policy reason when the task policy is %s, resolving no secret", async (_name, settings, reason) => {
+    const harness = await setup(enabled);
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId,
+      executionWorkspaceSettings: settings as never });
+    let resolutions = 0;
+    const originalResolve = harness.ctx.secrets.resolve;
+    harness.ctx.secrets.resolve = async (ref: { secretId?: string } | null) => { resolutions += 1; return originalResolve(ref); };
+    try {
+      await harness.emit("agent.run.started", started);
+      const response = await admittedBind();
+      expect(response.status).toBe(503);
+      expect(resolutions).toBe(0);
+      expect(currentManager().hasOffloadBinding(companyId, runId, workspaceId)).toBe(false);
+      expect(harness.logs.some((entry) => entry.message === "boat: local-run offload binding refused"
+        && String((entry.meta as Record<string, unknown> | undefined)?.reason).includes(reason))).toBe(true);
+      // Policy values never reach logs or the response.
+      expect(JSON.stringify({ logs: harness.logs, body: response.body }))
+        .not.toContain("private-policy.example.test");
+      expect(JSON.stringify({ logs: harness.logs, body: response.body }))
+        .not.toContain("synthetic-policy-payload-do-not-emit");
+    } finally {
+      harness.ctx.secrets.resolve = originalResolve;
+    }
   });
 
   it("agent.run.started alone resolves no secret and binds nothing", async () => {
@@ -373,10 +456,10 @@ describe("plugin wiring", () => {
 
   it("binds on the first offload request when the workspace was prepared after the started event", async () => {
     const harness = await setup(enabled);
-    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null, executionWorkspaceSettings: {} });
     await harness.emit("agent.run.started", started);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
-    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId });
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionWorkspaceSettings: {} });
     expect((await exec(runId)).status).toBe(200);
     expect((await exec(randomUUID())).status).toBe(403);
   });
@@ -659,9 +742,9 @@ describe("plugin wiring", () => {
 
   it("a failed state write on the first offload request falls back locally and stays retryable", async () => {
     const harness = await setup(enabled);
-    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null, executionWorkspaceSettings: {} });
     await harness.emit("agent.run.started", started);
-    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId });
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: workspaceId, executionWorkspaceSettings: {} });
     const originalSet = harness.ctx.state.set;
     harness.ctx.state.set = async (input: { namespace?: string; scopeKind: string; stateKey: string }, value: unknown) => {
       if (input.namespace === "boat-offload-workspaces") throw new Error("state store unavailable");
@@ -676,7 +759,7 @@ describe("plugin wiring", () => {
 
   it("accepts the live shape: a null execution workspace id bound on the project workspace id", async () => {
     const harness = await setup(enabled);
-    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null });
+    harness.issues.set(issueId, { status: "in_progress", executionWorkspaceId: null, executionWorkspaceSettings: {} });
     await harness.emit("agent.run.started", started);
     expect(harness.logs.some((entry) => entry.message === "boat: bound local run for offload")).toBe(false);
     harness.projectWorkspaces.set(issueId, { id: projectWorkspaceId, projectId: "project",

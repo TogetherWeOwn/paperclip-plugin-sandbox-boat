@@ -101,6 +101,14 @@ const plugin = definePlugin({
     });
     const workspaceHost: Omit<LocalRunHost, "apiKey"> = {
       issueWorkspaceId: async (id, company) => (await ctx.issues.get(id, company))?.executionWorkspaceId ?? null,
+      // The task's current network policy gates the local-run bind, mirroring
+      // the resume-lease reader: field presence is part of the contract.
+      issueExecutionWorkspaceSettings: async (id, company) => {
+        const issue = await ctx.issues.get(id, company);
+        if (!issue) return { present: false, settings: undefined };
+        return { present: Object.prototype.hasOwnProperty.call(issue, "executionWorkspaceSettings"),
+          settings: issue.executionWorkspaceSettings };
+      },
       // The live issue shape leaves executionWorkspaceId null; the shim then
       // reports the project workspace id, so resolve that host-owned workspace.
       issueProjectWorkspace: async (id, company) => {

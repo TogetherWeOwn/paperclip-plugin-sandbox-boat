@@ -95,7 +95,7 @@ function startHost(source: string, options: { bindings?: Array<{ secretId: strin
   const invocations = new Map<string, string>();
   const pending = new Map<number, (message: { result?: unknown; error?: { message: string } }) => void>();
   let nextId = 1;
-  const issues = new Map<string, Record<string, unknown>>([[issueId, { id: issueId, companyId, status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId }]]);
+  const issues = new Map<string, Record<string, unknown>>([[issueId, { id: issueId, companyId, status: "in_progress", executionWorkspaceId: workspaceId, executionRunId: runId, executionWorkspaceSettings: {} }]]);
   const workspaceRows = new Map<string, Record<string, unknown>>([[workspaceId, {
     id: workspaceId, companyId, projectId: randomUUID(), projectWorkspaceId: randomUUID(), cwd: source, providerRef: null,
     repoUrl: "https://github.com/example/public", baseRef: "main", branchName: "two-190", providerType: "git_worktree",
