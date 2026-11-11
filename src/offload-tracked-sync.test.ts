@@ -234,6 +234,29 @@ describe("secret content scan", () => {
   });
 
   it.each([
+    ["Anthropic key", `key = "foo_sk-ant-api03-${"a".repeat(30)}"\n`],
+    ["OpenAI-style key", `key = "foo_sk-${"a".repeat(32)}"\n`],
+    ["OpenRouter key", `key = "foo_sk-or-v1-${"a".repeat(30)}"\n`],
+    ["GitLab token", `token = "token_glpat-${"a".repeat(20)}"\n`],
+  ])("flags an underscore-adjacent %s at admission", async (_label, content) => {
+    const root = gitRepo({ "src/secret.rs": content });
+    const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
+    expect(await hasSecretInFiles(root, tracked)).toBe(true);
+    expect(containsSecretContent(content)).toBe(true);
+  });
+
+  it.each([
+    ["an underscore-adjacent bare prefix", "foo_sk-test foo_glpat-short\n"],
+    ["an alphanumeric-glued long token", `const T = "task-${"a".repeat(32)} myglpat-${"a".repeat(20)}"\n`],
+    ["an underscore config name", "const my_token_prefix = \"sk-\";\n"],
+  ])("passes ordinary source with %s", async (_label, content) => {
+    expect(containsSecretContent(content)).toBe(false);
+    const root = gitRepo({ "src/ordinary.rs": content });
+    const tracked = [...(await listTrackedFiles(root))!].filter((rel) => !isDefaultSyncExcluded(rel));
+    expect(await hasSecretInFiles(root, tracked)).toBe(false);
+  });
+
+  it.each([
     ["Anthropic key", `key = "sk-ant-api03-${"a".repeat(30)}"\n`],
     ["OpenAI-style key", `key = "sk-${"a".repeat(32)}"\n`],
     ["OpenRouter key", `key = "sk-or-v1-${"a".repeat(30)}"\n`],

@@ -171,10 +171,13 @@ export async function listTrackedFiles(sourceRoot: string): Promise<Set<string> 
  * shares with the env policy, each with a length guard so a bare prefix
  * mention (docs, a comment) or a short placeholder is not a hit. The guard
  * is uniform across prefixes; the env policy matches the bare prefix, which
- * is stricter for an env value and still safe for a source file.
+ * is stricter for an env value and still safe for a source file. The leading
+ * boundary mirrors the env policy (`(?:^|[^A-Za-z0-9])`): a word character
+ * such as `_` separates, but an alphanumeric glue such as `task-...` does
+ * not count, which keeps ordinary mixed-up words from matching.
  */
 const WELL_KNOWN_CREDENTIAL_CONTENT_RES: readonly RegExp[] = WELL_KNOWN_CREDENTIAL_PREFIXES.map((prefix) =>
-  new RegExp(`\\b${prefix.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}[A-Za-z0-9_-]{16,}\\b`),
+  new RegExp(`(?:^|[^A-Za-z0-9])${prefix.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}[A-Za-z0-9_-]{16,}\\b`),
 );
 
 /** Known credential shapes. Each pattern is linear in the scanned text. */
