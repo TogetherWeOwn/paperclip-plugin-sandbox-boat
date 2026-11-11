@@ -65,7 +65,10 @@ describe("check-release-version.sh", () => {
 
   it("package.json and PLUGIN_VERSION agree on main", () => {
     const pkg = JSON.parse(readFileSync(path.resolve(__dirname, "../package.json"), "utf8"));
+    const lock = JSON.parse(readFileSync(path.resolve(__dirname, "../package-lock.json"), "utf8"));
     expect(PLUGIN_VERSION).toBe(pkg.version);
+    expect(lock.version).toBe(pkg.version);
+    expect(lock.packages[""].version).toBe(pkg.version);
   });
 
   // The staged package bundles a real copy of the SDK its build used, since a
