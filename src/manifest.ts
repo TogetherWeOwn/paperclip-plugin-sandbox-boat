@@ -435,6 +435,12 @@ const manifest: PaperclipPluginManifestV1 = {
             description: "Timeout for VM start, SSH setup and commands without their own timeout, in milliseconds.",
             ...advanced("API"),
           },
+          executeMaxOutputBytes: {
+            type: "number",
+            default: 8388608,
+            description: "Whole-run execute cap per output stream, in bytes (65536 to 67108864). Output past the cap is discarded as it arrives; the command still runs to its own exit and the result flags the truncation.",
+            ...advanced("API"),
+          },
           stopConfirmTimeoutMs: {
             type: "number",
             default: 120000,

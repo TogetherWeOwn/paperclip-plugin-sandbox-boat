@@ -58,6 +58,10 @@ export interface SshExecutionResult {
   timedOut: boolean;
   stdout: string;
   stderr: string;
+  /** True when stdout was cut at the caller's byte cap (truncate mode). */
+  stdoutTruncated?: boolean;
+  /** True when stderr was cut at the caller's byte cap (truncate mode). */
+  stderrTruncated?: boolean;
   /**
    * Set by supervised ssh runs: true only when remote cancel/finalize completed
    * cleanly (no timeout, signal, nonzero or null exit). false means cleanup
@@ -364,19 +368,21 @@ export class SshManager {
   async run(
     session: SshSession,
     remoteCommand: string,
-    options: { stdin?: string; timeoutMs: number; maxOutputBytes?: number },
+    options: { stdin?: string; timeoutMs: number; maxOutputBytes?: number; outputLimitBehavior?: "fail" | "truncate" },
   ): Promise<SshExecutionResult> {
     // Same supervised path as runStream: an unsupervised multiplexed slave
     // never ends on timeout, because killing the local ssh client leaves the
     // master holding the channel until the remote job exits on its own. The
     // supervisor wrap + bounded cancel in runSupervised make timeoutMs real
-    // for execute, scrub, prepareRemote and env staging alike. Output stays
-    // uncapped unless the caller bounds it, matching run()'s prior contract
-    // (whole-run execute returns the command's full stdout to the host).
+    // for execute, scrub, prepareRemote and env staging alike. Output is
+    // always bounded: control callers without an explicit cap fail closed at
+    // the shared default; whole-run execute passes its configured cap with
+    // truncate semantics so a flooding guest cannot grow the worker heap.
     return await this.runSupervised(session, remoteCommand, {
       stdin: options.stdin != null ? Readable.from([options.stdin]) : undefined,
       timeoutMs: options.timeoutMs,
-      maxOutputBytes: options.maxOutputBytes ?? null,
+      maxOutputBytes: options.maxOutputBytes,
+      outputLimitBehavior: options.outputLimitBehavior,
       // run()'s old contract: a command that exits without reading its stdin
       // (or an ssh that never connects) reports its own status — 3, or 255 —
       // never a thrown EPIPE that would bypass callers' status handling.
@@ -651,8 +657,16 @@ export function sleep(ms: number): Promise<void> {
 export interface StreamProcessOptions {
   stdin?: Readable;
   stdout?: Writable;
-  /** Control-output cap per stream. `null` collects without a cap (run() only). */
-  maxOutputBytes?: number | null;
+  /** Collected-output cap per stream (bytes). Unset: the 256 KiB default. */
+  maxOutputBytes?: number;
+  /**
+   * What happens past the cap. `fail` (default) rejects with
+   * SSH_CONTROL_OUTPUT_LIMIT: control-plane callers parse the output, so a
+   * cut prefix would be misread. `truncate` keeps the first cap bytes per
+   * stream, discards the rest as it drains, and flags the result: whole-run
+   * execute, where the command still runs to its own exit.
+   */
+  outputLimitBehavior?: "fail" | "truncate";
   timeoutMs: number;
   /** Fixed working directory and environment instead of inheriting the worker's. */
   cwd?: string;
@@ -674,8 +688,12 @@ export interface StreamProcessOptions {
 
 /** Backpressured binary IO, bounded control output, and cleanup on either pipe's failure. */
 export async function runStreamProcess(command: string, args: string[], options: StreamProcessOptions): Promise<SshExecutionResult> {
-  const cap = options.maxOutputBytes === null ? Number.POSITIVE_INFINITY : (options.maxOutputBytes ?? 256 * 1024);
-  if ((cap !== Number.POSITIVE_INFINITY && (!Number.isSafeInteger(cap) || cap < 0)) || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+  const cap = options.maxOutputBytes ?? 256 * 1024;
+  const truncate = options.outputLimitBehavior === "truncate";
+  if (options.outputLimitBehavior != null && !truncate && options.outputLimitBehavior !== "fail") {
+    throw new Error("Invalid streaming process limits.");
+  }
+  if ((!Number.isSafeInteger(cap) || cap < 0) || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
     throw new Error("Invalid streaming process limits.");
   }
   const child = spawn(command, args, {
@@ -787,28 +805,47 @@ export async function runStreamProcess(command: string, args: string[], options:
   }, options.timeoutMs);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
-  function collector(chunks: Buffer[]): Writable {
+  // Only collected streams count: a caller-piped stream (options.stdout)
+  // forwards bytes without holding them, so this cap guards the heap the
+  // collector itself would grow.
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
+  function collector(chunks: Buffer[], markTruncated: (value: boolean) => void): Writable {
     let bytes = 0;
     return new Writable({ write(chunk: Buffer, _encoding, done) {
-      bytes += chunk.length;
-      if (bytes > cap) {
-        // Carries a code so control-plane callers can fail closed on an
-        // overgrown page (output overflow) instead of surfacing a generic
-        // transport error. The message text is unchanged.
-        const limit = new Error("Streaming process control output exceeds its byte limit.") as Error & { code?: string };
-        limit.code = "SSH_CONTROL_OUTPUT_LIMIT";
-        done(limit);
+      if (bytes + chunk.length > cap) {
+        if (!truncate) {
+          // Carries a code so control-plane callers can fail closed on an
+          // overgrown page (output overflow) instead of surfacing a generic
+          // transport error. The message text is unchanged.
+          const limit = new Error("Streaming process control output exceeds its byte limit.") as Error & { code?: string };
+          limit.code = "SSH_CONTROL_OUTPUT_LIMIT";
+          done(limit);
+          return;
+        }
+        // Truncate: keep the cap-sized byte prefix, discard the rest as we
+        // drain, and flag it. Copying only the kept slice keeps one huge
+        // pipe chunk from spiking the heap. A split multi-byte sequence at
+        // the cut decodes to a replacement character; the flag is the
+        // contract that the tail was cut.
+        markTruncated(true);
+        if (bytes < cap) chunks.push(Buffer.from(chunk.subarray(0, cap - bytes)));
+        bytes = cap + 1;
+        done();
+        return;
       }
-      else { chunks.push(Buffer.from(chunk)); done(); }
+      bytes += chunk.length;
+      chunks.push(Buffer.from(chunk));
+      done();
     } });
   }
   // Observe every pipe immediately: waiting for exit first deadlocks a full pipe.
   const stdinPipe = pipeline(options.stdin ?? Readable.from([]), child.stdin);
   const pipes = [
-    pipeline(child.stdout, options.stdout ?? collector(stdout)),
+    pipeline(child.stdout, options.stdout ?? collector(stdout, (value) => { stdoutTruncated = value; })),
     // The detach destroys stderr before its EOF whenever the slave exits
     // first; that premature close is ours, not a stream failure.
-    pipeline(child.stderr, collector(stderr)).catch((error: NodeJS.ErrnoException) => {
+    pipeline(child.stderr, collector(stderr, (value) => { stderrTruncated = value; })).catch((error: NodeJS.ErrnoException) => {
       if (!stderrDetached || error.code !== "ERR_STREAM_PREMATURE_CLOSE") throw error;
     }),
     // With tolerateStdinClose, an EPIPE here just means the child stopped
@@ -821,7 +858,8 @@ export async function runStreamProcess(command: string, args: string[], options:
     await Promise.allSettled(pipes);
     if (failure && !timedOut) throw failure;
     return { exitCode: timedOut ? null : result.code, signal: result.signal, timedOut,
-      stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
+      stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"),
+      ...(stdoutTruncated ? { stdoutTruncated: true } : {}), ...(stderrTruncated ? { stderrTruncated: true } : {}) };
   } finally {
     clearTimeout(timer);
     // Same rule as the close handler: never cancel a pending group SIGKILL
@@ -835,8 +873,10 @@ export async function runStreamProcess(command: string, args: string[], options:
 export async function runProcess(
   command: string,
   args: string[],
-  options: { stdin?: string; timeoutMs: number },
+  options: { stdin?: string; timeoutMs: number; maxOutputBytes?: number },
 ): Promise<SshExecutionResult> {
+  const cap = options.maxOutputBytes ?? 256 * 1024;
+  if (!Number.isSafeInteger(cap) || cap < 0) throw new Error("Invalid streaming process limits.");
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"] });
     // Collect raw bytes and decode once at the end: decoding each chunk on
@@ -879,12 +919,27 @@ export async function runProcess(
             forceTimer = setTimeout(() => finish(exited?.code ?? null, exited?.signal ?? null), SIGKILL_GRACE_MS * 2);
           }, options.timeoutMs)
         : null;
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout.push(Buffer.from(chunk));
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr.push(Buffer.from(chunk));
-    });
+    // Local helpers (ssh-keygen, ssh -V) print well under this cap; a
+    // runaway local child fails closed instead of growing the heap.
+    const stdoutBytes = { count: 0 };
+    const stderrBytes = { count: 0 };
+    const pushCapped = (chunks: Buffer[], counter: { count: number }, chunk: Buffer) => {
+      if (counter.count + chunk.length > cap) {
+        const limit = new Error("Streaming process control output exceeds its byte limit.") as Error & { code?: string };
+        limit.code = "SSH_CONTROL_OUTPUT_LIMIT";
+        if (!settled) {
+          settled = true;
+          clearTimers();
+          child.kill("SIGKILL");
+          reject(limit);
+        }
+        return;
+      }
+      counter.count += chunk.length;
+      chunks.push(Buffer.from(chunk));
+    };
+    child.stdout?.on("data", (chunk: Buffer) => pushCapped(stdout, stdoutBytes, chunk));
+    child.stderr?.on("data", (chunk: Buffer) => pushCapped(stderr, stderrBytes, chunk));
     child.on("error", (error) => {
       if (settled) return;
       settled = true;

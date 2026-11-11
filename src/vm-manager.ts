@@ -3281,8 +3281,29 @@ export class BoatVmManager {
       // which execs `env -u ASCII_TOKEN -u BOAT_ID sh -c <script>`: the shell
       // above the payload never had boat's credentials in its environment,
       // and it exits with the payload's status (128+n for a signal, not 255).
-      const result = await this.ssh.run(session, buildRemoteCommand(script), { stdin: params.stdin, timeoutMs });
+      // The whole-run cap (config.ts): the command runs to its own exit, its
+      // output is bounded per stream at executeMaxOutputBytes, and any cut is
+      // flagged below. A flooding guest then costs this worker at most the
+      // cap, not the whole timeout.
+      const result = await this.ssh.run(session, buildRemoteCommand(script), {
+        stdin: params.stdin,
+        timeoutMs,
+        maxOutputBytes: config.executeMaxOutputBytes,
+        outputLimitBehavior: "truncate",
+      });
       let stderr = result.stderr;
+      // The returned stdout/stderr are the cap-sized byte prefixes. Name the
+      // cut in both places a caller can see it: stderr (a line, never out
+      // content) and structured metadata. A run that fit the cap keeps its
+      // output byte-identical and adds no fields.
+      const outputTruncated = result.stdoutTruncated === true || result.stderrTruncated === true;
+      if (outputTruncated) {
+        const streams = [
+          ...(result.stdoutTruncated ? ["stdout"] : []),
+          ...(result.stderrTruncated ? ["stderr"] : []),
+        ].join(" and ");
+        stderr = `${stderr}\nboat: ${streams} exceeded ${config.executeMaxOutputBytes} bytes and was truncated; the command's exit reflects the full run, this output is a prefix.`.trim();
+      }
       if (result.exitCode === 255) {
         if (await this.sessionLost(config, sandboxId)) {
           // A stopped VM loses /tmp, so the env file is gone with it.
@@ -3298,7 +3319,19 @@ export class BoatVmManager {
         timedOut: result.timedOut,
         stdout: result.stdout,
         stderr,
-        metadata: { provider: "boat", sandboxId, tunnel: session.tunnel },
+        metadata: {
+          provider: "boat",
+          sandboxId,
+          tunnel: session.tunnel,
+          ...(outputTruncated
+            ? {
+              outputTruncated: true,
+              stdoutTruncated: result.stdoutTruncated === true,
+              stderrTruncated: result.stderrTruncated === true,
+              maxOutputBytes: config.executeMaxOutputBytes,
+            }
+            : {}),
+        },
       };
     } finally {
       await this.endActivity(params.companyId, sandboxId);
