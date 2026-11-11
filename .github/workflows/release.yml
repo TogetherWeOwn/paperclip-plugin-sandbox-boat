@@ -1,7 +1,11 @@
 name: release
 
-# A pushed vX.Y.Z tag builds that commit with scripts/stage-package.sh and
-# publishes a GitHub Release with the package tarball and its .sha256.
+# A pushed vX.Y.Z tag builds that commit with scripts/stage-package.sh in a
+# read-only build job and publishes a GitHub Release with the package tarball
+# and its .sha256 from a second publish job that holds the write token. The
+# build job produces the tarball and its checksum as a workflow artifact, and
+# the publish job only verifies that artifact and uploads it: it checks out no
+# source and runs no build, test or install step.
 # workflow_dispatch releases a tag that already exists, for a tag whose commit
 # predates this workflow (a tag push runs the workflow file at the tagged
 # commit). See docs/releasing.md.
@@ -23,12 +27,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: release
+  build:
+    name: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write # create the release; GITHUB_TOKEN only
+      contents: read # build only; the write token never enters this job
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     defaults:
@@ -40,7 +44,7 @@ jobs:
         with:
           # stage-package.sh needs origin/main and the tag's history.
           fetch-depth: 0
-          # npm ci runs dependency scripts; keep the write token out of .git/config.
+          # npm ci runs dependency scripts; keep the read token out of .git/config.
           persist-credentials: false
       # No npm cache: a release build should not restore state other runs saved.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -74,6 +78,52 @@ jobs:
       - name: Check the tarball holds no links
         run: scripts/check-tarball-links.sh "$RUNNER_TEMP"/assets/*.tgz
 
+      # The notes travel with the assets so the publish job needs no source
+      # checkout to create the release.
+      - name: Stage release notes with the assets
+        run: cp "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/assets/notes.md"
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false
+          # The tarball is already gzipped; stored bytes are the release bytes.
+          compression-level: 0
+
+  publish:
+    name: publish
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the release; GITHUB_TOKEN only, no tagged code in this job
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        # Explicit bash adds pipefail, so a failed check cannot hide behind a pipe.
+        shell: bash
+    steps:
+      # No checkout, no setup-node, no install or build step: this job holds the
+      # write token and only verifies the artifact the build job produced.
+      - name: Download the release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets
+
+      - name: Verify the release assets
+        run: |
+          cd "$RUNNER_TEMP/assets"
+          test -f notes.md
+          test "$(find . -maxdepth 1 -name '*.tgz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*.tgz.sha256' | wc -l)" -eq 1
+          sha256sum -c *.tgz.sha256
+
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,5 +132,5 @@ jobs:
         run: |
           prerelease=()
           [[ $TAG == *-* ]] && prerelease=(--prerelease)
-          gh release create "$TAG" "$RUNNER_TEMP"/assets/* "${prerelease[@]}" \
-            --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$RUNNER_TEMP"/assets/*.tgz "$RUNNER_TEMP"/assets/*.tgz.sha256 "${prerelease[@]}" \
+            --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/assets/notes.md"
