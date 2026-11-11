@@ -46,13 +46,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 //
 //   4. ANTHROPIC_AUTH_TOKEN is delivered only under an explicit model
 //      policy: the reverse tunnel is on, ANTHROPIC_BASE_URL (after the
-//      tunnel rewrite) is http://127.0.0.1:<tunnelRemotePort>, and, when the
-//      operator configured `modelProxyKeyFingerprint`, the token's SHA-256
-//      matches it. Anything else — a provider key on some other base URL, a
-//      token that is not the dedicated sandbox proxy key — is dropped.
-//      Paperclip replaces the environment's token with a managed
-//      AI-connection pool credential when an agent has such a binding, so
-//      the value alone is never trusted.
+//      tunnel rewrite) is http://127.0.0.1:<tunnelRemotePort>, and the
+//      operator configured `modelProxyKeyFingerprint` with the token's
+//      SHA-256 matching it. Anything else — a provider key on some other base
+//      URL, a token that is not the dedicated sandbox proxy key, or no
+//      fingerprint configured at all — is dropped. Paperclip replaces the
+//      environment's token with a managed AI-connection pool credential
+//      when an agent has such a binding, so the value alone is never trusted.
 //
 //   5. Managed GitHub names are delivered only when the operator set
 //      `managedGithub: true` (deny by default: any process in the VM, not
@@ -82,8 +82,8 @@ export const DEFAULT_ENV_ALLOWLIST: readonly string[] = [
   // Model proxy: 127.0.0.1:<tunnelRemotePort> in the VM is the reverse tunnel.
   "ANTHROPIC_BASE_URL",
   // The model-proxy key, delivered only under the explicit model policy
-  // (rule 4 above): on the tunnel URL, and matching modelProxyKeyFingerprint
-  // when one is configured. The only TOKEN name a model needs; any other
+  // (rule 4 above): on the tunnel URL, and matching modelProxyKeyFingerprint,
+  // which must be configured. The only TOKEN name a model needs; any other
   // *TOKEN* name is dropped.
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_MODEL",
@@ -368,6 +368,7 @@ export type EnvDropReason =
   | "secret_name_needs_exact_entry"
   | "secret_value"
   | "model_credential_not_dedicated"
+  | "model_credential_fingerprint_unset"
   | "model_credential_off_tunnel"
   | "github_capability_disabled"
   | "github_capability_rejected"
@@ -833,7 +834,7 @@ export interface EnvFilterOptions {
   tunnelTargetHost?: string;
   tunnelTargetPort?: number;
   tunnelRemotePort?: number;
-  /** SHA-256 (hex) of the one dedicated sandbox model-proxy key, or null/unset for unverified. */
+  /** SHA-256 (hex) of the one dedicated sandbox model-proxy key. Required: without it the model credential is always refused. */
   modelProxyKeyFingerprint?: string | null;
 }
 
@@ -853,9 +854,10 @@ function fingerprintMatches(value: string, configured: string): boolean {
  * only when it will be spent through this plugin's tunnel — the tunnel is
  * on and ANTHROPIC_BASE_URL is the tunnel address (127.0.0.1:<remote port>,
  * or the host-side tunnel target routeModelProxyThroughTunnel rewrites to
- * it) — and, when a fingerprint is configured, it is the dedicated key.
- * Without a fingerprint an on-tunnel token is delivered unverified;
- * validateConfig warns about that. The value is never logged.
+ * it) — and a fingerprint is configured and it is the dedicated key.
+ * Without a fingerprint the token is refused even on the tunnel, so a
+ * managed AI-connection pool credential can never reach a VM unverified.
+ * The value is never logged.
  */
 function modelCredentialProblem(value: string, options: EnvFilterOptions, baseUrl: string | undefined): EnvDropReason | null {
   if (options.cliproxyTunnel !== true || baseUrl == null) return "model_credential_off_tunnel";
@@ -874,7 +876,8 @@ function modelCredentialProblem(value: string, options: EnvFilterOptions, baseUr
     ((url.hostname === "127.0.0.1" && port === remotePort) || (url.hostname === targetHost.toLowerCase() && port === targetPort));
   if (!onTunnel) return "model_credential_off_tunnel";
   const fingerprint = options.modelProxyKeyFingerprint?.trim();
-  if (fingerprint && !fingerprintMatches(value, fingerprint)) return "model_credential_not_dedicated";
+  if (!fingerprint) return "model_credential_fingerprint_unset";
+  if (!fingerprintMatches(value, fingerprint)) return "model_credential_not_dedicated";
   return null;
 }
 

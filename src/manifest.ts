@@ -361,7 +361,7 @@ const manifest: PaperclipPluginManifestV1 = {
           modelProxyKeyFingerprint: {
             type: "string",
             description:
-              "SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. ANTHROPIC_AUTH_TOKEN reaches the VM only when it is that key and ANTHROPIC_BASE_URL is the tunnel address; any other value (for example a managed AI-connection pool credential) is dropped. Unset: an on-tunnel token is delivered unverified and validation warns; an off-tunnel token is dropped either way.",
+              "SHA-256 (64 hex) of the one dedicated, low-limit sandbox model-proxy key. ANTHROPIC_AUTH_TOKEN reaches the VM only when it is that key and ANTHROPIC_BASE_URL is the tunnel address; any other value (for example a managed AI-connection pool credential) is dropped. Unset: the model credential is withheld and validation warns; an off-tunnel token is dropped either way.",
             ...advanced("Model proxy tunnel"),
           },
           managedGithub: {

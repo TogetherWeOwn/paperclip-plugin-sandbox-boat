@@ -115,13 +115,13 @@ describe("config", () => {
     });
   });
 
-  it("credentials need explicit policy: managedGithub warns when on, the model key warns unverified or off-tunnel, a bad fingerprint fails", () => {
+  it("credentials need explicit policy: managedGithub warns when on, the model key warns withheld or off-tunnel, a bad fingerprint fails", () => {
     const warningsFor = (raw: Record<string, unknown>) => validateDriverConfig(parseDriverConfig({ apiKey: "k", ...raw }), { apiKey: "k", ...raw }).warnings.join("\n");
     const errorsFor = (raw: Record<string, unknown>) => validateDriverConfig(parseDriverConfig({ apiKey: "k", ...raw }), { apiKey: "k", ...raw }).errors.join("\n");
     expect(warningsFor({ managedGithub: true })).toMatch(/managedGithub is on: any process in the VM/);
     expect(warningsFor({ managedGithub: false })).not.toMatch(/managedGithub is on/);
-    expect(warningsFor({})).toMatch(/modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is delivered unverified/);
-    expect(warningsFor({ modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated") })).not.toMatch(/delivered unverified/);
+    expect(warningsFor({})).toMatch(/modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is withheld/);
+    expect(warningsFor({ modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated") })).not.toMatch(/withheld \(model_credential_fingerprint_unset\)/);
     expect(warningsFor({ cliproxyTunnel: false })).toMatch(/cliproxyTunnel is off: ANTHROPIC_AUTH_TOKEN is always dropped/);
     expect(errorsFor({ modelProxyKeyFingerprint: "not-a-sha256" })).toMatch(/modelProxyKeyFingerprint must be the SHA-256/);
     expect(errorsFor({ modelProxyKeyFingerprint: modelProxyKeyFingerprintOf("sk-dedicated").toUpperCase() })).toBe("");
@@ -682,8 +682,10 @@ describe("env policy", () => {
       }
     });
 
-    it("without a fingerprint, keeps an on-tunnel token unverified but still drops an off-tunnel one", () => {
-      expect(tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "sk-anything" }, tunnel).token).toBe("kept");
+    it("without a fingerprint, refuses an on-tunnel token (fail closed) and still drops an off-tunnel one", () => {
+      const { result, token } = tokenOutcome({ ANTHROPIC_BASE_URL: "http://127.0.0.1:8317", ANTHROPIC_AUTH_TOKEN: "sk-anything" }, tunnel);
+      expect(token).toBe("model_credential_fingerprint_unset");
+      expect(buildRemoteEnvFileContents(result.kept)).not.toContain("sk-anything");
       expect(tokenOutcome({ ANTHROPIC_BASE_URL: "https://api.anthropic.com", ANTHROPIC_AUTH_TOKEN: "sk-anything" }, tunnel).token).toBe("model_credential_off_tunnel");
     });
 
