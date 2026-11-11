@@ -149,9 +149,13 @@ jobs:
           # Exactly one entry, naming exactly this tarball by basename:
           # sha256sum -c alone would trust whatever filename the checksum
           # file lists and could pass for notes.md while the tarball that
-          # is published went unchecked.
+          # is published went unchecked. The entry filename is everything
+          # after the 64-char digest and its two-char separator, taken
+          # whole: taking only the second whitespace field would let an
+          # entry naming "pkg.tgz decoy" pass for pkg.tgz while sha256sum
+          # -c checked the decoy file instead.
           test "$(wc -l < "${checksums[0]}")" -eq 1
-          test "$(awk '{print $2}' "${checksums[0]}" | sed 's/^\*//')" = "$tarball"
+          test "$(cut -c67- "${checksums[0]}")" = "$tarball"
           sha256sum -c "${checksums[0]}"
 
       - name: Publish the GitHub Release

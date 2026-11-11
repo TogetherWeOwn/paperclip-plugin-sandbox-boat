@@ -160,7 +160,7 @@ function guardViolations(doc: WorkflowDoc): string[] {
   check(verify.includes('sha256sum -c "${checksums[0]}"'), "verify must check the specific bound checksum file");
   check(verify.includes('"$tarball.sha256"') || verify.includes("$tarball.sha256"), "verify must require the checksum basename to match the tarball");
   check(verify.includes("wc -l"), "verify must require exactly one checksum entry");
-  check(verify.includes("awk") && verify.includes("sed"), "verify must extract and compare the entry filename");
+  check(verify.includes("cut -c67-"), "verify must compare the whole entry filename, not one whitespace field");
 
   const publishStep = publishSteps.find(
     (s) => typeof s.run === "string" && executable(s.run as string).includes("gh release create"),
@@ -291,6 +291,17 @@ describe("release workflow publish verification", () => {
     const files = goodArtifact();
     files[`${TARBALL}.sha256`] =
       checksumFor(TARBALL, TARBALL_CONTENT) + checksumFor("notes.md", NOTES);
+    expect(runVerifyScript(verifyScript, files)).not.toBe(0);
+  });
+
+  it("rejects a checksum entry naming a whitespace decoy instead of the tarball", () => {
+    // `sha256sum -c` treats everything after the digest separator as the
+    // filename, so an entry for "pkg.tgz decoy" checks that decoy file
+    // while the published tarball goes unchecked. Comparing only the
+    // second whitespace field would wrongly accept this.
+    const files = goodArtifact();
+    files[`${TARBALL} decoy`] = "";
+    files[`${TARBALL}.sha256`] = checksumFor(`${TARBALL} decoy`, "");
     expect(runVerifyScript(verifyScript, files)).not.toBe(0);
   });
 
