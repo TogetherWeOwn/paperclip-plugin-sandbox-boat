@@ -10,6 +10,7 @@ import {
   HARDENED_GIT_CONFIG,
   hardenedGitEnv,
   isAuthenticatableRemoteUrl,
+  makeIsolatedHome,
   type GitRunner,
   type GitRunnerRaw,
 } from "./repo-auth.js";
@@ -106,6 +107,24 @@ describe("hardened git environment", () => {
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(HARDENED_GIT_CONFIG).toContain("core.askPass=");
     expect(HARDENED_GIT_CONFIG).toContain("credential.helper=");
+  });
+
+  it("fails closed (null) when isolated-HOME creation fails instead of falling back to the filesystem root", () => {
+    const prior = process.env.TMPDIR;
+    process.env.TMPDIR = "/definitely-not-a-real-directory-boat-test";
+    try {
+      expect(makeIsolatedHome()).toBeNull();
+    } finally {
+      if (prior === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = prior;
+    }
+  });
+
+  it("creates an isolated HOME inside the temp area, never the filesystem root", async () => {
+    const home = makeIsolatedHome();
+    expect(home).not.toBeNull();
+    expect(home).not.toBe(path.parse(home!).root);
+    await rm(home!, { recursive: true, force: true });
   });
 });
 

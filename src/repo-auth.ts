@@ -121,11 +121,11 @@ function gitArgs(...rest: string[]): string[] {
   return ["--no-replace-objects", ...HARDENED_GIT_CONFIG.flatMap((item) => ["-c", item]), ...rest];
 }
 
-function makeIsolatedHome(): string {
+export function makeIsolatedHome(): string | null {
   try {
     return mkdtempSync(path.join(tmpdir(), "boat-git-home-"));
   } catch {
-    return path.parse(tmpdir()).root;
+    return null;
   }
 }
 
@@ -139,6 +139,7 @@ function cleanupHome(home: string): void {
 
 function runGitReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: string; exit: number }> {
   const home = makeIsolatedHome();
+  if (home === null) return Promise.resolve({ stdout: "", exit: 128 });
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: { stdout: string; exit: number }) => {
@@ -168,6 +169,7 @@ function runGitReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: s
 
 function runGitRawReal(args: string[], opts: { cwd?: string }): Promise<{ stdout: Buffer; exit: number }> {
   const home = makeIsolatedHome();
+  if (home === null) return Promise.resolve({ stdout: Buffer.alloc(0), exit: 128 });
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: { stdout: Buffer; exit: number }) => {
