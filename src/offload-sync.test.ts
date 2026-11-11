@@ -436,6 +436,42 @@ describe("LocalGuestStore.push", () => {
     ).rejects.toMatchObject({ code: "SYNC_TRAVERSAL" });
   });
 
+  it("rejects a mirror file that outgrows its manifest entry mid-read without buffering it whole", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "src/a.rs": "a\n" });
+    const snap = await captureSnapshot(live, snapDir);
+    await new LocalGuestStore().push(snapDir, planPush(null, snap.manifest).toSend, guest);
+    // Stat reports the manifest size, but the first chunk already exceeds it.
+    // A compare that drains the stream before rejecting would resume it again.
+    let reads = 0;
+    let destroyed = false;
+    let closed = false;
+    const handle = {
+      stat: async () => ({ isFile: () => true, size: 2 }),
+      createReadStream: () => ({
+        async *[Symbol.asyncIterator]() {
+          reads += 1;
+          yield Buffer.alloc(8, 1);
+          reads += 1;
+          yield Buffer.alloc(8, 2);
+        },
+        destroy() { destroyed = true; },
+      }),
+      close: async () => { closed = true; },
+    };
+    const growing = new LocalGuestStore({ open: (async () => handle) as unknown as typeof fsp.open });
+    const result = await growing.push(snapDir, planPush(null, snap.manifest).toSend, guest);
+    expect(result.files).toBe(1);
+    expect(result.bytes).toBe(2);
+    expect(result.skipped).toBe(0);
+    expect(reads).toBe(1);
+    expect(destroyed).toBe(true);
+    expect(closed).toBe(true);
+    expect(readFileSync(path.join(guest, "src/a.rs"), "utf8")).toBe("a\n");
+  });
+
   it("recovers a partial transfer by sending only what is missing", async () => {
     const live = makeTemp();
     const snapDir = makeTemp();
