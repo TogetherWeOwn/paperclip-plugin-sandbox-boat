@@ -713,7 +713,7 @@ export interface GuestStore {
 export interface LocalGuestStoreOptions {
   /** Test hook: runs before each copy or metadata fix; throwing aborts the push mid-transfer. */
   beforeCopy?: (entry: SyncFileEntry) => void;
-  /** Test hook: opens guest files for bounded reads; defaults to fsp.open. Lets tests stream more bytes than stat reported. */
+  /** Test hook: opens guest files for bounded reads and the push compare; defaults to fsp.open. Lets tests stream more bytes than stat reported. */
   open?: typeof fsp.open;
   /** Scan hash budget in bytes (test seam); files past it are recorded unhashed. */
   maxScanBytes?: number;
@@ -732,7 +732,7 @@ export class LocalGuestStore implements GuestStore {
     let skipped = 0;
     for (const entry of entries) {
       const dest = await resolveContained(guest, entry.path);
-      const match = await matchGuestEntry(dest, entry);
+      const match = await matchGuestEntry(dest, entry, this.opts.open ?? fsp.open);
       if (match === "identical") {
         skipped += 1;
         continue;
@@ -942,8 +942,13 @@ type GuestMatch = "identical" | "metadata-only" | "different";
  * Compare a mirror path against a manifest entry. Same bytes with a stale
  * mode or mtime is metadata-only: the push fixes it in place without
  * rewriting the file. Mtimes compare floored, matching what utimes can set.
+ * The file is stream-hashed capped at the manifest entry size (the
+ * hashGuestFile pattern): a mirror file grown between the lstat and the
+ * read returns "different" the moment the stream exceeds entry.size,
+ * buffering at most one chunk instead of the whole grown file. The open is
+ * injected so tests can stream more bytes than stat reported.
  */
-async function matchGuestEntry(dest: string, entry: SyncFileEntry): Promise<GuestMatch> {
+async function matchGuestEntry(dest: string, entry: SyncFileEntry, open: typeof fsp.open = fsp.open): Promise<GuestMatch> {
   const st = await fsp.lstat(dest).catch(() => null);
   if (!st) return "different";
   if (entry.symlink !== undefined) {
@@ -952,7 +957,39 @@ async function matchGuestEntry(dest: string, entry: SyncFileEntry): Promise<Gues
   }
   if (!st.isFile()) return "different";
   if (st.size !== entry.size) return "different";
-  if (sha256Hex(await fsp.readFile(dest)) !== entry.sha256) return "different";
+  // O_NONBLOCK so a file-to-FIFO swap after the lstat cannot park the open
+  // waiting for a writer; the handle stat then refuses non-regular files.
+  // O_NOFOLLOW so a file-to-link swap cannot redirect the read outside the
+  // mirror. A handle-stat size disagreeing with entry.size means the file
+  // changed between the lstat and the open: refuse before reading.
+  let handle: fsp.FileHandle;
+  try {
+    handle = await open(dest, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (error) {
+    if (isGuestVanished(error) || (error as { code?: string })?.code === "ELOOP") return "different";
+    throw error;
+  }
+  try {
+    const hst = await handle.stat();
+    if (!hst.isFile() || hst.size !== entry.size) return "different";
+    const hash = createHash("sha256");
+    const stream = handle.createReadStream();
+    let total = 0;
+    try {
+      for await (const chunk of stream) {
+        const buf = chunk as Buffer;
+        total += buf.length;
+        if (total > entry.size) return "different";
+        hash.update(buf);
+      }
+    } finally {
+      stream.destroy();
+    }
+    if (total !== entry.size) return "different";
+    if (hash.digest("hex") !== entry.sha256) return "different";
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
   const modeOk = (st.mode & 0o777) === (entry.mode & 0o777);
   const mtimeOk = Math.floor(st.mtimeMs) === Math.floor(entry.mtimeMs);
   return modeOk && mtimeOk ? "identical" : "metadata-only";
