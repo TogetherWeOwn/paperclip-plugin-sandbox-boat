@@ -47,10 +47,10 @@ export interface BoatDriverConfig {
    */
   managedGithub: boolean;
   /**
-   * SHA-256 (hex) of the one dedicated sandbox model-proxy key. When set,
-   * ANTHROPIC_AUTH_TOKEN reaches the VM only if it is that key, spent
-   * through the tunnel. Null: an on-tunnel token is delivered unverified
-   * (validation warns); an off-tunnel one is dropped either way.
+   * SHA-256 (hex) of the one dedicated sandbox model-proxy key.
+   * ANTHROPIC_AUTH_TOKEN reaches the VM only when it is that key, spent
+   * through the tunnel. Unset: the model credential is refused (validation
+   * warns); an off-tunnel one is dropped either way.
    */
   modelProxyKeyFingerprint: string | null;
   sshConnectTimeoutSec: number;
@@ -383,7 +383,7 @@ export function validateDriverConfig(config: BoatDriverConfig, raw: Record<strin
     config.envAllowlist == null || allowlistDelivers("ANTHROPIC_AUTH_TOKEN", config.envAllowlist);
   if (modelTokenDeliverable && config.cliproxyTunnel && config.modelProxyKeyFingerprint == null) {
     warnings.push(
-      "modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is delivered unverified whenever ANTHROPIC_BASE_URL is the tunnel address (an off-tunnel token is dropped). Set it to the SHA-256 of the dedicated, low-limit sandbox proxy key so a managed AI-connection pool credential can never reach a VM, and do not bind agents on boat environments to managed AI connections.",
+      "modelProxyKeyFingerprint is not set: ANTHROPIC_AUTH_TOKEN is withheld (model_credential_fingerprint_unset) even whenever ANTHROPIC_BASE_URL is the tunnel address (an off-tunnel token is dropped). Set it to the SHA-256 of the dedicated, low-limit sandbox proxy key so the model credential can reach the VM, and do not bind agents on boat environments to managed AI connections.",
     );
   }
   if (modelTokenDeliverable && !config.cliproxyTunnel) {
