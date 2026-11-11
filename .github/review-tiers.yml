@@ -34,13 +34,16 @@ default_tier: sensitive # anything not matched below
 
 tiers:
   low:
-    # Docs copy and prose only; content triggers still escalate.
+    # Docs copy and prose only; content triggers still escalate, and
+    # sensitive-floor filenames under docs/ (CODEOWNERS, AGENTS.md, CLAUDE.md,
+    # SKILL.md, .claude/**) still tier sensitive via the overlap rule.
     - "README.md"
     - "CHANGELOG.md"
     - "CONTEXT.md"
     - "LICENSE"
     - "docs/**"
     # Additive unit tests only; weakened/deleted tests escalate via triggers.
+    # Tests under src/test-support/** stay sensitive via the overlap rule.
     - "src/**/*.test.ts"
 
   ordinary: [] # path globs, audited modules only; none justified yet
@@ -50,6 +53,15 @@ tiers:
     - ".github/review-tiers.yml"
     - ".github/**"
     - "CODEOWNERS"
+    # Ownership/instruction/tool-permission filenames are sensitive wherever
+    # they appear: docs/CODEOWNERS is a real GitHub CODEOWNERS location that
+    # changes required-reviewer routing, and the **/ forms stop these files
+    # escaping under the low docs/** lane via the overlap rule.
+    - "**/CODEOWNERS"
+    - "**/AGENTS.md"
+    - "**/CLAUDE.md"
+    - "**/SKILL.md"
+    - "**/.claude/**"
     # Dependency manifests, lockfiles, and install/build/test gates.
     - "package.json"
     - "package-lock.json"
@@ -63,8 +75,12 @@ tiers:
     - "bin/**"
     - "scripts/**"
     # Test harness, fixtures, and guest helpers: changes here can weaken
-    # coverage without touching assertions, so they stay sensitive.
+    # coverage without touching assertions, so they stay sensitive and win
+    # over the low src/**/*.test.ts lane on overlap.
     - "src/test-support/**"
-    # Runtime source is a trust-boundary surface (VM lifecycle, SSH, secrets,
-    # budgets); only *.test.ts above is carved out.
-    - "src/**"
+    # NOTE: there is deliberately no "src/**" entry here. src/**/*.test.ts in
+    # `low` is the only carve-out; every other runtime source path is
+    # unmatched and therefore tiers sensitive via default_tier anyway (the
+    # runtime is a trust-boundary surface: VM lifecycle, SSH, secrets,
+    # budgets). Listing "src/**" here would shadow the low test lane and
+    # contradict it.
