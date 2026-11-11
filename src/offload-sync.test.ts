@@ -472,6 +472,38 @@ describe("LocalGuestStore.push", () => {
     expect(readFileSync(path.join(guest, "src/a.rs"), "utf8")).toBe("a\n");
   });
 
+  it("replaces a FIFO installed immediately before the copy", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "a.rs": "new\n" });
+    const snapshot = await captureSnapshot(live, snapDir);
+    const target = path.join(guest, "a.rs");
+    writeFileSync(target, "old\n");
+    const store = new LocalGuestStore({
+      beforeCopy: () => {
+        rmSync(target);
+        execFileSync("mkfifo", [target]);
+      },
+    });
+    const result = await store.push(snapDir, planPush(null, snapshot.manifest).toSend, guest);
+    expect(result.files).toBe(1);
+    expect(lstatSync(target).isFile()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("new\n");
+  }, 3000);
+
+  it("bounds the runtime copy-to-FIFO behavior in a child process", () => {
+    const root = makeTemp();
+    const src = path.join(root, "src");
+    const fifo = path.join(root, "fifo");
+    writeFileSync(src, "data");
+    execFileSync("mkfifo", [fifo]);
+    expect(() => execFileSync(process.execPath, ["-e", "require('node:fs').copyFileSync(process.argv[1], process.argv[2])", src, fifo], {
+      timeout: 1000,
+      killSignal: "SIGKILL",
+    })).toThrow(expect.objectContaining({ code: "ETIMEDOUT" }));
+  }, 5000);
+
   it("recovers a partial transfer by sending only what is missing", async () => {
     const live = makeTemp();
     const snapDir = makeTemp();
@@ -1337,6 +1369,31 @@ describe("planPush metadata changes", () => {
 });
 
 describe("LocalGuestStore.push metadata-only sync", () => {
+  it("compares metadata from the opened file after a path replacement", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "src/a.rs": "a\n" });
+    chmodSync(path.join(live, "src/a.rs"), 0o644);
+    const snapshot = await captureSnapshot(live, snapDir);
+    const entries = planPush(null, snapshot.manifest).toSend;
+    await new LocalGuestStore().push(snapDir, entries, guest);
+    const target = path.join(guest, "src/a.rs");
+    const store = new LocalGuestStore({
+      open: (async (file, flags) => {
+        await fsp.unlink(target);
+        await fsp.writeFile(target, "a\n", { mode: 0o600 });
+        await fsp.utimes(target, new Date(0), new Date(0));
+        return fsp.open(file, flags);
+      }) as typeof fsp.open,
+    });
+    const result = await store.push(snapDir, entries, guest);
+    expect(result).toMatchObject({ files: 1, bytes: 0, skipped: 0 });
+    const repaired = lstatSync(target);
+    expect(repaired.mode & 0o777).toBe(0o644);
+    expect(Math.floor(repaired.mtimeMs)).toBe(Math.floor(entries[0].mtimeMs));
+  });
+
   it("applies a mode change without rewriting bytes", async () => {
     const live = makeTemp();
     const snapDir = makeTemp();

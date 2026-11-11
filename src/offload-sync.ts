@@ -795,12 +795,21 @@ export class LocalGuestStore implements GuestStore {
         await fsp.chmod(dest, entry.mode);
         await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
       } else {
-        const st = await fsp.lstat(dest).catch(() => null);
-        if (st && (st.isSymbolicLink() || st.isDirectory())) await fsp.rm(dest, { recursive: true, force: true });
-        await fsp.copyFile(src, dest);
-        await fsp.chmod(dest, entry.mode);
-        // Whole-millisecond floor: the most Node's utimes can set (rsync keeps full precision).
-        await fsp.utimes(dest, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
+        // Copy to a fresh private sibling first: never open the guest-controlled
+        // destination for writing, even if it changes after inspection.
+        const tempDir = await fsp.mkdtemp(path.join(path.dirname(dest), ".boat-push-"));
+        try {
+          const tempFile = path.join(tempDir, "file");
+          await fsp.copyFile(src, tempFile);
+          await fsp.chmod(tempFile, entry.mode);
+          // Whole-millisecond floor: the most Node's utimes can set (rsync keeps full precision).
+          await fsp.utimes(tempFile, new Date(Math.floor(entry.mtimeMs)), new Date(Math.floor(entry.mtimeMs)));
+          const st = await fsp.lstat(dest).catch(() => null);
+          if (st?.isDirectory()) await fsp.rm(dest, { recursive: true, force: true });
+          await fsp.rename(tempFile, dest);
+        } finally {
+          await fsp.rm(tempDir, { recursive: true, force: true });
+        }
       }
       files += 1;
       bytes += match === "metadata-only" ? 0 : entry.size;
@@ -1034,12 +1043,12 @@ async function matchGuestEntry(dest: string, entry: SyncFileEntry, open: typeof 
     }
     if (total !== entry.size) return "different";
     if (hash.digest("hex") !== entry.sha256) return "different";
+    const modeOk = (hst.mode & 0o777) === (entry.mode & 0o777);
+    const mtimeOk = Math.floor(hst.mtimeMs) === Math.floor(entry.mtimeMs);
+    return modeOk && mtimeOk ? "identical" : "metadata-only";
   } finally {
     await handle.close().catch(() => undefined);
   }
-  const modeOk = (st.mode & 0o777) === (entry.mode & 0o777);
-  const mtimeOk = Math.floor(st.mtimeMs) === Math.floor(entry.mtimeMs);
-  return modeOk && mtimeOk ? "identical" : "metadata-only";
 }
 
 export interface RsyncPushSpec {
