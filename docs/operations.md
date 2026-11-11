@@ -83,10 +83,12 @@ carries the canonical path and the on-disk URL — and that identity is
 authenticated against its remote: unauthenticated `git ls-remote` must
 advertise the checkout's HEAD, and the tracked tree must match it. The on-disk
 origin is agent-writable, so agreement of the row and the origin alone is not
-proof; both strings could be rewritten to an allowlisted repo. All facts are
-re-checked on every executor resolve, so re-pointing the row, the path or the
-origin — or losing remote authentication — after the bind stops dispatch
-(commands fall back locally, never sync). The offload request body
+proof; both strings could be rewritten to an allowlisted repo. The bound
+source, its on-disk origin and its remote authentication are re-checked on
+every executor resolve, so re-pointing the origin or losing remote
+authentication after the bind stops dispatch (commands fall back locally,
+never sync). The workspace row is not re-read: the bound workspace identity
+is what each resolve re-proves. The offload request body
 supplies nothing, and the secret in step 4 is resolved last, after every
 check: a bind retried from an offload request runs only for a run with no
 existing binding and only for the workspace that request named, so probing
