@@ -1,0 +1,70 @@
+# Risk-tiered review map for paperclip-plugin-sandbox-boat.
+# Canonical policy: org-wide risk-tiered review record (parent plan).
+#
+# Classification rules:
+# - A PR's tier is the highest tier of any changed file.
+# - `sensitive` always wins on overlap; anything unmatched falls back to
+#   `default_tier: sensitive`.
+# - Path globs are a floor, not proof of safety. These content triggers
+#   escalate a change to sensitive regardless of path:
+#     * new/changed public endpoint or input parsing
+#     * auth, authz, or session handling
+#     * crypto or key material
+#     * secrets or credentials
+#     * permission checks
+#     * tenant isolation or personal data
+#     * SQL, schema, or migrations
+#     * dependency or lockfile changes
+#     * CI or workflow changes
+#     * weakened test assertions, deleted tests/snapshots, or lowered gates
+#       in test files
+# - Review per tier: low -> QA; ordinary -> QA; sensitive/unclassified ->
+#   Security -> QA. QA verifies the author's `risk_tier` attestation and may
+#   escalate any PR.
+# - `.github/review-tiers.yml` itself is always sensitive.
+#
+# Low = allowlisted docs copy, static non-sensitive fixtures, additive unit
+# tests (content triggers still apply). Ordinary = only modules justified in
+# the PR body (no untrusted input, sensitive output, permissions, persistence
+# or trust-boundary effect). When in doubt, leave a path unlisted (=
+# sensitive); every new top-level path is sensitive until classified here.
+
+version: 1
+default_tier: sensitive # anything not matched below
+
+tiers:
+  low:
+    # Docs copy and prose only; content triggers still escalate.
+    - "README.md"
+    - "CHANGELOG.md"
+    - "CONTEXT.md"
+    - "LICENSE"
+    - "docs/**"
+    # Additive unit tests only; weakened/deleted tests escalate via triggers.
+    - "src/**/*.test.ts"
+
+  ordinary: [] # path globs, audited modules only; none justified yet
+
+  sensitive:
+    # Review policy and ownership.
+    - ".github/review-tiers.yml"
+    - ".github/**"
+    - "CODEOWNERS"
+    # Dependency manifests, lockfiles, and install/build/test gates.
+    - "package.json"
+    - "package-lock.json"
+    - ".npmrc"
+    - "tsconfig*.json"
+    - "vitest.config.ts"
+    # Agent/tool-permission files.
+    - "AGENTS.md"
+    - ".claude/**"
+    # Executables, release/CI/guest scripts, and install shims.
+    - "bin/**"
+    - "scripts/**"
+    # Test harness, fixtures, and guest helpers: changes here can weaken
+    # coverage without touching assertions, so they stay sensitive.
+    - "src/test-support/**"
+    # Runtime source is a trust-boundary surface (VM lifecycle, SSH, secrets,
+    # budgets); only *.test.ts above is carved out.
+    - "src/**"
