@@ -355,8 +355,10 @@ export async function hasSecretInFiles(root: string, relPaths: readonly string[]
     if (st.isSymbolicLink() || st.isDirectory()) continue;
     if (!st.isFile()) return true;
     if (st.size > MAX_SCAN_FILE_BYTES) return true;
-    total += st.size;
-    if (total > MAX_SCAN_TOTAL_BYTES) return true;
+    // `total` counts only completed files: it gates this file against the
+    // aggregate budget here, then gains this file's bytes exactly once after
+    // the capped read below.
+    if (total + st.size > MAX_SCAN_TOTAL_BYTES) return true;
     let handle;
     try {
       // O_NONBLOCK so a regular-file-to-FIFO swap after the lstat cannot
