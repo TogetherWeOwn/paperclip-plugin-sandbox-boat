@@ -472,6 +472,38 @@ describe("LocalGuestStore.push", () => {
     expect(readFileSync(path.join(guest, "src/a.rs"), "utf8")).toBe("a\n");
   });
 
+  it("replaces a FIFO installed immediately before the copy", async () => {
+    const live = makeTemp();
+    const snapDir = makeTemp();
+    const guest = makeTemp();
+    writeTree(live, { "a.rs": "new\n" });
+    const snapshot = await captureSnapshot(live, snapDir);
+    const target = path.join(guest, "a.rs");
+    writeFileSync(target, "old\n");
+    const store = new LocalGuestStore({
+      beforeCopy: () => {
+        rmSync(target);
+        execFileSync("mkfifo", [target]);
+      },
+    });
+    const result = await store.push(snapDir, planPush(null, snapshot.manifest).toSend, guest);
+    expect(result.files).toBe(1);
+    expect(lstatSync(target).isFile()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("new\n");
+  }, 3000);
+
+  it("bounds the runtime copy-to-FIFO behavior in a child process", () => {
+    const root = makeTemp();
+    const src = path.join(root, "src");
+    const fifo = path.join(root, "fifo");
+    writeFileSync(src, "data");
+    execFileSync("mkfifo", [fifo]);
+    expect(() => execFileSync(process.execPath, ["-e", "require('node:fs').copyFileSync(process.argv[1], process.argv[2])", src, fifo], {
+      timeout: 1000,
+      killSignal: "SIGKILL",
+    })).toThrow(expect.objectContaining({ code: "ETIMEDOUT" }));
+  }, 5000);
+
   it("recovers a partial transfer by sending only what is missing", async () => {
     const live = makeTemp();
     const snapDir = makeTemp();
